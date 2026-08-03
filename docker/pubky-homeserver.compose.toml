@@ -1,0 +1,31 @@
+[general]
+database_url = "postgres://locks:locks@postgres:5432/pubky_homeserver"
+signup_mode = "open"
+
+[drive]
+pubky_listen_socket = "0.0.0.0:6287"
+icann_listen_socket = "0.0.0.0:6286"
+
+[storage]
+type = "file_system"
+
+[admin]
+enabled = true
+listen_socket = "0.0.0.0:6288"
+admin_password = "admin"
+
+[metrics]
+enabled = false
+listen_socket = "0.0.0.0:6289"
+
+[pkdns]
+public_ip = "127.0.0.1"
+public_pubky_tls_port = 6287
+public_icann_http_port = 6286
+icann_domain = "localhost"
+user_keys_republisher_interval = 14400
+dht_request_timeout_ms = 2000
+
+[logging]
+level = "info"
+module_levels = ["pubky_homeserver=debug", "tower_http=debug"]

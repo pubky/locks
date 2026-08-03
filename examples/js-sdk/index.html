@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pubky Locks JS SDK creator demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+      section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+      label { display: block; margin: 0.75rem 0; }
+      input, select, button, textarea { font: inherit; }
+      input[type="text"], input[type="number"], textarea { width: 100%; box-sizing: border-box; }
+      pre { background: #f7f7f7; padding: 0.75rem; overflow: auto; }
+      .ok { color: #067d17; }
+      .error { color: #a40000; }
+      .muted { color: #666; }
+      .row { display: flex; gap: 0.5rem; align-items: center; }
+      .prefix { white-space: nowrap; color: #555; }
+    </style>
+  </head>
+  <body>
+    <h1>Pubky Locks JS SDK creator demo</h1>
+    <p style="background:#eef3ff;border:1px solid #c7d6ff;border-radius:8px;padding:0.5rem 0.75rem;">
+      Authorizing the Lock Server uses a <strong>full-page redirect</strong>. &nbsp;→
+      <a href="/examples/js-sdk/iframe.html">Switch to iframe flow</a> &nbsp;·&nbsp;
+      <a href="/examples/js-sdk/flows.html">All flows</a></p>
+    <p>This local testnet demo exercises the browser JS/WASM SDK against a configured Lock Server.</p>
+
+    <section id="demo-auth">
+      <h2>1. Authenticate demo server to homeserver</h2>
+      <p id="demo-auth-status" class="muted">Checking status...</p>
+      <button id="start-demo-auth">Start demo-server auth</button>
+      <pre id="demo-auth-command"></pre>
+    </section>
+
+    <section id="lock-server-auth">
+      <h2>2. Authenticate creator to Lock Server</h2>
+      <p id="lock-auth-status" class="muted">Waiting for demo auth.</p>
+      <button id="start-lock-auth" disabled>Authenticate to Lock Server</button>
+    </section>
+
+    <section id="creator-publishing">
+      <h2>3. Creator publishing</h2>
+      <p id="publishing-status" class="muted">Waiting for Lock Server session.</p>
+      <button id="configure-pointer" disabled>Configure Lock Service Pointer</button>
+
+      <form id="locked-content-form" hidden>
+        <label>
+          Select primary file
+          <input id="primary-content-file" type="file" required />
+          <span class="muted">The primary file is the default file readers usually open first.</span>
+        </label>
+        <label>
+          Select secondary files
+          <input id="secondary-content-files" type="file" multiple />
+          <span class="muted">Secondary files are additional resources protected by the same content lock.</span>
+        </label>
+        <div id="selected-resources" class="muted" hidden>
+          <strong>Selected resources</strong>
+          <ul id="selected-resource-list"></ul>
+        </div>
+        <label>
+          Primary guarded resource path
+          <div class="row">
+            <span class="prefix">/priv/locks.app/content/</span>
+            <input id="resource-filename" type="text" required />
+          </div>
+          <span class="muted">Secondary guarded resource paths are derived from each secondary file name. Use distinct file names.</span>
+        </label>
+        <label>
+          Verifier type
+          <select id="verifier-type">
+            <option value="dev-static">dev-static</option>
+          </select>
+        </label>
+        <label>
+          Criterion ID
+          <input id="criterion-id" type="text" value="criterion-1" required />
+        </label>
+        <label>
+          Dev-static satisfied
+          <select id="criterion-satisfied">
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+        <label>
+          Access credential TTL seconds
+          <input id="access-ttl" type="number" min="1" value="900" required />
+        </label>
+        <button type="submit">Create locked content</button>
+      </form>
+      <h3>Result</h3>
+      <pre id="creator-result"></pre>
+      <p><strong>Viewer content lock resource</strong></p>
+      <pre id="viewer-resource"></pre>
+    </section>
+
+    <script type="module" src="/examples/js-sdk/app.js"></script>
+  </body>
+</html>

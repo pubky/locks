@@ -1,0 +1,9 @@
+{
+  "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+  "path": "/pub/locks.app/config.json",
+  "lock_service_pointer": {
+    "version": 1,
+    "default_lock_server": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+    "created_at": "<created_at>"
+  }
+}

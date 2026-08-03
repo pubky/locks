@@ -1,0 +1,22 @@
+{
+  "name": "@pubky/locks-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser JS/WASM bindings for the Pubky Locks Creator SDK",
+  "type": "module",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir pkg",
+    "check:wasm": "cargo check -p locks-sdk-wasm --target wasm32-unknown-unknown",
+    "smoke:pkg": "npm run build && node scripts/smoke-generated-api.mjs",
+    "smoke:demo": "node scripts/smoke-demo.mjs",
+    "smoke:examples": "node scripts/smoke-examples.mjs",
+    "release:audit": "node scripts/release-readiness.mjs",
+    "live:smoke:check": "node scripts/live-smoke-check.mjs",
+    "test:native": "cargo test -p locks-sdk-wasm",
+    "test": "npm run test:native && npm run check:wasm && npm run smoke:pkg && npm run smoke:demo && npm run smoke:examples"
+  },
+  "devDependencies": {}
+}

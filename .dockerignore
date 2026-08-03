@@ -1,0 +1,18 @@
+/target
+/.git
+/.github
+/.hermes
+/.local
+
+# Local/generated JS artifacts are not needed to build the Rust server.
+/node_modules
+/locks-sdk/bindings/js/pkg
+/locks-sdk/bindings/js/node_modules
+/examples/js-sdk/node_modules
+
+# Local runtime state and secrets.
+/.pubky-lock
+*.sess
+*.log
+.env
+.env.*

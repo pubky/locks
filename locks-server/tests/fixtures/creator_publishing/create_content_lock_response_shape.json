@@ -1,0 +1,36 @@
+{
+  "lock_id": "<lock_id>",
+  "content_lock_path": "/pub/locks.app/<lock_id>.json",
+  "content_lock": {
+    "version": 1,
+    "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+    "primary_resource": {
+      "path": "/priv/locks.app/content/example.txt",
+      "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+      "content_type": "text/plain",
+      "size": 13
+    },
+    "criteria": [
+      {
+        "criterion_id": "criterion-1",
+        "verifier_type": "dev-static",
+        "params": {
+          "satisfied": true
+        }
+      }
+    ],
+    "lock_logic": {
+      "type": "all",
+      "criteria": [
+        "criterion-1"
+      ]
+    },
+    "access_policy": {
+      "requested_credential_ttl_seconds": 900
+    },
+    "lock_server": {
+      "override": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
+    },
+    "created_at": "<created_at>"
+  }
+}

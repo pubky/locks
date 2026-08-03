@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "locks-core",
+    "locks-service",
+    "locks-server",
+    "locks-sdk",
+    "locks-sdk/bindings/js",
+    "locks-e2e",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/pubky/locks"
+rust-version = "1.89.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base32 = "0.5.1"
+base64 = "0.22"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+locks-core = { path = "locks-core" }
+locks-service = { path = "locks-service" }
+mime = "0.3"
+pubky = { version = "0.9.0", features = ["json"] }
+pubky-common = "0.9.0"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+pkarr = "6.0.1"
+percent-encoding = "2"
+rand = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "0.3.2"
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "time",
+    "json",
+    "migrate",
+] }
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde", "serde-well-known"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "js"] }

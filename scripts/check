@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5433/locks_test
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+run() {
+  printf '\n==> %s\n' "$*"
+  "$@"
+}
+
+run cargo fmt --check
+run cargo clippy --workspace --all-targets --all-features -- -D warnings
+run cargo nextest run --workspace --exclude locks-e2e --exclude locks-service
+run cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres
+
+run cargo nextest run -p locks-e2e --test creator_publishing_http
+run cargo nextest run -p locks-e2e --test retrieval_access_http
+run cargo nextest run -p locks-e2e --test production_creator_publishing_http
+run cargo nextest run -p locks-e2e --test production_creator_authority_acquisition
+
+run npm --prefix locks-sdk/bindings/js run test
+
+if [[ -n "${TEST_DATABASE_URL:-}" ]]; then
+  run env TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo nextest run --workspace
+else
+  printf '\n==> skipping Postgres-backed full workspace checks: TEST_DATABASE_URL is not set\n'
+  printf '    Set TEST_DATABASE_URL=postgres://user:pass@host:port/db to include them.\n'
+fi
+
+run git diff --check
+
+printf '\n==> check complete\n'
+exit 0

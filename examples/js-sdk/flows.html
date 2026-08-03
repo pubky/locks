@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pubky Locks JS SDK creator demo — flows</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 760px; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+      h1 { font-size: 1.5rem; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 1.25rem 1.5rem; margin: 1rem 0; }
+      .card h2 { margin: 0 0 0.4rem; font-size: 1.15rem; }
+      .card a { display: inline-block; margin-top: 0.6rem; font-weight: 600; }
+      .muted { color: #666; }
+      code { background: #f4f4f4; padding: 1px 5px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Pubky Locks JS SDK — creator demo</h1>
+    <p class="muted">
+      Both demos run the same creator flow (authenticate → grant the Lock Server access → publish locked content).
+      They differ only in how the creator authorizes the Lock Server. Pick one:
+    </p>
+
+    <div class="card">
+      <h2>Redirect flow</h2>
+      <p>Authorizing the Lock Server navigates the whole page to the Lock Server and back
+        (classic OAuth-style full-page redirect). The session token is stored in
+        <code>localStorage</code>.</p>
+      <a href="/examples/js-sdk/">Open redirect flow →</a>
+    </div>
+
+    <div class="card">
+      <h2>Iframe flow</h2>
+      <p>Authorizing the Lock Server happens inside an <strong>iframe modal</strong> — the page never leaves
+        the app origin. The Lock Server passes the result back to the parent via <code>postMessage</code>,
+        and the session token is kept <strong>in memory only</strong> (not <code>localStorage</code>).
+        Works inside an installed PWA (standalone).</p>
+      <a href="/examples/js-sdk/iframe.html">Open iframe flow →</a>
+    </div>
+
+    <p class="muted">See <code>examples/js-sdk/README.md</code> for local testnet setup.</p>
+  </body>
+</html>

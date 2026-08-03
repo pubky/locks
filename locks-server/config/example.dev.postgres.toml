@@ -1,0 +1,62 @@
+bind_addr = "127.0.0.1:3000"
+
+[credentials]
+lock_server_secret_key = "~/.pubky-lock/secret.sess"
+lock_server_public_key = "<derived-on-first-run>"
+max_ttl_seconds = 900
+
+[database]
+url_env = "PUBKY_LOCK_DATABASE_URL"
+max_connections = 10
+run_migrations_on_startup = true
+
+[worker]
+enabled = true
+poll_interval_ms = 250
+claim_timeout_seconds = 60
+worker_id = "default-worker"
+
+[runtime]
+environment = "development"
+
+[paykit]
+server_url = "http://127.0.0.1:3001"
+minimum_confirmations = 0
+
+[creator_authority_acquisition]
+enabled = true
+method = "legacy-connect"
+frontend_session_ttl_seconds = 86400
+frontend_session_code_ttl_seconds = 120
+
+[creator_authority_acquisition.legacy_connect]
+allowed_return_origins = ["http://localhost:3000"]
+
+[secrets]
+creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+
+[logging]
+level = "info"
+
+[pubky]
+network = "testnet"
+
+[pkdns]
+# Public endpoint data published in the Lock Server PKARR record.
+# Operators must configure these for reachable production deployments; Locks does not auto-detect them.
+public_ip = "127.0.0.1"
+public_pubky_tls_port = 6287
+public_icann_http_port = 80
+icann_domain = "localhost"
+pkarr_relays = []
+key_republisher_interval_seconds = 3600
+
+[rate_limits.verification_submission]
+enabled = true
+max_requests = 60
+window_seconds = 60
+
+[content_locks]
+max_resource_bytes = 10_000_000
+max_resources = 10
+max_total_resource_bytes = 100_000_000

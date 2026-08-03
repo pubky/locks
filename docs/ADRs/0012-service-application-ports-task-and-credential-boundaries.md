@@ -1,0 +1,279 @@
+# ADR 0012: Service Application Ports, Task Lifecycle, and Credential Boundaries
+
+## Status
+
+Accepted
+
+## Context
+
+`locks-core` owns protocol/domain payloads, identifier parsing, canonical JSON, hashing, and pure value-object rules. `locks-service` owns Lock Server orchestration: repositories, verifier boundaries, verification task state, access credential issuance, and runtime concerns.
+
+The first vertical slice uses in-memory adapters and a `dev-static` verifier, but future adapters will perform Pubky homeserver reads/writes, network I/O, persistent storage, verifier calls, and HTTP/runtime composition. The service boundary should avoid a known cross-cutting refactor when those adapters arrive.
+
+Access credentials are bearer secrets. Their lifecycle is separate from durable `BundleId` entitlement recovery and internal operational `TaskId` runtime coordination.
+
+## Decision
+
+### Async service boundary
+
+`locks-service` application ports and use cases are async from v0.
+
+- Ports use `async-trait`.
+- Port traits are object-safe and intended for runtime composition as `dyn Trait + Send + Sync`.
+- Port methods take `&self`; adapters own interior mutability.
+- `locks-service` may use Tokio for runtime/tests.
+- `locks-core` must remain runtime-free and must not depend on Tokio or `async-trait`.
+
+Rationale: even though v0 adapters are in-memory, the real service boundary is I/O-shaped. Making ports/use cases async now avoids a broad later refactor when Pubky/network/storage adapters are introduced.
+
+### Application models and errors
+
+Application-layer operational data lives in `locks-service/src/application/models.rs`. Port traits live in `locks-service/src/application/ports.rs`.
+
+Generic port/infrastructure errors are available now:
+
+- `DuplicateRecord { record }`
+- `MissingRecord { record }`
+- `Storage { message }`
+- `Verifier { message }`
+
+Workflow-specific errors are introduced only when concrete use cases need them.
+
+### Repository and store semantics
+
+Repository/store read methods return `Result<Option<T>, ApplicationError>`.
+
+- `Ok(None)` represents an expected missing record.
+- Missing data is interpreted by use cases, not repositories.
+- Infrastructure failures remain `Err(ApplicationError)`.
+
+Write method names encode mutation semantics:
+
+- `insert_*`: create only; duplicate is `DuplicateRecord`.
+- `upsert_*`: create or replace.
+- `update_*`: update existing only; missing is `MissingRecord`.
+- `delete_*`: means “ensure absent”; deleting a missing record returns `Ok(())`.
+
+Rationale: repositories expose persistence access, not product meaning. Use cases decide whether absence means invalid credential, revoked entitlement, content lock unavailable, expired task, or user-facing not found.
+
+### Verification task lifecycle
+
+`VerificationTaskRecord` is service operational state, not protocol entitlement state.
+
+Fields:
+
+- `task_id: TaskId`
+- `creator: CreatorPubky`
+- `submitted_proof_bundle: SubmittedProofBundle`
+- `status: VerificationTaskStatus`
+- `submitted_at: OffsetDateTime`
+- `started_at: Option<OffsetDateTime>`
+- `completed_at: Option<OffsetDateTime>`
+- `failure_message: Option<String>`
+
+It does not store `VerificationResult`; successful verification evidence lives in `VerifiedProofBundle`.
+
+Allowed transitions:
+
+- `pending -> in_progress`
+- `pending -> expired`
+- `in_progress -> completed`
+- `in_progress -> failed`
+- `in_progress -> expired`
+
+Terminal states:
+
+- `completed`
+- `failed`
+- `expired`
+
+Transition validity is enforced by `VerificationTaskRecord::transition_to` in `locks-service`.
+
+Polling and worker orchestration are separate use cases:
+
+- `GetVerificationTaskUseCase` is read-only: load by `TaskId`, return task lifecycle view, missing task returns `MissingRecord { record: "verification_task" }`, and it must not dispatch verifiers or mutate state.
+- `CompleteVerificationTaskUseCase` is worker-owned: verifier dispatch/run and entitlement persistence happen outside the polling path. It loads the submitted proof bundle from the stored task, reads the content lock via `pubky_lock_resource`, dispatches through `CriterionVerifierRegistry`, injects this Lock Server's identity into verifier requests as `verified_by`, persists `InProgress` after verifier dispatch succeeds, persists a `VerifiedProofBundle` on satisfied verification, then marks the task `Completed`. Failures persist `Failed` with a non-empty message.
+
+Failure-message rules:
+
+- `failed` requires a non-empty failure message.
+- non-`failed` transitions reject failure messages.
+- expired tasks represent expiry by status, not failure message.
+- current task state is validated before transition.
+
+Invalid lifecycle behavior uses dedicated errors, not generic storage errors:
+
+- `InvalidVerificationTaskTransition { from, to }`
+- `InvalidVerificationTaskState { message }`
+- `InvalidVerificationTaskFailureMessage`
+
+### Access credential format and storage
+
+Access credentials are short-lived opaque bearer secrets generated by `locks-service`.
+
+Format:
+
+- 32 bytes cryptographic randomness.
+- Encoded as base64url without padding.
+- Not a `BundleId` and not a `TaskId`.
+- Redacted in `Debug` output.
+
+Store lookup uses `AccessCredentialLookupKey`, not the raw bearer credential:
+
+```text
+AccessCredentialLookupKey = BLAKE3(access_credential.as_bytes())
+```
+
+The raw access credential is returned to the caller once. Stores map lookup key to:
+
+```text
+{ creator, bundle_id, expires_at }
+```
+
+Rationale: raw bearer tokens should not become map keys or stored identifiers. Plain BLAKE3 is the v0 compromise until runtime server-secret config exists; a keyed hash/HMAC can replace it later.
+
+### Credential generation port
+
+Add an application port:
+
+```rust
+#[async_trait]
+pub trait AccessCredentialGenerator: Send + Sync {
+    async fn generate_access_credential(&self) -> Result<AccessCredential, ApplicationError>;
+}
+```
+
+Infrastructure implementations use OS CSPRNG and base64url/no-padding encoding. Tests may inject deterministic generators.
+
+Rationale: credential generation is security-sensitive and must be injectable/testable rather than hidden behind global randomness.
+
+### Credential TTL policy
+
+Credential issuance uses an explicit policy object:
+
+```rust
+pub struct AccessCredentialPolicy {
+    pub default_ttl_seconds: u64,
+    pub max_ttl_seconds: u64,
+}
+```
+
+Rules:
+
+- Default requested TTL is 900 seconds.
+- Requested TTL comes from `ContentLock.access_policy.requested_credential_ttl_seconds`.
+- Requested TTL must be non-zero and less than or equal to service-configured max.
+- Unsupported TTL is rejected explicitly; it is not clamped.
+
+Use-case-specific error:
+
+```rust
+UnsupportedCredentialTtl {
+    requested_seconds: u64,
+    max_seconds: u64,
+}
+```
+
+### Entitlement evaluation
+
+Credential issuance and validation use a focused service-layer evaluator:
+
+```rust
+pub fn evaluate_entitlement(
+    content_lock: &ContentLock,
+    verification_result: &VerificationResult,
+) -> Result<bool, ApplicationError>;
+```
+
+The evaluator lives in `locks-service/src/application/entitlement_evaluator.rs`.
+
+Rules:
+
+- Empty content lock criteria are invalid.
+- Duplicate content lock criterion IDs are invalid.
+- Duplicate verification result criterion IDs are invalid.
+- Verification result criterion IDs not present in the content lock are invalid.
+- `all`: every content lock criterion must have a satisfied result.
+- `any`: at least one content lock criterion must have a satisfied result.
+- Missing or unsatisfied evidence is valid-but-insufficient and returns `Ok(false)`.
+- Malformed/corrupt evidence returns specific `ApplicationError` variants.
+
+Rationale: issuing a bearer token must not trust persisted entitlement records blindly. Re-evaluating stored evidence against the current hash-verified content lock catches corrupt or over-broad entitlement records and gives issuance/validation one shared rule surface.
+
+### Credential issuance and validation use-case boundaries
+
+Credential issuance takes only `{ creator, bundle_id }`; it resolves entitlement internally rather than trusting caller-supplied verified objects. Issuance returns `{ credential, expires_at }` and is the only use-case boundary that returns a raw access credential.
+
+Credential issuance is intentionally explicit and separate from both task polling and completion. `GetVerificationTaskUseCase` is read-only and must never mint or expose bearer credentials. `CompleteVerificationTaskUseCase` persists entitlement evidence and marks the task `Completed`; it does not generate an access credential. This avoids unsafe polling side effects, repeated secret exposure, and lost-credential edge cases where a raw bearer token is generated but the response is not received.
+
+Credential validation takes the raw presented `AccessCredential` and returns `{ creator, bundle_id, expires_at }` on success. It does not expose the storage record type directly.
+
+Both issuance and validation re-check entitlement state by loading the verified proof bundle, loading the current content lock, verifying content lock path/hash integrity, and evaluating the stored verification result against the content lock.
+
+Validation deletes the credential when it is expired or when entitlement re-check fails. Revocation is sticky for issued credentials; if entitlement is restored, the viewer can request a new credential using the Bundle ID.
+
+Use-case errors are explicit:
+
+- `EntitlementNotFound`
+- `ContentLockUnavailable`
+- `ContentLockHashMismatch { expected, actual }`
+- `EntitlementNotSatisfied`
+- `ContentLockCanonicalization { message }`
+- `InvalidAccessCredential`
+- `ExpiredAccessCredential`
+
+### Verification task ID generator
+
+Submit-proof orchestration uses a service-owned task ID generator:
+
+```rust
+#[async_trait]
+pub trait VerificationTaskIdGenerator: Send + Sync {
+    async fn generate_task_id(&self) -> Result<TaskId, ApplicationError>;
+}
+```
+
+`SubmitProofBundleUseCase` accepts `{ submitted_proof_bundle }`, derives the creator from `submitted_proof_bundle.pubky_lock_resource`, creates or finds the task for `{ creator, bundle_id }`, generates the internal `TaskId` only for a new task, inserts a pending `VerificationTaskRecord`, and returns public lifecycle metadata without exposing `task_id`.
+
+Rationale: `BundleId` is viewer-generated durable entitlement recovery state and, with creator, is the public verification attempt handle. `TaskId` is server-owned operational coordination state. Callers should not choose or depend on workflow IDs.
+
+### Verifier type dispatch
+
+Criterion and proof payloads use a protocol-facing `VerifierType` enum, serialized as strings such as `dev-static`, rather than raw strings throughout service code. Completion orchestration dispatches via a registry:
+
+```rust
+pub trait CriterionVerifierRegistry: Send + Sync {
+    fn verifier_for(&self, verifier_type: VerifierType) -> Option<&dyn CriterionVerifier>;
+}
+```
+
+The first retrieval/access slice provides a static infrastructure adapter, `StaticCriterionVerifierRegistry`, under `locks-service/src/infrastructure/verifiers/registry.rs`. It starts empty, can be explicitly wired with a `dev-static` verifier, and returns `None` for known-but-unregistered verifier types.
+
+If a verifier type is known to the protocol but is not registered on this Lock Server, the use case returns:
+
+```rust
+ApplicationError::UnsupportedVerifierType { verifier_type }
+```
+
+Rationale: `verifier_type` is a protocol discriminator, not decoration or a Rust implementation name. Raw unsupported strings are rejected during protocol payload parsing; known-but-unavailable verifier types are service dispatch errors.
+
+### Clock port
+
+Add a sync clock port:
+
+```rust
+pub trait Clock: Send + Sync {
+    fn now(&self) -> OffsetDateTime;
+}
+```
+
+Rationale: credential expiry and task lifecycle behavior require deterministic tests. Reading time is not I/O, so the clock port does not need to be async. This avoids scattered direct calls to `OffsetDateTime::now_utc()` and keeps time-sensitive use cases injectable.
+
+## Consequences
+
+- `locks-service` gets async/runtime dependencies; `locks-core` does not.
+- Initial in-memory adapters will implement async ports even though they complete immediately.
+- Runtime composition can use shared trait objects without mutable app state.
+- Task transition logic has one implementation point and one test surface.
+- Credential generation and time become explicit injectable boundaries.
+- Future production credential storage can upgrade lookup keys from plain BLAKE3 to keyed hash/HMAC without changing the user-facing credential format.

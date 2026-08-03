@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pubky Locks Browser SDK Demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 54rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+      label { display: block; margin-top: 1rem; font-weight: 600; }
+      input, textarea, button { width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.6rem; font: inherit; }
+      button { width: auto; cursor: pointer; }
+      .row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; }
+      pre { background: #111827; color: #e5e7eb; padding: 1rem; overflow: auto; border-radius: 0.5rem; }
+      .warning { border-left: 4px solid #d97706; padding: 0.75rem 1rem; background: #fffbeb; }
+    </style>
+  </head>
+  <body>
+    <h1>Pubky Locks Browser SDK Demo</h1>
+    <p class="warning">
+      Local demo scaffold only. It imports the generated wasm-pack package from <code>../pkg/locks_sdk_wasm.js</code>.
+      Run <code>npm --prefix locks-sdk/bindings/js run build</code> before serving this directory.
+      Viewer/access SDK helpers are available, but this demo intentionally does not fake a live lock-type verifier flow.
+    </p>
+
+    <label>
+      Lock Server Pubky
+      <input id="lock-server" autocomplete="off" placeholder="pubky..." />
+    </label>
+
+    <label>
+      Creator Pubky for live discovery
+      <input id="creator" autocomplete="off" placeholder="pubky..." />
+    </label>
+
+    <div class="row">
+      <button id="discover-creator">Discover from creator</button>
+    </div>
+
+    <label>
+      Already-fetched creator Lock Service Pointer JSON
+      <textarea id="creator-pointer" rows="5" placeholder='{"version":1,"default_lock_server":"pubky...","created_at":"2026-06-03T00:00:00Z"}'></textarea>
+    </label>
+
+    <div class="row">
+      <button id="use-creator-pointer">Use creator pointer JSON</button>
+    </div>
+
+    <label>
+      Callback URL
+      <input id="return-to" autocomplete="off" />
+    </label>
+
+    <div class="row">
+      <button id="connect">Create connect URL</button>
+      <button id="handle-callback">Handle callback</button>
+      <button id="restore-session">Restore saved session</button>
+      <button id="signout">Sign out</button>
+    </div>
+
+    <label>
+      Public content lock resource
+      <input id="content-lock-resource" autocomplete="off" placeholder="pubky.../pub/locks.app/<lock_id>.json" />
+    </label>
+
+    <div class="row">
+      <button id="read-content-lock">Read content lock</button>
+      <button id="select-content-lock-server">Select Lock Server from content lock</button>
+    </div>
+
+    <label>
+      Viewer BundleId
+      <input id="bundle-id" autocomplete="off" placeholder="caller-managed durable BundleId" />
+    </label>
+
+    <div class="row">
+      <button id="generate-bundle-id">Generate BundleId</button>
+    </div>
+
+    <label>
+      Guarded resource path
+      <input id="resource-path" value="/priv/locks.app/content/demo.txt" />
+    </label>
+
+    <label>
+      Guarded resource text
+      <textarea id="resource-text" rows="4">hello from locks sdk demo</textarea>
+    </label>
+
+    <div class="row">
+      <button id="register-resource">Register guarded resource</button>
+      <button id="set-pointer">Set Lock Service Pointer</button>
+    </div>
+
+    <h2>Log</h2>
+    <pre id="log"></pre>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

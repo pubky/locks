@@ -1,0 +1,14 @@
+{
+  "submitted_proof_bundle": {
+    "version": 1,
+    "bundle_id": "000G40R40M30E209185GR38E1W",
+    "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+    "proofs": [
+      {
+        "criterion_id": "criterion-1",
+        "verifier_type": "dev-static",
+        "payload": { "satisfied": true }
+      }
+    ]
+  }
+}

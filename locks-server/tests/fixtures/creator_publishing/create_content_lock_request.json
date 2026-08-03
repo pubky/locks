@@ -1,0 +1,30 @@
+{
+  "primary_resource": {
+    "path": "/priv/locks.app/content/example.txt",
+    "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+    "content_type": "text/plain",
+    "size": 13
+  },
+  "secondary_resources": {},
+  "criteria": [
+    {
+      "criterion_id": "criterion-1",
+      "verifier_type": "dev-static",
+      "params": {
+        "satisfied": true
+      }
+    }
+  ],
+  "lock_logic": {
+    "type": "all",
+    "criteria": [
+      "criterion-1"
+    ]
+  },
+  "access_policy": {
+    "requested_credential_ttl_seconds": 900
+  },
+  "lock_server": {
+    "override": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
+  }
+}

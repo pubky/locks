@@ -1,0 +1,9 @@
+{
+  "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+  "guarded_resource": {
+    "path": "/priv/locks.app/content/example.txt",
+    "hash": "<guarded_resource_hash>",
+    "content_type": "text/plain",
+    "size": 13
+  }
+}

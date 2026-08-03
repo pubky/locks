@@ -1,0 +1,17 @@
+{
+  "name": "@pubky/locks-js-sdk-examples",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "init-config": "node scripts/init-config.mjs",
+    "create-user": "node scripts/create-user.mjs",
+    "authenticate": "node scripts/authenticate.mjs",
+    "start-server": "node scripts/start-demo-server.mjs",
+    "start-reader-server": "node scripts/start-reader-demo-server.mjs",
+    "check": "node --check scripts/init-config.mjs && node --check scripts/create-user.mjs && node --check scripts/authenticate.mjs && node --check scripts/start-demo-server.mjs && node --check scripts/start-reader-demo-server.mjs && node --check app.js && node --check app-iframe.js && node --check creator-complete-flow.js && node --check reader-app.js && node --check reader-flow.js"
+  },
+  "dependencies": {
+    "@synonymdev/pubky": "^0.9.3"
+  }
+}

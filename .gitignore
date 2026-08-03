@@ -1,0 +1,6 @@
+/target
+/.local/
+/examples/js-sdk/node_modules/
+/.env
+/scripts/target
+/locks-sdk/bindings/js/node_modules/

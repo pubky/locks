@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pubky Locks JS SDK reader demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+      section { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+      label { display: block; margin: 0.75rem 0; }
+      input, select, button, textarea { font: inherit; }
+      input[type="text"], textarea { width: 100%; box-sizing: border-box; }
+      pre { background: #f7f7f7; padding: 0.75rem; overflow: auto; white-space: pre-wrap; }
+      .ok { color: #067d17; }
+      .error { color: #a40000; }
+      .muted { color: #666; }
+      .warning { color: #8a5a00; }
+      .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+      .danger { border-color: #a40000; color: #a40000; }
+    </style>
+  </head>
+  <body>
+    <h1>Pubky Locks JS SDK reader demo</h1>
+    <p>This local testnet demo exercises the unauthenticated reader flow against a configured Lock Server.</p>
+    <p class="warning"><strong>Local-dev warning:</strong> bundle IDs and access credentials are bearer-like secrets. This page displays them for debugging only.</p>
+
+    <div class="row">
+      <button id="reset-reader-state" class="danger">Reset reader state</button>
+      <span id="config-status" class="muted">Loading config...</span>
+    </div>
+
+    <section>
+      <h2>1. Load content lock</h2>
+      <label>
+        Content lock resource from creator demo
+        <input id="content-lock-resource" type="text" placeholder="pubky.../pub/locks.app/...json" />
+      </label>
+      <button id="load-content-lock">Load lock</button>
+      <p id="load-status" class="muted">Paste a content lock resource.</p>
+      <h3>Loaded lock</h3>
+      <pre id="loaded-lock-output"></pre>
+    </section>
+
+    <section>
+      <h2>2. Submit proof bundle</h2>
+      <label>
+        Verifier type
+        <select id="verifier-type">
+          <option value="dev-static">dev-static</option>
+        </select>
+      </label>
+      <label>
+        Dev-static satisfied
+        <select id="proof-satisfied">
+          <option value="true">true</option>
+          <option value="false">false</option>
+        </select>
+      </label>
+      <button id="submit-proof" disabled>Submit proof bundle</button>
+      <p id="proof-status" class="muted">Waiting for loaded lock.</p>
+      <h3>Proof bundle / lifecycle</h3>
+      <pre id="proof-output"></pre>
+    </section>
+
+    <section>
+      <h2>3. Complete dev verification</h2>
+      <button id="complete-verification" disabled>Complete dev verification</button>
+      <p id="completion-status" class="muted">Waiting for proof bundle.</p>
+      <pre id="completion-output"></pre>
+    </section>
+
+    <section>
+      <h2>4. Issue access credential</h2>
+      <button id="issue-credential" disabled>Issue access credential</button>
+      <p id="credential-status" class="muted">Waiting for completed verification.</p>
+      <pre id="credential-output"></pre>
+    </section>
+
+    <section>
+      <h2>5. Read guarded content</h2>
+      <p class="muted">Load a content lock to see its primary file and secondary files. After issuing an access credential, click any listed file to read it.</p>
+      <div id="lock-resources" hidden>
+        <h3>Primary file</h3>
+        <ul id="primary-resource-list"></ul>
+        <h3>Secondary files</h3>
+        <ul id="secondary-resource-list"></ul>
+      </div>
+      <button id="read-content" disabled hidden>Read selected guarded content</button>
+      <p id="read-status" class="muted">Waiting for access credential.</p>
+      <h3>Content</h3>
+      <pre id="read-output"></pre>
+    </section>
+
+    <script type="module" src="/reader-app.js"></script>
+  </body>
+</html>

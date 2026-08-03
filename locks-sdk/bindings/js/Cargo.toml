@@ -1,0 +1,40 @@
+[package]
+name = "locks-sdk-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Browser JS/WASM bindings for the Pubky Locks Creator SDK"
+repository = "https://github.com/pubky/locks"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+locks-core.workspace = true
+locks-sdk = { path = "../.." }
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = "0.6"
+thiserror.workspace = true
+url.workspace = true
+pkarr6 = { package = "pkarr", version = "6.0.1", default-features = false, features = ["relays", "endpoints"] }
+futures-lite = "2.6"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "guarded_resource_not_found",
+    "message": "guarded resource not found"
+  }
+}

@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: locks_test
+      POSTGRES_USER: locks
+      POSTGRES_PASSWORD: locks
+    ports:
+      - "${LOCKS_POSTGRES_PORT:-55433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locks -d locks_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pubky-testnet:
+    build:
+      context: .
+      dockerfile: docker/pubky-testnet.Dockerfile
+      args:
+        PUBKY_CORE_REV: f68014c111af0458e6a321e2d87a12479bfb3218
+    ports:
+      - "${LOCKS_DHT_PORT:-6881}:6881/udp"
+      - "${LOCKS_DHT_PORT:-6881}:6881/tcp"
+      - "${LOCKS_PKARR_RELAY_PORT:-15411}:15411"
+      - "${LOCKS_HTTP_RELAY_PORT:-15412}:15412"
+      - "${LOCKS_HOMESERVER_HTTP_PORT:-6286}:6286"
+      - "${LOCKS_HOMESERVER_PUBKY_PORT:-6287}:6287"
+      - "${LOCKS_HOMESERVER_ADMIN_PORT:-6288}:6288"
+      - "${LOCKS_SERVER_PORT:-3000}:3000"
+      - "${LOCKS_CREATOR_DEMO_PORT:-8080}:8080"
+      - "${LOCKS_READER_DEMO_PORT:-8081}:8081"
+    volumes:
+      - ./docker/pubky-homeserver.compose.toml:/etc/pubky-homeserver/config.toml:ro
+    command: ["pubky-testnet", "--homeserver-config", "/etc/pubky-homeserver/config.toml"]
+
+  locks-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubky-testnet:
+        condition: service_started
+    network_mode: service:pubky-testnet
+    environment:
+      PUBKY_LOCK_DATABASE_URL: postgres://locks:locks@postgres:5432/locks_test
+      PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY: ${PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY:?set PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY to a 32-byte base64url key}
+    volumes:
+      - lock-home:/var/lib/pubky-lock
+    command: ["locks-server-compose-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/readyz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  creator-demo:
+    image: node:22-bookworm-slim
+    working_dir: /workspace
+    depends_on:
+      locks-server:
+        condition: service_healthy
+      pubky-testnet:
+        condition: service_started
+    network_mode: service:pubky-testnet
+    environment:
+      LOCKS_INTERNAL_LOCK_SERVER_URL: http://127.0.0.1:3000
+      LOCKS_INTERNAL_HTTP_RELAY: http://localhost:15412
+      LOCKS_INTERNAL_PKARR_RELAY: http://localhost:15411
+      LOCKS_INTERNAL_DHT_BOOTSTRAP: 127.0.0.1:6881
+    volumes:
+      - .:/workspace
+      - lock-home:/root
+      - js-demo-node-modules:/workspace/examples/js-sdk/node_modules
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        until [ -f /root/.pubky-lock/config.toml ]; do echo '[creator-demo] waiting for lock-server config'; sleep 1; done
+        npm --prefix examples/js-sdk install
+        npm --prefix examples/js-sdk run init-config
+        npm --prefix examples/js-sdk run create-user -- --role content-creator
+        npm --prefix examples/js-sdk run start-server -- --allow-unhealthy
+
+  reader-demo:
+    image: node:22-bookworm-slim
+    working_dir: /workspace
+    depends_on:
+      locks-server:
+        condition: service_healthy
+      pubky-testnet:
+        condition: service_started
+    network_mode: service:pubky-testnet
+    environment:
+      LOCKS_INTERNAL_LOCK_SERVER_URL: http://127.0.0.1:3000
+      LOCKS_INTERNAL_HTTP_RELAY: http://localhost:15412
+      LOCKS_INTERNAL_PKARR_RELAY: http://localhost:15411
+      LOCKS_INTERNAL_DHT_BOOTSTRAP: 127.0.0.1:6881
+    volumes:
+      - .:/workspace
+      - lock-home:/root
+      - js-demo-node-modules:/workspace/examples/js-sdk/node_modules
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        until [ -f /root/.pubky-lock/config.toml ]; do echo '[reader-demo] waiting for lock-server config'; sleep 1; done
+        npm --prefix examples/js-sdk install
+        npm --prefix examples/js-sdk run init-config
+        npm --prefix examples/js-sdk run start-reader-server -- --allow-unhealthy
+
+volumes:
+  postgres-data:
+  lock-home:
+  js-demo-node-modules:
