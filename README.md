@@ -39,6 +39,17 @@ The integrated Docker Compose flow starts PostgreSQL, a local Pubky testnet, the
 Server, and separate creator/reader browser demos. Follow the copy-pasteable setup in
 [`examples/js-sdk/README.md`](examples/js-sdk/README.md).
 
+From a fresh clone:
+
+```bash
+docker compose up --build
+```
+
+The Compose entrypoint generates and persists a random creator-authority encryption
+key in the private `lock-home` volume. Set
+`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before startup only when you need to supply
+your own 32-byte base64url key.
+
 Verified browser-facing defaults are:
 
 - Lock Server: <http://localhost:3000>
