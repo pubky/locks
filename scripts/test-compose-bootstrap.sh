@@ -35,12 +35,20 @@ run_entrypoint() {
     sh "$entrypoint"
 }
 
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
+
 run_entrypoint
 key_file="$service_home/creator-authority-encryption-key"
 test -f "$key_file"
 test "$(wc -c < "$key_file" | tr -d ' ')" -eq 43
 grep -Eq '^[A-Za-z0-9_-]{43}$' "$key_file"
-test "$(stat -c '%a' "$key_file")" = 600
+test "$(file_mode "$key_file")" = 600
 cmp -s "$key_file" "$capture"
 first_key="$(cat "$key_file")"
 
