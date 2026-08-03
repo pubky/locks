@@ -49,7 +49,7 @@ services:
     network_mode: service:pubky-testnet
     environment:
       PUBKY_LOCK_DATABASE_URL: postgres://locks:locks@postgres:5432/locks_test
-      PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY: ${PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY:?set PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY to a 32-byte base64url key}
+      PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY: ${PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY:-}
     volumes:
       - lock-home:/var/lib/pubky-lock
     command: ["locks-server-compose-entrypoint.sh"]

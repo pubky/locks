@@ -84,6 +84,9 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      - name: Compose bootstrap regression
+        run: ./scripts/test-compose-bootstrap.sh
+
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

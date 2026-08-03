@@ -5,8 +5,26 @@ service_home="${LOCKS_SERVICE_HOME:-/var/lib/pubky-lock/.pubky-lock}"
 generated_config="$service_home/config.toml"
 compose_config="${LOCKS_COMPOSE_CONFIG:-/var/lib/pubky-lock/config.compose.toml}"
 secret_path="$service_home/secret.sess"
+creator_authority_key_path="$service_home/creator-authority-encryption-key"
 
 mkdir -p "$service_home"
+
+if [ -z "${PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY:-}" ]; then
+  if [ ! -f "$creator_authority_key_path" ]; then
+    echo "[locks-compose] generating creator-authority encryption key"
+    umask 077
+    temporary_key_path="$creator_authority_key_path.tmp.$$"
+    head -c 32 /dev/urandom \
+      | base64 \
+      | tr '+/' '-_' \
+      | tr -d '=\n' > "$temporary_key_path"
+    chmod 600 "$temporary_key_path"
+    mv "$temporary_key_path" "$creator_authority_key_path"
+  fi
+
+  PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(cat "$creator_authority_key_path")"
+  export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY
+fi
 
 if [ ! -f "$generated_config" ] || [ ! -f "$secret_path" ]; then
   echo "[locks-compose] initializing Lock Server identity/config in $service_home"

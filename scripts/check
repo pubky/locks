@@ -12,6 +12,7 @@ run() {
 }
 
 run cargo fmt --check
+run ./scripts/test-compose-bootstrap.sh
 run cargo clippy --workspace --all-targets --all-features -- -D warnings
 run cargo nextest run --workspace --exclude locks-e2e --exclude locks-service
 run cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres

@@ -78,18 +78,16 @@ The demos need four processes/services alive at the same time:
 
 ### Docker Compose local stack
 
-For a containerized local stack from the repository root, set a creator-authority encryption key and start compose:
+For a containerized local stack from the repository root:
 
 ```bash
-export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(
-  python3 - <<'PY'
-import base64, os
-print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
-PY
-)"
-
 docker compose up --build
 ```
+
+On first startup, the Lock Server entrypoint generates a random creator-authority
+encryption key and persists it in the private `lock-home` volume. Later starts reuse
+that key. To supply your own 32-byte base64url key instead, export
+`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before running Compose.
 
 The compose stack starts:
 
@@ -102,7 +100,9 @@ The compose stack starts:
 The Pubky testnet image is built from the public `pubky/pubky-core` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
 
-Compose keeps Lock Server identity/config in the `lock-home` Docker volume and Postgres data in `postgres-data`. To reset everything:
+Compose keeps the Lock Server identity, config, and generated creator-authority
+encryption key in the `lock-home` Docker volume and Postgres data in `postgres-data`.
+To reset everything:
 
 ```bash
 docker compose down -v
