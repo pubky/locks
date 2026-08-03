@@ -23,7 +23,7 @@ axum = "0.8"
 base32 = "0.5.1"
 base64 = "0.22"
 blake3 = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 clap = { version = "4", features = ["derive"] }
 locks-core = { path = "locks-core" }
 locks-service = { path = "locks-service" }
