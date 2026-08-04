@@ -56,6 +56,20 @@ Verified browser-facing defaults are:
 - creator demo: <http://localhost:8080/examples/js-sdk/>
 - reader demo: <http://localhost:8081/reader/>
 
+For the opt-in payment-lock demonstration, including Paykit Server, Bitcoin regtest,
+and Fulcrum, use the separate Compose definition:
+
+```bash
+docker compose -f compose.paykit-local-demo.yaml up --build
+```
+
+Its external build contexts use anonymously reachable public repositories pinned to
+immutable commits; no sibling Paykit or Pubky checkout is required. The full demo adds
+Paykit Server at <http://localhost:3001> and publishes the reader at
+<http://localhost:8088/reader/>. Pubky Testnet is built from `pubky/pubky-core` source at
+commit `75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b`, not from a released Pubky image or
+version. Payment remains a manual operator action.
+
 ## Documentation
 
 - [Lock Server API](docs/API.md)

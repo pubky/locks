@@ -11,6 +11,60 @@ Creator publishing is authenticated. The removed unauthenticated local/dev creat
 - [`docs/RUNTIME.md`](RUNTIME.md): startup/config/worker/health-readiness behavior.
 - [`docs/API.md`](API.md): route contract and fixture-backed request/response shapes.
 - [`docs/LOCAL_DEMO.md`](LOCAL_DEMO.md): E2E/test-support client demo using Axum `Router::oneshot`.
+- [`examples/js-sdk/README.md`](../examples/js-sdk/README.md): browser-facing Paykit local demo setup and operator commands.
+
+## Paykit Compose local demonstration
+
+The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet, Locks, Paykit Server, and the creator and reader browser demos. External source builds use anonymous public Git contexts pinned to immutable commits; no sibling repository checkout is required.
+
+The startup dependency flow is:
+
+```mermaid
+flowchart TD
+    composeBootstrap[compose-bootstrap] --> postgres
+    composeBootstrap --> paykitPostgres[paykit-postgres]
+    composeBootstrap --> bitcoin
+
+    postgres --> pubkyTestnet[pubky-testnet]
+    postgres --> locksServer[locks-server]
+    pubkyTestnet --> locksServer[locks-server]
+
+    bitcoin --> bitcoinBootstrap[bitcoin-bootstrap]
+    bitcoinBootstrap --> fulcrum
+    fulcrum --> electrumReadiness[electrum-readiness]
+
+    locksServer --> paykitConfig[paykit-config]
+    locksServer --> demoConfig[demo-config]
+
+    paykitPostgres --> paykitServer[paykit-server]
+    pubkyTestnet --> paykitServer
+    paykitConfig --> paykitServer
+    electrumReadiness --> paykitServer
+
+    locksServer --> creatorDemo[creator-demo]
+    paykitServer --> creatorDemo
+    demoConfig --> creatorDemo
+    pubkyTestnet --> creatorDemo
+
+    locksServer --> readerDemo[reader-demo]
+    paykitServer --> readerDemo
+    demoConfig --> readerDemo
+    pubkyTestnet --> readerDemo
+```
+
+`creator-demo` and `reader-demo` wait for healthy `locks-server` and `paykit-server` services plus successful `demo-config` completion.
+
+The bootstrap and configuration services are one-shot startup jobs. Exiting successfully is their healthy terminal state; they do not remain as long-running processes:
+
+| Service | Responsibility | Downstream gate |
+| --- | --- | --- |
+| `compose-bootstrap` | Creates or validates ignored local credentials, service environment files, Pubky homeserver configuration, state directories, ownership, and permissions. | Both PostgreSQL services and Bitcoin start only after successful completion. |
+| `bitcoin-bootstrap` | Waits for regtest RPC, creates or loads the `miner` wallet, and mines to height 101 so coinbase funds are mature and spendable. | Fulcrum starts only after successful completion. |
+| `electrum-readiness` | Sends an Electrum `server.version` request and validates the response; a started container or open TCP port alone is insufficient. | Paykit Server starts only after protocol readiness succeeds. |
+| `paykit-config` | Waits for Locks Server to publish its runtime public key, then generates Paykit Server configuration that trusts that exact identity. | Paykit Server starts only after successful generation. |
+| `demo-config` | Generates the shared browser configuration from the runtime Locks Server identity and local testnet endpoints. | Creator and reader demos start only after successful generation. |
+
+The complete startup and reset commands, browser URLs, local state boundaries, and manual payment workflow are maintained in [`examples/js-sdk/README.md`](../examples/js-sdk/README.md).
 
 ## Dev legacy-connect testnet automation
 

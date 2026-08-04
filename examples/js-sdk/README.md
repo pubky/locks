@@ -1,6 +1,6 @@
 # JS SDK local testnet creator/reader demos
 
-These examples are a script-driven local Pubky testnet workflow plus browser UIs for the Locks JS/WASM SDK creator and unauthenticated reader paths.
+These examples are a script-driven local Pubky testnet workflow plus browser UIs for the Locks JS/WASM SDK creator and reader paths. The reader browser remains unauthenticated; `paykit-payment` additionally uses a fixed `content-viewer` identity only inside the native Paykit reader helper.
 
 The creator demo publishes locked content and displays a **Viewer content lock resource**. It has separate controls for selecting the primary file and optional secondary files. The primary file becomes the default resource readers usually open first; each secondary file is uploaded as an additional resource in the same content lock. Copy the viewer resource into the separate reader demo to exercise the unauthenticated reader flow.
 
@@ -17,6 +17,11 @@ examples/js-sdk/reader-flow.js
 examples/js-sdk/scripts/init-config.mjs
 examples/js-sdk/scripts/create-user.mjs
 examples/js-sdk/scripts/authenticate.mjs
+examples/js-sdk/scripts/prepare-paykit-reader.mjs
+examples/js-sdk/scripts/receive-paykit-request.mjs
+examples/js-sdk/scripts/register-paykit-reader.mjs
+examples/js-sdk/scripts/lib/paykit-reader-worker.mjs
+examples/js-sdk/scripts/test-paykit-reader-worker.mjs
 examples/js-sdk/scripts/start-demo-server.mjs
 examples/js-sdk/scripts/start-reader-demo-server.mjs
 ```
@@ -24,7 +29,7 @@ examples/js-sdk/scripts/start-reader-demo-server.mjs
 Generated local state lives under:
 
 ```text
-./.local/js-sdk-demo/config.json
+./.local/demo-config/config.json
 ./.local/js-sdk-demo/content-creator-session.json
 ./.local/lock-server/passphrase
 ./.local/lock-server/recovery_file
@@ -32,6 +37,13 @@ Generated local state lives under:
 ./.local/content-creator/passphrase
 ./.local/content-creator/recovery_file
 ./.local/content-creator/profile.json
+./.local/content-viewer/passphrase
+./.local/content-viewer/recovery_file
+./.local/content-viewer/profile.json
+./.local/paykit-reader/state.v1
+./.local/paykit-reader/prepared.v1.json
+./.local/paykit-reader/worker.v1.json
+./.local/paykit-reader/owner.lock
 ```
 
 ## Prerequisites
@@ -69,14 +81,11 @@ The examples package uses `@synonymdev/pubky` for Node-side Pubky testnet auth/k
 
 ## Local environment setup
 
-The demos need four processes/services alive at the same time:
+The supported end-to-end path is the complete local Compose stack documented below. It generates ignored owner-only credentials, starts both databases and both application servers, bootstraps Bitcoin regtest, waits for Fulcrum using `server.version`, and starts the creator and reader demos.
 
-1. local Pubky testnet
-2. Postgres
-3. Lock Server on `127.0.0.1:3000`
-4. creator demo server on `localhost:8080` and/or reader demo server on `localhost:8081`
+For direct npm development without Compose, provide a running local Pubky testnet, PostgreSQL, Lock Server, and Paykit Server first. `init-config` reads the Lock Server public key from `~/.pubky-lock/config.toml` by default; it does not read the Lock Server signing secret.
 
-### Docker Compose local stack
+### Basic Locks stack
 
 For a containerized local stack from the repository root:
 
@@ -116,121 +125,6 @@ docker compose exec creator-demo npm --prefix examples/js-sdk run create-user --
 
 The browser-facing demo config still uses `localhost`; container-internal health checks/auth use Docker service names through `LOCKS_INTERNAL_*` environment overrides.
 
-### 1. Start local Pubky testnet
-
-Start `pubky-core/pubky-testnet` using its local static development defaults. From the Locks examples' point of view, these endpoints must respond:
-
-```bash
-curl -i http://localhost:15411
-curl -i http://localhost:15412
-```
-
-`404` from the relay root is fine. Connection refused means the testnet is not running or is using different ports.
-
-The examples assume the homeserver Pubky is:
-
-```text
-pubky8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo
-```
-
-If your local testnet homeserver differs, edit `./.local/js-sdk-demo/config.json` after `init-config` and change `testnet.homeserver`.
-
-### 2. Start Postgres
-
-Use whatever local Postgres you normally use. The Lock Server reads its URL from `PUBKY_LOCK_DATABASE_URL`; include the database name explicitly:
-
-```bash
-export PUBKY_LOCK_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test'
-```
-
-A quick readiness check:
-
-```bash
-psql "$PUBKY_LOCK_DATABASE_URL" -c 'select 1;'
-```
-
-If you use a different local database/user/port, keep the same environment variable name and update only the URL value.
-
-### 3. Configure Lock Server for the JS demos
-
-The examples do **not** generate or mutate Lock Server TOML. They read the Lock Server Pubky from:
-
-```text
-~/.pubky-lock/config.toml
-```
-
-Generate a local creator-authority encryption key for the same shell that starts the Lock Server:
-
-```bash
-export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(
-  python3 - <<'PY'
-import base64, os
-print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
-PY
-)"
-```
-
-To generate the default config and Lock Server secret, start the server once after setting `PUBKY_LOCK_DATABASE_URL` and `PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY`:
-
-```bash
-cargo run -p locks-server
-```
-
-Stop it after it writes `~/.pubky-lock/config.toml` and `~/.pubky-lock/secret.sess`. The generated config contains the real `credentials.lock_server_public_key`; the JS demo config initializer refuses placeholder values.
-
-For the browser creator/reader demos, edit `~/.pubky-lock/config.toml` and make sure it has these local-testnet values:
-
-```toml
-bind_addr = "127.0.0.1:3000"
-
-[worker]
-enabled = true
-
-[runtime]
-environment = "development"
-
-[creator_authority_acquisition]
-enabled = true
-method = "legacy-connect"
-frontend_session_ttl_seconds = 86400
-frontend_session_code_ttl_seconds = 120
-
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://localhost:8080"]
-
-[pubky]
-network = "testnet"
-
-[pkdns]
-icann_domain = "localhost"
-public_icann_http_port = 3000
-pkarr_relays = ["http://localhost:15411"]
-```
-
-Keep the generated or derived `credentials.lock_server_public_key` value in that file. If it is still:
-
-```toml
-lock_server_public_key = "<derived-on-first-run>"
-```
-
-start the Lock Server once so it can initialize `~/.pubky-lock/secret.sess` and rewrite/derive the real public key before running `npm --prefix examples/js-sdk run init-config`.
-
-### 4. Start Lock Server
-
-```bash
-cargo run -p locks-server
-```
-
-Wait for these checks to pass:
-
-```bash
-curl -fsS http://127.0.0.1:3000/healthz
-curl -fsS http://127.0.0.1:3000/readyz
-curl -fsS http://127.0.0.1:3000/.well-known/locks-server
-```
-
-The Lock Server also needs its PKARR record published to the local relay. With the config above, startup/republishing should publish through `http://localhost:15411`. The browser SDK depends on that record when resolving `_pubky.<lock-server>`.
-
 ## Local Pubky testnet defaults
 
 `pubky-core/pubky-testnet` local static development uses:
@@ -240,12 +134,13 @@ PKARR relay     = http://localhost:15411
 HTTP/auth relay = http://localhost:15412
 Pubky Auth inbox = http://localhost:15412/inbox/
 DHT bootstrap   = localhost:6881
+Paykit browser  = http://localhost:3001
 ```
 
 These values are written to:
 
 ```text
-./.local/js-sdk-demo/config.json
+./.local/demo-config/config.json
 ```
 
 ## Setup
@@ -262,7 +157,13 @@ Create the content creator signing keypair:
 npm --prefix examples/js-sdk run create-user -- --role content-creator
 ```
 
-The unauthenticated reader demo does not need a `content-viewer` keypair.
+The dev-static reader flow does not need a `content-viewer` keypair. The Paykit reader flow does:
+
+```bash
+npm --prefix examples/js-sdk run create-user -- --role content-viewer
+```
+
+The embedded reader worker registers that identity with the configured local homeserver before invoking the native helper. Reader recovery material is loaded from the existing encrypted role files and sent only on helper stdin.
 
 Existing keypairs are reused. To regenerate one role:
 
@@ -270,7 +171,44 @@ Existing keypairs are reused. To regenerate one role:
 npm --prefix examples/js-sdk run create-user -- --role content-creator --force
 ```
 
+Replacing the content-creator identity clears any persisted demo-auth session for the old key before and after rotation. The demo server also validates persisted and newly approved sessions against the current role profile, so an approval that completes during rotation cannot restore the old identity. Authenticate the demo again before continuing.
+
 ## Run the demo server
+
+### Complete local Compose stack
+
+Build and start the complete stack:
+
+```bash
+docker compose -f compose.paykit-local-demo.yaml up --build
+```
+
+The Paykit Server, Paykit Rust, Locks, and Pubky Core build inputs are fetched from
+anonymous public Git URLs pinned to immutable commits. The active Locks checkout is
+used only for the Locks and browser-demo images being developed. No sibling repository
+checkout is required.
+
+`compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose -f compose.paykit-local-demo.yaml config --no-env-resolution` model.
+
+This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`; Locks reaches it at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers at `/usr/local/bin`; they receive only their explicit role/runtime directories and generated WASM package, never the repository root or Lock Server identity volume.
+
+Open:
+
+```text
+Creator: http://localhost:8080/examples/js-sdk/
+Reader:  http://localhost:8088/reader/
+Paykit:  http://localhost:3001/setup
+```
+
+The Compose reader process still listens on container port `8081`; only its host mapping is `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
+
+```bash
+npm --prefix examples/js-sdk run reset-paykit-demo
+```
+
+Do not use `docker compose -f compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
+
+### Direct npm server
 
 ```bash
 npm --prefix examples/js-sdk run start-server
@@ -351,9 +289,9 @@ It signs up/registers the `content-creator` with the configured homeserver, appr
 
 Click **Authenticate to Lock Server**.
 
-The browser uses the Locks JS/WASM SDK to redirect to the Lock-Server-hosted `/connect` shell. The raw legacy-connect authorization URL stays on the Lock Server origin.
+Both creator pages open the Lock Server `/connect` shell in an iframe modal. The raw legacy-connect authorization URL stays on the Lock Server origin.
 
-The callback URL is:
+The shell returns `{ state, code }` directly to the parent with `postMessage`. The parent accepts the result only from the exact Lock Server origin and iframe window, then validates the state before exchanging the one-time code. The configured callback URL supplies the parent target origin; the browser does not navigate to it:
 
 ```text
 http://localhost:8080/auth/lock-server/callback
@@ -367,7 +305,7 @@ npm --prefix examples/js-sdk run authenticate -- \
   --auth "pubkyauth://..."
 ```
 
-After callback, the browser stores the Locks frontend session in `localStorage`.
+The demo homeserver flow and Lock Server flow must both be approved by that same content-creator identity. The browser verifies the creator returned by the Lock Server against the live demo-auth creator. If the demo creator later changes or signs out, the browser revokes and clears the old Locks frontend session, closes any pending Locks auth flow, clears creator-scoped pointer state, and requires matching reauthentication before publishing. After a successful code exchange, the Locks frontend session is kept in memory only and is cleared on reload.
 
 ### 3. Configure pointer and create locked content
 
@@ -384,10 +322,29 @@ Rules:
   ```
 - only the filename segment is editable
 - `/` in filename is rejected
-- verifier dropdown has one option:
-  ```text
-  dev-static
-  ```
+- lock type defaults to `dev-static`; `paykit-payment` is the alternate mode
+- `paykit-payment` amount is a positive decimal integer string in sats
+- payment asset is fixed to `BTC`
+- payment recipient is the authenticated content creator; it is not user-editable
+- payment is the content lock's sole criterion and the lock logic references exactly that criterion
+- payment publishing is rejected until Paykit setup succeeds for the current authenticated creator
+- selecting `paykit-payment` opens `GET http://localhost:3001/setup` in a Paykit-origin iframe
+- the parent accepts completion only from that exact iframe window and origin with the pending state
+- the success callback is only `{ type: "paykit-setup-callback", state }`; failures add only `error: "setup-failed"`, and account data stays inside Paykit
+
+The Paykit iframe displays the auth URL and both approved local commands. First create or load the dedicated Bitcoin Core descriptor wallet and print its external BIP84 account `tpub` and account index:
+
+```bash
+npm --prefix examples/js-sdk run generate-paykit-account-tpub
+```
+
+This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. Then run the companion-auth wrapper:
+
+```bash
+docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+```
+
+The command loads the existing encrypted content-creator recovery file and starts `/usr/local/bin/paykit-companion-auth` directly with no arguments. `PAYKIT_COMPANION_AUTH_BIN` may override that executable path for local testing. Interactive input prompts for the Paykit auth URL, account xpub/tpub, and account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline. Sensitive inputs are sent only through the helper's stdin and are never forwarded in wrapper output.
 
 The browser uses the Locks JS/WASM SDK for publishing:
 
@@ -405,11 +362,11 @@ After success, the page displays the **Viewer content lock resource**:
 
 ## Reader browser flow
 
-The reader demo is unauthenticated for now. It does not create or use a Pubky reader identity.
+The browser remains unauthenticated. A `paykit-payment` proof carries the public key prepared by the native helper; the browser never receives the reader secret or encrypted Paykit state.
 
 1. Copy the creator demo's **Viewer content lock resource** and paste it into the reader demo.
 2. Click **Load lock**. The browser SDK validates the content lock and resolves the Lock Server.
-3. Choose `dev-static` proof control:
+3. The loaded lock selects its verifier mode. For `dev-static`, choose:
    ```text
    satisfied = true | false
    ```
@@ -417,6 +374,20 @@ The reader demo is unauthenticated for now. It does not create or use a Pubky re
 5. Click **Complete dev verification**. This uses the Lock Server's dev-only viewer completion route directly from the browser SDK.
 6. Click **Issue access credential**.
 7. Click **Read guarded content**.
+
+For `paykit-payment`:
+
+1. The in-process Paykit reader worker starts with `reader-demo`, creates or restores the durable encrypted reader state, publishes and reads back its Receiver Marker, and waits for private Paykit messages. The page polls its closed status automatically; proof submission remains disabled until the worker is prepared and its Reader Pubky matches the current `content-viewer` identity.
+2. Click **Submit proof bundle**. The browser submits one `paykit-payment` proof with the confirmed top-level `reader_public_key` and an empty `{}` criterion payload. It never calls the dev completion route.
+3. The worker advances the Paykit/Noise link and receives the real Payment Request without a foreground command. The page displays only its validated request ID, regtest address, amount in sats, canonical manual `bitcoin-cli` payment command, and optional mining command.
+4. Run the displayed payment command in a terminal. Mining is optional because local Locks uses `minimum_confirmations = 0`.
+5. The page polls `pending` and `in_progress` lifecycle states. On `completed`, it issues an access credential and reads the primary guarded resource. `failed`, `expired`, and unknown states fail closed. Use **Resume payment verification polling** after a reload.
+
+The worker is the sole mutable owner of `./.local/paykit-reader/state.v1`. A direct child holds a kernel advisory lock on the owner-only `./.local/paykit-reader/owner.lock` file for the worker lifetime; the child exits when the parent's stdin closes, so the kernel releases ownership after normal exit or a crash without stale-lock takeover. The legacy `prepare-paykit-reader` and `receive-paykit-request` wrappers reject execution while the embedded worker is enabled and acquire the same lock when run standalone.
+
+`GET /api/health` reports HTTP-process liveness only. `GET /api/paykit-reader/status` reports the separate worker readiness/projection contract; Compose uses that second endpoint for health so a serving but unprepared or failed reader is not considered ready.
+
+The native helper is `/usr/local/bin/paykit-reader-demo`; `PAYKIT_READER_DEMO_BIN` is a test-only executable override. Its state path and local Pubky endpoints come from the `PAYKIT_READER_*` Compose environment. Reader homeserver registration runs in a separate direct-spawned Node subprocess with bounded output, timeout, and TERM→KILL cancellation because the Pubky JS API does not expose request cancellation; cancellation waits for child settlement before ownership is released. The worker derives the Paykit peer from the public `content-creator` profile, then passes only the closed native helper environment. The state path must end in `.local/paykit-reader/state.v1`. The helper owns encrypted versioned state, owner-only file permissions, fresh-nonce rewrites, and invariant validation. The worker fences status publication and state checkpoints on current kernel-lock ownership, atomically writes its separate owner-only `worker.v1.json` projection, and clears in-memory readiness immediately if ownership is lost. The HTTP server validates the projection again and requires current in-memory ownership before returning a ready browser status. Terminal worker failure closes PID 1 after a coarse error so Compose restart policy applies.
 
 The reader page persists local progress in browser `localStorage` under `pubky-locks-reader-demo.*` and has a visible **Reset reader state** button. Bundle IDs and access credentials are bearer-like local-dev secrets; the demo displays them for debugging only.
 
@@ -432,8 +403,8 @@ This does not run live browser flows. It verifies that the examples keep the agr
 
 ## Boundaries
 
-- Authenticated reader UI is deferred.
-- The reader demo uses manual paste only; it does not auto-read creator demo state.
-- Lock Server TOML generation is out of scope.
+- Browser-side authenticated reader sessions are not used; the Paykit reader identity stays in the one-shot native helper workflow.
+- The reader demo manually pastes only the creator's content-lock resource; the Paykit Reader Pubky comes exclusively from the local prepared-status handshake.
+- Compose generates closed Locks and Paykit TOML from actual local identities; trusted-key placeholders are never runnable configuration.
 - The second auth flow must use Lock Server `/connect`, not a demo-origin rendering of the raw `authorization_url`.
 - The examples do not use a gateway/base URL fallback. SDK calls resolve through browser PKARR/domain paths using the configured local PKARR relay.
