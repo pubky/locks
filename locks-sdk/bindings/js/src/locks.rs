@@ -343,11 +343,12 @@ impl Locks {
             .prepare_exchange_request_with_pkarr_resolver(&request, &resolver, None)
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
-        let token = post_json_for_session_token(&request).await?;
-        Ok(Session::new(
-            self.inner.restore_session(token),
+        let response = post_json_for_session(&request).await?;
+        Ok(Session::new_with_creator(
+            self.inner.restore_session(&response.session_token),
             self.inner.clone(),
             self.options.clone(),
+            Some(response.creator.to_string()),
         ))
     }
 }
@@ -684,7 +685,9 @@ async fn fetch_content_lock_json(request_plan: &JsPreparedContentLockRequest) ->
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn post_json_for_session_token(request_plan: &JsPreparedRequest) -> JsResult<String> {
+async fn post_json_for_session(
+    request_plan: &JsPreparedRequest,
+) -> JsResult<FrontendSessionResponse> {
     let request_init = web_sys::RequestInit::new();
     request_init.set_method(request_plan.method);
     request_init.set_mode(web_sys::RequestMode::Cors);
@@ -725,16 +728,67 @@ async fn post_json_for_session_token(request_plan: &JsPreparedRequest) -> JsResu
     .map_err(|err| invalid_input(format!("failed to parse JSON response: {err:?}")))?;
     let value: Value = serde_wasm_bindgen::from_value(json)
         .map_err(|err| invalid_input(format!("invalid session response JSON: {err}")))?;
-    value
+    parse_frontend_session_response(value).map_err(invalid_input)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrontendSessionResponse {
+    session_token: String,
+    creator: CreatorPubky,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn parse_frontend_session_response(value: Value) -> Result<FrontendSessionResponse, String> {
+    let session_token = value
         .get("session_token")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| invalid_input("frontend session response missing session_token"))
+        .ok_or_else(|| "frontend session response missing session_token".to_owned())?;
+    let creator = value
+        .get("creator")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "frontend session response missing creator".to_owned())
+        .and_then(|creator| {
+            CreatorPubky::from_str(creator)
+                .map_err(|_| "frontend session response contains invalid creator".to_owned())
+        })?;
+    Ok(FrontendSessionResponse {
+        session_token,
+        creator,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_session_response_preserves_authenticated_creator() {
+        let response = parse_frontend_session_response(serde_json::json!({
+            "session_token": "frontend-session-secret",
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "expires_at": "2030-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(response.session_token, "frontend-session-secret");
+        assert_eq!(
+            response.creator.to_string(),
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
+        );
+    }
+
+    #[test]
+    fn frontend_session_response_rejects_missing_creator() {
+        let error = parse_frontend_session_response(serde_json::json!({
+            "session_token": "frontend-session-secret",
+            "expires_at": "2030-01-01T00:00:00Z"
+        }))
+        .unwrap_err();
+
+        assert!(error.contains("missing creator"));
+    }
 
     #[test]
     fn locks_constructor_is_available_for_valid_lock_server_pubky() {

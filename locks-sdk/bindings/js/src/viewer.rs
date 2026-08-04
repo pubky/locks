@@ -210,6 +210,23 @@ impl Viewer {
             .map_err(|err| invalid_input(err.to_string()))?;
         fetch_viewer_bytes(&request).await
     }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = proxyReadGuardedResourceResponse)]
+    pub async fn proxy_read_guarded_resource_response(
+        &self,
+        access_credential: &str,
+        path: String,
+    ) -> JsResult<web_sys::Response> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_proxy_read_guarded_resource_request(access_credential, path)
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_viewer_response(&request).await
+    }
 }
 
 impl Viewer {
@@ -408,13 +425,8 @@ async fn fetch_viewer_json_value(request: &JsPreparedViewerRequest) -> JsResult<
 
 #[cfg(target_arch = "wasm32")]
 async fn fetch_viewer_bytes(request: &JsPreparedViewerRequest) -> JsResult<js_sys::Uint8Array> {
-    let response = fetch_viewer(request).await?;
-    if !response.ok() {
-        return Err(invalid_input(format!(
-            "Lock Server viewer request failed with HTTP {}",
-            response.status()
-        )));
-    }
+    let response = fetch_viewer_response(request).await?;
+
     let buffer = wasm_bindgen_futures::JsFuture::from(
         response
             .array_buffer()
@@ -423,6 +435,18 @@ async fn fetch_viewer_bytes(request: &JsPreparedViewerRequest) -> JsResult<js_sy
     .await
     .map_err(|err| invalid_input(format!("failed to read byte response: {err:?}")))?;
     Ok(js_sys::Uint8Array::new(&buffer))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_viewer_response(request: &JsPreparedViewerRequest) -> JsResult<web_sys::Response> {
+    let response = fetch_viewer(request).await?;
+    if !response.ok() {
+        return Err(invalid_input(format!(
+            "Lock Server viewer request failed with HTTP {}",
+            response.status()
+        )));
+    }
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]

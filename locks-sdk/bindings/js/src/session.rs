@@ -240,6 +240,7 @@ impl JsAuthorizedRequestPlan {
 pub struct Session {
     inner: locks_sdk::LocksSession,
     client: locks_sdk::LocksClient,
+    creator_pubky: Option<String>,
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     options: LocksOptions,
 }
@@ -254,6 +255,11 @@ impl Session {
     #[wasm_bindgen(js_name = lockServer)]
     pub fn lock_server(&self) -> String {
         self.client.lock_server().to_string()
+    }
+
+    #[wasm_bindgen(js_name = creatorPubky)]
+    pub fn creator_pubky(&self) -> Option<String> {
+        self.creator_pubky.clone()
     }
 
     #[wasm_bindgen(getter)]
@@ -280,9 +286,19 @@ impl Session {
         client: locks_sdk::LocksClient,
         options: LocksOptions,
     ) -> Self {
+        Self::new_with_creator(inner, client, options, None)
+    }
+
+    pub(crate) fn new_with_creator(
+        inner: locks_sdk::LocksSession,
+        client: locks_sdk::LocksClient,
+        options: LocksOptions,
+        creator_pubky: Option<String>,
+    ) -> Self {
         Self {
             inner,
             client,
+            creator_pubky,
             options,
         }
     }
@@ -508,6 +524,20 @@ mod tests {
             restored.creator().export_session_secret_for_tests(),
             "frontend-session-secret"
         );
+    }
+
+    #[test]
+    fn exchanged_session_exposes_authenticated_creator_pubky() {
+        let client = test_client();
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let session = Session::new_with_creator(
+            client.restore_session("frontend-session-secret"),
+            client,
+            LocksOptions::new(),
+            Some(creator.to_owned()),
+        );
+
+        assert_eq!(session.creator_pubky(), Some(creator.to_owned()));
     }
 
     #[test]

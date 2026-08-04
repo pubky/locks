@@ -60,6 +60,7 @@ const requiredSnippets = [
   'lookupVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
   'issueAccessCredential(options: VerificationTaskHandleOptions): Promise<any>;',
   'proxyReadGuardedResource(access_credential: string, path: string): Promise<Uint8Array>;',
+  'proxyReadGuardedResourceResponse(access_credential: string, path: string): Promise<Response>;',
   'export class VerificationTaskHandleOptions',
   'constructor(creator: string, bundle_id: string);',
   'export class Session',
