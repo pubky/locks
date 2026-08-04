@@ -1,6 +1,6 @@
 FROM rust:1.89.0-bookworm AS builder
 
-ARG PUBKY_CORE_REV=f68014c111af0458e6a321e2d87a12479bfb3218
+ARG PUBKY_CORE_REV=75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b
 WORKDIR /usr/src/pubky-core
 RUN git clone --filter=blob:none https://github.com/pubky/pubky-core.git . \
     && git checkout --detach "${PUBKY_CORE_REV}"

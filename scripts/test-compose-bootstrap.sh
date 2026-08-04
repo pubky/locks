@@ -12,6 +12,7 @@ trap 'rm -rf "$tmp"' EXIT
 service_home="$tmp/home/.pubky-lock"
 bin_dir="$tmp/bin"
 capture="$tmp/captured-key"
+public_config="$tmp/locks-public/config.toml"
 mkdir -p "$service_home" "$bin_dir"
 
 cat > "$service_home/config.toml" <<'EOF'
@@ -31,6 +32,7 @@ run_entrypoint() {
     PATH="$bin_dir:$PATH" \
     LOCKS_SERVICE_HOME="$service_home" \
     LOCKS_COMPOSE_CONFIG="$tmp/config.compose.toml" \
+    LOCKS_PUBLIC_CONFIG="$public_config" \
     LOCKS_TEST_KEY_CAPTURE="$capture" \
     sh "$entrypoint"
 }
@@ -50,6 +52,8 @@ test "$(wc -c < "$key_file" | tr -d ' ')" -eq 43
 grep -Eq '^[A-Za-z0-9_-]{43}$' "$key_file"
 test "$(file_mode "$key_file")" = 600
 cmp -s "$key_file" "$capture"
+test "$(cat "$public_config")" = 'lock_server_public_key = "test-public-key"'
+test "$(file_mode "$public_config")" = 644
 first_key="$(cat "$key_file")"
 
 run_entrypoint
@@ -60,6 +64,7 @@ PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$override" \
   PATH="$bin_dir:$PATH" \
   LOCKS_SERVICE_HOME="$service_home" \
   LOCKS_COMPOSE_CONFIG="$tmp/config.compose.toml" \
+  LOCKS_PUBLIC_CONFIG="$public_config" \
   LOCKS_TEST_KEY_CAPTURE="$capture" \
   sh "$entrypoint"
 test "$(cat "$capture")" = "$override"
