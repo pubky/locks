@@ -126,4 +126,7 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 
 ## Related records
 
-The Paykit-owned counterpart is `paykit-server/docs/ADRs/0003-locks-integration-v1-contract.md`. That record is self-contained for Paykit Server implementation and verification.
+Paykit-owned runtime behavior and invoice-delivery semantics are documented in
+the public [Paykit Server README](https://github.com/pubky/paykit-server#invoice-and-delivery-semantics).
+Its local Locks image and generated-config boundary are documented in
+[Local Locks demo image](https://github.com/pubky/paykit-server/blob/master/docs/local-locks-demo.md).
