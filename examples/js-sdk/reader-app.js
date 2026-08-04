@@ -1,11 +1,17 @@
 import {
+  classifyPaymentLifecycle,
   completeDevVerification,
   issueAccessCredential,
   loadContentLock,
   lookupVerificationTask,
   readGuardedContent,
   submitDevStaticProof,
+  submitPaykitPaymentProof,
   creatorFromResource,
+  createLatestRequestGate,
+  parsePaykitReaderBrowserStatus,
+  selectCurrentPaykitPaymentRequest,
+  workflowHandleMatches,
 } from './reader-flow.js';
 
 const STATE_KEY = 'pubky-locks-reader-demo.state';
@@ -16,6 +22,15 @@ const state = {
   guardedResourcePath: '',
   lockResources: [],
   proofSatisfied: true,
+  verifierType: 'dev-static',
+  readerPublicKey: '',
+  paykitReaderPrepared: false,
+  paykitReaderState: 'starting',
+  paykitPaymentRequest: null,
+  baselinePaymentRequestId: null,
+  loadingLock: false,
+  submittingProof: false,
+  paymentPolling: false,
   loaded: null,
   creator: null,
   bundleId: null,
@@ -26,6 +41,12 @@ const state = {
   accessCredentialResponse: null,
   readResult: null,
 };
+
+let workflowIncarnation = 0;
+const paykitReaderStatusRequests = createLatestRequestGate();
+let activeLoadToken = null;
+let activeSubmissionToken = null;
+let activePollToken = null;
 
 const el = {
   configStatus: document.querySelector('#config-status'),
@@ -39,6 +60,12 @@ const el = {
   loadedOutput: document.querySelector('#loaded-lock-output'),
   verifierType: document.querySelector('#verifier-type'),
   proofSatisfied: document.querySelector('#proof-satisfied'),
+  paykitReaderCommands: document.querySelector('#paykit-reader-commands'),
+  readerPublicKey: document.querySelector('#reader-public-key'),
+  refreshPaykitReader: document.querySelector('#refresh-paykit-reader'),
+  paykitReaderStatus: document.querySelector('#paykit-reader-status'),
+  paykitReaderPayment: document.querySelector('#paykit-reader-payment'),
+  pollPayment: document.querySelector('#poll-payment'),
   submitProof: document.querySelector('#submit-proof'),
   proofStatus: document.querySelector('#proof-status'),
   proofOutput: document.querySelector('#proof-output'),
@@ -59,7 +86,9 @@ async function bootstrap() {
   el.configStatus.className = 'ok';
   restoreState();
   bindEvents();
+  await refreshPaykitReaderStatus();
   render();
+  setInterval(() => { void refreshPaykitReaderStatus(); }, 1_000);
   await postClientLog('info', 'reader-bootstrap-config-loaded', {
     lockServerPubky: state.config.lockServer.pubky,
     lockServerUrl: state.config.lockServer.url,
@@ -71,12 +100,22 @@ async function bootstrap() {
 
 function bindEvents() {
   el.reset.addEventListener('click', async () => {
+    invalidateWorkflow();
     localStorage.removeItem(STATE_KEY);
     Object.assign(state, {
       resource: '',
       guardedResourcePath: '',
       lockResources: [],
       proofSatisfied: true,
+      verifierType: 'dev-static',
+      readerPublicKey: '',
+      paykitReaderPrepared: false,
+      paykitReaderState: 'starting',
+      paykitPaymentRequest: null,
+      baselinePaymentRequestId: null,
+      loadingLock: false,
+      submittingProof: false,
+      paymentPolling: false,
       loaded: null,
       creator: null,
       bundleId: null,
@@ -92,7 +131,12 @@ function bindEvents() {
   });
 
   el.resource.addEventListener('input', () => {
-    state.resource = el.resource.value.trim();
+    const resource = el.resource.value.trim();
+    if (resource !== state.resource) {
+      invalidateWorkflow();
+      clearVerificationState({ clearLoaded: true });
+      state.resource = resource;
+    }
     persistState();
     render();
   });
@@ -103,8 +147,10 @@ function bindEvents() {
     render();
   });
 
+  el.refreshPaykitReader.addEventListener('click', refreshPaykitReaderStatus);
   el.load.addEventListener('click', loadLock);
   el.submitProof.addEventListener('click', submitProof);
+  el.pollPayment.addEventListener('click', pollPaymentLifecycle);
   el.completeVerification.addEventListener('click', completeVerification);
   el.issueCredential.addEventListener('click', issueCredential);
   el.readContent.addEventListener('click', () => readContent(state.guardedResourcePath));
@@ -115,20 +161,65 @@ function bindEvents() {
   });
 }
 
-async function loadLock() {
+async function refreshPaykitReaderStatus() {
+  const request = paykitReaderStatusRequests.begin(workflowIncarnation);
   try {
-    const resource = el.resource.value.trim();
+    const response = await fetch('/api/paykit-reader/status', { method: 'GET', cache: 'no-store' });
+    const status = parsePaykitReaderBrowserStatus(await response.json());
+    if (!paykitReaderStatusRequests.isCurrent(request, workflowIncarnation)) return;
+    const available = !['starting', 'failed'].includes(status.state);
+    if (available !== response.ok) {
+      throw new Error('contradictory Paykit reader worker status');
+    }
+    const paymentRequest = selectCurrentPaykitPaymentRequest({
+      status,
+      baselinePaymentRequestId: state.baselinePaymentRequestId,
+      currentPaymentRequest: state.paykitPaymentRequest,
+    });
+    state.paykitReaderState = status.state === 'request_received' && !paymentRequest
+      ? 'waiting'
+      : status.state;
+    state.paykitReaderPrepared = available;
+    state.readerPublicKey = status.reader_pubky ?? '';
+    state.paykitPaymentRequest = paymentRequest;
+  } catch {
+    if (!paykitReaderStatusRequests.isCurrent(request, workflowIncarnation)) return;
+    state.paykitReaderState = 'failed';
+    state.paykitReaderPrepared = false;
+    state.readerPublicKey = '';
+    state.paykitPaymentRequest = null;
+  }
+  paykitReaderStatusRequests.finish(request);
+  persistState();
+  render();
+}
+
+async function loadLock() {
+  const resource = el.resource.value.trim();
+  invalidateWorkflow();
+  clearVerificationState({ clearLoaded: true });
+  state.resource = resource;
+  state.loadingLock = true;
+  const incarnation = workflowIncarnation;
+  const loadToken = Symbol('load-lock');
+  activeLoadToken = loadToken;
+  persistState();
+  render();
+  try {
     await postClientLog('info', 'reader-load-lock-started', { resource });
+    if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     el.loadStatus.textContent = 'Loading content lock...';
     el.loadStatus.className = 'muted';
     const loaded = await loadContentLock({
       resource,
       pkarrRelays: pkarrRelays(),
     });
-    state.resource = resource;
+    if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation || state.resource !== resource) return;
     state.creator = creatorFromResource(resource);
     state.lockResources = loaded.resources;
+    state.verifierType = contentLockVerifierType(loaded.contentLock);
     state.guardedResourcePath = loaded.resources[0]?.readPath ?? '';
+
     state.loaded = {
       resource,
       creator: state.creator,
@@ -140,24 +231,67 @@ async function loadLock() {
     render();
     await postClientLog('info', 'reader-load-lock-succeeded', state.loaded);
   } catch (error) {
+    if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     await postClientLog('error', 'reader-load-lock-failed', serializeError(error));
     showError(el.loadStatus, error);
+  } finally {
+    if (activeLoadToken === loadToken) {
+      activeLoadToken = null;
+      state.loadingLock = false;
+      render();
+    }
   }
 }
 
 async function submitProof() {
+  if (state.submittingProof) return;
+  if (
+    state.verifierType === 'paykit-payment'
+    && (!state.paykitReaderPrepared || !state.readerPublicKey)
+  ) {
+    showError(el.proofStatus, new Error('prepare and confirm the Paykit reader before submitting payment proof'));
+    return;
+  }
+  invalidateWorkflow();
+  clearVerificationState();
+  state.submittingProof = true;
+  const incarnation = workflowIncarnation;
+  const submissionToken = Symbol('submit-proof');
+  activeSubmissionToken = submissionToken;
+  const snapshot = Object.freeze({
+    incarnation,
+    resource: state.resource,
+    verifierType: state.verifierType,
+    readerPublicKey: state.readerPublicKey,
+    paykitReaderPrepared: state.paykitReaderPrepared,
+    proofSatisfied: state.proofSatisfied,
+    primaryPath: state.lockResources.find((resource) => resource.kind === 'primary')?.readPath ?? '',
+    pkarrRelays: Object.freeze([...pkarrRelays()]),
+  });
+  persistState();
+  render();
   try {
     await postClientLog('info', 'reader-submit-proof-started', {
-      resource: state.resource,
-      satisfied: state.proofSatisfied,
+      resource: snapshot.resource,
+      verifierType: snapshot.verifierType,
     });
+    if (activeSubmissionToken !== submissionToken || !workflowMatches(snapshot)) return;
     el.proofStatus.textContent = 'Submitting proof bundle...';
     el.proofStatus.className = 'muted';
-    const result = await submitDevStaticProof({
-      resource: state.resource,
-      satisfied: state.proofSatisfied,
-      pkarrRelays: pkarrRelays(),
-    });
+    const common = {
+      resource: snapshot.resource,
+      pkarrRelays: snapshot.pkarrRelays,
+    };
+    const result = snapshot.verifierType === 'paykit-payment'
+      ? await submitPaykitPaymentProof({
+        ...common,
+        readerPublicKey: snapshot.paykitReaderPrepared ? snapshot.readerPublicKey : '',
+      })
+      : await submitDevStaticProof({ ...common, satisfied: snapshot.proofSatisfied });
+    if (
+      activeSubmissionToken !== submissionToken
+      || !workflowMatches(snapshot)
+    ) return;
     state.creator = result.creator;
     state.bundleId = result.bundleId;
     state.submittedProofBundle = result.submittedProofBundle;
@@ -166,21 +300,36 @@ async function submitProof() {
     state.accessCredential = null;
     state.accessCredentialResponse = null;
     state.readResult = null;
+    activeSubmissionToken = null;
+    state.submittingProof = false;
     persistState();
     render();
     await postClientLog('info', 'reader-submit-proof-succeeded', {
-      creator: state.creator,
-      bundleId: state.bundleId,
-      lifecycle: state.lifecycle,
+      creator: result.creator,
+      bundleId: result.bundleId,
+      lifecycle: result.lifecycle,
     });
+    if (snapshot.verifierType === 'paykit-payment') {
+      void pollPaymentLifecycle(createPaymentHandle(snapshot, result));
+    }
   } catch (error) {
+    if (activeSubmissionToken !== submissionToken || !workflowMatches(snapshot)) return;
     await postClientLog('error', 'reader-submit-proof-failed', serializeError(error));
     showError(el.proofStatus, error);
+  } finally {
+    if (activeSubmissionToken === submissionToken) {
+      activeSubmissionToken = null;
+      state.submittingProof = false;
+      render();
+    }
   }
 }
 
 async function completeVerification() {
   try {
+    if (state.verifierType === 'paykit-payment') {
+      throw new Error('paykit-payment verification is completed by the Lock Server payment verifier');
+    }
     await postClientLog('info', 'reader-complete-verification-started', handleDetails());
     el.completionStatus.textContent = 'Completing dev verification...';
     el.completionStatus.className = 'muted';
@@ -223,17 +372,112 @@ async function completeVerification() {
   }
 }
 
-async function issueCredential() {
+async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
+  if (activePollToken) return;
+  const pollToken = Symbol('payment-poll');
+  activePollToken = pollToken;
+  state.paymentPolling = true;
+  render();
   try {
-    await postClientLog('info', 'reader-issue-credential-started', handleDetails());
+    if (!handle || !workflowMatches(handle)) {
+      throw new Error('payment proof bundle is required before polling');
+    }
+    await postClientLog('info', 'reader-payment-poll-started', handleDetails(handle));
+    for (let attempt = 0; attempt < 600; attempt += 1) {
+      if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+      const lifecycle = await lookupVerificationTask({
+        resource: handle.resource,
+        creator: handle.creator,
+        bundleId: handle.bundleId,
+        pkarrRelays: handle.pkarrRelays,
+      });
+      if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+      state.lifecycle = lifecycle;
+      persistState();
+      render();
+
+      const status = lifecycle.status;
+      const classification = classifyPaymentLifecycle(lifecycle);
+      if (status === 'pending' || status === 'in_progress') {
+        await delay(1_000);
+        continue;
+      }
+      if (status === 'failed' || status === 'expired' || classification === 'failed') {
+        throw new Error(`payment verification ended with status ${status}`);
+      }
+      if (classification === 'completed') {
+        await postClientLog('info', 'reader-payment-poll-completed', handleDetails(handle));
+        if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+        const credential = await issuePaymentCredential(handle);
+        if (credential && handle.primaryPath) {
+          await readPaymentContent(handle, handle.primaryPath, credential);
+        }
+        return;
+      }
+    }
+    throw new Error('payment verification polling timed out');
+  } catch (error) {
+    if (!handle || !workflowMatches(handle) || activePollToken !== pollToken) return;
+    await postClientLog('error', 'reader-payment-poll-failed', serializeError(error));
+    showError(el.proofStatus, error);
+  } finally {
+    if (activePollToken === pollToken) {
+      activePollToken = null;
+      state.paymentPolling = false;
+      render();
+    }
+  }
+}
+
+async function issuePaymentCredential(handle) {
+  const response = await issueAccessCredential({
+    resource: handle.resource,
+    creator: handle.creator,
+    bundleId: handle.bundleId,
+    pkarrRelays: handle.pkarrRelays,
+  });
+  if (!workflowMatches(handle)) return null;
+  state.accessCredentialResponse = response;
+  state.accessCredential = response.credential;
+  persistState();
+  render();
+  return response.credential;
+}
+
+async function readPaymentContent(handle, path, accessCredential) {
+  const result = await readGuardedContent({
+    resource: handle.resource,
+    accessCredential,
+    path,
+    pkarrRelays: handle.pkarrRelays,
+  });
+  if (!workflowMatches(handle)) return;
+  state.guardedResourcePath = path;
+  state.readResult = {
+    path,
+    size: result.size,
+    contentType: result.contentType,
+    text: result.text,
+  };
+  persistState();
+  render();
+}
+
+async function issueCredential() {
+  const handle = currentVerificationHandle();
+  try {
+    if (!handle) throw new Error('completed verification handle is required');
+    await postClientLog('info', 'reader-issue-credential-started', handleDetails(handle));
+    if (!workflowMatches(handle)) return;
     el.credentialStatus.textContent = 'Issuing access credential...';
     el.credentialStatus.className = 'muted';
     const response = await issueAccessCredential({
-      resource: state.resource,
-      creator: state.creator,
-      bundleId: state.bundleId,
-      pkarrRelays: pkarrRelays(),
+      resource: handle.resource,
+      creator: handle.creator,
+      bundleId: handle.bundleId,
+      pkarrRelays: handle.pkarrRelays,
     });
+    if (!workflowMatches(handle)) return;
     state.accessCredentialResponse = response;
     state.accessCredential = response.credential;
     persistState();
@@ -243,38 +487,49 @@ async function issueCredential() {
       credentialLength: response.credential?.length,
     });
   } catch (error) {
+    if (handle && !workflowMatches(handle)) return;
     await postClientLog('error', 'reader-issue-credential-failed', serializeError(error));
     showError(el.credentialStatus, error);
   }
 }
 
 async function readContent(path) {
+  const handle = currentVerificationHandle();
+  const accessCredential = state.accessCredential;
   try {
+    if (!handle) throw new Error('verification handle is required');
     path = path?.trim();
     if (!path) throw new Error('guarded resource path is required');
     await postClientLog('info', 'reader-proxy-read-started', {
-      resource: state.resource,
+      resource: handle.resource,
       path,
-      hasCredential: Boolean(state.accessCredential),
+      hasCredential: Boolean(accessCredential),
     });
+    if (!workflowMatches(handle)) return;
     el.readStatus.textContent = 'Reading guarded content...';
     el.readStatus.className = 'muted';
     const result = await readGuardedContent({
-      resource: state.resource,
-      accessCredential: state.accessCredential,
+      resource: handle.resource,
+      accessCredential,
       path,
-      pkarrRelays: pkarrRelays(),
+      pkarrRelays: handle.pkarrRelays,
     });
+    if (!workflowMatches(handle)) return;
     state.guardedResourcePath = path;
     state.readResult = {
       path,
       size: result.size,
+      contentType: result.contentType,
       text: result.text,
     };
     persistState();
     render();
-    await postClientLog('info', 'reader-proxy-read-succeeded', { size: result.size });
+    await postClientLog('info', 'reader-proxy-read-succeeded', {
+      size: result.size,
+      contentType: result.contentType,
+    });
   } catch (error) {
+    if (handle && !workflowMatches(handle)) return;
     await postClientLog('error', 'reader-proxy-read-failed', serializeError(error));
     showError(el.readStatus, error);
   }
@@ -283,8 +538,44 @@ async function readContent(path) {
 function render() {
   el.resource.value = state.resource ?? '';
   el.proofSatisfied.value = String(Boolean(state.proofSatisfied));
+  el.verifierType.value = state.verifierType;
+  el.verifierType.disabled = true;
+  el.readerPublicKey.value = state.readerPublicKey ?? '';
+  const paymentMode = state.verifierType === 'paykit-payment';
+  el.proofSatisfied.closest('label').hidden = paymentMode;
+  el.paykitReaderCommands.hidden = !paymentMode;
+  el.load.disabled = state.loadingLock || state.submittingProof;
+  if (state.paykitReaderState === 'request_received') {
+    el.paykitReaderStatus.textContent = 'Paykit reader received and validated the Payment Request.';
+    el.paykitReaderStatus.className = 'ok';
+  } else if (state.paykitReaderState === 'waiting') {
+    el.paykitReaderStatus.textContent = 'Paykit reader is prepared and waiting for a Payment Request.';
+    el.paykitReaderStatus.className = 'ok';
+  } else if (state.paykitReaderState === 'retrying') {
+    el.paykitReaderStatus.textContent = 'Paykit reader is retrying private protocol processing.';
+    el.paykitReaderStatus.className = 'warning';
+  } else if (state.paykitReaderState === 'failed') {
+    el.paykitReaderStatus.textContent = 'Paykit reader worker failed. Inspect coarse container logs.';
+    el.paykitReaderStatus.className = 'error';
+  } else {
+    el.paykitReaderStatus.textContent = 'Paykit reader worker is starting.';
+    el.paykitReaderStatus.className = 'muted';
+  }
+  el.paykitReaderPayment.textContent = state.paykitPaymentRequest
+    ? format({
+      payment_request_id: state.paykitPaymentRequest.payment_request_id,
+      asset: state.paykitPaymentRequest.asset,
+      amount_sats: state.paykitPaymentRequest.amount_sats,
+      address: state.paykitPaymentRequest.address,
+      payment_command: state.paykitPaymentRequest.payment_command,
+      optional_mining_command: state.paykitPaymentRequest.optional_mining_command,
+    })
+    : '';
 
-  if (state.loaded) {
+  if (state.loadingLock) {
+    el.loadStatus.textContent = 'Loading content lock...';
+    el.loadStatus.className = 'muted';
+  } else if (state.loaded) {
     el.loadStatus.textContent = 'Content lock loaded.';
     el.loadStatus.className = 'ok';
   } else if (state.resource) {
@@ -297,10 +588,16 @@ function render() {
   el.loadedOutput.textContent = format(state.loaded);
   renderLockResources();
 
-  el.submitProof.disabled = !state.loaded;
-  if (state.lifecycle) {
+  el.submitProof.disabled = state.loadingLock
+    || state.submittingProof
+    || !state.loaded
+    || (paymentMode && (!state.paykitReaderPrepared || !state.readerPublicKey));
+  if (state.submittingProof) {
+    el.proofStatus.textContent = 'Submitting proof bundle...';
+    el.proofStatus.className = 'muted';
+  } else if (state.lifecycle) {
     el.proofStatus.textContent = `Proof submitted. Status: ${state.lifecycle.status}`;
-    el.proofStatus.className = state.lifecycle.status === 'failed' ? 'error' : 'ok';
+    el.proofStatus.className = ['failed', 'expired'].includes(state.lifecycle.status) ? 'error' : 'ok';
   } else {
     el.proofStatus.textContent = state.loaded ? 'Ready to submit proof bundle.' : 'Waiting for loaded lock.';
     el.proofStatus.className = 'muted';
@@ -309,11 +606,15 @@ function render() {
     submittedProofBundle: state.submittedProofBundle,
     lifecycle: state.lifecycle,
   });
+  el.pollPayment.disabled = !paymentMode || !state.bundleId || state.paymentPolling;
 
-  el.completeVerification.disabled = !state.bundleId;
+  el.completeVerification.disabled = paymentMode || !state.bundleId;
   if (state.completion) {
     el.completionStatus.textContent = `Dev verification completed. Status: ${state.completion.status}`;
     el.completionStatus.className = state.completion.status === 'failed' ? 'error' : 'ok';
+  } else if (paymentMode) {
+    el.completionStatus.textContent = 'Payment verification is completed by the Lock Server; no dev completion call is used.';
+    el.completionStatus.className = 'muted';
   } else {
     el.completionStatus.textContent = state.bundleId ? 'Ready to complete dev verification.' : 'Waiting for proof bundle.';
     el.completionStatus.className = 'muted';
@@ -332,7 +633,7 @@ function render() {
 
   el.readContent.disabled = !state.accessCredential || !state.guardedResourcePath;
   if (state.readResult) {
-    el.readStatus.textContent = `Read ${state.readResult.size} bytes from ${state.readResult.path}.`;
+    el.readStatus.textContent = `Read ${state.readResult.size} bytes (${state.readResult.contentType}) from ${state.readResult.path}.`;
     el.readStatus.className = 'ok';
   } else {
     el.readStatus.textContent = state.accessCredential ? 'Ready to read guarded content.' : 'Waiting for access credential.';
@@ -376,18 +677,52 @@ function renderLockResources() {
   }
 }
 
+function contentLockVerifierType(contentLock) {
+  const criteria = toPlainJson(contentLock)?.criteria;
+  if (!Array.isArray(criteria) || criteria.length === 0) {
+    throw new Error('content lock has no verifier criteria');
+  }
+  const types = new Set(criteria.map((criterion) => criterion?.verifier_type));
+  if (types.size !== 1) throw new Error('reader demo requires one verifier type per content lock');
+  const [verifierType] = types;
+  if (!['dev-static', 'paykit-payment'].includes(verifierType)) {
+    throw new Error(`reader demo does not support verifier type ${String(verifierType)}`);
+  }
+  return verifierType;
+}
+
 function restoreState() {
   const raw = localStorage.getItem(STATE_KEY);
   if (!raw) return;
   try {
-    Object.assign(state, JSON.parse(raw));
+    Object.assign(state, JSON.parse(raw), {
+      loadingLock: false,
+      submittingProof: false,
+      paymentPolling: false,
+      paykitReaderPrepared: false,
+      readerPublicKey: '',
+      paykitReaderState: 'starting',
+      paykitPaymentRequest: null,
+      baselinePaymentRequestId: null,
+    });
   } catch {
     localStorage.removeItem(STATE_KEY);
   }
 }
 
 function persistState() {
-  const { config: _config, ...persisted } = state;
+  const {
+    config: _config,
+    loadingLock: _loadingLock,
+    submittingProof: _submittingProof,
+    paymentPolling: _paymentPolling,
+    paykitReaderPrepared: _paykitReaderPrepared,
+    readerPublicKey: _readerPublicKey,
+    paykitReaderState: _paykitReaderState,
+    paykitPaymentRequest: _paykitPaymentRequest,
+    baselinePaymentRequestId: _baselinePaymentRequestId,
+    ...persisted
+  } = state;
   localStorage.setItem(STATE_KEY, JSON.stringify(persisted));
 }
 
@@ -395,8 +730,85 @@ function pkarrRelays() {
   return [state.config.testnet.pkarrRelay];
 }
 
-function handleDetails() {
-  return { creator: state.creator, bundleId: state.bundleId };
+function invalidateWorkflow() {
+  workflowIncarnation += 1;
+  paykitReaderStatusRequests.invalidate();
+  if (state.paykitPaymentRequest?.payment_request_id) {
+    state.baselinePaymentRequestId = state.paykitPaymentRequest.payment_request_id;
+  }
+  state.paykitPaymentRequest = null;
+  activeLoadToken = null;
+  activeSubmissionToken = null;
+  activePollToken = null;
+  state.loadingLock = false;
+  state.submittingProof = false;
+  state.paymentPolling = false;
+}
+
+function clearVerificationState({ clearLoaded = false } = {}) {
+  if (clearLoaded) {
+    state.loaded = null;
+    state.lockResources = [];
+    state.guardedResourcePath = '';
+    state.verifierType = 'dev-static';
+  }
+  state.creator = null;
+  state.bundleId = null;
+  state.submittedProofBundle = null;
+  state.lifecycle = null;
+  state.completion = null;
+  state.accessCredential = null;
+  state.accessCredentialResponse = null;
+  state.readResult = null;
+}
+
+function workflowMatches(handle) {
+  return workflowHandleMatches(handle, {
+    incarnation: workflowIncarnation,
+    resource: state.resource,
+    creator: state.creator,
+    bundleId: state.bundleId,
+  });
+}
+
+function createPaymentHandle(snapshot, result) {
+  return Object.freeze({
+    incarnation: snapshot.incarnation,
+    resource: snapshot.resource,
+    creator: result.creator,
+    bundleId: result.bundleId,
+    primaryPath: snapshot.primaryPath,
+    pkarrRelays: snapshot.pkarrRelays,
+  });
+}
+
+function currentVerificationHandle() {
+  if (!state.creator || !state.bundleId) return null;
+  return Object.freeze({
+    incarnation: workflowIncarnation,
+    resource: state.resource,
+    creator: state.creator,
+    bundleId: state.bundleId,
+    pkarrRelays: Object.freeze([...pkarrRelays()]),
+  });
+}
+
+function currentPaymentHandle() {
+  if (state.verifierType !== 'paykit-payment') return null;
+  const handle = currentVerificationHandle();
+  if (!handle) return null;
+  return Object.freeze({
+    ...handle,
+    primaryPath: state.lockResources.find((resource) => resource.kind === 'primary')?.readPath ?? '',
+  });
+}
+
+function handleDetails(handle = currentPaymentHandle()) {
+  return { creator: handle?.creator ?? state.creator, bundleId: handle?.bundleId ?? state.bundleId };
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function fetchJson(url, options) {
@@ -426,21 +838,15 @@ function toPlainJson(value) {
   return value;
 }
 
-async function postClientLog(level, event, details = {}) {
+async function postClientLog(level) {
   try {
     await fetch('/api/client-log', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        level,
-        event,
-        details,
-        location: window.location.href,
-        at: new Date().toISOString(),
-      }),
+      body: JSON.stringify({ level }),
     });
-  } catch (error) {
-    console.warn('failed to post reader client log', error);
+  } catch {
+    console.warn('failed to post reader client log');
   }
 }
 

@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { extname, join, normalize, resolve, sep } from 'node:path';
+import { extname, join } from 'node:path';
 
 import { AuthFlowKind, pubkyForConfig } from './lib/pubky.mjs';
-import { contentCreatorSessionPath, examplesRoot, parseArgs, repoRoot, writeJson } from './lib/paths.mjs';
+import { contentCreatorSessionPath, examplesRoot, parseArgs, repoRoot } from './lib/paths.mjs';
 import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
+import {
+  readCreatorDemoSessionForCurrentRole,
+  writeCreatorDemoSessionForCurrentRole,
+} from './lib/creator-session-state.mjs';
+import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 
 const args = parseArgs();
 const allowUnhealthy = Boolean(args['allow-unhealthy']);
@@ -49,8 +53,13 @@ const server = createServer(async (request, response) => {
       return sendJson(response, debugSnapshot(config, preflightStatus));
     }
     if (request.method === 'POST' && url.pathname === '/api/client-log') {
-      const entry = await readJsonBody(request);
-      console.log(`[client:${entry.level ?? 'info'}] ${entry.event ?? 'event'} ${JSON.stringify(entry)}`);
+      let level;
+      try {
+        level = await readClientLogLevel(request);
+      } catch {
+        return sendJson(response, { error: 'invalid client log' }, 400);
+      }
+      console.log(`[creator-client:${level}] event`);
       return sendJson(response, { ok: true });
     }
     if (request.method === 'POST' && url.pathname === '/api/demo-auth/start') {
@@ -61,8 +70,8 @@ const server = createServer(async (request, response) => {
       return sendJson(response, await demoAuthStatus());
     }
     if (request.method === 'GET' && url.pathname === '/auth/lock-server/callback') {
-      // Only the redirect flow (app.js) navigates here; it gets index.html. The iframe flow uses
-      // direct postMessage delivery and never hits this callback route.
+      // Legacy callback URLs still resolve to the creator page. Both current creator pages use
+      // direct postMessage delivery and never navigate to this route.
       return serveStatic(response, join(examplesRoot, 'index.html'));
     }
     if (request.method !== 'GET') {
@@ -71,8 +80,8 @@ const server = createServer(async (request, response) => {
     }
     return servePath(url.pathname, response);
   } catch (error) {
-    console.error(error);
-    sendJson(response, { error: error.message }, 500);
+    console.error('demo request failed');
+    sendJson(response, { error: 'request failed' }, 500);
   }
 });
 
@@ -96,19 +105,23 @@ async function startDemoAuth() {
     demoAuthPromise = activeDemoAuthFlow
       .awaitApproval()
       .then(async (session) => {
-        await writeJson(contentCreatorSessionPath, {
+        await writeCreatorDemoSessionForCurrentRole({
           role: 'content-creator',
           pubky: session.info.publicKey.toString(),
           capabilities: session.info.capabilities,
           exported_session: session.export(),
           authenticated_at: new Date().toISOString(),
         });
-        activeDemoAuthFlow = null;
         return session;
       })
       .catch((error) => {
+        console.error('demo auth failed');
+      })
+      .finally(() => {
         activeDemoAuthFlow = null;
-        console.error(`demo auth failed: ${error.message}`);
+        activeDemoAuthUrl = null;
+        activeDemoAuthStartedAt = null;
+        demoAuthPromise = null;
       });
   }
   return {
@@ -121,8 +134,8 @@ async function startDemoAuth() {
 }
 
 async function demoAuthStatus() {
-  if (existsSync(contentCreatorSessionPath)) {
-    const session = JSON.parse(await readFile(contentCreatorSessionPath, 'utf8'));
+  const session = await readCreatorDemoSessionForCurrentRole();
+  if (session) {
     if (debugEnabled) {
       console.log(`[demo] demo-auth persisted session pubky=${session.pubky} path=./.local/js-sdk-demo/content-creator-session.json`);
     }
@@ -144,7 +157,7 @@ async function demoAuthStatus() {
 }
 
 async function hasPersistedDemoSession() {
-  return existsSync(contentCreatorSessionPath);
+  return Boolean(await readCreatorDemoSessionForCurrentRole());
 }
 
 function publicBrowserConfig(source) {
@@ -152,6 +165,7 @@ function publicBrowserConfig(source) {
   return {
     demoServer: source.demoServer,
     lockServer: source.lockServer,
+    paykit: source.paykit,
     testnet: source.testnet,
     paths: {
       lockServerCallback: `${source.demoServer.url}/auth/lock-server/callback`,
@@ -163,7 +177,7 @@ function logStartupDiagnostics(source, preflight) {
   if (!debugEnabled) return;
   const authRelay = pubkyAuthRelayInboxUrl(source.testnet.httpRelay);
   console.log('[demo] startup diagnostics');
-  console.log('[demo] config path: ./.local/js-sdk-demo/config.json');
+  console.log('[demo] config path: ./.local/demo-config/config.json');
   console.log(`[demo] demoServer.url=${source.demoServer.url}`);
   console.log(`[demo] lockServer.url=${source.lockServer.url}`);
   console.log(`[demo] lockServer.pubky=${source.lockServer.pubky}`);
@@ -200,7 +214,7 @@ function logRequest(request, url) {
   if (!debugEnabled) return;
   const interesting = url.pathname.startsWith('/api/') || url.pathname.startsWith('/auth/') || url.pathname === '/config.json';
   if (!interesting) return;
-  console.log(`[demo] ${request.method} ${url.pathname}${url.search}`);
+  console.log(`[demo] ${request.method} ${url.pathname}`);
 }
 
 async function runPreflight(source) {
@@ -243,27 +257,31 @@ async function checkHttp(url, name, checks, acceptsStatus) {
   }
 }
 
-async function readJsonBody(request) {
+async function readClientLogLevel(request) {
   const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  const text = Buffer.concat(chunks).toString('utf8');
-  if (!text) return {};
-  try {
-    return JSON.parse(text);
-  } catch (error) {
-    return { level: 'warn', event: 'invalid-client-log-json', raw: text, parseError: error.message };
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 128) throw new Error('client log too large');
+    chunks.push(chunk);
   }
+  const text = Buffer.concat(chunks).toString('utf8');
+  const value = JSON.parse(text);
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || Object.keys(value).length !== 1
+    || !Object.hasOwn(value, 'level')
+    || !['info', 'warn', 'error'].includes(value.level)
+  ) throw new Error('invalid client log');
+  return value.level;
 }
 
 function servePath(pathname, response) {
-  let relative = pathname === '/' ? '/examples/js-sdk/' : pathname;
-  if (relative === '/examples/js-sdk/') relative = '/examples/js-sdk/index.html';
-  if (relative.startsWith('/pkg/')) relative = `/locks-sdk/bindings/js${relative}`;
-
-  const normalized = normalize(relative).replace(/^\/+/, '');
-  const filePath = resolve(repoRoot, normalized);
-  if (!filePath.startsWith(repoRoot + sep)) {
-    response.writeHead(403).end('forbidden');
+  const filePath = resolveCreatorStaticPath(pathname, { repoRoot, examplesRoot });
+  if (!filePath) {
+    response.writeHead(404).end('not found');
     return;
   }
   if (!existsSync(filePath) || statSync(filePath).isDirectory()) {

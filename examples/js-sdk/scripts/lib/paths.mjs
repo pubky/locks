@@ -1,14 +1,33 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { chmod, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const repoRoot = resolve(fileURLToPath(new URL('../../../../', import.meta.url)));
 export const examplesRoot = join(repoRoot, 'examples', 'js-sdk');
 export const localPath = join(repoRoot, '.local');
 export const demoStateDir = join(localPath, 'js-sdk-demo');
-export const demoConfigPath = join(demoStateDir, 'config.json');
+export const demoPublicConfigDir = join(localPath, 'demo-config');
+export const demoConfigPath = join(demoPublicConfigDir, 'config.json');
 export const contentCreatorSessionPath = join(demoStateDir, 'content-creator-session.json');
+export const creatorPublicDir = join(localPath, 'creator-public');
+export const creatorPublicProfilePath = join(creatorPublicDir, 'profile.json');
+export const paykitReaderDir = join(localPath, 'paykit-reader');
+export const bitcoinBootstrapDir = join(localPath, 'bitcoin-bootstrap');
+export const paykitReaderPreparedPath = join(paykitReaderDir, 'prepared.v1.json');
+export const paykitReaderWorkerStatusPath = join(paykitReaderDir, 'worker.v1.json');
+export const paykitReaderOwnershipPath = join(paykitReaderDir, 'owner.lock');
+export const composeSecretsPath = join(localPath, 'compose-secrets.json');
+export const locksPostgresEnvPath = join(localPath, 'locks-postgres', 'locks-postgres.env');
+export const locksServerComposeEnvPath = join(localPath, 'locks-server', 'compose.env');
+export const paykitServerDir = join(localPath, 'paykit-server');
+export const paykitPostgresEnvPath = join(localPath, 'paykit-postgres', 'postgres.env');
+export const paykitServerEnvPath = join(paykitServerDir, 'paykit.env');
+export const paykitPublicConfigDir = join(localPath, 'paykit-config');
+export const paykitServerConfigPath = join(paykitPublicConfigDir, 'config.toml');
+export const bitcoinRpcEnvPath = join(localPath, 'bitcoin-rpc', 'bitcoin-rpc.env');
+export const pubkyHomeserverConfigPath = join(localPath, 'pubky-homeserver', 'config.toml');
 
 export const validRoles = ['lock-server', 'content-creator', 'content-viewer'];
 
@@ -75,13 +94,43 @@ export async function readJson(path) {
 }
 
 export async function writeJson(path, value, { mode = 0o644 } = {}) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode });
+  await writeAtomicFile(path, `${JSON.stringify(value, null, 2)}\n`, mode);
 }
 
 export async function writeSecret(path, bytesOrText) {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, bytesOrText, { mode: 0o600 });
+  await writeAtomicFile(path, bytesOrText, 0o600);
+}
+
+export async function writeAtomicFile(path, content, mode) {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const directoryStat = await lstat(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+    throw new Error('generated state parent must be a directory');
+  }
+  await chmod(directory, 0o700);
+  const temporary = join(directory, `.${basename(path)}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
+  let handle;
+  try {
+    handle = await open(temporary, 'wx', mode);
+    await handle.writeFile(content);
+    await handle.chmod(mode);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, path);
+  } finally {
+    await handle?.close().catch(() => {});
+    await rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+export async function readPrivateText(path) {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
+    throw new Error('persisted secret must be a regular owner-only file');
+  }
+  return readFile(path, 'utf8');
 }
 
 export async function readMaybeText(path) {

@@ -47,6 +47,7 @@
         Verifier type
         <select id="verifier-type">
           <option value="dev-static">dev-static</option>
+          <option value="paykit-payment">paykit-payment</option>
         </select>
       </label>
       <label>
@@ -56,6 +57,18 @@
           <option value="false">false</option>
         </select>
       </label>
+      <section id="paykit-reader-commands" hidden>
+        <p>The Paykit reader worker runs automatically inside the reader demo.</p>
+        <button id="refresh-paykit-reader" type="button">Refresh Paykit reader</button>
+        <p id="paykit-reader-status" class="muted">Waiting for the Paykit reader worker.</p>
+        <label>
+          Reader Pubky
+          <input id="reader-public-key" readonly />
+        </label>
+        <p>Validated Payment Request and manual operator commands:</p>
+        <pre id="paykit-reader-payment"></pre>
+        <button id="poll-payment" type="button" disabled>Resume payment verification polling</button>
+      </section>
       <button id="submit-proof" disabled>Submit proof bundle</button>
       <p id="proof-status" class="muted">Waiting for loaded lock.</p>
       <h3>Proof bundle / lifecycle</h3>

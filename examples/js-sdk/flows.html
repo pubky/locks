@@ -17,25 +17,24 @@
   <body>
     <h1>Pubky Locks JS SDK — creator demo</h1>
     <p class="muted">
-      Both demos run the same creator flow (authenticate → grant the Lock Server access → publish locked content).
-      They differ only in how the creator authorizes the Lock Server. Pick one:
+      Both creator pages use iframe auth and run the same flow
+      (authenticate → grant the Lock Server access → publish locked content). Pick one:
     </p>
 
     <div class="card">
-      <h2>Redirect flow</h2>
-      <p>Authorizing the Lock Server navigates the whole page to the Lock Server and back
-        (classic OAuth-style full-page redirect). The session token is stored in
-        <code>localStorage</code>.</p>
-      <a href="/examples/js-sdk/">Open redirect flow →</a>
+      <h2>Primary creator page</h2>
+      <p>Authorizing the Lock Server happens inside an iframe modal. The session token is kept
+        in memory only.</p>
+      <a href="/examples/js-sdk/">Open primary creator page →</a>
     </div>
 
     <div class="card">
-      <h2>Iframe flow</h2>
+      <h2>Alternate creator page</h2>
       <p>Authorizing the Lock Server happens inside an <strong>iframe modal</strong> — the page never leaves
         the app origin. The Lock Server passes the result back to the parent via <code>postMessage</code>,
-        and the session token is kept <strong>in memory only</strong> (not <code>localStorage</code>).
+        and the session token is kept <strong>in memory only</strong>.
         Works inside an installed PWA (standalone).</p>
-      <a href="/examples/js-sdk/iframe.html">Open iframe flow →</a>
+      <a href="/examples/js-sdk/iframe.html">Open alternate creator page →</a>
     </div>
 
     <p class="muted">See <code>examples/js-sdk/README.md</code> for local testnet setup.</p>

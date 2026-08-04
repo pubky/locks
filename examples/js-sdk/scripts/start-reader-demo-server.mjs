@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { extname, join, normalize, resolve, sep } from 'node:path';
+import { extname, join, normalize } from 'node:path';
 
 import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
-import { examplesRoot, parseArgs, repoRoot } from './lib/paths.mjs';
+import { examplesRoot, parseArgs, readJson, repoRoot, roleProfilePath } from './lib/paths.mjs';
+import { resolveExistingPathWithin } from './lib/creator-static-path.mjs';
+import {
+  runPaykitReaderWorker,
+  supervisePaykitReaderWorker,
+} from './lib/paykit-reader-worker.mjs';
+import {
+  buildPaykitReaderBrowserStatus,
+  readPaykitReaderWorkerStatus,
+  writePaykitReaderWorkerStatus,
+} from './lib/paykit-reader-status.mjs';
 
 const args = parseArgs(process.argv.slice(2));
 const allowUnhealthy = args['allow-unhealthy'] === true;
@@ -14,6 +24,9 @@ const readerUrl = new URL(config.demoServer.url);
 readerUrl.port = String(args.port ?? 8081);
 const readerServerUrl = readerUrl.toString().replace(/\/$/, '');
 const preflightStatus = await runPreflight(serviceConfig);
+const workerEnabled = process.env.PAYKIT_READER_WORKER_ENABLED === '1';
+const workerController = new AbortController();
+let workerOwnsState = false;
 
 logStartupDiagnostics(config, preflightStatus);
 
@@ -34,6 +47,9 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, readerServerUrl);
     logRequest(request, url);
+    if (request.method === 'GET' && url.pathname === '/api/health') {
+      return sendJson(response, { status: 'ok' });
+    }
     if (request.method === 'GET' && url.pathname === '/config.json') {
       return sendJson(response, publicBrowserConfig(config));
     }
@@ -43,9 +59,20 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/api/debug/config') {
       return sendJson(response, debugSnapshot(config, preflightStatus));
     }
+    if (request.method === 'GET' && url.pathname === '/api/paykit-reader/status') {
+      const status = await publicPaykitReaderStatus({
+        currentOwner: workerEnabled && workerOwnsState,
+      });
+      return sendJson(response, status, ['starting', 'failed'].includes(status.state) ? 503 : 200);
+    }
     if (request.method === 'POST' && url.pathname === '/api/client-log') {
-      const entry = await readJsonBody(request);
-      console.log(`[reader-client:${entry.level ?? 'info'}] ${entry.event ?? 'event'} ${JSON.stringify(entry)}`);
+      let level;
+      try {
+        level = await readClientLogLevel(request);
+      } catch {
+        return sendJson(response, { error: 'invalid client log' }, 400);
+      }
+      console.log(`[reader-client:${level}] event`);
       return sendJson(response, { ok: true });
     }
     if (request.method !== 'GET') {
@@ -56,9 +83,9 @@ const server = createServer(async (request, response) => {
       return serveStatic(response, join(examplesRoot, 'reader.html'));
     }
     return servePath(url.pathname, response);
-  } catch (error) {
-    console.error(error);
-    sendJson(response, { error: error.message }, 500);
+  } catch {
+    console.error('reader demo request failed');
+    sendJson(response, { error: 'request failed' }, 500);
   }
 });
 
@@ -66,6 +93,20 @@ server.listen(Number(readerUrl.port), () => {
   console.log(`JS SDK reader demo server listening at ${readerServerUrl}`);
   console.log(`Open ${readerServerUrl}/reader/`);
 });
+
+const workerTask = workerEnabled
+  ? supervisePaykitReaderWorker(
+    runPaykitReaderWorker({
+      signal: workerController.signal,
+      writeWorkerStatus: writePaykitReaderWorkerStatus,
+      onOwnershipChange: (owned) => { workerOwnsState = owned; },
+    }),
+    { onTerminalFailure: handleTerminalWorkerFailure },
+  )
+  : Promise.resolve({ status: 'stopped' });
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => { void shutdown(signal); });
+}
 
 function publicBrowserConfig(source) {
   validateDemoConfig(source);
@@ -75,6 +116,44 @@ function publicBrowserConfig(source) {
     testnet: source.testnet,
     paths: {},
   };
+}
+
+export async function publicPaykitReaderStatus({
+  readWorker = readPaykitReaderWorkerStatus,
+  readProfile = () => readJson(roleProfilePath('content-viewer')),
+  currentOwner = false,
+} = {}) {
+  const [worker, profile] = await Promise.all([
+    Promise.resolve().then(readWorker).catch(() => null),
+    Promise.resolve().then(readProfile).catch(() => null),
+  ]);
+  return buildPaykitReaderBrowserStatus(worker, profile, { currentOwner });
+}
+
+async function handleTerminalWorkerFailure(error) {
+  const terminalError = [
+    'invalid_input',
+    'invalid_config',
+    'invalid_state',
+    'output_failed',
+    'prepare_timeout',
+  ].includes(error) ? error : 'worker_failed';
+  console.error(`[reader-demo] Paykit reader worker stopped (${terminalError})`);
+  workerController.abort();
+  process.exitCode = 1;
+  server.close();
+}
+
+let shutdownStarted = false;
+async function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`[reader-demo] shutting down after ${signal}`);
+  workerController.abort();
+  await Promise.allSettled([
+    workerTask,
+    new Promise((resolveClose) => server.close(resolveClose)),
+  ]);
 }
 
 function debugSnapshot(source, preflight) {
@@ -115,11 +194,13 @@ async function checkHttp(url, name, checks, acceptsStatus) {
 
 function servePath(pathname, response) {
   const normalizedPath = normalize(pathname).replace(/^[/\\]+/, '');
-  const resolved = normalizedPath.startsWith('locks-sdk/')
-    ? resolve(repoRoot, normalizedPath)
-    : resolve(examplesRoot, normalizedPath);
-  const allowedRoots = [examplesRoot, resolve(repoRoot, 'locks-sdk/bindings/js/pkg')];
-  if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(`${root}${sep}`))) {
+  const packagePrefix = 'locks-sdk/bindings/js/pkg/';
+  const resolved = normalizedPath.startsWith(packagePrefix)
+    ? resolveExistingPathWithin(join(repoRoot, 'locks-sdk/bindings/js/pkg'), normalizedPath.slice(packagePrefix.length))
+    : normalizedPath.startsWith('locks-sdk/')
+      ? null
+      : resolveExistingPathWithin(examplesRoot, normalizedPath);
+  if (!resolved) {
     response.writeHead(404).end('not found');
     return;
   }
@@ -152,15 +233,31 @@ function contentType(filePath) {
 }
 
 function sendJson(response, body, status = 200) {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  response.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-type': 'application/json; charset=utf-8',
+  });
   response.end(JSON.stringify(body));
 }
 
-async function readJsonBody(request) {
+async function readClientLogLevel(request) {
   const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 128) throw new Error('client log too large');
+    chunks.push(chunk);
+  }
+  const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (
+    value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || Object.keys(value).length !== 1
+    || !Object.hasOwn(value, 'level')
+    || !['info', 'warn', 'error'].includes(value.level)
+  ) throw new Error('invalid client log');
+  return value.level;
 }
 
 function logStartupDiagnostics(source, preflight) {

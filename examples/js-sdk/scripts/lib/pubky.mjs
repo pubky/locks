@@ -26,6 +26,25 @@ export async function loadRoleKeypair(role) {
   return Keypair.fromRecoveryFile(new Uint8Array(recoveryFile), passphrase);
 }
 
+export function secretFromRecoveryFile(recoveryFile, passphrase) {
+  const keypair = Keypair.fromRecoveryFile(new Uint8Array(recoveryFile), passphrase);
+  try {
+    const secret = keypair.secret();
+    if (!(secret instanceof Uint8Array) || secret.length !== 32) {
+      throw new Error('recovery file did not contain a 32-byte Pubky secret');
+    }
+    return secret;
+  } finally {
+    keypair.free();
+  }
+}
+
+export async function loadRoleSecret(role) {
+  const passphrase = (await readFile(rolePassphrasePath(role), 'utf8')).trim();
+  const recoveryFile = await readFile(roleRecoveryFilePath(role));
+  return secretFromRecoveryFile(recoveryFile, passphrase);
+}
+
 export async function loadRoleProfile(role) {
   return readJson(new URL(`../../../../.local/${role}/profile.json`, import.meta.url).pathname);
 }
