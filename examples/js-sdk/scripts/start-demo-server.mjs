@@ -11,9 +11,11 @@ import {
   writeCreatorDemoSessionForCurrentRole,
 } from './lib/creator-session-state.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
+import { publishCreatorProfile } from './publish-creator-profile.mjs';
 
 const args = parseArgs();
 const allowUnhealthy = Boolean(args['allow-unhealthy']);
+const externalWallet = Boolean(args['external-wallet']);
 const config = await readDemoConfig();
 const serviceConfig = withInternalServiceUrls(config);
 const port = Number(new URL(config.demoServer.url).port || 8080);
@@ -105,13 +107,15 @@ async function startDemoAuth() {
     demoAuthPromise = activeDemoAuthFlow
       .awaitApproval()
       .then(async (session) => {
-        await writeCreatorDemoSessionForCurrentRole({
+        const creatorSession = {
           role: 'content-creator',
           pubky: session.info.publicKey.toString(),
           capabilities: session.info.capabilities,
           exported_session: session.export(),
           authenticated_at: new Date().toISOString(),
-        });
+        };
+        await writeCreatorDemoSessionForCurrentRole(creatorSession, sessionStateOptions());
+        if (externalWallet) await publishCreatorProfile({ profile: creatorSession });
         return session;
       })
       .catch((error) => {
@@ -134,7 +138,7 @@ async function startDemoAuth() {
 }
 
 async function demoAuthStatus() {
-  const session = await readCreatorDemoSessionForCurrentRole();
+  const session = await readCurrentCreatorSession();
   if (session) {
     if (debugEnabled) {
       console.log(`[demo] demo-auth persisted session pubky=${session.pubky} path=./.local/js-sdk-demo/content-creator-session.json`);
@@ -157,7 +161,17 @@ async function demoAuthStatus() {
 }
 
 async function hasPersistedDemoSession() {
-  return Boolean(await readCreatorDemoSessionForCurrentRole());
+  return Boolean(await readCurrentCreatorSession());
+}
+
+function sessionStateOptions() {
+  return externalWallet ? { profilePath: null } : {};
+}
+
+async function readCurrentCreatorSession() {
+  const session = await readCreatorDemoSessionForCurrentRole(sessionStateOptions());
+  if (session && externalWallet) await publishCreatorProfile({ profile: session });
+  return session;
 }
 
 function publicBrowserConfig(source) {
@@ -227,6 +241,9 @@ async function runPreflight(source) {
   } catch (error) {
     push('config', false, error.message);
   }
+
+  const wasmPackage = join(repoRoot, 'locks-sdk/bindings/js/pkg/locks_sdk_wasm_bg.wasm');
+  push('WASM package', existsSync(wasmPackage), existsSync(wasmPackage) ? 'present' : 'missing');
 
   await checkHttp(`${source.lockServer.url}/healthz`, 'lock-server /healthz', checks, (status) => status >= 200 && status < 300);
   await checkHttp(`${source.lockServer.url}/readyz`, 'lock-server /readyz', checks, (status) => status >= 200 && status < 300);

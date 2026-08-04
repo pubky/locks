@@ -14,6 +14,7 @@ const REQUIRED_SERVICES = [
   'fulcrum',
   'electrum-readiness',
   'pubky-testnet',
+  'homegate-bridge',
   'locks-server',
   'paykit-config',
   'demo-config',
@@ -39,6 +40,7 @@ export function validateSafeComposeModel(model) {
     'electrum-readiness',
     'paykit-config',
     'demo-config',
+    'homegate-bridge',
     'creator-demo',
     'reader-demo',
   ]) {
@@ -84,8 +86,10 @@ export function validateSafeComposeModel(model) {
   ) {
     throw new Error('bitcoin-bootstrap must use reset-managed scratch state');
   }
-  for (const port of model.services['pubky-testnet'].ports ?? []) {
-    if (port.host_ip !== '127.0.0.1') throw new Error('published demo ports must bind to loopback');
+  for (const service of Object.values(model.services)) {
+    for (const port of service.ports ?? []) {
+      if (port.host_ip !== '127.0.0.1') throw new Error('published demo ports must bind to loopback');
+    }
   }
   return model;
 }

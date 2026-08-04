@@ -176,6 +176,8 @@ async function runPreflight(source) {
   } catch (error) {
     checks.push({ name: 'config', ok: false, message: error.message });
   }
+  const wasmPackage = join(repoRoot, 'locks-sdk/bindings/js/pkg/locks_sdk_wasm_bg.wasm');
+  checks.push({ name: 'WASM package', ok: existsSync(wasmPackage), message: existsSync(wasmPackage) ? 'present' : 'missing' });
   await checkHttp(`${source.lockServer.url}/healthz`, 'lock-server /healthz', checks, (status) => status === 200);
   await checkHttp(`${source.lockServer.url}/readyz`, 'lock-server /readyz', checks, (status) => status === 200);
   await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status === 200 || status === 404);

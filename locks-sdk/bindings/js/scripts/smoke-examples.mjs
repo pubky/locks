@@ -385,14 +385,16 @@ const {
 const creatorSessionTestDir = mkdtempSync(join(tmpdir(), 'locks-creator-session-'));
 const creatorSessionTestPath = join(creatorSessionTestDir, 'content-creator-session.json');
 const creatorProfileTestPath = join(creatorSessionTestDir, 'profile.json');
+const firstCreatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
+const secondCreatorPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 try {
   writeFileSync(creatorSessionTestPath, '{"exported_session":"sensitive"}');
   await clearCreatorDemoSession(creatorSessionTestPath);
   assert.equal(existsSync(creatorSessionTestPath), false);
   await clearCreatorDemoSession(creatorSessionTestPath);
 
-  writeFileSync(creatorProfileTestPath, JSON.stringify({ role: 'content-creator', pubky: 'creator-b' }));
-  writeFileSync(creatorSessionTestPath, JSON.stringify({ role: 'content-creator', pubky: 'creator-a', exported_session: 'old-secret' }));
+  writeFileSync(creatorProfileTestPath, JSON.stringify({ role: 'content-creator', pubky: secondCreatorPubky }));
+  writeFileSync(creatorSessionTestPath, JSON.stringify({ role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'old-secret' }));
   assert.equal(await readCreatorDemoSessionForCurrentRole({
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -401,14 +403,14 @@ try {
 
   await assert.rejects(
     writeCreatorDemoSessionForCurrentRole(
-      { role: 'content-creator', pubky: 'creator-a', exported_session: 'late-old-secret' },
+      { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'late-old-secret' },
       { sessionPath: creatorSessionTestPath, profilePath: creatorProfileTestPath },
     ),
     /creator identity changed during demo authentication/,
   );
   assert.equal(existsSync(creatorSessionTestPath), false);
 
-  const currentSession = { role: 'content-creator', pubky: 'creator-b', exported_session: 'current-secret' };
+  const currentSession = { role: 'content-creator', pubky: secondCreatorPubky, exported_session: 'current-secret' };
   await writeCreatorDemoSessionForCurrentRole(currentSession, {
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -421,6 +423,18 @@ try {
     currentSession,
   );
   assert.equal(statSync(creatorSessionTestPath).mode & 0o777, 0o600);
+  const externalSession = { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'external-secret' };
+  await writeCreatorDemoSessionForCurrentRole(externalSession, {
+    sessionPath: creatorSessionTestPath,
+    profilePath: null,
+  });
+  assert.deepEqual(
+    await readCreatorDemoSessionForCurrentRole({
+      sessionPath: creatorSessionTestPath,
+      profilePath: null,
+    }),
+    externalSession,
+  );
 } finally {
   rmSync(creatorSessionTestDir, { recursive: true, force: true });
 }
@@ -965,8 +979,15 @@ const guardedResponse = new Response(new TextEncoder().encode('payment unlocked'
 });
 const decodedGuarded = await decodeGuardedContentResponse(guardedResponse);
 assert.equal(decodedGuarded.contentType, 'text/plain; charset=utf-8');
+assert.equal(decodedGuarded.kind, 'text');
 assert.equal(decodedGuarded.text, 'payment unlocked');
 assert.equal(decodedGuarded.size, 16);
+const decodedImage = await decodeGuardedContentResponse(new Response(Uint8Array.of(1, 2, 3), {
+  headers: { 'content-type': 'image/png' },
+}));
+assert.equal(decodedImage.kind, 'image');
+assert.equal(decodedImage.text, null);
+assert.deepEqual([...decodedImage.bytes], [1, 2, 3]);
 
 const {
   buildReaderHelperInput,

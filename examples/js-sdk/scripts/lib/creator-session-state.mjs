@@ -25,8 +25,8 @@ export async function readCreatorDemoSessionForCurrentRole({
     throw error;
   }
 
-  const profile = await readJson(profilePath);
-  if (!creatorIdentitiesMatch(session, profile)) {
+  const profile = profilePath ? await readJson(profilePath) : null;
+  if (!validCreatorSession(session) || (profile && !creatorIdentitiesMatch(session, profile))) {
     await clearCreatorDemoSession(sessionPath);
     return null;
   }
@@ -42,8 +42,8 @@ export async function writeCreatorDemoSessionForCurrentRole(
     profilePath = defaultProfilePath,
   } = {},
 ) {
-  const profileBeforeWrite = await readJson(profilePath);
-  if (!creatorIdentitiesMatch(session, profileBeforeWrite)) {
+  const profileBeforeWrite = profilePath ? await readJson(profilePath) : null;
+  if (!validCreatorSession(session) || (profileBeforeWrite && !creatorIdentitiesMatch(session, profileBeforeWrite))) {
     await clearCreatorDemoSession(sessionPath);
     throw new Error('creator identity changed during demo authentication');
   }
@@ -51,16 +51,20 @@ export async function writeCreatorDemoSessionForCurrentRole(
   await writeJson(sessionPath, session, { mode: 0o600 });
   await chmod(sessionPath, 0o600);
 
-  const profileAfterWrite = await readJson(profilePath);
-  if (!creatorIdentitiesMatch(session, profileAfterWrite)) {
+  const profileAfterWrite = profilePath ? await readJson(profilePath) : null;
+  if (profileAfterWrite && !creatorIdentitiesMatch(session, profileAfterWrite)) {
     await clearCreatorDemoSession(sessionPath);
     throw new Error('creator identity changed during demo authentication');
   }
 }
 
 function creatorIdentitiesMatch(session, profile) {
-  return session?.role === 'content-creator'
+  return validCreatorSession(session)
     && profile?.role === 'content-creator'
-    && typeof session.pubky === 'string'
     && session.pubky === profile.pubky;
+}
+
+function validCreatorSession(session) {
+  return session?.role === 'content-creator'
+    && /^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(session.pubky ?? '');
 }

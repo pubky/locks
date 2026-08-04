@@ -14,12 +14,13 @@ const CANONICAL_PUBKY = /^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/;
 export async function publishCreatorProfile({
   source = roleProfilePath('content-creator'),
   destination = creatorPublicProfilePath,
+  profile,
 } = {}) {
-  const profile = await readJson(source);
-  if (profile?.role !== 'content-creator' || !CANONICAL_PUBKY.test(profile.pubky ?? '')) {
+  const creatorProfile = profile ?? await readJson(source);
+  if (creatorProfile?.role !== 'content-creator' || !CANONICAL_PUBKY.test(creatorProfile.pubky ?? '')) {
     throw new Error('valid content-creator profile is required');
   }
-  const publicProfile = Object.freeze({ role: 'content-creator', pubky: profile.pubky });
+  const publicProfile = Object.freeze({ role: 'content-creator', pubky: creatorProfile.pubky });
   await writeJson(destination, publicProfile);
   return publicProfile;
 }

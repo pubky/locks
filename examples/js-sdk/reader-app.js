@@ -101,6 +101,7 @@ async function bootstrap() {
 function bindEvents() {
   el.reset.addEventListener('click', async () => {
     invalidateWorkflow();
+    clearReadResult();
     localStorage.removeItem(STATE_KEY);
     Object.assign(state, {
       resource: '',
@@ -299,7 +300,7 @@ async function submitProof() {
     state.completion = null;
     state.accessCredential = null;
     state.accessCredentialResponse = null;
-    state.readResult = null;
+    clearReadResult();
     activeSubmissionToken = null;
     state.submittingProof = false;
     persistState();
@@ -453,12 +454,7 @@ async function readPaymentContent(handle, path, accessCredential) {
   });
   if (!workflowMatches(handle)) return;
   state.guardedResourcePath = path;
-  state.readResult = {
-    path,
-    size: result.size,
-    contentType: result.contentType,
-    text: result.text,
-  };
+  setReadResult(path, result);
   persistState();
   render();
 }
@@ -516,12 +512,7 @@ async function readContent(path) {
     });
     if (!workflowMatches(handle)) return;
     state.guardedResourcePath = path;
-    state.readResult = {
-      path,
-      size: result.size,
-      contentType: result.contentType,
-      text: result.text,
-    };
+    setReadResult(path, result);
     persistState();
     render();
     await postClientLog('info', 'reader-proxy-read-succeeded', {
@@ -639,7 +630,7 @@ function render() {
     el.readStatus.textContent = state.accessCredential ? 'Ready to read guarded content.' : 'Waiting for access credential.';
     el.readStatus.className = 'muted';
   }
-  el.readOutput.textContent = state.readResult ? state.readResult.text : '';
+  renderReadOutput();
 }
 
 function renderLockResources() {
@@ -704,6 +695,7 @@ function restoreState() {
       paykitReaderState: 'starting',
       paykitPaymentRequest: null,
       baselinePaymentRequestId: null,
+      readResult: null,
     });
   } catch {
     localStorage.removeItem(STATE_KEY);
@@ -721,6 +713,7 @@ function persistState() {
     paykitReaderState: _paykitReaderState,
     paykitPaymentRequest: _paykitPaymentRequest,
     baselinePaymentRequestId: _baselinePaymentRequestId,
+    readResult: _readResult,
     ...persisted
   } = state;
   localStorage.setItem(STATE_KEY, JSON.stringify(persisted));
@@ -759,8 +752,59 @@ function clearVerificationState({ clearLoaded = false } = {}) {
   state.completion = null;
   state.accessCredential = null;
   state.accessCredentialResponse = null;
+  clearReadResult();
+}
+
+function setReadResult(path, result) {
+  clearReadResult();
+  const objectUrl = result.kind === 'text'
+    ? null
+    : URL.createObjectURL(new Blob([result.bytes], { type: result.contentType }));
+  state.readResult = {
+    path,
+    size: result.size,
+    contentType: result.contentType,
+    kind: result.kind,
+    text: result.text,
+    objectUrl,
+  };
+}
+
+function clearReadResult() {
+  if (state.readResult?.objectUrl) URL.revokeObjectURL(state.readResult.objectUrl);
   state.readResult = null;
 }
+
+function renderReadOutput() {
+  el.readOutput.replaceChildren();
+  const result = state.readResult;
+  if (!result) return;
+
+  if (result.kind === 'text') {
+    const output = document.createElement('pre');
+    output.textContent = result.text;
+    el.readOutput.append(output);
+    return;
+  }
+
+  if (result.kind === 'image') {
+    const image = document.createElement('img');
+    image.src = result.objectUrl;
+    image.alt = `Guarded content from ${result.path}`;
+    el.readOutput.append(image);
+    return;
+  }
+
+  const metadata = document.createElement('p');
+  metadata.textContent = `${result.contentType}, ${result.size} bytes`;
+  const download = document.createElement('a');
+  download.href = result.objectUrl;
+  download.download = result.path.split('/').pop() || 'guarded-content';
+  download.textContent = 'Download guarded content';
+  el.readOutput.append(metadata, download);
+}
+
+window.addEventListener('pagehide', clearReadResult);
 
 function workflowMatches(handle) {
   return workflowHandleMatches(handle, {

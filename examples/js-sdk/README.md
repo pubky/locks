@@ -15,6 +15,7 @@ examples/js-sdk/reader.html
 examples/js-sdk/reader-app.js
 examples/js-sdk/reader-flow.js
 examples/js-sdk/scripts/init-config.mjs
+examples/js-sdk/scripts/homegate-bridge.mjs
 examples/js-sdk/scripts/create-user.mjs
 examples/js-sdk/scripts/authenticate.mjs
 examples/js-sdk/scripts/prepare-paykit-reader.mjs
@@ -61,7 +62,7 @@ Required tools/services:
   DHT bootstrap    localhost:6881
   ```
 
-Build the local WASM SDK package first:
+For direct npm development, build the local WASM SDK package first:
 
 ```bash
 npm --prefix locks-sdk/bindings/js run build
@@ -82,6 +83,8 @@ The examples package uses `@synonymdev/pubky` for Node-side Pubky testnet auth/k
 ## Local environment setup
 
 The supported end-to-end path is the complete local Compose stack documented below. It generates ignored owner-only credentials, starts both databases and both application servers, bootstraps Bitcoin regtest, waits for Fulcrum using `server.version`, and starts the creator and reader demos.
+
+The Compose image builds the JS/WASM package itself. A fresh checkout does not need a host-generated `locks-sdk/bindings/js/pkg` directory.
 
 For direct npm development without Compose, provide a running local Pubky testnet, PostgreSQL, Lock Server, and Paykit Server first. `init-config` reads the Lock Server public key from `~/.pubky-lock/config.toml` by default; it does not read the Lock Server signing secret.
 
@@ -190,7 +193,7 @@ checkout is required.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose -f compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
-This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`; Locks reaches it at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers at `/usr/local/bin`; they receive only their explicit role/runtime directories and generated WASM package, never the repository root or Lock Server identity volume.
+This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`, the Homegate bridge at `http://localhost:6288`, and Fulcrum at `tcp://localhost:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
 
 Open:
 
@@ -265,7 +268,9 @@ POST /api/demo-auth/start
 GET /api/demo-auth/status
 ```
 
-It displays a `pubkyauth://...` string and command like:
+It displays a `pubkyauth://...` string. In the Compose external-wallet flow, scan or paste that request into the wallet under test. The approved wallet identity becomes the canonical creator identity and is published for the reader and Paykit services; the demo never imports the wallet private key.
+
+For direct npm development outside the Compose external-wallet mode, the recovery-file command remains available:
 
 ```bash
 npm --prefix examples/js-sdk run authenticate -- \
@@ -279,7 +284,7 @@ npm --prefix examples/js-sdk run authenticate -- \
 npm --prefix examples/js-sdk run authenticate -- --role content-creator
 ```
 
-It signs up/registers the `content-creator` with the configured homeserver, approves the auth string, and the demo server persists its session to:
+That command signs up/registers the local `content-creator`, approves the auth string, and the demo server persists its session to:
 
 ```text
 ./.local/js-sdk-demo/content-creator-session.json
@@ -297,7 +302,7 @@ The shell returns `{ state, code }` directly to the parent with `postMessage`. T
 http://localhost:8080/auth/lock-server/callback
 ```
 
-Approve the Lock Server auth string with the same role:
+Approve the Lock Server auth string with the same identity. In Compose, scan or paste it into the same external wallet. For direct npm development, use:
 
 ```bash
 npm --prefix examples/js-sdk run authenticate -- \
@@ -338,7 +343,7 @@ The Paykit iframe displays the auth URL and both approved local commands. First 
 npm --prefix examples/js-sdk run generate-paykit-account-tpub
 ```
 
-This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. Then run the companion-auth wrapper:
+This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. In the external-wallet flow, scan or paste the Paykit authorization request into the same wallet. For direct npm development with a generated creator recovery file, the companion-auth wrapper remains available:
 
 ```bash
 docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
@@ -389,7 +394,7 @@ The worker is the sole mutable owner of `./.local/paykit-reader/state.v1`. A dir
 
 The native helper is `/usr/local/bin/paykit-reader-demo`; `PAYKIT_READER_DEMO_BIN` is a test-only executable override. Its state path and local Pubky endpoints come from the `PAYKIT_READER_*` Compose environment. Reader homeserver registration runs in a separate direct-spawned Node subprocess with bounded output, timeout, and TERM→KILL cancellation because the Pubky JS API does not expose request cancellation; cancellation waits for child settlement before ownership is released. The worker derives the Paykit peer from the public `content-creator` profile, then passes only the closed native helper environment. The state path must end in `.local/paykit-reader/state.v1`. The helper owns encrypted versioned state, owner-only file permissions, fresh-nonce rewrites, and invariant validation. The worker fences status publication and state checkpoints on current kernel-lock ownership, atomically writes its separate owner-only `worker.v1.json` projection, and clears in-memory readiness immediately if ownership is lost. The HTTP server validates the projection again and requires current in-memory ownership before returning a ready browser status. Terminal worker failure closes PID 1 after a coarse error so Compose restart policy applies.
 
-The reader page persists local progress in browser `localStorage` under `pubky-locks-reader-demo.*` and has a visible **Reset reader state** button. Bundle IDs and access credentials are bearer-like local-dev secrets; the demo displays them for debugging only.
+The reader page persists local progress in browser `localStorage` under `pubky-locks-reader-demo.*` and has a visible **Reset reader state** button. Retrieved guarded bytes are never persisted: text and JSON render as text, images use a temporary object URL, and other binary content exposes metadata and a temporary download link. Bundle IDs and access credentials are bearer-like local-dev secrets; the demo displays them for debugging only.
 
 ## Static drift check
 
