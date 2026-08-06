@@ -26,7 +26,9 @@ assert.match(composeSource, /^# Local development and demonstration only;/);
 assert.match(composeSource, /^name: pubky-locks-paykit-demo$/m);
 assert.match(creatorAppSource, /hasExactKeys\(event\.data, \['type', 'state', 'code'\]\)/);
 assert.match(creatorAppSource, /body: JSON\.stringify\(\{ level \}\)/);
+assert.match(creatorAppSource, /\[result\.authorizationUrl, result\.command\]\.filter\(Boolean\)/);
 assert.doesNotMatch(creatorServerSource, /JSON\.stringify\(entry\)|url\.search/);
+assert.match(creatorServerSource, /if \(!externalWallet\) \{\s+result\.command =/);
 assert.doesNotMatch(lockAuthoritySource, /dev: legacy-connect authorization URL/);
 assert.match(defaultComposeSource, /^services:/);
 assert.doesNotMatch(defaultComposeSource, /^  paykit-server:/m);
@@ -343,6 +345,7 @@ assert.ok(!compose.includes('- ./:/workspace'), 'services must not mount the rep
 assert.ok(!compose.includes('- lock-home:/root'), 'demo services must not mount Lock Server identity state');
 const creatorService = compose.slice(compose.indexOf('  creator-demo:'), compose.indexOf('\n  reader-demo:'));
 assert.ok(creatorService.includes('--external-wallet'), 'creator must use the authenticated external wallet identity');
+assert.ok(creatorService.includes('rm -f /workspace/.local/creator-public/profile.json'), 'creator must clear stale public identity before external wallet auth');
 assert.ok(!creatorService.includes('create-user -- --role content-creator'), 'external wallet mode must not create a second creator identity');
 assert.ok(!creatorService.includes('.local/content-creator'), 'external wallet mode must not mount creator recovery state');
 assert.ok(!creatorService.includes('--allow-unhealthy'), 'creator preflight must fail closed');

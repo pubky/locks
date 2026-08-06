@@ -329,7 +329,7 @@ el.startDemoAuth.addEventListener('click', async () => {
       await refreshDemoAuthStatus();
       return;
     }
-    el.demoAuthCommand.textContent = `${result.authorizationUrl}\n\n${result.command}`;
+    el.demoAuthCommand.textContent = [result.authorizationUrl, result.command].filter(Boolean).join('\n\n');
   } catch (error) {
     showError(el.demoAuthStatus, error);
   }

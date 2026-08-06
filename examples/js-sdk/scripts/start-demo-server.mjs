@@ -41,6 +41,8 @@ if (allowUnhealthy && preflightStatus.checks.some((check) => !check.ok)) {
   console.warn('Starting despite unhealthy preflight because --allow-unhealthy was provided.');
 }
 
+if (externalWallet) await readCurrentCreatorSession();
+
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, config.demoServer.url);
@@ -128,13 +130,16 @@ async function startDemoAuth() {
         demoAuthPromise = null;
       });
   }
-  return {
+  const result = {
     authenticated: false,
     role: 'content-creator',
     authorizationUrl: activeDemoAuthUrl,
     startedAt: activeDemoAuthStartedAt,
-    command: `npm --prefix examples/js-sdk run authenticate -- --role content-creator --auth "${activeDemoAuthUrl}"`,
   };
+  if (!externalWallet) {
+    result.command = `npm --prefix examples/js-sdk run authenticate -- --role content-creator --auth "${activeDemoAuthUrl}"`;
+  }
+  return result;
 }
 
 async function demoAuthStatus() {

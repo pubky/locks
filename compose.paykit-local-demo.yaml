@@ -362,6 +362,7 @@ services:
       - -lc
       - |
         set -eu
+        rm -f /workspace/.local/creator-public/profile.json
         npm --prefix examples/js-sdk run start-server -- --external-wallet
 
   reader-demo:
