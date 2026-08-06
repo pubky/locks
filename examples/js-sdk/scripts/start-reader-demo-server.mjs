@@ -24,7 +24,11 @@ const readerUrl = new URL(config.demoServer.url);
 readerUrl.port = String(args.port ?? 8081);
 const readerServerUrl = readerUrl.toString().replace(/\/$/, '');
 const preflightStatus = await runPreflight(serviceConfig);
-const workerEnabled = process.env.PAYKIT_READER_WORKER_ENABLED === '1';
+const externalReaderPubky = process.env.PAYKIT_EXTERNAL_READER_PUBKY?.trim() ?? '';
+if (externalReaderPubky && !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(externalReaderPubky)) {
+  throw new Error('PAYKIT_EXTERNAL_READER_PUBKY must be a canonical Pubky');
+}
+const workerEnabled = !externalReaderPubky && process.env.PAYKIT_READER_WORKER_ENABLED === '1';
 const workerController = new AbortController();
 let workerOwnsState = false;
 
@@ -123,6 +127,9 @@ export async function publicPaykitReaderStatus({
   readProfile = () => readJson(roleProfilePath('content-viewer')),
   currentOwner = false,
 } = {}) {
+  if (externalReaderPubky) {
+    return { version: 1, state: 'waiting', reader_pubky: externalReaderPubky };
+  }
   const [worker, profile] = await Promise.all([
     Promise.resolve().then(readWorker).catch(() => null),
     Promise.resolve().then(readProfile).catch(() => null),

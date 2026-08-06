@@ -8,8 +8,7 @@ use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
 
 use crate::app_state::pubky_clients::{
-    PubkyClientConstructor, PubkyHttpClientConstructor, pubky_auth_relay_for_network,
-    pubky_client_constructor, pubky_http_client_constructor,
+    PubkyHttpClientConstructor, pubky_auth_relay_for_network, pubky_http_client_constructor,
 };
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
 use crate::config::{
@@ -206,18 +205,6 @@ async fn postgres_state_has_rate_limiter_configured_from_runtime_config() {
 }
 
 #[test]
-fn pubky_client_constructor_follows_configured_network() {
-    assert_eq!(
-        pubky_client_constructor(PubkyNetwork::Mainnet),
-        PubkyClientConstructor::Mainnet
-    );
-    assert_eq!(
-        pubky_client_constructor(PubkyNetwork::Testnet),
-        PubkyClientConstructor::Testnet
-    );
-}
-
-#[test]
 fn pubky_http_client_constructor_follows_configured_network() {
     assert_eq!(
         pubky_http_client_constructor(PubkyNetwork::Mainnet),
@@ -225,7 +212,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
     );
     assert_eq!(
         pubky_http_client_constructor(PubkyNetwork::Testnet),
-        PubkyHttpClientConstructor::Testnet
+        PubkyHttpClientConstructor::Testnet("127.0.0.1")
     );
 }
 

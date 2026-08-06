@@ -281,11 +281,11 @@ services:
   paykit-server:
     image: pubky-locks-paykit-server:local
     build:
-      context: "https://github.com/pubky/paykit-server.git#f38c7915e6b9b104e040773e78438f8aa984c46c"
+      context: "https://github.com/pubky/paykit-server.git#4d6992fa3a7dd14479775b2d75f06cdb43f857ea"
       dockerfile: Dockerfile.local
       additional_contexts:
-        paykit-lib: "https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib"
-        paykit-sdk: "https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk"
+        paykit-lib: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-lib"
+        paykit-sdk: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk"
         locks: "https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a"
 
     depends_on:
@@ -393,6 +393,7 @@ services:
       PAYKIT_READER_RECEIVER_PATH: bitkit/wallet
       PAYKIT_READER_SERVER_PATH: bitkit/server
       PAYKIT_READER_WORKER_ENABLED: "1"
+      PAYKIT_EXTERNAL_READER_PUBKY: ${PAYKIT_EXTERNAL_READER_PUBKY:-}
       PUBKY_LOCK_DEBUG: ${PUBKY_LOCK_DEBUG:-0}
     volumes:
       - ./.local/demo-config:/workspace/.local/demo-config:ro
@@ -403,7 +404,9 @@ services:
       - sh
       - -euc
       - |
-        npm --prefix examples/js-sdk run create-user -- --role content-viewer
+        if [ -z "$PAYKIT_EXTERNAL_READER_PUBKY" ]; then
+          npm --prefix examples/js-sdk run create-user -- --role content-viewer
+        fi
         exec node examples/js-sdk/scripts/start-reader-demo-server.mjs
     healthcheck:
       test:

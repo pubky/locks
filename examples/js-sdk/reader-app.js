@@ -85,6 +85,8 @@ async function bootstrap() {
   el.configStatus.textContent = `Reader demo using Lock Server ${state.config.lockServer.pubky}`;
   el.configStatus.className = 'ok';
   restoreState();
+  const resource = new URL(window.location.href).searchParams.get('resource')?.trim();
+  if (resource) state.resource = resource;
   bindEvents();
   await refreshPaykitReaderStatus();
   render();

@@ -119,7 +119,7 @@ async function startDemoAuth() {
         return session;
       })
       .catch((error) => {
-        console.error('demo auth failed');
+        console.error(`demo auth failed: ${error instanceof Error ? error.message : String(error)}`);
       })
       .finally(() => {
         activeDemoAuthFlow = null;
