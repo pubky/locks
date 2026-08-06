@@ -13,6 +13,7 @@ import {
   acquirePaykitReaderOwnership,
   runPaykitReaderWorker,
   supervisePaykitReaderWorker,
+  waitForCreatorProfile,
 } from './lib/paykit-reader-worker.mjs';
 import {
   buildPaykitReaderBrowserStatus,
@@ -115,6 +116,35 @@ assert.deepEqual(parsePaykitReaderBrowserStatus({
   reader_pubky: readerPubky,
   error: 'receive_timeout',
 });
+assert.deepEqual(
+  parsePaykitReaderBrowserStatus({ version: 1, state: 'waiting_for_creator' }),
+  { version: 1, state: 'waiting_for_creator' },
+);
+
+let creatorProfileReads = 0;
+const creatorProfileWaits = [];
+assert.deepEqual(await waitForCreatorProfile({
+  signal: new AbortController().signal,
+  readProfile: async () => {
+    creatorProfileReads += 1;
+    if (creatorProfileReads < 3) {
+      const error = new Error('profile not published yet');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return { role: 'content-creator', pubky: readerPubky };
+  },
+  wait: async (milliseconds) => { creatorProfileWaits.push(milliseconds); },
+}), { role: 'content-creator', pubky: readerPubky });
+assert.equal(creatorProfileReads, 3);
+assert.deepEqual(creatorProfileWaits, [1_000, 1_000]);
+await assert.rejects(
+  waitForCreatorProfile({
+    signal: new AbortController().signal,
+    readProfile: async () => { throw new SyntaxError('invalid profile JSON'); },
+  }),
+  /invalid profile JSON/,
+);
 
 const newerReceived = {
   ...received,
@@ -255,6 +285,13 @@ try {
       { currentOwner: false },
     ),
     { version: 1, state: 'starting' },
+  );
+  assert.deepEqual(
+    buildPaykitReaderBrowserStatus(null, null, {
+      currentOwner: false,
+      waitingForCreator: true,
+    }),
+    { version: 1, state: 'waiting_for_creator' },
   );
 } finally {
   await rm(statusRoot, { recursive: true, force: true });

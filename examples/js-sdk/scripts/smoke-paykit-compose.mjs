@@ -89,7 +89,7 @@ await assert.rejects(
   /content-creator profile/,
 );
 const config = buildPaykitServerConfig({ lockServerPubky });
-assert.equal(config, `[http]\nlisten_addr = "0.0.0.0:3001"\n\n[locks]\ntrusted_public_key = "${lockServerPubky}"\n\n[setup]\nallowed_origins = ["http://localhost:8080"]\n\n[paykit]\nreceiver_path = "bitkit/server"\nreceiver_path_priority = ["bitkit"]\nnetwork = "testnet"\n\n[bitcoin]\nnetwork = "regtest"\n\n[electrum]\nendpoint = "tcp://fulcrum:50001"\npoll_interval = "1s"\nrequest_timeout = "10s"\nconnect_retries = 1\n\n[outbox]\npoll_interval = "500ms"\nbatch_size = 16\nlease_duration = "30s"\nretry_initial = "1s"\nretry_max = "5m"\n`);
+assert.equal(config, `[http]\nlisten_addr = "0.0.0.0:3001"\n\n[locks]\ntrusted_public_key = "${lockServerPubky}"\n\n[setup]\nallowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]\n\n[paykit]\nreceiver_path = "bitkit/server"\nreceiver_path_priority = ["bitkit"]\nnetwork = "testnet"\n\n[bitcoin]\nnetwork = "regtest"\n\n[electrum]\nendpoint = "tcp://fulcrum:50001"\npoll_interval = "1s"\nrequest_timeout = "10s"\nconnect_retries = 1\n\n[outbox]\npoll_interval = "500ms"\nbatch_size = 16\nlease_duration = "30s"\nretry_initial = "1s"\nretry_max = "5m"\n`);
 assert.throws(() => buildPaykitServerConfig({ lockServerPubky: 'invalid' }), /Lock Server Pubky/);
 assert.deepEqual(validatePaykitComposeEnvironment({
   PAYKIT_DATABASE_URL: 'postgres://paykit:secret@paykit-postgres:5432/paykit',
@@ -290,9 +290,9 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_CORE_REV: 75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b',
-  'https://github.com/pubky/paykit-server.git#f38c7915e6b9b104e040773e78438f8aa984c46c',
-  'https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk',
+  'https://github.com/pubky/paykit-server.git#5ed3e8e849a16045c26c37a75068625dda333785',
+  'https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk',
   'https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8081',

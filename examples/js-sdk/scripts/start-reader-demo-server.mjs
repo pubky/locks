@@ -9,6 +9,7 @@ import { resolveExistingPathWithin } from './lib/creator-static-path.mjs';
 import {
   runPaykitReaderWorker,
   supervisePaykitReaderWorker,
+  waitForCreatorProfile,
 } from './lib/paykit-reader-worker.mjs';
 import {
   buildPaykitReaderBrowserStatus,
@@ -31,6 +32,7 @@ if (externalReaderPubky && !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test
 const workerEnabled = !externalReaderPubky && process.env.PAYKIT_READER_WORKER_ENABLED === '1';
 const workerController = new AbortController();
 let workerOwnsState = false;
+let workerWaitingForCreator = workerEnabled;
 
 logStartupDiagnostics(config, preflightStatus);
 
@@ -66,6 +68,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/api/paykit-reader/status') {
       const status = await publicPaykitReaderStatus({
         currentOwner: workerEnabled && workerOwnsState,
+        waitingForCreator: workerWaitingForCreator,
       });
       return sendJson(response, status, ['starting', 'failed'].includes(status.state) ? 503 : 200);
     }
@@ -100,11 +103,7 @@ server.listen(Number(readerUrl.port), () => {
 
 const workerTask = workerEnabled
   ? supervisePaykitReaderWorker(
-    runPaykitReaderWorker({
-      signal: workerController.signal,
-      writeWorkerStatus: writePaykitReaderWorkerStatus,
-      onOwnershipChange: (owned) => { workerOwnsState = owned; },
-    }),
+    runWorkerAfterCreatorProfile(),
     { onTerminalFailure: handleTerminalWorkerFailure },
   )
   : Promise.resolve({ status: 'stopped' });
@@ -122,10 +121,25 @@ function publicBrowserConfig(source) {
   };
 }
 
+async function runWorkerAfterCreatorProfile() {
+  await waitForCreatorProfile({
+    signal: workerController.signal,
+    readProfile: () => readJson(roleProfilePath('content-creator')),
+  });
+  if (workerController.signal.aborted) return { status: 'stopped' };
+  workerWaitingForCreator = false;
+  return runPaykitReaderWorker({
+    signal: workerController.signal,
+    writeWorkerStatus: writePaykitReaderWorkerStatus,
+    onOwnershipChange: (owned) => { workerOwnsState = owned; },
+  });
+}
+
 export async function publicPaykitReaderStatus({
   readWorker = readPaykitReaderWorkerStatus,
   readProfile = () => readJson(roleProfilePath('content-viewer')),
   currentOwner = false,
+  waitingForCreator = false,
 } = {}) {
   if (externalReaderPubky) {
     return { version: 1, state: 'waiting', reader_pubky: externalReaderPubky };
@@ -134,7 +148,7 @@ export async function publicPaykitReaderStatus({
     Promise.resolve().then(readWorker).catch(() => null),
     Promise.resolve().then(readProfile).catch(() => null),
   ]);
-  return buildPaykitReaderBrowserStatus(worker, profile, { currentOwner });
+  return buildPaykitReaderBrowserStatus(worker, profile, { currentOwner, waitingForCreator });
 }
 
 async function handleTerminalWorkerFailure(error) {

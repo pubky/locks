@@ -9,7 +9,7 @@ export const defaultLockServerConfigPath = '~/.pubky-lock/config.toml';
 
 export const defaultDemoConfig = {
   demoServer: {
-    url: 'http://localhost:8080',
+    url: 'http://127.0.0.1:8080',
   },
   lockServer: {
     url: 'http://127.0.0.1:3000',
@@ -17,13 +17,13 @@ export const defaultDemoConfig = {
     configPath: defaultLockServerConfigPath,
   },
   paykit: {
-    url: 'http://localhost:3001',
+    url: 'http://127.0.0.1:3001',
   },
   testnet: {
     homeserver: 'pubky8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo',
-    httpRelay: 'http://localhost:15412',
-    pkarrRelay: 'http://localhost:15411',
-    dhtBootstrap: 'localhost:6881',
+    httpRelay: 'http://127.0.0.1:15412',
+    pkarrRelay: 'http://127.0.0.1:15411',
+    dhtBootstrap: '127.0.0.1:6881',
   },
 };
 
@@ -155,7 +155,7 @@ listen_addr = "0.0.0.0:3001"
 trusted_public_key = "${lockServerPubky}"
 
 [setup]
-allowed_origins = ["http://localhost:8080"]
+allowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
 
 [paykit]
 receiver_path = "bitkit/server"

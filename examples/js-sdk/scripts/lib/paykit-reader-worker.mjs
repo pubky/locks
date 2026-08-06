@@ -93,6 +93,37 @@ export async function supervisePaykitReaderWorker(task, { onTerminalFailure } = 
   return result;
 }
 
+export async function waitForCreatorProfile({
+  signal,
+  readProfile,
+  wait = waitForDelay,
+} = {}) {
+  if (!signal || typeof readProfile !== 'function') {
+    throw new Error('Paykit reader creator wait dependencies are incomplete');
+  }
+  while (!signal.aborted) {
+    let profile;
+    try {
+      profile = await readProfile();
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      profile = null;
+    }
+    if (profile === null) {
+      await wait(INITIAL_RETRY_MS, signal);
+      continue;
+    }
+    if (
+      profile.role !== 'content-creator'
+      || !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(profile.pubky)
+    ) {
+      throw new Error('Paykit reader creator profile is invalid');
+    }
+    return profile;
+  }
+  return null;
+}
+
 export async function runPaykitReaderWorker({
   signal,
   runOperation = runReaderOperation,

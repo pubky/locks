@@ -222,6 +222,9 @@ export function parsePaykitReaderBrowserStatus(value) {
   if (value.state === 'starting' && hasExactKeys(value, ['version', 'state'])) {
     return Object.freeze({ ...value });
   }
+  if (value.state === 'waiting_for_creator' && hasExactKeys(value, ['version', 'state'])) {
+    return Object.freeze({ ...value });
+  }
   if (
     value.state === 'waiting'
     && hasExactKeys(value, ['version', 'state', 'reader_pubky'])

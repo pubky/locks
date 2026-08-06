@@ -547,6 +547,9 @@ function render() {
   } else if (state.paykitReaderState === 'retrying') {
     el.paykitReaderStatus.textContent = 'Paykit reader is retrying private protocol processing.';
     el.paykitReaderStatus.className = 'warning';
+  } else if (state.paykitReaderState === 'waiting_for_creator') {
+    el.paykitReaderStatus.textContent = 'Paykit reader is waiting for the content creator to authenticate.';
+    el.paykitReaderStatus.className = 'muted';
   } else if (state.paykitReaderState === 'failed') {
     el.paykitReaderStatus.textContent = 'Paykit reader worker failed. Inspect coarse container logs.';
     el.paykitReaderStatus.className = 'error';

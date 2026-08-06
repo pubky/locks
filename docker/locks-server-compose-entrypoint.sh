@@ -86,7 +86,7 @@ frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
 [creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://localhost:8080"]
+allowed_return_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
 
 [secrets]
 creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
@@ -101,7 +101,7 @@ network = "testnet"
 public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 3000
-icann_domain = "localhost"
+icann_domain = "127.0.0.1"
 pkarr_relays = ["http://127.0.0.1:15411"]
 key_republisher_interval_seconds = 86400
 
