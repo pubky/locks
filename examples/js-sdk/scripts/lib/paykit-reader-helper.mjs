@@ -191,15 +191,23 @@ export function requireReaderEnvironment(env = process.env) {
   }
 }
 
+export async function readReaderCreatorProfile({
+  env = process.env,
+  readProfile = readJson,
+  loadProfile = loadRoleProfile,
+} = {}) {
+  return env.PAYKIT_READER_CREATOR_PROFILE_PATH
+    ? readProfile(env.PAYKIT_READER_CREATOR_PROFILE_PATH)
+    : loadProfile('content-creator');
+}
+
 export async function resolveReaderEnvironment({
   env = process.env,
   loadProfile = loadRoleProfile,
 } = {}) {
   const resolved = { ...env };
   if (!resolved.PAYKIT_READER_SERVER_PUBKY) {
-    const profile = resolved.PAYKIT_READER_CREATOR_PROFILE_PATH
-      ? await readJson(resolved.PAYKIT_READER_CREATOR_PROFILE_PATH).catch(() => undefined)
-      : await loadProfile('content-creator').catch(() => undefined);
+    const profile = await readReaderCreatorProfile({ env: resolved, loadProfile }).catch(() => undefined);
     if (profile?.role !== 'content-creator' || !isCanonicalPubky(profile.pubky)) {
       throw new Error('valid content-creator profile is required for Paykit reader setup');
     }

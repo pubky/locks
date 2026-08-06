@@ -10,7 +10,7 @@ import {
 } from './lib/config.mjs';
 import { repoRoot, writeSecret } from './lib/paths.mjs';
 import { initializePaykitCompose } from './init-paykit-compose.mjs';
-import { resolveReaderEnvironment } from './lib/paykit-reader-helper.mjs';
+import { readReaderCreatorProfile, resolveReaderEnvironment } from './lib/paykit-reader-helper.mjs';
 import { extractBip84AccountXpub } from './generate-paykit-account-tpub.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
@@ -234,6 +234,13 @@ try {
   })}\n`, { mode: 0o600 });
   await publishCreatorProfile({ source: privateProfilePath, destination: publicProfilePath });
   assert.deepEqual(JSON.parse(await readFile(publicProfilePath, 'utf8')), {
+    role: 'content-creator',
+    pubky: creatorPubky,
+  });
+  assert.deepEqual(await readReaderCreatorProfile({
+    env: { PAYKIT_READER_CREATOR_PROFILE_PATH: publicProfilePath },
+    loadProfile: async () => { throw new Error('private creator profile must not be loaded'); },
+  }), {
     role: 'content-creator',
     pubky: creatorPubky,
   });

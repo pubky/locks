@@ -6,6 +6,7 @@ import { extname, join, normalize } from 'node:path';
 import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
 import { examplesRoot, parseArgs, readJson, repoRoot, roleProfilePath } from './lib/paths.mjs';
 import { resolveExistingPathWithin } from './lib/creator-static-path.mjs';
+import { readReaderCreatorProfile } from './lib/paykit-reader-helper.mjs';
 import {
   runPaykitReaderWorker,
   supervisePaykitReaderWorker,
@@ -124,7 +125,7 @@ function publicBrowserConfig(source) {
 async function runWorkerAfterCreatorProfile() {
   await waitForCreatorProfile({
     signal: workerController.signal,
-    readProfile: () => readJson(roleProfilePath('content-creator')),
+    readProfile: readReaderCreatorProfile,
   });
   if (workerController.signal.aborted) return { status: 'stopped' };
   workerWaitingForCreator = false;
