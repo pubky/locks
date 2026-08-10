@@ -359,7 +359,8 @@ async fn post_proof_bundles_rejects_paykit_payment_when_paykit_is_not_configured
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(creator());

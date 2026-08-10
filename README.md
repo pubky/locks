@@ -439,7 +439,8 @@ Example:
       "params": {
         "recipient_pubky": "pubky<creator_z32>",
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
       }
     }
   ],
@@ -472,7 +473,7 @@ For example:
 
 A submitted proof bundle is sent by the viewer before verification. It is not stored as an entitlement unless verification succeeds.
 
-For `paykit-payment`, the content lock criterion params are exactly `recipient_pubky`, positive base-unit string `amount`, and non-empty `asset`. `recipient_pubky` must equal the content-lock creator. In v1 it must be the lock's only criterion, referenced exactly once by the lock logic. The submitted proof carries no payment details in its proof payload; it uses top-level `reader_public_key` plus the canonical `pubky_lock_resource` so the Lock Server can create the Paykit invoice.
+For `paykit-payment`, the content lock criterion params are exactly `recipient_pubky`, positive base-unit string `amount`, non-empty `asset`, and positive whole-hour JSON `u64` `payment_in`. `recipient_pubky` must equal the content-lock creator. In v1 it must be the lock's only criterion, referenced exactly once by the lock logic. The submitted proof carries no payment details in its proof payload; it uses top-level `reader_public_key` plus the canonical `pubky_lock_resource` so the Lock Server can create the Paykit invoice.
 
 Example:
 
