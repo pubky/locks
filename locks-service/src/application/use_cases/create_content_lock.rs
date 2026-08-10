@@ -330,6 +330,7 @@ mod tests {
             "recipient_pubky": creator().to_string(),
             "amount": "0",
             "asset": "BTC",
+            "payment_in": 24,
         });
 
         let result = use_case.execute(request).await;
@@ -353,7 +354,8 @@ mod tests {
             params: json!({
                 "recipient_pubky": creator().to_string(),
                 "amount": "50000",
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         });
         request.lock_logic = LockLogic::All {

@@ -213,6 +213,14 @@ impl CreateContentLockRequestBuilder {
             .criteria
             .as_ref()
             .ok_or_else(|| "content lock request requires criteria".to_owned())?;
+        let typed_criteria: Vec<locks_core::lock_policy::Criterion> =
+            serde_json::from_value(criteria.clone())
+                .map_err(|err| format!("invalid content lock criteria: {err}"))?;
+        for criterion in &typed_criteria {
+            criterion
+                .validate_params()
+                .map_err(|err| format!("invalid content lock criterion: {err}"))?;
+        }
         body.insert("criteria".to_owned(), criteria.clone());
         let lock_logic = state
             .lock_logic
@@ -617,6 +625,31 @@ mod tests {
         let err = builder.build_value().unwrap_err();
 
         assert!(format!("{err:?}").contains("criteria"));
+    }
+
+    #[test]
+    fn create_content_lock_request_builder_rejects_invalid_paykit_payment_in() {
+        let builder = complete_builder();
+        builder.state.borrow_mut().primary_resource =
+            Some(resource("/priv/locks.app/content/example.txt", "hash", 13));
+        builder.state.borrow_mut().criteria = Some(serde_json::json!([{
+            "criterion_id": "payment",
+            "verifier_type": "paykit-payment",
+            "params": {
+                "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                "amount": "50000",
+                "asset": "BTC",
+                "payment_in": 0
+            }
+        }]));
+        builder.state.borrow_mut().lock_logic = Some(serde_json::json!({
+            "type": "all",
+            "criteria": ["payment"]
+        }));
+
+        let err = builder.build_value().unwrap_err();
+
+        assert!(err.contains("payment_in"));
     }
 
     #[test]

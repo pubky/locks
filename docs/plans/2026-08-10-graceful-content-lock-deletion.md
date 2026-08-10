@@ -222,7 +222,7 @@ Each task is a separate review/commit checkpoint. Do not commit automatically.
 ```bash
 cargo test -p locks-core
 cargo test -p locks-sdk
-cargo test -p locks-sdk-js
+cargo test -p locks-sdk-wasm
 cargo test --workspace --no-run
 ```
 
@@ -450,7 +450,7 @@ cargo test -p locks-core
 cargo test -p locks-service
 cargo test -p locks-server
 cargo test -p locks-sdk
-cargo test -p locks-sdk-js
+cargo test -p locks-sdk-wasm
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test -p locks-e2e --test postgres_runtime
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test -p locks-e2e --test production_creator_publishing_http
 TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test -p locks-e2e --test retrieval_access_http
