@@ -98,6 +98,7 @@ pub(super) async fn create_content_lock_for_authenticated_creator(
     validate_content_lock_limits(&request, state.config().content_locks.clone())?;
     let use_case = CreateContentLockUseCase::new(
         state.content_locks().as_ref(),
+        state.content_lock_ownership().as_ref(),
         state.guarded_resources().as_ref(),
         state.clock().as_ref(),
     );

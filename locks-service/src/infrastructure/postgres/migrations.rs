@@ -49,6 +49,7 @@ mod tests {
         assert_table_exists(&mut connection, "pending_creator_connect_flows").await;
         assert_table_exists(&mut connection, "frontend_session_codes").await;
         assert_table_exists(&mut connection, "frontend_sessions").await;
+        assert_table_exists(&mut connection, "content_lock_ownership").await;
         assert_column_exists(&mut connection, "verification_tasks", "creator").await;
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;
@@ -70,10 +71,20 @@ mod tests {
         .await;
         assert_column_exists(&mut connection, "frontend_session_codes", "code_hash").await;
         assert_column_exists(&mut connection, "frontend_sessions", "token_hash").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "creator").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "guarded_path").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "lock_id").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "status").await;
         assert_unique_constraint_exists(
             &mut connection,
             "verification_tasks",
             "verification_tasks_creator_bundle_unique",
+        )
+        .await;
+        assert_unique_constraint_exists(
+            &mut connection,
+            "content_lock_ownership",
+            "content_lock_ownership_creator_path_unique",
         )
         .await;
         drop(connection);
