@@ -1,6 +1,7 @@
 pub mod semantics {}
 
 mod access;
+mod content_lock_ownership;
 mod creator_authority;
 mod entitlement;
 mod guarded_resources;
@@ -9,6 +10,7 @@ mod runtime;
 mod verification;
 
 pub use access::*;
+pub use content_lock_ownership::*;
 pub use creator_authority::*;
 pub use entitlement::*;
 pub use guarded_resources::*;

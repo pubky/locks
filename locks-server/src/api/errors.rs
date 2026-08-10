@@ -23,6 +23,7 @@ pub enum ApiErrorCode {
     FrontendSessionUnavailable,
     FrontendSessionExpired,
     FrontendSessionStateMismatch,
+    ContentLockPathConflict,
     TaskStateConflict,
     UnsupportedVerifierType,
     PaykitNotConfigured,
@@ -53,6 +54,7 @@ impl ApiErrorCode {
             Self::FrontendSessionUnavailable => "frontend_session_unavailable",
             Self::FrontendSessionExpired => "frontend_session_expired",
             Self::FrontendSessionStateMismatch => "frontend_session_state_mismatch",
+            Self::ContentLockPathConflict => "content_lock_path_conflict",
             Self::TaskStateConflict => "task_state_conflict",
             Self::UnsupportedVerifierType => "unsupported_verifier_type",
             Self::PaykitNotConfigured => "paykit_not_configured",
@@ -84,7 +86,7 @@ impl ApiErrorCode {
                 StatusCode::UNAUTHORIZED
             }
             Self::FrontendSessionStateMismatch => StatusCode::BAD_REQUEST,
-            Self::TaskStateConflict => StatusCode::CONFLICT,
+            Self::ContentLockPathConflict | Self::TaskStateConflict => StatusCode::CONFLICT,
             Self::UnsupportedVerifierType
             | Self::PaykitNotConfigured
             | Self::ReaderPubkyUnresolvable => StatusCode::UNPROCESSABLE_ENTITY,
@@ -192,6 +194,10 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::FrontendSessionStateMismatch => Self::new(
                 ApiErrorCode::FrontendSessionStateMismatch,
                 "frontend session state mismatch",
+            ),
+            ApplicationError::ContentLockPathConflict { .. } => Self::new(
+                ApiErrorCode::ContentLockPathConflict,
+                "content lock path is already owned",
             ),
             ApplicationError::InvalidGuardedResource { .. } => {
                 Self::new(ApiErrorCode::InvalidRequest, "invalid guarded resource")
@@ -411,6 +417,11 @@ mod tests {
                 "task_state_conflict",
             ),
             (
+                ApiErrorCode::ContentLockPathConflict,
+                StatusCode::CONFLICT,
+                "content_lock_path_conflict",
+            ),
+            (
                 ApiErrorCode::UnsupportedVerifierType,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "unsupported_verifier_type",
@@ -476,6 +487,26 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn content_lock_path_conflict_maps_to_409_stable_envelope() {
+        let api_error = ApiError::from(ApplicationError::ContentLockPathConflict {
+            guarded_path: "/priv/locks.app/content/already-owned.txt".to_owned(),
+        });
+
+        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
+        let json = serde_json::to_value(api_error.error_response()).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "error": {
+                    "code": "content_lock_path_conflict",
+                    "message": "content lock path is already owned"
+                }
+            })
+        );
+        assert!(!json.to_string().contains("already-owned.txt"));
     }
 
     #[test]
