@@ -144,7 +144,18 @@ POST /payment-request-drain-lookups
 { "lock_resource": "..." }
 ```
 
-Returns aggregate factual state only; no Bundle IDs, readers, Payment Request IDs, addresses, or raw errors.
+Both drain endpoints return `200` with the same closed aggregate body:
+
+```json
+{
+  "status": "active",
+  "accepted_count": 0,
+  "terminal_count": 0,
+  "cancellation_enqueued_count": 0
+}
+```
+
+`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Exact replay returns the same aggregate body.
 
 ### Per-Bundle status
 
@@ -153,7 +164,18 @@ POST /payment-requests/status
 { "creator": "pubky...", "bundle_id": "..." }
 ```
 
-Returns orthogonal `request_state` and `payment_state`, immutable invoice/deadline timestamps, confirmations, and amount match.
+Returns this exact closed body with orthogonal lifecycle and payment facts:
+
+```json
+{
+  "request_state": "proposed",
+  "payment_state": "undetected",
+  "invoice_created_at": "<RFC3339 UTC>",
+  "payment_deadline": "<RFC3339 UTC>",
+  "confirmations": 0,
+  "amount_matched": false
+}
+```
 
 The canonical persisted `request_state` is one of these exact closed snake-case values, mapped one-to-one from Paykit SDK lifecycle state:
 
@@ -167,6 +189,15 @@ The canonical persisted `request_state` is one of these exact closed snake-case 
 - `recovery_required`
 - `invalid_conflict`
 
+`payment_state` is exactly one of:
+
+- `undetected`
+- `detected`
+- `confirmed`
+- `expired`
+
+`expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
+
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
 
 - `accepted` is accepted and blocking;
@@ -175,6 +206,13 @@ Drain classification uses the persisted state without inference from invoice del
 - `recovery_required`, `invalid_conflict`, `proof_submitted`, and `active_recurring` fail drain classification rather than being collapsed into another lifecycle.
 
 For the later HTTP slice, `recovery_required` maps to `503 unavailable`; `invalid_conflict`, `proof_submitted`, and `active_recurring` map to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
+
+The stable drain-classification error envelopes are:
+
+- `409 {"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}`
+- `503 {"error":{"code":"unavailable","message":"payment request state is unavailable"}}`
+
+Absent drain lookups and absent per-Bundle statuses reuse `404 {"error":{"code":"not_found","message":"requested resource was not found"}}`.
 
 ### Drain cleanup
 
@@ -500,11 +538,9 @@ Cross-service acceptance must additionally prove:
 
 These do not reopen accepted product semantics, but code must not start for the affected slice until both plans are patched identically:
 
-1. Exact `request_state` and `payment_state` wire enum values and mappings for Paykit recovery/conflict conditions.
-2. Exact aggregate drain response fields/status values.
-3. Exact signed route/body for deleting completed Paykit operational drain state.
-4. Exact Locks stable `failure_code` vocabulary.
-5. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
+1. Exact signed route/body for deleting completed Paykit operational drain state.
+2. Exact Locks stable `failure_code` vocabulary.
+3. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
 
 ## Out of scope
 
