@@ -153,7 +153,28 @@ POST /payment-requests/status
 { "creator": "pubky...", "bundle_id": "..." }
 ```
 
-Returns orthogonal `request_state` and `payment_state`, immutable invoice/deadline timestamps, confirmations, and amount match. Exact enum spellings and invalid/recovery-state HTTP mapping are an implementation-contract gate and must be synchronized in both plans before code.
+Returns orthogonal `request_state` and `payment_state`, immutable invoice/deadline timestamps, confirmations, and amount match.
+
+The canonical persisted `request_state` is one of these exact closed snake-case values, mapped one-to-one from Paykit SDK lifecycle state:
+
+- `proposed`
+- `proposal_expired`
+- `accepted`
+- `rejected`
+- `canceled`
+- `proof_submitted`
+- `active_recurring`
+- `recovery_required`
+- `invalid_conflict`
+
+Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
+
+- `accepted` is accepted and blocking;
+- `rejected`, `canceled`, and `proposal_expired` are terminal and non-blocking;
+- `proposed` is unanswered and requires durable cancellation enqueue;
+- `recovery_required`, `invalid_conflict`, `proof_submitted`, and `active_recurring` fail drain classification rather than being collapsed into another lifecycle.
+
+For the later HTTP slice, `recovery_required` maps to `503 unavailable`; `invalid_conflict`, `proof_submitted`, and `active_recurring` map to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
 
 ### Drain cleanup
 
