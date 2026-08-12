@@ -14,7 +14,7 @@
 
 ## Status and provenance
 
-- Plan status: **accepted product design; Tasks 1–5 committed and Task 6 implemented pending commit; Tasks 7–10 remain**.
+- Plan status: **accepted product design; Tasks 1, 2, 4, 5, and 6 committed; the omitted Task 3 prerequisite is implemented pending commit; Tasks 7–10 remain**.
 - Repository inspected: `/home/u/Projects/Synonym/Pubky/locks-public`.
 - Planning base when written: clean `master` at `ba49a77`.
 - There has been no production deployment. New persistence may require a clean pre-production database; no historical backfill is required.

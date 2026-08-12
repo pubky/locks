@@ -53,7 +53,14 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                   AND NOT EXISTS (
                       SELECT 1 FROM paykit_task_admissions
                       WHERE verification_task_id = verification_tasks.task_id
-                        AND ready = FALSE
+                        AND (
+                            ready = FALSE
+                            OR payment_in_hours IS NULL
+                            OR payment_in_hours <= 0
+                            OR invoice_created_at IS NULL
+                            OR payment_deadline IS NULL
+                            OR invoice_created_at > payment_deadline
+                        )
                   )
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
@@ -248,7 +255,7 @@ mod tests {
             datetime!(2026-05-29 12:00:00 UTC),
         );
 
-        let first = admissions.reserve(pending.clone()).await.unwrap();
+        let first = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(first.requires_paykit);
         assert!(
             claimer
@@ -258,14 +265,33 @@ mod tests {
                 .is_none()
         );
 
-        let replay = admissions.reserve(pending.clone()).await.unwrap();
+        let replay = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(replay.requires_paykit);
         assert_eq!(replay.task, pending);
 
-        admissions.mark_ready(&pending).await.unwrap();
-        let ready_replay = admissions.reserve(pending.clone()).await.unwrap();
+        let invoice_window = crate::infrastructure::postgres::PaykitInvoiceWindow {
+            invoice_created_at: datetime!(2026-05-29 12:00:00 UTC),
+            payment_deadline: datetime!(2026-05-30 12:00:00 UTC),
+        };
+        admissions
+            .mark_ready(&pending, invoice_window)
+            .await
+            .unwrap();
+        let divergent_window = crate::infrastructure::postgres::PaykitInvoiceWindow {
+            invoice_created_at: datetime!(2026-05-29 12:00:01 UTC),
+            payment_deadline: datetime!(2026-05-30 12:00:01 UTC),
+        };
+        assert!(
+            admissions
+                .mark_ready(&pending, divergent_window)
+                .await
+                .is_err()
+        );
+        let ready_replay = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(!ready_replay.requires_paykit);
         assert_eq!(ready_replay.task, pending);
+        assert_eq!(ready_replay.payment_in, 24);
+        assert_eq!(ready_replay.invoice_window, Some(invoice_window));
         assert_eq!(
             claimer
                 .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
@@ -275,6 +301,50 @@ mod tests {
                 .task
                 .task_id,
             pending.task_id
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_paykit_admission_without_authoritative_window_fails_closed() {
+        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
+
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d16",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+        tasks
+            .insert_verification_task(pending.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO paykit_task_admissions
+                 (verification_task_id, ready, ready_at)
+             VALUES ($1::uuid, TRUE, now())",
+        )
+        .bind(pending.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            admissions
+                .find_existing(&pending.submitted_proof_bundle)
+                .await
+                .is_err()
+        );
+        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        assert!(
+            claimer
+                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         database.cleanup().await;

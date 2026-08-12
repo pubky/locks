@@ -283,7 +283,15 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                     FROM content_lock_deletion_task_snapshot AS snapshot
                     JOIN paykit_task_admissions AS admission
                       ON admission.verification_task_id = snapshot.verification_task_id
-                    WHERE snapshot.deletion_job_id = $1 AND admission.ready = FALSE
+                    WHERE snapshot.deletion_job_id = $1
+                      AND (
+                          admission.ready = FALSE
+                          OR admission.payment_in_hours IS NULL
+                          OR admission.payment_in_hours <= 0
+                          OR admission.invoice_created_at IS NULL
+                          OR admission.payment_deadline IS NULL
+                          OR admission.invoice_created_at > admission.payment_deadline
+                      )
                 )",
             )
             .bind(job_id)
@@ -879,8 +887,10 @@ mod tests {
         let lock = content_lock();
         let task = verification_task(&lock, BundleId::from_bytes([3; 16]));
         let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let admission = admissions.reserve(task.clone()).await.unwrap();
+        let admission = admissions.reserve(task.clone(), 24).await.unwrap();
         assert!(admission.requires_paykit);
+        assert_eq!(admission.payment_in, 24);
+        assert_eq!(admission.invoice_window, None);
 
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         repository
@@ -918,7 +928,7 @@ mod tests {
         let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
         let mut external_calls = 0;
         let result = admissions
-            .reserve(verification_task(&lock, BundleId::from_bytes([4; 16])))
+            .reserve(verification_task(&lock, BundleId::from_bytes([4; 16])), 24)
             .await;
         if result.is_ok() {
             external_calls += 1;
@@ -940,7 +950,7 @@ mod tests {
         let lock = content_lock();
         let task = verification_task(&lock, BundleId::from_bytes([6; 16]));
         let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let admission = admissions.reserve(task).await.unwrap();
+        let admission = admissions.reserve(task.clone(), 24).await.unwrap();
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         repository
             .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
@@ -974,7 +984,22 @@ mod tests {
         assert_eq!(still_running.state, ContentLockDeletionState::Running);
         assert_eq!(still_running.phase, ContentLockDeletionPhase::Withdraw);
 
-        admissions.mark_ready(&admission.task).await.unwrap();
+        let invoice_window = crate::infrastructure::postgres::PaykitInvoiceWindow {
+            invoice_created_at: datetime!(2026-08-12 05:01:00 UTC),
+            payment_deadline: datetime!(2026-08-13 05:01:00 UTC),
+        };
+        admissions
+            .mark_ready(&admission.task, invoice_window)
+            .await
+            .unwrap();
+        let replay = admissions
+            .find_existing(&task.submitted_proof_bundle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!replay.requires_paykit);
+        assert_eq!(replay.payment_in, 24);
+        assert_eq!(replay.invoice_window, Some(invoice_window));
         let advanced = repository
             .advance_phase(
                 claim.job.job_id,
@@ -987,6 +1012,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(advanced.phase, ContentLockDeletionPhase::StartPaymentDrain);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn payment_drain_phase_rejects_snapshotted_legacy_admission_without_invoice_window() {
+        use crate::infrastructure::postgres::verification_tasks::PostgresVerificationTaskRepository;
+
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([7; 16]));
+        PostgresVerificationTaskRepository::new(database.pool().clone())
+            .insert_verification_task(task.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO paykit_task_admissions
+                 (verification_task_id, ready, ready_at)
+             VALUES ($1::uuid, TRUE, now())",
+        )
+        .bind(task.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        repository
+            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
+            .await
+            .unwrap();
+        let claim = repository
+            .claim_next("worker", NOW, NOW + time::Duration::seconds(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = repository
+            .advance_phase(
+                claim.job.job_id,
+                "worker",
+                claim.claim_token,
+                NOW,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::InvalidContentLockDeletionState { message })
+                if message == "payment drain cannot start before reserved Paykit admissions are ready"
+        ));
 
         database.cleanup().await;
     }
@@ -1017,7 +1092,7 @@ mod tests {
 
         let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
         let task = verification_task(&content_lock(), BundleId::from_bytes([5; 16]));
-        assert!(admissions.reserve(task).await.is_err());
+        assert!(admissions.reserve(task, 24).await.is_err());
         let task_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM verification_tasks")
             .fetch_one(database.pool())
             .await
