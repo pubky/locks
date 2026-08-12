@@ -52,6 +52,8 @@ mod tests {
         assert_table_exists(&mut connection, "content_lock_ownership").await;
         assert_table_exists(&mut connection, "content_lock_deletion_jobs").await;
         assert_table_exists(&mut connection, "content_lock_force_deletion_receipts").await;
+        assert_table_exists(&mut connection, "content_lock_deletion_task_snapshot").await;
+        assert_table_exists(&mut connection, "paykit_task_admissions").await;
         assert_column_exists(&mut connection, "verification_tasks", "creator").await;
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;

@@ -378,7 +378,7 @@ cargo test --workspace --no-run
 
 **RED:** Concurrent tests prove task-first commit joins snapshot, deletion-first commit rejects a new Bundle, exact old replay succeeds, and conflicting replay remains rejected.
 
-**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. Do not use viewer timestamps or tombstone publication as the cutoff.
+**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. For Paykit-backed submissions, atomically persist a hidden, unclaimable admission reservation before the external invoice call; classify durable exact replay/conflict before mutable lock lookup or reader resolution, and resume an unready reservation from its persisted canonical fields. Paykit success makes it ready. This guarantees that deletion either snapshots the durable obligation or commits first and prevents any Paykit call. Do not permit transition to `start_payment_drain` while a snapshotted reservation is unready: Paykit's active drain accepts exact replay only for invoices already created before drain start. Do not hold a database transaction across HTTP, and do not use viewer timestamps or tombstone publication as the cutoff.
 
 **Suggested commit:** `feat(service): enforce deletion admission cutoff`
 
