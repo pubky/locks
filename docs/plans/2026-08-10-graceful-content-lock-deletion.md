@@ -14,7 +14,7 @@
 
 ## Status and provenance
 
-- Plan status: **accepted product design; implementation not started**.
+- Plan status: **accepted product design; Tasks 1–5 committed and Task 6 implemented pending commit; Tasks 7–10 remain**.
 - Repository inspected: `/home/u/Projects/Synonym/Pubky/locks-public`.
 - Planning base when written: clean `master` at `ba49a77`.
 - There has been no production deployment. New persistence may require a clean pre-production database; no historical backfill is required.
@@ -59,11 +59,13 @@
 25. Creator-visible job status is only `queued|running|completed|failed`; failed responses include a stable secret-free `failure_code` only.
 26. Missing or replaced tombstone before destructive work halts as failed. Creator restores the exact tombstone and repeats graceful DELETE to resume the same job.
 27. Guarded paths are exclusive to one managed lock. Enforce unique `(creator, guarded_path)` ownership in PostgreSQL. There is no historical backfill.
-28. Lock publication uses best-effort reservation compensation and accepts crash-orphaned ownership requiring operator cleanup; do not claim cross-system atomicity.
+28. Lock publication uses best-effort ownership compensation and a durable opaque per-lock publication intent under the same PostgreSQL fence as deletion admission. Graceful/force deletion cannot start while publication is in flight. The intent is cleared only after ownership is durably published or failed publication is safely compensated. Process death can leave operator-reconciled intent/ownership state; do not claim cross-system atomicity.
 29. Graceful final cleanup deletes guarded content first and tombstone last, purges Locks authorization/task/job state, asks Paykit to remove operational drain state, and releases path ownership. It forgets the deletion so the same canonical Lock ID may later be published fresh with new Bundle IDs.
 30. Paykit retains terminal financial invoice/payment history; delayed old lifecycle events cannot reactivate a fresh publication.
 31. New force deletion is synchronous: persist a permanent minimal blocking receipt, delete lock/tombstone first, then best-effort guarded resources. Do not drain Paykit/tasks/credentials. Return failed paths. A force-deleted Lock ID can never be republished.
-32. `force=true` against an active graceful job persists `force_requested` and returns `202`; the worker escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
+32. `force=true` against an active graceful job persists `force_requested`, revokes the current claim token/lease, requeues the same frozen job, and returns `202`; a fresh worker claim escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
+33. Graceful job insertion/resume and permanent force-receipt establishment acquire the same canonical per-lock PostgreSQL fence. The durable result is either an active graceful job or a permanent force receipt, never both. Failed graceful replay requeues the same job and frozen manifest. Force against a terminal job atomically replaces that operational row with the permanent receipt before synchronous external deletion.
+34. Any Content Lock fetched from Pubky for deletion must hash to the requested Lock ID and name the authenticated creator before its manifest is frozen or used for resource deletion.
 
 ### Source-derived constraints
 
@@ -233,12 +235,16 @@ DELETE /creator/content-locks/{lock_id}?graceful=true
 
 Starts/replays/resumes graceful deletion and returns `202` for queued/running work. A completed-and-forgotten absent lock is an idempotent absent postcondition.
 
+Queued/running deletion and deletion status use the closed body `{ "lock_id": "...", "status": "queued|running|completed|failed", "failure_code"?: "..." }`. If both the canonical lock and deletion job are absent, graceful DELETE returns `200` with `{ "lock_id": "...", "status": "completed" }`.
+
 ```http
 DELETE /creator/content-locks/{lock_id}?force=true
 ```
 
 - No graceful job: synchronous `200` force summary.
 - Existing graceful job: persist `force_requested`, return `202` job status.
+
+The synchronous force summary is exactly `{ "lock_id": "...", "lock_deleted": true, "failed_resource_paths": ["..."] }`. It does not expose a force mode or internal receipt.
 
 Reject `force=true&graceful=true`, unknown fields, malformed booleans, and duplicate conflicting query values.
 
@@ -247,6 +253,8 @@ GET /creator/content-locks/{lock_id}/deletion
 ```
 
 Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. The closed stable vocabulary is exactly `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
+
+If no job or force receipt exists, status returns `404 content_lock_deletion_not_found`. A permanent force receipt projects as `{ "lock_id": "...", "status": "completed" }` without exposing force mode.
 
 ## Internal state model
 

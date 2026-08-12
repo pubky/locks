@@ -109,6 +109,17 @@ pub struct ClaimedContentLockDeletionJob {
     pub claim_token: Uuid,
 }
 
+/// Durable decision made while serializing force deletion against graceful lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareForceDeletionResult {
+    /// A pre-existing publication intent must reconcile before force can begin.
+    PublicationInProgress,
+    /// An active graceful job was durably marked for asynchronous force processing.
+    Active(ContentLockDeletionJob),
+    /// A permanent force receipt was established. A terminal frozen job is returned when present.
+    Synchronous(Option<ContentLockDeletionJob>),
+}
+
 impl ContentLockDeletionJob {
     /// Creates a queued deletion job from a canonical frozen content lock.
     pub fn new(

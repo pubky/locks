@@ -10,7 +10,7 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, ContentLockDeletionState,
+        ContentLockDeletionPhase, ContentLockDeletionState, PrepareForceDeletionResult,
     },
     ports::ContentLockDeletionRepository,
 };
@@ -30,6 +30,7 @@ struct StoredJob {
 pub struct InMemoryContentLockDeletionRepository {
     jobs: RwLock<HashMap<JobKey, StoredJob>>,
     force_receipts: RwLock<HashSet<JobKey>>,
+    publication_intents: RwLock<HashMap<JobKey, Uuid>>,
 }
 
 impl InMemoryContentLockDeletionRepository {
@@ -40,11 +41,80 @@ impl InMemoryContentLockDeletionRepository {
 
 #[async_trait]
 impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
+    async fn begin_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<(), ApplicationError> {
+        let key = (creator.clone(), lock_id.clone());
+        let mut intents = self.publication_intents.write().await;
+        let jobs = self.jobs.read().await;
+        let receipts = self.force_receipts.read().await;
+        if jobs.contains_key(&key) || receipts.contains(&key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        if intents.contains_key(&key) {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: "content lock publication in progress".to_owned(),
+            });
+        }
+        intents.insert(key, publication_token);
+        Ok(())
+    }
+
+    async fn finish_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        remove_publication_intent(
+            &self.publication_intents,
+            creator,
+            lock_id,
+            publication_token,
+        )
+        .await
+    }
+
+    async fn abandon_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        remove_publication_intent(
+            &self.publication_intents,
+            creator,
+            lock_id,
+            publication_token,
+        )
+        .await
+    }
+
+    async fn publication_in_progress(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self
+            .publication_intents
+            .read()
+            .await
+            .contains_key(&(creator.clone(), lock_id.clone())))
+    }
+
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
         job.validate_frozen_identity()?;
         job.validate_state(false)?;
         let key = (job.creator.clone(), job.lock_id.clone());
+        let intents = self.publication_intents.read().await;
         let mut jobs = self.jobs.write().await;
+        let receipts = self.force_receipts.read().await;
+        if intents.contains_key(&key) || receipts.contains(&key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         if jobs.contains_key(&key) || jobs.values().any(|stored| stored.job.job_id == job.job_id) {
             return Err(ApplicationError::DuplicateRecord {
                 record: "content_lock_deletion_job",
@@ -188,34 +258,66 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         Ok(Some(stored.job.clone()))
     }
 
-    async fn request_force(
+    async fn resume_failed_job(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        requested_at: OffsetDateTime,
-    ) -> Result<bool, ApplicationError> {
+        _resumed_at: OffsetDateTime,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
         let mut jobs = self.jobs.write().await;
-        let Some(stored) = jobs.get_mut(&(creator.clone(), lock_id.clone())) else {
-            return Ok(false);
-        };
-        if stored.job.force_requested_at.is_some() {
-            return Ok(false);
+        let receipts = self.force_receipts.read().await;
+        if receipts.contains(&(creator.clone(), lock_id.clone())) {
+            return Ok(None);
         }
-        stored.job.force_requested_at = Some(requested_at);
-        Ok(true)
+        let Some(stored) = jobs.get_mut(&(creator.clone(), lock_id.clone())) else {
+            return Ok(None);
+        };
+        if stored.job.state == ContentLockDeletionState::Failed {
+            stored.job.state = ContentLockDeletionState::Queued;
+            stored.job.attempt_count = 0;
+            stored.job.next_attempt_at = None;
+            stored.job.failure_code = None;
+            clear_claim(stored);
+        }
+        Ok(Some(stored.job.clone()))
     }
 
-    async fn record_force_receipt(
+    async fn prepare_force_deletion(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        _forced_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        self.force_receipts
-            .write()
-            .await
-            .insert((creator.clone(), lock_id.clone()));
-        Ok(())
+        forced_at: OffsetDateTime,
+    ) -> Result<PrepareForceDeletionResult, ApplicationError> {
+        let key = (creator.clone(), lock_id.clone());
+        let intents = self.publication_intents.read().await;
+        if intents.contains_key(&key) {
+            return Ok(PrepareForceDeletionResult::PublicationInProgress);
+        }
+        let mut jobs = self.jobs.write().await;
+        let mut receipts = self.force_receipts.write().await;
+        if receipts.contains(&key) {
+            return Ok(PrepareForceDeletionResult::Synchronous(
+                jobs.get(&key).map(|stored| stored.job.clone()),
+            ));
+        }
+        if let Some(stored) = jobs.get_mut(&key) {
+            if matches!(
+                stored.job.state,
+                ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+            ) {
+                stored.job.force_requested_at.get_or_insert(forced_at);
+                stored.job.state = ContentLockDeletionState::Queued;
+                stored.job.next_attempt_at = None;
+                clear_claim(stored);
+                return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
+            }
+            let job = stored.job.clone();
+            jobs.remove(&key);
+            receipts.insert(key);
+            return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
+        }
+        receipts.insert(key);
+        Ok(PrepareForceDeletionResult::Synchronous(None))
     }
 
     async fn has_force_receipt(
@@ -229,6 +331,21 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .await
             .contains(&(creator.clone(), lock_id.clone())))
     }
+}
+
+async fn remove_publication_intent(
+    intents: &RwLock<HashMap<JobKey, Uuid>>,
+    creator: &CreatorPubky,
+    lock_id: &LockId,
+    publication_token: Uuid,
+) -> Result<bool, ApplicationError> {
+    let key = (creator.clone(), lock_id.clone());
+    let mut intents = intents.write().await;
+    if intents.get(&key) != Some(&publication_token) {
+        return Ok(false);
+    }
+    intents.remove(&key);
+    Ok(true)
 }
 
 fn is_claimable(stored: &StoredJob, now: OffsetDateTime) -> bool {

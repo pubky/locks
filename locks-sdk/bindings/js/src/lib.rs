@@ -6,8 +6,8 @@ mod session;
 mod viewer;
 
 pub use creator::{
-    CreateContentLockRequestBuilder, Creator, DeleteGuardedResourceOptions,
-    RegisterGuardedResourceOptions, SetLockServicePointerOptions,
+    CreateContentLockRequestBuilder, Creator, DeleteContentLockMode, DeleteContentLockOptions,
+    DeleteGuardedResourceOptions, RegisterGuardedResourceOptions, SetLockServicePointerOptions,
 };
 pub use locks::{
     ConnectCallback, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions, Locks, LocksOptions,

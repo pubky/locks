@@ -11,7 +11,7 @@ use locks_service::{
     application::{
         models::{
             ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-            ContentLockDeletionState,
+            ContentLockDeletionState, PrepareForceDeletionResult,
         },
         ports::ContentLockDeletionRepository,
     },
@@ -224,28 +224,15 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
             .is_some()
     );
 
-    assert!(
+    assert!(matches!(
         repository
-            .request_force(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
             .await
-            .unwrap()
-    );
+            .unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
     assert!(
         !repository
-            .request_force(&job.creator, &job.lock_id, NOW)
-            .await
-            .unwrap()
-    );
-    repository
-        .record_force_receipt(&job.creator, &job.lock_id, NOW)
-        .await
-        .unwrap();
-    repository
-        .record_force_receipt(&job.creator, &job.lock_id, NOW)
-        .await
-        .unwrap();
-    assert!(
-        repository
             .has_force_receipt(&job.creator, &job.lock_id)
             .await
             .unwrap()

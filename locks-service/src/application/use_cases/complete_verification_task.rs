@@ -1236,6 +1236,14 @@ mod tests {
         ) -> Result<Option<ContentLock>, ApplicationError> {
             Ok(self.content_lock.clone())
         }
+
+        async fn delete_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _content_lock_path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!("completion must not delete content locks")
+        }
     }
 
     #[derive(Default)]

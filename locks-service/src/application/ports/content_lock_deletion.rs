@@ -7,13 +7,44 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase,
+        ContentLockDeletionPhase, PrepareForceDeletionResult,
     },
 };
 
 /// Durable repository and fenced worker lease boundary for content-lock deletion jobs.
 #[async_trait]
 pub trait ContentLockDeletionRepository: Send + Sync {
+    /// Reserves canonical publication under the same per-lock fence used by force deletion.
+    async fn begin_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<(), ApplicationError>;
+
+    /// Finalizes the exact publication reservation after external publication and ownership commit.
+    async fn finish_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
+    /// Removes the exact unfinalized reservation after a safely compensated publication failure.
+    async fn abandon_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
+    /// Checks publication admission under the canonical per-lock fence.
+    async fn publication_in_progress(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<bool, ApplicationError>;
+
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError>;
 
     async fn get_job(
@@ -57,21 +88,21 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         failure_code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
 
-    /// Permanently records force escalation. Returns true only on the first request.
-    async fn request_force(
+    /// Requeues a failed job with its frozen manifest unless a permanent force receipt exists.
+    async fn resume_failed_job(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        requested_at: OffsetDateTime,
-    ) -> Result<bool, ApplicationError>;
+        resumed_at: OffsetDateTime,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
 
-    /// Idempotently records the permanent minimal force-deletion receipt.
-    async fn record_force_receipt(
+    /// Atomically escalates an active job or establishes the permanent synchronous-force receipt.
+    async fn prepare_force_deletion(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
         forced_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<PrepareForceDeletionResult, ApplicationError>;
 
     async fn has_force_receipt(
         &self,
