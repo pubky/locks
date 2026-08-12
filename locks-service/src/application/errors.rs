@@ -18,6 +18,12 @@ pub enum ApplicationError {
         /// Full creator-scoped guarded path for structured internal handling.
         guarded_path: String,
     },
+    /// Persisted content-lock deletion state violates its internal invariants.
+    #[error("invalid content lock deletion state: {message}")]
+    InvalidContentLockDeletionState {
+        /// Secret-free invariant failure detail.
+        message: String,
+    },
     /// An update-only operation targeted a missing record.
     #[error("missing {record} record")]
     MissingRecord {

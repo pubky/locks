@@ -229,6 +229,7 @@ impl From<ApplicationError> for ApiError {
                 Self::new(ApiErrorCode::RateLimited, "rate limit exceeded")
             }
             ApplicationError::Storage { .. }
+            | ApplicationError::InvalidContentLockDeletionState { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }
             | ApplicationError::ContentLockCanonicalization { .. }

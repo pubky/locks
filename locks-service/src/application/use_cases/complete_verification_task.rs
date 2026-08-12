@@ -357,6 +357,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         ApplicationError::Storage { .. }
         | ApplicationError::DuplicateRecord { .. }
         | ApplicationError::ContentLockPathConflict { .. }
+        | ApplicationError::InvalidContentLockDeletionState { .. }
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
