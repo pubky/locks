@@ -11,6 +11,8 @@ use locks_service::infrastructure::verifiers::paykit_payment::{
 use pubky_common::crypto::Keypair;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use url::Url;
 
 use crate::config::{
@@ -41,6 +43,8 @@ pub enum PaykitClientError {
     },
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
+    #[error("Paykit invoice response was invalid: {0}")]
+    InvalidInvoiceResponse(String),
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +58,21 @@ pub struct PaykitHttpClient {
 pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
+    pub payment_in: u64,
     pub reader: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaykitInvoiceResponse {
+    pub invoice_created_at: OffsetDateTime,
+    pub payment_deadline: OffsetDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaykitInvoiceResponseBody {
+    invoice_created_at: String,
+    payment_deadline: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,17 +127,33 @@ impl PaykitHttpClient {
     pub async fn create_invoice(
         &self,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceResponse, PaykitClientError> {
         let response = self.signed_post("invoices", request).await?;
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(PaykitClientError::NonSuccess {
+        if !response.status().is_success() {
+            return Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
                 status: response.status(),
-            })
+            });
         }
+
+        let body = response
+            .json::<PaykitInvoiceResponseBody>()
+            .await
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        let invoice_created_at = OffsetDateTime::parse(&body.invoice_created_at, &Rfc3339)
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        let payment_deadline = OffsetDateTime::parse(&body.payment_deadline, &Rfc3339)
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        if payment_deadline < invoice_created_at {
+            return Err(PaykitClientError::InvalidInvoiceResponse(
+                "payment_deadline precedes invoice_created_at".to_owned(),
+            ));
+        }
+        Ok(PaykitInvoiceResponse {
+            invoice_created_at,
+            payment_deadline,
+        })
     }
 
     pub async fn transaction_status(
@@ -272,7 +306,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(body).unwrap(),
             format!(
-                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"reader\":\"{READER}\"}}"
+                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"payment_in\":24,\"reader\":\"{READER}\"}}"
             )
         );
     }
@@ -365,7 +399,16 @@ mod tests {
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
         let expected_signature = sign_body(&keypair, &expected_body);
 
-        client.create_invoice(&invoice_request()).await.unwrap();
+        let response = client.create_invoice(&invoice_request()).await.unwrap();
+
+        assert_eq!(
+            response.invoice_created_at,
+            time::macros::datetime!(2026-08-12 10:00:00 UTC)
+        );
+        assert_eq!(
+            response.payment_deadline,
+            time::macros::datetime!(2026-08-13 10:00:00 UTC)
+        );
 
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
@@ -444,6 +487,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_invoice_rejects_malformed_or_inconsistent_success_body() {
+        for body in [
+            r#"{"invoice_created_at":"2026-08-12T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"not-a-time","payment_deadline":"2026-08-13T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"2026-08-13T10:00:00Z","payment_deadline":"2026-08-12T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"2026-08-12T10:00:00Z","payment_deadline":"2026-08-13T10:00:00Z","extra":true}"#,
+        ] {
+            let server_url =
+                spawn_configured_invoice_server(axum::http::StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                client.create_invoice(&invoice_request()).await,
+                Err(PaykitClientError::InvalidInvoiceResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn status_not_found_and_invalid_success_body_use_retryable_client_error() {
         for (status, body) in [
             (axum::http::StatusCode::NOT_FOUND, "not found"),
@@ -474,6 +541,7 @@ mod tests {
             bundle_id: BUNDLE_ID.to_owned(),
             lock_resource: LOCK_RESOURCE.to_owned(),
             reader: READER.to_owned(),
+            payment_in: 24,
         }
     }
 
@@ -516,6 +584,21 @@ mod tests {
         let app = Router::new()
             .route("/invoices", post(hang))
             .route("/transactions/status", post(hang));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_configured_invoice_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> String {
+        let app = Router::new()
+            .route("/invoices", post(configured_status))
+            .with_state(ConfiguredStatusResponse { status, body });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -568,7 +651,10 @@ mod tests {
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        (axum::http::StatusCode::CREATED, "accepted")
+        Json(json!({
+            "invoice_created_at": "2026-08-12T10:00:00Z",
+            "payment_deadline": "2026-08-13T10:00:00Z",
+        }))
     }
 
     async fn capture_status(

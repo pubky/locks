@@ -20,7 +20,9 @@ use locks_service::application::use_cases::submit_proof_bundle::{
 use locks_service::application::use_cases::validate_paykit_payment_submission::{
     ValidatePaykitPaymentSubmissionRequest, ValidatePaykitPaymentSubmissionUseCase,
 };
-use locks_service::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
+use locks_service::infrastructure::postgres::{
+    PaykitInvoiceWindow, PostgresPaykitTaskAdmissionRepository,
+};
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
 use crate::api::dtos::{
@@ -116,13 +118,20 @@ async fn maybe_prepare_paykit_submission(
         let admissions = PostgresPaykitTaskAdmissionRepository::new(pool.clone());
         if let Some(admission) = admissions.find_existing(submitted).await? {
             if admission.requires_paykit {
-                create_paykit_invoice(state, &admission.task.submitted_proof_bundle).await?;
-                admissions.mark_ready(&admission.task).await?;
+                let invoice_window = create_paykit_invoice(
+                    state,
+                    &admission.task.submitted_proof_bundle,
+                    admission.payment_in,
+                )
+                .await?;
+                admissions
+                    .mark_ready(&admission.task, invoice_window)
+                    .await?;
             }
             return Ok(Some(admission.task.into()));
         }
     }
-    ValidatePaykitPaymentSubmissionUseCase::new(state.content_locks().as_ref())
+    let validated = ValidatePaykitPaymentSubmissionUseCase::new(state.content_locks().as_ref())
         .execute(ValidatePaykitPaymentSubmissionRequest {
             submitted_proof_bundle: submitted.clone(),
         })
@@ -140,10 +149,17 @@ async fn maybe_prepare_paykit_submission(
     if let Some(pool) = state.postgres_pool() {
         let task = submit_use_case.prepare_task(submitted.clone()).await?;
         let admissions = PostgresPaykitTaskAdmissionRepository::new(pool.clone());
-        let admission = admissions.reserve(task).await?;
+        let admission = admissions.reserve(task, validated.payment_in).await?;
         if admission.requires_paykit {
-            create_paykit_invoice(state, &admission.task.submitted_proof_bundle).await?;
-            admissions.mark_ready(&admission.task).await?;
+            let invoice_window = create_paykit_invoice(
+                state,
+                &admission.task.submitted_proof_bundle,
+                admission.payment_in,
+            )
+            .await?;
+            admissions
+                .mark_ready(&admission.task, invoice_window)
+                .await?;
         }
         return Ok(Some(admission.task.into()));
     }
@@ -160,6 +176,7 @@ async fn maybe_prepare_paykit_submission(
         .create_invoice(&PaykitInvoiceRequest {
             bundle_id: submitted.bundle_id.to_string(),
             lock_resource: submitted.pubky_lock_resource.to_string(),
+            payment_in: validated.payment_in,
             reader: reader.to_string(),
         })
         .await
@@ -170,14 +187,15 @@ async fn maybe_prepare_paykit_submission(
 async fn create_paykit_invoice(
     state: &AppState,
     submitted: &SubmittedProofBundle,
-) -> Result<(), ApiError> {
+    payment_in: u64,
+) -> Result<PaykitInvoiceWindow, ApiError> {
     let reader = submitted.reader_public_key.as_ref().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::InvalidRequest,
             "paykit-payment requires reader_public_key",
         )
     })?;
-    state
+    let response = state
         .paykit_http_client()
         .ok_or_else(|| {
             ApiError::new(
@@ -188,10 +206,15 @@ async fn create_paykit_invoice(
         .create_invoice(&PaykitInvoiceRequest {
             bundle_id: submitted.bundle_id.to_string(),
             lock_resource: submitted.pubky_lock_resource.to_string(),
+            payment_in,
             reader: reader.to_string(),
         })
         .await
-        .map_err(map_paykit_invoice_error)
+        .map_err(map_paykit_invoice_error)?;
+    Ok(PaykitInvoiceWindow {
+        invoice_created_at: response.invoice_created_at,
+        payment_deadline: response.payment_deadline,
+    })
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {

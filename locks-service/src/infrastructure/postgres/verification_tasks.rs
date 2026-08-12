@@ -189,7 +189,14 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
               AND NOT EXISTS (
                   SELECT 1 FROM paykit_task_admissions
                   WHERE verification_task_id = verification_tasks.task_id
-                    AND ready = FALSE
+                    AND (
+                        ready = FALSE
+                        OR payment_in_hours IS NULL
+                        OR payment_in_hours <= 0
+                        OR invoice_created_at IS NULL
+                        OR payment_deadline IS NULL
+                        OR invoice_created_at > payment_deadline
+                    )
               )"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -213,7 +220,14 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
               AND NOT EXISTS (
                   SELECT 1 FROM paykit_task_admissions
                   WHERE verification_task_id = verification_tasks.task_id
-                    AND ready = FALSE
+                    AND (
+                        ready = FALSE
+                        OR payment_in_hours IS NULL
+                        OR payment_in_hours <= 0
+                        OR invoice_created_at IS NULL
+                        OR payment_deadline IS NULL
+                        OR invoice_created_at > payment_deadline
+                    )
               )"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -487,6 +501,36 @@ mod tests {
                     .unwrap(),
                     &BundleId::from_str(BUNDLE_ID).unwrap(),
                 )
+                .await
+                .unwrap(),
+            None
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_paykit_admission_without_authoritative_window_is_hidden_from_all_lookups() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let pending = task(VerificationTaskStatus::Pending);
+        let task_id = pending.task_id;
+        let creator = pending.creator.clone();
+        let bundle_id = pending.submitted_proof_bundle.bundle_id.clone();
+        repo.insert_verification_task(pending).await.unwrap();
+        sqlx::query(
+            "INSERT INTO paykit_task_admissions
+                 (verification_task_id, ready, ready_at)
+             VALUES ($1::uuid, TRUE, now())",
+        )
+        .bind(task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(repo.get_verification_task(&task_id).await.unwrap(), None);
+        assert_eq!(
+            repo.get_verification_task_by_handle(&creator, &bundle_id)
                 .await
                 .unwrap(),
             None
