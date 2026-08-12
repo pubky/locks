@@ -51,6 +51,19 @@ impl ContentLockRepository for InMemoryContentLockRepository {
             .get(&(creator.clone(), content_lock_path.clone()))
             .cloned())
     }
+
+    async fn delete_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self
+            .records
+            .write()
+            .await
+            .remove(&(creator.clone(), content_lock_path.clone()))
+            .is_some())
+    }
 }
 
 #[cfg(test)]

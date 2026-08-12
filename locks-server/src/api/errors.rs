@@ -25,6 +25,7 @@ pub enum ApiErrorCode {
     FrontendSessionStateMismatch,
     ContentLockPathConflict,
     ContentLockDeletionInProgress,
+    ContentLockDeletionNotFound,
     TaskStateConflict,
     UnsupportedVerifierType,
     PaykitNotConfigured,
@@ -57,6 +58,7 @@ impl ApiErrorCode {
             Self::FrontendSessionStateMismatch => "frontend_session_state_mismatch",
             Self::ContentLockPathConflict => "content_lock_path_conflict",
             Self::ContentLockDeletionInProgress => "content_lock_deletion_in_progress",
+            Self::ContentLockDeletionNotFound => "content_lock_deletion_not_found",
             Self::TaskStateConflict => "task_state_conflict",
             Self::UnsupportedVerifierType => "unsupported_verifier_type",
             Self::PaykitNotConfigured => "paykit_not_configured",
@@ -78,6 +80,7 @@ impl ApiErrorCode {
             Self::VerificationTaskNotFound
             | Self::GuardedResourceNotFound
             | Self::ContentLockNotFound
+            | Self::ContentLockDeletionNotFound
             | Self::CreatorConnectFlowUnavailable
             | Self::FrontendSessionCodeUnavailable => StatusCode::NOT_FOUND,
             Self::CreatorAuthorityUnavailable => StatusCode::SERVICE_UNAVAILABLE,

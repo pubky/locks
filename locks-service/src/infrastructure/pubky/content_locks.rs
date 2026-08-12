@@ -61,6 +61,21 @@ where
             })
             .transpose()
     }
+
+    async fn delete_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError> {
+        let path = content_lock_path.to_string();
+        let existed = self
+            .client
+            .get_json_value_as_creator(creator, &path)
+            .await?
+            .is_some();
+        self.client.delete_as_creator(creator, &path).await?;
+        Ok(existed)
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +157,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded, None);
+    }
+
+    #[tokio::test]
+    async fn delete_content_lock_reads_and_deletes_the_exact_canonical_path() {
+        let requested_path = content_lock(900).content_lock_path().unwrap();
+        let repository = PubkyContentLockRepository::new(
+            FakeStorageClient::default().with_json_read(Some(json!({}))),
+        );
+
+        assert!(
+            repository
+                .delete_content_lock(&creator(), &requested_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!(
+                    "get_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+                ),
+                format!(
+                    "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+                )
+            ]
+        );
     }
 
     #[tokio::test]
@@ -253,10 +294,15 @@ mod tests {
 
         async fn delete_as_creator(
             &self,
-            _creator: &CreatorPubky,
-            _path: &str,
+            creator: &CreatorPubky,
+            path: &str,
         ) -> Result<(), ApplicationError> {
-            unimplemented!("not needed by content lock repository tests")
+            self.maybe_error()?;
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("delete {creator} {path}"));
+            Ok(())
         }
     }
 

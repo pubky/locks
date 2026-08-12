@@ -1,4 +1,5 @@
 pub use locks_core::creator_publishing::{CreateContentLockRequest, SetLockServicePointerRequest};
+use locks_core::ids::LockId;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Serialize;
 use serde_json::Value;
@@ -55,6 +56,19 @@ pub struct DeleteGuardedResourceRequest {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteContentLockMode {
+    DefaultGraceful,
+    ExplicitGraceful,
+    Force,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteContentLockRequest {
+    pub lock_id: LockId,
+    pub mode: DeleteContentLockMode,
+}
+
 impl CreatorLocks {
     pub fn new(session: LocksSession) -> Self {
         Self { session }
@@ -100,6 +114,22 @@ impl CreatorLocks {
         self.delete_guarded_resource_request(request)
     }
 
+    pub fn delete_content_lock(&self, request: DeleteContentLockRequest) -> SdkRequest {
+        let suffix = match request.mode {
+            DeleteContentLockMode::DefaultGraceful => "",
+            DeleteContentLockMode::ExplicitGraceful => "?graceful=true",
+            DeleteContentLockMode::Force => "?force=true",
+        };
+        self.empty_request(
+            "DELETE",
+            format!("/creator/content-locks/{}{suffix}", request.lock_id),
+        )
+    }
+
+    pub fn get_content_lock_deletion(&self, lock_id: LockId) -> SdkRequest {
+        self.empty_request("GET", format!("/creator/content-locks/{lock_id}/deletion"))
+    }
+
     pub fn create_content_lock_request(&self, request: CreateContentLockRequest) -> SdkRequest {
         self.post_json("/creator/content-locks", request)
     }
@@ -128,6 +158,16 @@ impl CreatorLocks {
             body: SdkRequestBody::Json(
                 serde_json::to_value(body).expect("SDK request bodies serialize to JSON"),
             ),
+        }
+    }
+
+    fn empty_request(&self, method: &'static str, path: String) -> SdkRequest {
+        SdkRequest {
+            method,
+            path,
+            authorization: self.session.authorization_header_value(),
+            content_type: String::new(),
+            body: SdkRequestBody::Bytes(Vec::new()),
         }
     }
 }

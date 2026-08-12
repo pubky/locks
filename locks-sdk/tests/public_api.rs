@@ -2,11 +2,11 @@ use std::str::FromStr;
 
 use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
 use locks_sdk::{
-    AccessCredentialResponse, CreatorLockServicePointer, DeleteGuardedResourceRequest, LocksClient,
-    LocksSession, ReadLockedResourceRequest, RegisterGuardedResourceRequest,
-    VerificationTaskHandleRequest, VerificationTaskLifecycleResponse, VerificationTaskStatus,
-    ViewerLocks, content_lock_resource_url, creator_lock_service_pointer_url,
-    lock_server_for_content_lock,
+    AccessCredentialResponse, CreatorLockServicePointer, DeleteContentLockMode,
+    DeleteContentLockRequest, DeleteGuardedResourceRequest, LocksClient, LocksSession,
+    ReadLockedResourceRequest, RegisterGuardedResourceRequest, VerificationTaskHandleRequest,
+    VerificationTaskLifecycleResponse, VerificationTaskStatus, ViewerLocks,
+    content_lock_resource_url, creator_lock_service_pointer_url, lock_server_for_content_lock,
 };
 
 #[test]
@@ -112,4 +112,51 @@ fn crate_root_exports_foundation_sdk_types() {
     ) -> locks_sdk::Result<LockServerPubky> = lock_server_for_content_lock;
 
     assert_eq!(LocksSession::new("another").export_secret(), "another");
+}
+
+#[test]
+fn creator_content_lock_deletion_requests_use_closed_routes_and_modes() {
+    let creator = LocksSession::new("frontend-session-secret").creator();
+    let lock_id =
+        locks_core::ids::LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG")
+            .unwrap();
+
+    let default_graceful = creator.delete_content_lock(DeleteContentLockRequest {
+        lock_id: lock_id.clone(),
+        mode: DeleteContentLockMode::DefaultGraceful,
+    });
+    assert_eq!(default_graceful.method, "DELETE");
+    assert_eq!(
+        default_graceful.path,
+        format!("/creator/content-locks/{lock_id}")
+    );
+    assert_eq!(
+        default_graceful.authorization,
+        "Bearer frontend-session-secret"
+    );
+
+    let explicit_graceful = creator.delete_content_lock(DeleteContentLockRequest {
+        lock_id: lock_id.clone(),
+        mode: DeleteContentLockMode::ExplicitGraceful,
+    });
+    assert_eq!(
+        explicit_graceful.path,
+        format!("/creator/content-locks/{lock_id}?graceful=true")
+    );
+
+    let force = creator.delete_content_lock(DeleteContentLockRequest {
+        lock_id: lock_id.clone(),
+        mode: DeleteContentLockMode::Force,
+    });
+    assert_eq!(
+        force.path,
+        format!("/creator/content-locks/{lock_id}?force=true")
+    );
+
+    let status = creator.get_content_lock_deletion(lock_id.clone());
+    assert_eq!(status.method, "GET");
+    assert_eq!(
+        status.path,
+        format!("/creator/content-locks/{lock_id}/deletion")
+    );
 }

@@ -19,7 +19,7 @@ The Lock Server has one non-production route family and one authenticated creato
 - `POST /verification-task-completions`
   - Requires `runtime.environment = "development"`.
   - `staging` and `production` never mount it.
-- Authenticated creator publishing routes: `PUT /creator/priv-resources/content/<path>`, `DELETE /creator/priv-resources/content/<path>`, `POST /creator/content-locks`, `POST /creator/lock-service-config`
+- Authenticated creator publishing routes: `PUT /creator/priv-resources/content/<path>`, `DELETE /creator/priv-resources/content/<path>`, `POST /creator/content-locks`, `DELETE /creator/content-locks/{lock_id}`, `GET /creator/content-locks/{lock_id}/deletion`, `POST /creator/lock-service-config`
   - Always Pubky homeserver-backed.
   - Can run in `development`, `staging`, or `production`.
   - Require `Authorization: Bearer <frontend_session_token>`.
@@ -47,7 +47,9 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | --- | --- | --- | --- | --- |
 | `PUT /creator/priv-resources/content/<path>` | `200` JSON guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; MIME from `Content-Type`. | No bearer secrets or raw bytes in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
 | `DELETE /creator/priv-resources/content/<path>` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets or raw bytes in response. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `503 creator_authority_unavailable` |
-| `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `409 content_lock_path_conflict`, `503 creator_authority_unavailable` |
+| `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `409 content_lock_path_conflict`, `409 content_lock_deletion_in_progress`, `503 creator_authority_unavailable` |
+| `DELETE /creator/content-locks/{lock_id}` | Graceful: `202` redacted lifecycle, or `200` completed absent postcondition. Replaying a failed graceful job requeues the same frozen manifest. `force=true`: synchronous `200` force summary when no active graceful job exists; an active graceful job is marked for worker escalation and returns `202`. | Requires `Authorization: Bearer <frontend_session_token>`. Default and `graceful=true` are graceful; `force=true` is explicit and mutually exclusive. | No snapshots, task IDs, attempts, dependency errors, or force marker in lifecycle responses. Force summary contains only Lock ID, lock-deleted boolean, and failed guarded paths. | `400 invalid_request`, `400 invalid_identifier`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
+| `GET /creator/content-locks/{lock_id}/deletion` | `200` redacted lifecycle JSON | Requires `Authorization: Bearer <frontend_session_token>`. | Contains only Lock ID, stable status, and an optional closed failure code. Permanent force receipts project as completed without exposing force mode. | `400 invalid_identifier`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 content_lock_deletion_not_found` |
 | `POST /creator/lock-service-config` | `200` JSON lock-service pointer | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
 | `GET /connect` | `200` HTML Lock-Server-hosted connect shell | No bearer auth. Mounted when `[creator_authority_acquisition].enabled = true`; `return_to` must match `allowed_return_origins` or explicit wildcard policy. | HTML intentionally contains the secret-bearing Pubky authorization URL on Lock Server origin; response must not contain frontend session token, one-time code, or creator authority secret. | `400 invalid_request`, `503 creator_authority_unavailable`, `404` when route gated off |
 | `POST /connect/{flow_id}/complete` | `303` redirect to stored `return_to` | No bearer auth. Mounted when `[creator_authority_acquisition].enabled = true`; stored `return_to` is revalidated before redirect. | `Location` contains only callback `state` and one-time `code`; no authorization URL, frontend session token, or creator authority secret. | `400 invalid_request`, `404 creator_connect_flow_unavailable`, `410 creator_connect_flow_expired`, `503 creator_authority_unavailable`, `404` when route gated off |
@@ -99,7 +101,7 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `frontend_session_expired` | 401 | Frontend session token existed but expired. |
 | `frontend_session_state_mismatch` | 400 | One-time code exchange state did not match. |
 | `creator_authority_unavailable` | 503 | Creator-granted homeserver authority is unavailable or could not be revalidated. |
-| `content_lock_path_conflict` | 409 | The creator-scoped guarded path already has an in-flight or published Content Lock owner. |
+| `content_lock_path_conflict` | 409 | A creator-scoped guarded path already has an in-flight/published owner, or the canonical Content Lock publication itself is still in flight. |
 | `task_state_conflict` | 409 | Submission or completion conflicts with existing task state. |
 | `content_lock_deletion_in_progress` | 409 | A deletion cutoff committed before this new proof Bundle could be admitted. |
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
@@ -327,6 +329,20 @@ Authorization: Bearer <frontend_session_token>
 
 Success returns `204 No Content`. Missing resources return `404 guarded_resource_not_found`.
 
+### `DELETE /creator/content-locks/{lock_id}`
+
+Requires the authenticated creator frontend session. With no query, or with `graceful=true`, it starts or replays the durable graceful deletion job. Queued and running work returns `202` with only `lock_id` and `status`; a completed-and-forgotten absent lock returns `200 { "lock_id": "...", "status": "completed" }`.
+
+`force=true` is explicit and cannot be combined with `graceful=true`. With no active graceful job, force deletion synchronously stores the permanent blocking receipt, removes the public lock/tombstone, and then best-effort deletes guarded resources. A terminal graceful job supplies its frozen manifest for this synchronous cleanup. It returns exactly `{ "lock_id": "...", "lock_deleted": true, "failed_resource_paths": ["..."] }`. With a queued or running graceful job, it revokes any current worker claim, durably requeues the job for force escalation, and returns that redacted job at `202`. An in-flight canonical publication returns redacted `409 content_lock_path_conflict`; force has not started and no receipt exists, so the creator may retry after publication reconciles.
+
+Unknown query keys, malformed or false booleans, and ambiguous modes return `400 invalid_request`. The accepted wire forms are exactly no query, `graceful=true`, or `force=true`.
+
+Rust SDK callers use `CreatorLocks::delete_content_lock(DeleteContentLockRequest { lock_id, mode })`, where `DeleteContentLockMode` is closed to `DefaultGraceful`, `ExplicitGraceful`, and `Force`. JS/WASM callers use `creator.deleteContentLock(lockId, options?)`; omitting `options` selects default graceful, while `new DeleteContentLockOptions(DeleteContentLockMode.ExplicitGraceful)` and `new DeleteContentLockOptions(DeleteContentLockMode.Force)` select the two explicit query modes.
+
+### `GET /creator/content-locks/{lock_id}/deletion`
+
+Returns only `{ "lock_id": "...", "status": "queued|running|completed|failed", "failure_code"?: "..." }`. The optional failure vocabulary is closed to `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. If neither a job nor permanent force receipt exists, it returns `404 content_lock_deletion_not_found`.
+
 ### `POST /creator/content-locks`
 
 Fixtures:
@@ -341,7 +357,7 @@ Creates or replaces a content lock from a resource set. A content lock may conta
 
 At least one resource is required. If a primary resource is present, its path must not also appear in `secondary_resources`. `secondary_resources` keys are full canonical private paths such as `/priv/locks.app/content/attachments/a.txt`.
 
-With Pubky-backed repositories, this writes the public content lock JSON to the creator homeserver under its derived `content_lock_path`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
+With Pubky-backed repositories, this writes the public content lock JSON to the creator homeserver under its derived `content_lock_path`. Before external publication, Locks persists an opaque per-lock publication intent under the same PostgreSQL fence used by graceful deletion and force-receipt establishment. Deletion cannot start while that intent exists; force therefore cannot report permanent deletion and then lose a race to a late Pubky write. After an upsert error, Locks reads the canonical path: an exact expected lock is reconciled as published, proven absence permits reservation compensation, and a mismatched payload or failed read retains both ownership and intent for fail-closed operator reconciliation. The intent is removed only after path ownership is durably marked published or safely compensated. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
 Every referenced guarded resource must currently exist for the same creator/path and must match hash, content type, and size. If the creator has overwritten or deleted a guarded resource path, content lock creation rejects the stale descriptor.
 
