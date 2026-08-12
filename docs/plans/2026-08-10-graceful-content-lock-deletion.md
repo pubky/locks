@@ -246,7 +246,7 @@ Reject `force=true&graceful=true`, unknown fields, malformed booleans, and dupli
 GET /creator/content-locks/{lock_id}/deletion
 ```
 
-Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
+Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. The closed stable vocabulary is exactly `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
 
 ## Internal state model
 
@@ -544,8 +544,7 @@ Cross-service acceptance must additionally prove:
 
 These do not reopen accepted product semantics, but code must not start for the affected slice until both plans are patched identically:
 
-1. Exact Locks stable `failure_code` vocabulary.
-2. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
+1. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
 
 ## Out of scope
 
