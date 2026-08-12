@@ -10,7 +10,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use locks_core::ids::{
-    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
+    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
@@ -29,16 +29,19 @@ use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::{
     AccessCredential, AccessCredentialLookupKey, ContentLockDeletionJob,
     ContentLockOwnershipStatus, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret, VerificationTaskStatus,
+    CreatorAuthoritySecret, VerificationTaskRecord, VerificationTaskStatus,
 };
-use locks_service::application::ports::ContentLockDeletionRepository;
+use locks_service::application::ports::{
+    ContentLockDeletionRepository, VerificationTaskRepository,
+};
 use locks_service::infrastructure::memory::{
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
     lock_service_pointers::InMemoryLockServicePointerRepository,
 };
 use locks_service::infrastructure::postgres::{
-    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository, run_migrations,
+    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository,
+    PostgresVerificationTaskRepository, run_migrations,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -107,6 +110,61 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         .await
         .unwrap();
     assert!(stored_credential.is_some());
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn manual_completion_hides_legacy_paykit_admission_without_authoritative_window() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let submitted = paykit_submission_for(&paykit_content_lock());
+    let task = VerificationTaskRecord {
+        task_id: TaskId::from_str(&uuid::Uuid::new_v4().to_string()).unwrap(),
+        creator: submitted.pubky_lock_resource.creator().clone(),
+        submitted_proof_bundle: submitted.clone(),
+        status: VerificationTaskStatus::Pending,
+        submitted_at: datetime!(2026-08-12 06:00:00 UTC),
+        started_at: None,
+        completed_at: None,
+        failure_message: None,
+    };
+    PostgresVerificationTaskRepository::new(database.pool().clone())
+        .insert_verification_task(task.clone())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO paykit_task_admissions
+             (verification_task_id, ready, ready_at)
+         VALUES ($1::uuid, TRUE, now())",
+    )
+    .bind(task.task_id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let response = router(app_state(database.pool().clone()))
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-completions",
+            json!({
+                "creator": submitted.pubky_lock_resource.creator(),
+                "bundle_id": submitted.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "verification_task_not_found",
+                "message": "verification task not found"
+            }
+        })
+    );
 
     database.cleanup().await;
 }
@@ -275,9 +333,18 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
             let call = paykit_state.fetch_add(1, Ordering::SeqCst);
             async move {
                 if call == 0 {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({ "error": "injected" })),
+                    )
                 } else {
-                    StatusCode::OK
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "invoice_created_at": "2026-08-12T10:00:00Z",
+                            "payment_deadline": "2026-08-13T10:00:00Z",
+                        })),
+                    )
                 }
             }
         }),
