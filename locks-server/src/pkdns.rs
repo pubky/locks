@@ -292,6 +292,7 @@ mod tests {
             pkdns: PkdnsConfig::default(),
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
+            deletion: crate::config::DeletionConfig::default(),
             paykit: None,
         }
     }

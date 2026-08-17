@@ -26,6 +26,7 @@ use locks_service::{
         },
     },
     infrastructure::{
+        final_credentials::FinalCredentialCipher,
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
             content_lock_deletions::InMemoryContentLockDeletionRepository,
@@ -181,6 +182,24 @@ pub struct AppState {
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
 }
 
+/// Purpose-separated runtime ciphers derived from the configured master key.
+pub struct RuntimeSecretCiphers {
+    creator_authority: CreatorAuthoritySecretCipher,
+    final_credential: FinalCredentialCipher,
+}
+
+impl RuntimeSecretCiphers {
+    pub fn new(
+        creator_authority: CreatorAuthoritySecretCipher,
+        final_credential: FinalCredentialCipher,
+    ) -> Self {
+        Self {
+            creator_authority,
+            final_credential,
+        }
+    }
+}
+
 impl std::fmt::Debug for AppState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -224,7 +243,12 @@ impl AppState {
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
-        let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
+        let access_credentials = Arc::new(
+            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+                verification_tasks.clone(),
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -242,7 +266,8 @@ impl AppState {
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_verification_task_fence(
+                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                    Arc::clone(&access_credentials),
                     verification_task_deletion_fence,
                 ),
             ),
@@ -285,7 +310,12 @@ impl AppState {
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
-        let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
+        let access_credentials = Arc::new(
+            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+                verification_tasks.clone(),
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -302,7 +332,8 @@ impl AppState {
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_verification_task_fence(
+                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                    Arc::clone(&access_credentials),
                     verification_task_deletion_fence,
                 ),
             ),
@@ -345,7 +376,12 @@ impl AppState {
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
-        let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
+        let access_credentials = Arc::new(
+            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+                verification_tasks.clone(),
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -379,7 +415,8 @@ impl AppState {
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_verification_task_fence(
+                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                    Arc::clone(&access_credentials),
                     verification_task_deletion_fence,
                 ),
             ),
@@ -407,11 +444,16 @@ impl AppState {
         config: LockServerRuntimeConfig,
         pool: PgPool,
         creator_authority_cipher: CreatorAuthoritySecretCipher,
+        final_credential_cipher: FinalCredentialCipher,
     ) -> Self {
         let verification_tasks = Arc::new(PostgresVerificationTaskRepository::new(pool.clone()));
         let verification_task_claimer =
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
-        let access_credentials = Arc::new(PostgresAccessCredentialStore::new(pool.clone()));
+        let access_credentials =
+            Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
+                pool.clone(),
+                final_credential_cipher,
+            ));
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -466,7 +508,7 @@ impl AppState {
     pub fn new_with_postgres_runtime_and_creator_repositories(
         config: LockServerRuntimeConfig,
         pool: PgPool,
-        creator_authority_cipher: CreatorAuthoritySecretCipher,
+        ciphers: RuntimeSecretCiphers,
         content_locks: Arc<dyn ContentLockRepository>,
         guarded_resources: Arc<dyn GuardedResourceRepository>,
         lock_service_pointers: Arc<dyn LockServicePointerRepository>,
@@ -475,9 +517,13 @@ impl AppState {
         let verification_tasks = Arc::new(PostgresVerificationTaskRepository::new(pool.clone()));
         let verification_task_claimer =
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
-        let access_credentials = Arc::new(PostgresAccessCredentialStore::new(pool.clone()));
+        let access_credentials =
+            Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
+                pool.clone(),
+                ciphers.final_credential,
+            ));
         let creator_authority_store =
-            PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
+            PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), ciphers.creator_authority);
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let pubky_http_client = build_pubky_http_client(config.pubky.network);
         let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
@@ -720,6 +766,15 @@ impl AppState {
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_access_credentials(
+        mut self,
+        access_credentials: Arc<dyn AccessCredentialStore>,
+    ) -> Self {
+        self.access_credentials = access_credentials;
         self
     }
 

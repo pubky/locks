@@ -1,6 +1,8 @@
+use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
 use locks_service::infrastructure::postgres::{
     CreatorAuthoritySecretCipher, PostgresError, run_migrations,
 };
+use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 use sqlx::postgres::PgPoolOptions;
 
 use crate::app_state::AppState;
@@ -13,10 +15,10 @@ pub enum RuntimeStorageError {
     Connect(#[from] sqlx::Error),
     #[error("failed to run postgres runtime migrations: {0}")]
     Migrate(#[from] PostgresError),
-    #[error("creator authority encryption key env var is not set: {0}")]
-    MissingCreatorAuthorityEncryptionKeyEnv(String),
-    #[error("invalid creator authority encryption key in env var: {0}")]
-    InvalidCreatorAuthorityEncryptionKey(String),
+    #[error("runtime master key env var is not set: {0}")]
+    MissingRuntimeMasterKeyEnv(String),
+    #[error("invalid runtime master key in env var: {0}")]
+    InvalidRuntimeMasterKey(String),
 }
 
 /// Builds application state for the production-shaped runtime.
@@ -30,7 +32,8 @@ pub enum RuntimeStorageError {
 pub async fn build_runtime_state(
     config: LockServerRuntimeConfig,
 ) -> Result<AppState, RuntimeStorageError> {
-    let creator_authority_cipher = creator_authority_cipher_from_env(&config.secrets)?;
+    let (creator_authority_cipher, final_credential_cipher) =
+        runtime_ciphers_from_env(&config.secrets)?;
     let pool = connect_database(&config.database).await?;
     if config.database.run_migrations_on_startup {
         run_migrations(&pool).await?;
@@ -40,22 +43,30 @@ pub async fn build_runtime_state(
         config,
         pool,
         creator_authority_cipher,
+        final_credential_cipher,
     ))
 }
 
+#[cfg(test)]
 fn creator_authority_cipher_from_env(
     config: &SecretsConfig,
 ) -> Result<CreatorAuthoritySecretCipher, RuntimeStorageError> {
-    let key = std::env::var(&config.creator_authority_key_env).map_err(|_| {
-        RuntimeStorageError::MissingCreatorAuthorityEncryptionKeyEnv(
-            config.creator_authority_key_env.clone(),
-        )
+    runtime_ciphers_from_env(config).map(|(creator, _)| creator)
+}
+
+fn runtime_ciphers_from_env(
+    config: &SecretsConfig,
+) -> Result<(CreatorAuthoritySecretCipher, FinalCredentialCipher), RuntimeStorageError> {
+    let key = std::env::var(&config.runtime_master_key_env).map_err(|_| {
+        RuntimeStorageError::MissingRuntimeMasterKeyEnv(config.runtime_master_key_env.clone())
     })?;
-    CreatorAuthoritySecretCipher::from_base64url_key(&key).map_err(|_| {
-        RuntimeStorageError::InvalidCreatorAuthorityEncryptionKey(
-            config.creator_authority_key_env.clone(),
-        )
-    })
+    let master_key = RuntimeMasterKey::from_base64url(&key).map_err(|_| {
+        RuntimeStorageError::InvalidRuntimeMasterKey(config.runtime_master_key_env.clone())
+    })?;
+    Ok((
+        CreatorAuthoritySecretCipher::new(master_key.creator_authority_key()),
+        FinalCredentialCipher::new(master_key.final_credential_key()),
+    ))
 }
 
 async fn connect_database(config: &DatabaseConfig) -> Result<sqlx::PgPool, sqlx::Error> {
@@ -81,7 +92,7 @@ mod tests {
             std::env::set_var(&env_name, URL_SAFE_NO_PAD.encode([7u8; 32]));
         }
         let config = SecretsConfig {
-            creator_authority_key_env: env_name.clone(),
+            runtime_master_key_env: env_name.clone(),
         };
 
         let cipher = creator_authority_cipher_from_env(&config).unwrap();
@@ -99,14 +110,14 @@ mod tests {
             std::env::remove_var(&env_name);
         }
         let config = SecretsConfig {
-            creator_authority_key_env: env_name.clone(),
+            runtime_master_key_env: env_name.clone(),
         };
 
         let error = creator_authority_cipher_from_env(&config).unwrap_err();
 
         assert_eq!(
             error.to_string(),
-            format!("creator authority encryption key env var is not set: {env_name}")
+            format!("runtime master key env var is not set: {env_name}")
         );
     }
 
@@ -117,14 +128,14 @@ mod tests {
             std::env::set_var(&env_name, "not-a-valid-key");
         }
         let config = SecretsConfig {
-            creator_authority_key_env: env_name.clone(),
+            runtime_master_key_env: env_name.clone(),
         };
 
         let error = creator_authority_cipher_from_env(&config).unwrap_err();
 
         assert!(matches!(
             error,
-            RuntimeStorageError::InvalidCreatorAuthorityEncryptionKey(ref name) if name == &env_name
+            RuntimeStorageError::InvalidRuntimeMasterKey(ref name) if name == &env_name
         ));
         let debug = format!("{error:?}");
         assert!(!debug.contains("not-a-valid-key"));
@@ -141,21 +152,21 @@ mod tests {
         }
         let mut config = TestServerApp::default_in_memory_config();
         config.secrets = SecretsConfig {
-            creator_authority_key_env: env_name.clone(),
+            runtime_master_key_env: env_name.clone(),
         };
 
         let error = build_runtime_state(config).await.unwrap_err();
 
         assert!(matches!(
             error,
-            RuntimeStorageError::MissingCreatorAuthorityEncryptionKeyEnv(ref name) if name == &env_name
+            RuntimeStorageError::MissingRuntimeMasterKeyEnv(ref name) if name == &env_name
         ));
         assert!(!error.to_string().contains("postgres://"));
     }
 
     fn unique_env_name(suffix: &str) -> String {
         format!(
-            "LOCKS_TEST_CREATOR_AUTH_KEY_{}_{}",
+            "LOCKS_TEST_RUNTIME_MASTER_KEY_{}_{}",
             suffix,
             uuid::Uuid::new_v4().simple()
         )

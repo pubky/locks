@@ -48,7 +48,14 @@ frontend_session_code_ttl_seconds = 120
 allowed_return_origins = ["http://localhost:3000"]
 
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
+
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
 
 [logging]
 level = "info"
@@ -308,6 +315,139 @@ fn allows_wildcard_return_origin_outside_production() {
     );
 }
 
+#[test]
+fn accepts_closed_deletion_defaults_and_runtime_master_key_contract() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        minimal_config(&secret_path, &public_key, "development"),
+    )
+    .unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+    assert_eq!(
+        config.secrets.runtime_master_key_env,
+        "PUBKY_LOCK_RUNTIME_MASTER_KEY"
+    );
+    assert_eq!(config.deletion.retry_max_attempts, 10);
+    assert_eq!(config.deletion.retry_initial_backoff_seconds, 1);
+    assert_eq!(config.deletion.retry_max_backoff_seconds, 300);
+    assert_eq!(
+        config.deletion.final_credential_issuance_window_seconds,
+        900
+    );
+    assert_eq!(config.deletion.final_read_window_seconds, 900);
+}
+
+#[test]
+fn rejects_retired_creator_authority_key_env() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "runtime_master_key_env = \"PUBKY_LOCK_RUNTIME_MASTER_KEY\"",
+        "creator_authority_key_env = \"PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY\"",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+    assert!(matches!(error, ConfigError::ParseConfig { .. }));
+    assert!(error.to_string().contains("creator_authority_key_env"));
+}
+
+#[test]
+fn rejects_zero_or_inverted_deletion_retry_contract() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+
+    for (name, from, to, expected) in [
+        (
+            "zero-attempts",
+            "retry_max_attempts = 10",
+            "retry_max_attempts = 0",
+            ConfigError::InvalidDeletionRetry,
+        ),
+        (
+            "zero-initial",
+            "retry_initial_backoff_seconds = 1",
+            "retry_initial_backoff_seconds = 0",
+            ConfigError::InvalidDeletionRetry,
+        ),
+        (
+            "inverted",
+            "retry_initial_backoff_seconds = 1",
+            "retry_initial_backoff_seconds = 301",
+            ConfigError::InvalidDeletionRetryBackoffOrder,
+        ),
+    ] {
+        let config_path = temp_dir.path().join(format!("{name}.toml"));
+        let config = minimal_config(&secret_path, &public_key, "development").replace(from, to);
+        std::fs::write(&config_path, config).unwrap();
+
+        let error = load_existing_config_from_path(&config_path).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+    }
+}
+
+#[test]
+fn accepts_maximum_deletion_windows_and_rejects_out_of_range_values() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let base = minimal_config(&secret_path, &public_key, "development");
+
+    let max_path = temp_dir.path().join("max.toml");
+    let max = base
+        .replace(
+            "final_credential_issuance_window_seconds = 900",
+            "final_credential_issuance_window_seconds = 3600",
+        )
+        .replace(
+            "final_read_window_seconds = 900",
+            "final_read_window_seconds = 3600",
+        );
+    std::fs::write(&max_path, max).unwrap();
+    assert!(load_existing_config_from_path(&max_path).is_ok());
+
+    for (name, from, to) in [
+        (
+            "zero-issuance",
+            "final_credential_issuance_window_seconds = 900",
+            "final_credential_issuance_window_seconds = 0",
+        ),
+        (
+            "long-issuance",
+            "final_credential_issuance_window_seconds = 900",
+            "final_credential_issuance_window_seconds = 3601",
+        ),
+        (
+            "zero-read",
+            "final_read_window_seconds = 900",
+            "final_read_window_seconds = 0",
+        ),
+        (
+            "long-read",
+            "final_read_window_seconds = 900",
+            "final_read_window_seconds = 3601",
+        ),
+    ] {
+        let config_path = temp_dir.path().join(format!("{name}.toml"));
+        std::fs::write(&config_path, base.replace(from, to)).unwrap();
+        assert!(matches!(
+            load_existing_config_from_path(&config_path).unwrap_err(),
+            ConfigError::InvalidDeletionCredentialWindow
+        ));
+    }
+}
+
 fn test_identity(secret_path: &std::path::Path) -> LockServerPubky {
     let keypair = pubky_common::crypto::Keypair::from_secret(&[9; 32]);
     let public_key = LockServerPubky::from_str(&keypair.public_key().to_string()).unwrap();
@@ -360,7 +500,14 @@ frontend_session_code_ttl_seconds = 120
 allowed_return_origins = []
 
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
+
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
 
 [logging]
 level = "info"

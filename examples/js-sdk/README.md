@@ -87,7 +87,7 @@ docker compose up --build
 On first startup, the Lock Server entrypoint generates a random creator-authority
 encryption key and persists it in the private `lock-home` volume. Later starts reuse
 that key. To supply your own 32-byte base64url key instead, export
-`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before running Compose.
+`PUBKY_LOCK_RUNTIME_MASTER_KEY` before running Compose.
 
 The compose stack starts:
 
@@ -159,10 +159,10 @@ The examples do **not** generate or mutate Lock Server TOML. They read the Lock 
 ~/.pubky-lock/config.toml
 ```
 
-Generate a local creator-authority encryption key for the same shell that starts the Lock Server:
+Generate a local runtime master key for the same shell that starts the Lock Server:
 
 ```bash
-export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(
+export PUBKY_LOCK_RUNTIME_MASTER_KEY="$(
   python3 - <<'PY'
 import base64, os
 print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
@@ -170,7 +170,7 @@ PY
 )"
 ```
 
-To generate the default config and Lock Server secret, start the server once after setting `PUBKY_LOCK_DATABASE_URL` and `PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY`:
+To generate the default config and Lock Server secret, start the server once after setting `PUBKY_LOCK_DATABASE_URL` and `PUBKY_LOCK_RUNTIME_MASTER_KEY`:
 
 ```bash
 cargo run -p locks-server

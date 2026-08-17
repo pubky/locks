@@ -7,14 +7,18 @@ use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-use super::defaults::{DEFAULT_CREATOR_AUTHORITY_KEY_ENV, PUBLIC_KEY_PLACEHOLDER};
+use super::defaults::{
+    DEFAULT_DELETION_RETRY_INITIAL_BACKOFF_SECONDS, DEFAULT_DELETION_RETRY_MAX_ATTEMPTS,
+    DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS, DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS,
+    DEFAULT_FINAL_READ_WINDOW_SECONDS, DEFAULT_RUNTIME_MASTER_KEY_ENV, PUBLIC_KEY_PLACEHOLDER,
+};
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig,
+    LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
+    LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS, PAYKIT_REQUEST_TIMEOUT_SECONDS,
+    PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +43,8 @@ pub(super) struct RawConfig {
     rate_limits: RawRateLimitsConfig,
     #[serde(default)]
     content_locks: RawContentLocksConfig,
+    #[serde(default)]
+    deletion: RawDeletionConfig,
     #[serde(default)]
     paykit: Option<RawPaykitConfig>,
 }
@@ -248,20 +254,64 @@ fn validate_allowed_return_origin(value: String) -> Result<String, ConfigError> 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSecretsConfig {
-    #[serde(default = "default_creator_authority_key_env")]
-    creator_authority_key_env: String,
+    #[serde(default = "default_runtime_master_key_env")]
+    runtime_master_key_env: String,
 }
 
 impl Default for RawSecretsConfig {
     fn default() -> Self {
         Self {
-            creator_authority_key_env: default_creator_authority_key_env(),
+            runtime_master_key_env: default_runtime_master_key_env(),
         }
     }
 }
 
-fn default_creator_authority_key_env() -> String {
-    DEFAULT_CREATOR_AUTHORITY_KEY_ENV.to_owned()
+fn default_runtime_master_key_env() -> String {
+    DEFAULT_RUNTIME_MASTER_KEY_ENV.to_owned()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeletionConfig {
+    #[serde(default = "default_deletion_retry_max_attempts")]
+    retry_max_attempts: u32,
+    #[serde(default = "default_deletion_retry_initial_backoff_seconds")]
+    retry_initial_backoff_seconds: u64,
+    #[serde(default = "default_deletion_retry_max_backoff_seconds")]
+    retry_max_backoff_seconds: u64,
+    #[serde(default = "default_final_credential_issuance_window_seconds")]
+    final_credential_issuance_window_seconds: u64,
+    #[serde(default = "default_final_read_window_seconds")]
+    final_read_window_seconds: u64,
+}
+
+impl Default for RawDeletionConfig {
+    fn default() -> Self {
+        Self {
+            retry_max_attempts: default_deletion_retry_max_attempts(),
+            retry_initial_backoff_seconds: default_deletion_retry_initial_backoff_seconds(),
+            retry_max_backoff_seconds: default_deletion_retry_max_backoff_seconds(),
+            final_credential_issuance_window_seconds:
+                default_final_credential_issuance_window_seconds(),
+            final_read_window_seconds: default_final_read_window_seconds(),
+        }
+    }
+}
+
+fn default_deletion_retry_max_attempts() -> u32 {
+    DEFAULT_DELETION_RETRY_MAX_ATTEMPTS
+}
+fn default_deletion_retry_initial_backoff_seconds() -> u64 {
+    DEFAULT_DELETION_RETRY_INITIAL_BACKOFF_SECONDS
+}
+fn default_deletion_retry_max_backoff_seconds() -> u64 {
+    DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS
+}
+fn default_final_credential_issuance_window_seconds() -> u64 {
+    DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS
+}
+fn default_final_read_window_seconds() -> u64 {
+    DEFAULT_FINAL_READ_WINDOW_SECONDS
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,11 +503,40 @@ impl RawCreatorAuthorityAcquisitionConfig {
 
 impl RawSecretsConfig {
     fn into_secrets_config(self) -> Result<SecretsConfig, ConfigError> {
-        if self.creator_authority_key_env.trim().is_empty() {
-            return Err(ConfigError::InvalidCreatorAuthorityKeyEnv);
+        if self.runtime_master_key_env.trim().is_empty() {
+            return Err(ConfigError::InvalidRuntimeMasterKeyEnv);
         }
         Ok(SecretsConfig {
-            creator_authority_key_env: self.creator_authority_key_env,
+            runtime_master_key_env: self.runtime_master_key_env,
+        })
+    }
+}
+
+impl RawDeletionConfig {
+    fn into_deletion_config(self) -> Result<DeletionConfig, ConfigError> {
+        if self.retry_max_attempts == 0
+            || self.retry_initial_backoff_seconds == 0
+            || self.retry_max_backoff_seconds == 0
+        {
+            return Err(ConfigError::InvalidDeletionRetry);
+        }
+        if self.retry_initial_backoff_seconds > self.retry_max_backoff_seconds {
+            return Err(ConfigError::InvalidDeletionRetryBackoffOrder);
+        }
+        if self.final_credential_issuance_window_seconds == 0
+            || self.final_credential_issuance_window_seconds
+                > MAX_DELETION_CREDENTIAL_WINDOW_SECONDS
+            || self.final_read_window_seconds == 0
+            || self.final_read_window_seconds > MAX_DELETION_CREDENTIAL_WINDOW_SECONDS
+        {
+            return Err(ConfigError::InvalidDeletionCredentialWindow);
+        }
+        Ok(DeletionConfig {
+            retry_max_attempts: self.retry_max_attempts,
+            retry_initial_backoff_seconds: self.retry_initial_backoff_seconds,
+            retry_max_backoff_seconds: self.retry_max_backoff_seconds,
+            final_credential_issuance_window_seconds: self.final_credential_issuance_window_seconds,
+            final_read_window_seconds: self.final_read_window_seconds,
         })
     }
 }
@@ -514,6 +593,7 @@ impl RawConfig {
         let pkdns = self.pkdns.into_pkdns_config()?;
         let rate_limits = self.rate_limits.into_rate_limits_config()?;
         let content_locks = self.content_locks.into_content_locks_config()?;
+        let deletion = self.deletion.into_deletion_config()?;
         let paykit = self
             .paykit
             .map(RawPaykitConfig::into_paykit_config)
@@ -557,6 +637,7 @@ impl RawConfig {
             pkdns,
             rate_limits,
             content_locks,
+            deletion,
             paykit,
         })
     }

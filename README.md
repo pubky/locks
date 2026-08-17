@@ -45,10 +45,12 @@ From a fresh clone:
 docker compose up --build
 ```
 
-The Compose entrypoint generates and persists a random creator-authority encryption
+The Compose entrypoint generates and persists a random runtime master
 key in the private `lock-home` volume. Set
-`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before startup only when you need to supply
-your own 32-byte base64url key.
+`PUBKY_LOCK_RUNTIME_MASTER_KEY` before startup only when you need to supply
+your own 32-byte unpadded-base64url key. A supplied override is atomically
+persisted to that volume, so a later startup without the environment variable
+continues using the same key rather than silently reverting to an older key.
 
 Verified browser-facing defaults are:
 

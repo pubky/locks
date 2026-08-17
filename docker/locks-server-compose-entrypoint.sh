@@ -5,25 +5,74 @@ service_home="${LOCKS_SERVICE_HOME:-/var/lib/pubky-lock/.pubky-lock}"
 generated_config="$service_home/config.toml"
 compose_config="${LOCKS_COMPOSE_CONFIG:-/var/lib/pubky-lock/config.compose.toml}"
 secret_path="$service_home/secret.sess"
-creator_authority_key_path="$service_home/creator-authority-encryption-key"
+runtime_master_key_path="$service_home/runtime-master-key"
+retired_creator_authority_key_path="$service_home/creator-authority-encryption-key"
 
 mkdir -p "$service_home"
 
-if [ -z "${PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY:-}" ]; then
-  if [ ! -f "$creator_authority_key_path" ]; then
-    echo "[locks-compose] generating creator-authority encryption key"
+if [ -f "$retired_creator_authority_key_path" ]; then
+  echo "[locks-compose] retired creator-authority key detected: $retired_creator_authority_key_path" >&2
+  echo "[locks-compose] stop the stack, discard and reacquire creator authority rows or recreate the local database, remove the retired key file, then restart" >&2
+  exit 1
+fi
+
+if [ -n "${PUBKY_LOCK_RUNTIME_MASTER_KEY:-}" ]; then
+  if ! printf '%s' "$PUBKY_LOCK_RUNTIME_MASTER_KEY" | grep -Eq '^[A-Za-z0-9_-]{43}$'; then
+    echo "[locks-compose] PUBKY_LOCK_RUNTIME_MASTER_KEY must be an unpadded base64url-encoded 32-byte key" >&2
+    exit 1
+  fi
+  umask 077
+  decoded_key_path="$runtime_master_key_path.decoded.$$"
+  cleanup_decoded_key() {
+    rm -f "$decoded_key_path"
+  }
+  trap cleanup_decoded_key EXIT HUP INT TERM
+  if ! printf '%s=' "$PUBKY_LOCK_RUNTIME_MASTER_KEY" \
+    | tr '_-' '/+' \
+    | base64 -d > "$decoded_key_path" 2>/dev/null \
+    || [ "$(wc -c < "$decoded_key_path" | tr -d ' ')" -ne 32 ]; then
+    echo "[locks-compose] PUBKY_LOCK_RUNTIME_MASTER_KEY must be an unpadded base64url-encoded 32-byte key" >&2
+    exit 1
+  fi
+  canonical_runtime_master_key="$(
+    base64 < "$decoded_key_path" \
+      | tr '+/' '-_' \
+      | tr -d '=\n'
+  )"
+  if [ "$canonical_runtime_master_key" != "$PUBKY_LOCK_RUNTIME_MASTER_KEY" ]; then
+    echo "[locks-compose] PUBKY_LOCK_RUNTIME_MASTER_KEY must be an unpadded base64url-encoded 32-byte key" >&2
+    exit 1
+  fi
+  cleanup_decoded_key
+  trap - EXIT HUP INT TERM
+  if [ -f "$runtime_master_key_path" ]; then
+    persisted_runtime_master_key="$(cat "$runtime_master_key_path")"
+    if [ "$persisted_runtime_master_key" != "$PUBKY_LOCK_RUNTIME_MASTER_KEY" ]; then
+      echo "[locks-compose] PUBKY_LOCK_RUNTIME_MASTER_KEY does not match the persisted runtime master key" >&2
+      echo "[locks-compose] rotate only through an explicit data migration or reset that handles encrypted state" >&2
+      exit 1
+    fi
+  else
+    temporary_key_path="$runtime_master_key_path.tmp.$$"
+    printf '%s' "$PUBKY_LOCK_RUNTIME_MASTER_KEY" > "$temporary_key_path"
+    chmod 600 "$temporary_key_path"
+    mv "$temporary_key_path" "$runtime_master_key_path"
+  fi
+else
+  if [ ! -f "$runtime_master_key_path" ]; then
+    echo "[locks-compose] generating runtime master key"
     umask 077
-    temporary_key_path="$creator_authority_key_path.tmp.$$"
+    temporary_key_path="$runtime_master_key_path.tmp.$$"
     head -c 32 /dev/urandom \
       | base64 \
       | tr '+/' '-_' \
       | tr -d '=\n' > "$temporary_key_path"
     chmod 600 "$temporary_key_path"
-    mv "$temporary_key_path" "$creator_authority_key_path"
+    mv "$temporary_key_path" "$runtime_master_key_path"
   fi
 
-  PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(cat "$creator_authority_key_path")"
-  export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY
+  PUBKY_LOCK_RUNTIME_MASTER_KEY="$(cat "$runtime_master_key_path")"
+  export PUBKY_LOCK_RUNTIME_MASTER_KEY
 fi
 
 if [ ! -f "$generated_config" ] || [ ! -f "$secret_path" ]; then
@@ -78,7 +127,14 @@ frontend_session_code_ttl_seconds = 120
 allowed_return_origins = ["http://localhost:8080"]
 
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
+
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
 
 [logging]
 level = "info"

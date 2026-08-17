@@ -23,6 +23,7 @@ use locks_service::application::ports::{
     CreatorConnectFlowIdGenerator, FrontendSessionCodeGenerator, FrontendSessionTokenGenerator,
     VerificationTaskIdGenerator,
 };
+use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
 
 #[test]
@@ -41,8 +42,12 @@ async fn postgres_state_uses_postgres_for_private_runtime_adapters() {
         .connect_lazy("postgres://locks:locks@localhost/locks_test")
         .unwrap();
 
-    let state =
-        AppState::new_with_postgres_runtime(test_config(), pool, test_creator_authority_cipher());
+    let state = AppState::new_with_postgres_runtime(
+        test_config(),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
 
     assert_eq!(
         state.private_runtime_storage_kind(),
@@ -56,8 +61,12 @@ async fn postgres_state_wires_legacy_connect_flow_runtime_state() {
         .connect_lazy("postgres://locks:locks@localhost/locks_test")
         .unwrap();
 
-    let state =
-        AppState::new_with_postgres_runtime(test_config(), pool, test_creator_authority_cipher());
+    let state = AppState::new_with_postgres_runtime(
+        test_config(),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
 
     assert!(Arc::strong_count(state.creator_connect_flows()) >= 1);
     assert!(Arc::strong_count(state.frontend_session_codes()) >= 1);
@@ -74,7 +83,12 @@ async fn postgres_state_uses_acquisition_gate_to_wire_legacy_connect_client() {
     let mut config = test_config();
     config.creator_authority_acquisition.enabled = true;
 
-    let state = AppState::new_with_postgres_runtime(config, pool, test_creator_authority_cipher());
+    let state = AppState::new_with_postgres_runtime(
+        config,
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
 
     let result = state
         .legacy_creator_connect_flow_client()
@@ -125,8 +139,12 @@ async fn persisted_state_keeps_postgres_pool_for_readiness() {
         .connect_lazy("postgres://locks:locks@localhost/locks_test")
         .unwrap();
 
-    let state =
-        AppState::new_with_postgres_runtime(test_config(), pool, test_creator_authority_cipher());
+    let state = AppState::new_with_postgres_runtime(
+        test_config(),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
 
     assert!(state.postgres_pool().is_some());
 }
@@ -137,8 +155,12 @@ async fn persisted_state_composes_pubky_homeserver_creator_repositories() {
         .connect_lazy("postgres://locks:locks@localhost/locks_test")
         .unwrap();
 
-    let state =
-        AppState::new_with_postgres_runtime(test_config(), pool, test_creator_authority_cipher());
+    let state = AppState::new_with_postgres_runtime(
+        test_config(),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
 
     assert!(Arc::strong_count(state.content_locks()) >= 1);
     assert!(Arc::strong_count(state.guarded_resources()) >= 1);
@@ -187,6 +209,7 @@ async fn postgres_state_has_rate_limiter_configured_from_runtime_config() {
         test_config_with_rate_limit(true, 1, 60),
         pool,
         test_creator_authority_cipher(),
+        test_final_credential_cipher(),
     );
     let key = rate_limit_key();
     let now = datetime!(2026-06-03 12:00:00 UTC);
@@ -256,6 +279,10 @@ fn disabled_runtime_rate_limiter_in_state_always_allows() {
     }
 }
 
+fn test_final_credential_cipher() -> FinalCredentialCipher {
+    FinalCredentialCipher::new([8; 32])
+}
+
 fn test_creator_authority_cipher() -> CreatorAuthoritySecretCipher {
     CreatorAuthoritySecretCipher::new([7; 32])
 }
@@ -292,6 +319,7 @@ fn test_config() -> LockServerRuntimeConfig {
         pkdns: crate::config::PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        deletion: crate::config::DeletionConfig::default(),
         paykit: None,
     }
 }

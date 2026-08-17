@@ -91,6 +91,12 @@ pub enum ApplicationError {
         /// Human-readable credential generation failure detail.
         message: String,
     },
+    /// Final deletion credential envelope could not be encrypted or decrypted.
+    #[error("final credential secret error: {message}")]
+    FinalCredentialSecret {
+        /// Stable secret-free failure detail.
+        message: String,
+    },
     /// Creator-granted homeserver authority is missing, expired, revoked, or unusable.
     #[error("creator authority unavailable")]
     CreatorAuthorityUnavailable,
