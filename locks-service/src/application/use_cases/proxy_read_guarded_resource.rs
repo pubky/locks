@@ -1,5 +1,5 @@
 use crate::application::errors::ApplicationError;
-use crate::application::models::AccessCredential;
+use crate::application::models::{AccessCredential, AccessCredentialLookupKey};
 use crate::application::ports::{
     AccessCredentialStore, Clock, ContentLockRepository, EntitlementRepository,
     GuardedResourceRepository,
@@ -30,6 +30,14 @@ pub struct ProxiedGuardedResource {
     pub hash: GuardedResourceHash,
     /// Guarded resource bytes.
     pub bytes: Vec<u8>,
+    deletion_claim: Option<DeletionReadClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeletionReadClaim {
+    lookup_key: AccessCredentialLookupKey,
+    path: String,
+    claim_token: uuid::Uuid,
 }
 
 /// Validates an access credential and returns the currently guarded resource bytes.
@@ -64,6 +72,69 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
         &self,
         request: ProxyReadGuardedResourceRequest,
     ) -> Result<ProxiedGuardedResource, ApplicationError> {
+        let now = self.clock.now();
+        let lookup_key = AccessCredentialLookupKey::derive(&request.credential);
+        if let Some(authorization) = self
+            .credential_store
+            .prepare_deletion_read(
+                &lookup_key,
+                &request.path,
+                now,
+                now + time::Duration::seconds(30),
+            )
+            .await?
+        {
+            let claim_token = authorization.claim_token;
+            let guarded_resource = authorization.resource;
+            let prepared_response = async {
+                let guarded_record = self
+                    .guarded_resources
+                    .get_current_guarded_resource(&authorization.creator, &guarded_resource.path)
+                    .await?
+                    .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+                if guarded_record.hash != guarded_resource.hash
+                    || guarded_record.content_type != guarded_resource.content_type
+                    || guarded_record.size != guarded_resource.size
+                {
+                    return Err(ApplicationError::GuardedResourceUnavailable);
+                }
+                Ok(ProxiedGuardedResource {
+                    path: guarded_resource.path,
+                    content_type: guarded_record.content_type,
+                    hash: guarded_resource.hash,
+                    bytes: guarded_record.bytes,
+                    deletion_claim: claim_token.map(|claim_token| DeletionReadClaim {
+                        lookup_key: lookup_key.clone(),
+                        path: request.path.clone(),
+                        claim_token,
+                    }),
+                })
+            }
+            .await;
+            match prepared_response {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    if let Some(claim_token) = claim_token {
+                        self.credential_store
+                            .release_deletion_read(
+                                &lookup_key,
+                                &request.path,
+                                claim_token,
+                                self.clock.now(),
+                            )
+                            .await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if self
+            .credential_store
+            .deletion_credential_enrolled(&lookup_key)
+            .await?
+        {
+            return Err(ApplicationError::GuardedResourceUnavailable);
+        }
         let validation = ValidateAccessCredentialUseCase::new(
             self.credential_store,
             self.entitlements,
@@ -105,7 +176,51 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
             content_type: guarded_record.content_type,
             hash: guarded_resource.hash,
             bytes: guarded_record.bytes,
+            deletion_claim: None,
         })
+    }
+
+    /// Permanently consumes the exact final-read claim after a complete HTTP 200
+    /// response has been constructed. A lost claim prevents response return.
+    pub async fn consume_prepared_deletion_read(
+        &self,
+        response: &ProxiedGuardedResource,
+    ) -> Result<(), ApplicationError> {
+        let Some(claim) = &response.deletion_claim else {
+            return Ok(());
+        };
+        if !self
+            .credential_store
+            .consume_deletion_read(
+                &claim.lookup_key,
+                &claim.path,
+                claim.claim_token,
+                self.clock.now(),
+            )
+            .await?
+        {
+            return Err(ApplicationError::InvalidAccessCredential);
+        }
+        Ok(())
+    }
+
+    /// Releases the exact final-read claim when HTTP response construction fails.
+    pub async fn release_prepared_deletion_read(
+        &self,
+        response: &ProxiedGuardedResource,
+    ) -> Result<(), ApplicationError> {
+        let Some(claim) = &response.deletion_claim else {
+            return Ok(());
+        };
+        self.credential_store
+            .release_deletion_read(
+                &claim.lookup_key,
+                &claim.path,
+                claim.claim_token,
+                self.clock.now(),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -113,10 +228,13 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
 mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use serde_json::json;
     use time::OffsetDateTime;
     use time::macros::datetime;
+    use uuid::Uuid;
 
     use locks_core::ids::{
         BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
@@ -133,7 +251,8 @@ mod tests {
     use super::{ProxyReadGuardedResourceRequest, ProxyReadGuardedResourceUseCase};
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord, GuardedResourceRecord,
+        AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
+        DeletionReadAuthorization, GuardedResourceRecord,
     };
     use crate::application::ports::{
         AccessCredentialStore, Clock, ContentLockRepository, EntitlementRepository,
@@ -257,6 +376,207 @@ mod tests {
         assert_eq!(result, Err(ApplicationError::GuardedResourceUnavailable));
     }
 
+    #[tokio::test]
+    async fn deletion_read_stays_claimed_until_response_boundary_consumes_it() {
+        let fixture = Fixture::seed().await;
+        let credentials = DeletionReadStore::new();
+        let empty_public_locks = InMemoryContentLockRepository::new();
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &empty_public_locks,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let response = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/locks.app/content/resource.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.bytes, b"guarded bytes".to_vec());
+        assert_eq!(credentials.consumes.load(Ordering::SeqCst), 0);
+        use_case
+            .consume_prepared_deletion_read(&response)
+            .await
+            .unwrap();
+        assert_eq!(credentials.consumes.load(Ordering::SeqCst), 1);
+        assert_eq!(credentials.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_read_can_be_released_when_response_construction_fails() {
+        let fixture = Fixture::seed().await;
+        let credentials = DeletionReadStore::new();
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &fixture.content_locks,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let response = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/locks.app/content/resource.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        use_case
+            .release_prepared_deletion_read(&response)
+            .await
+            .unwrap();
+
+        assert_eq!(credentials.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(credentials.consumes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_read_releases_claim_when_upstream_resource_is_unavailable() {
+        let fixture = Fixture::seed_without_guarded_resource().await;
+        let credentials = DeletionReadStore::new();
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &fixture.content_locks,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let result = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/locks.app/content/resource.txt".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result, Err(ApplicationError::GuardedResourceUnavailable));
+        assert_eq!(credentials.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(credentials.consumes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_credential_denied_path_does_not_fall_through_to_public_lock() {
+        let fixture = Fixture::seed().await;
+        let credentials = DeletionReadStore::new();
+        let empty_public_locks = InMemoryContentLockRepository::new();
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &empty_public_locks,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let result = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/locks.app/content/not-frozen.txt".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result, Err(ApplicationError::GuardedResourceUnavailable));
+        assert_eq!(credentials.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(credentials.consumes.load(Ordering::SeqCst), 0);
+    }
+
+    struct DeletionReadStore {
+        ordinary: InMemoryAccessCredentialStore,
+        claim_token: Uuid,
+        releases: AtomicUsize,
+        consumes: AtomicUsize,
+    }
+
+    impl DeletionReadStore {
+        fn new() -> Self {
+            Self {
+                ordinary: InMemoryAccessCredentialStore::new(),
+                claim_token: Uuid::new_v4(),
+                releases: AtomicUsize::new(0),
+                consumes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AccessCredentialStore for DeletionReadStore {
+        async fn insert_access_credential(
+            &self,
+            lock_id: &locks_core::ids::LockId,
+            lookup_key: AccessCredentialLookupKey,
+            record: AccessCredentialRecord,
+        ) -> Result<(), ApplicationError> {
+            self.ordinary
+                .insert_access_credential(lock_id, lookup_key, record)
+                .await
+        }
+
+        async fn get_access_credential(
+            &self,
+            lookup_key: &AccessCredentialLookupKey,
+        ) -> Result<Option<AccessCredentialRecord>, ApplicationError> {
+            self.ordinary.get_access_credential(lookup_key).await
+        }
+
+        async fn delete_access_credential(
+            &self,
+            lookup_key: &AccessCredentialLookupKey,
+        ) -> Result<(), ApplicationError> {
+            self.ordinary.delete_access_credential(lookup_key).await
+        }
+
+        async fn prepare_deletion_read(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            path: &str,
+            _now: OffsetDateTime,
+            _claim_expires_at: OffsetDateTime,
+        ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
+            Ok((path == "/priv/locks.app/content/resource.txt").then(|| {
+                DeletionReadAuthorization {
+                    claim_token: Some(self.claim_token),
+                    creator: creator(),
+                    resource: content_lock_fixture().primary_resource.unwrap(),
+                }
+            }))
+        }
+
+        async fn deletion_credential_enrolled(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+        ) -> Result<bool, ApplicationError> {
+            Ok(true)
+        }
+
+        async fn release_deletion_read(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            _path: &str,
+            claim_token: Uuid,
+            _now: OffsetDateTime,
+        ) -> Result<bool, ApplicationError> {
+            assert_eq!(claim_token, self.claim_token);
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn consume_deletion_read(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            _path: &str,
+            claim_token: Uuid,
+            _now: OffsetDateTime,
+        ) -> Result<bool, ApplicationError> {
+            assert_eq!(claim_token, self.claim_token);
+            self.consumes.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
     struct Fixture {
         credentials: InMemoryAccessCredentialStore,
         entitlements: InMemoryEntitlementRepository,
@@ -313,6 +633,7 @@ mod tests {
                 .unwrap();
             credentials
                 .insert_access_credential(
+                    &content_lock.lock_id().unwrap(),
                     AccessCredentialLookupKey::derive(&credential),
                     AccessCredentialRecord {
                         creator: creator(),

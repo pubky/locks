@@ -106,7 +106,7 @@ If `/creator/lock-service-config` or `/creator/priv-resources/content/<path>` re
 ## Prerequisites
 
 - A Postgres database reachable through `PUBKY_LOCK_DATABASE_URL`.
-- A 32-byte base64url creator-authority encryption key in `PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY`.
+- A 32-byte base64url runtime master key in `PUBKY_LOCK_RUNTIME_MASTER_KEY`.
 - `curl`, `jq`, and `python3` available in your shell.
 - A generated/default Lock Server config and secret under `~/.pubky-lock/`.
 
@@ -116,10 +116,10 @@ The database URL below is a local development example. Real credentials must com
 export PUBKY_LOCK_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test'
 ```
 
-Generate a local creator-authority encryption key for this shell before starting the server:
+Generate a local runtime master key for this shell before starting the server:
 
 ```bash
-export PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY="$(python3 - <<'PY'
+export PUBKY_LOCK_RUNTIME_MASTER_KEY="$(python3 - <<'PY'
 import base64, os
 print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
 PY

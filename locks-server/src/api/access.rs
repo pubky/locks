@@ -8,7 +8,7 @@ use locks_service::application::use_cases::issue_access_credential::{
     IssueAccessCredentialRequest, IssueAccessCredentialUseCase,
 };
 use locks_service::application::use_cases::proxy_read_guarded_resource::{
-    ProxyReadGuardedResourceRequest, ProxyReadGuardedResourceUseCase,
+    ProxiedGuardedResource, ProxyReadGuardedResourceRequest, ProxyReadGuardedResourceUseCase,
 };
 
 use crate::api::dtos::{IssueAccessCredentialHttpRequest, IssueAccessCredentialHttpResponse};
@@ -58,6 +58,18 @@ pub(super) async fn proxy_read_guarded_resource(
     let proxied = use_case
         .execute(ProxyReadGuardedResourceRequest { credential, path })
         .await?;
+    let response = match build_proxy_read_response(&proxied) {
+        Ok(response) => response,
+        Err(error) => {
+            use_case.release_prepared_deletion_read(&proxied).await?;
+            return Err(error);
+        }
+    };
+    use_case.consume_prepared_deletion_read(&proxied).await?;
+    Ok(response)
+}
+
+fn build_proxy_read_response(proxied: &ProxiedGuardedResource) -> Result<Response, ApiError> {
     let content_type = HeaderValue::from_str(&proxied.content_type).map_err(|_| {
         ApiError::new(
             ApiErrorCode::InternalError,
@@ -88,7 +100,7 @@ pub(super) async fn proxy_read_guarded_resource(
                     .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "invalid etag"))?,
             ),
         ],
-        Body::from(proxied.bytes),
+        Body::from(proxied.bytes.clone()),
     )
         .into_response())
 }
