@@ -153,11 +153,12 @@ Both drain endpoints return `200` with the same closed aggregate body:
   "status": "active",
   "accepted_count": 0,
   "terminal_count": 0,
-  "cancellation_enqueued_count": 0
+  "cancellation_enqueued_count": 0,
+  "cleanup_token": "<43-character-unpadded-base64url>"
 }
 ```
 
-`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Exact replay returns the same aggregate body.
+`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Replay preserves the frozen drain identity, cancellation count, and cleanup token while returning its latest monotonic aggregate progress.
 
 ### Per-Bundle status
 
@@ -199,6 +200,8 @@ The canonical persisted `request_state` is one of these exact closed snake-case 
 - `expired`
 
 `expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
+
+Locks maps `rejected`, `canceled`, and `proposal_expired` requests to `VerificationTaskStatus::Expired`. An `accepted` request whose `payment_state` is `expired` also maps to `Expired`. These terminal outcomes carry no failure message and never map to `Failed`.
 
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
 
@@ -420,13 +423,20 @@ cargo test --workspace --no-run
 - Modify: `locks-server/src/paykit_http_client.rs`
 - Modify: `locks-server/src/app_state/mod.rs`
 - Create: `locks-service/src/application/ports/payment_drain.rs`
+- Create: `locks-service/src/application/ports/payment_drain_repository.rs`
 - Create: `locks-service/src/application/use_cases/drain_lock_payments.rs`
+- Create: `locks-service/src/infrastructure/postgres/payment_drains.rs`
+- Create: `locks-service/migrations/0015_content_lock_payment_drains.sql`
+- Modify: `locks-service/src/infrastructure/postgres/content_lock_deletions.rs`
+- Modify: `locks-service/src/infrastructure/postgres/verification_task_claims.rs`
 - Test: `locks-server/src/paykit_http_client.rs`
 - Test: deletion use-case tests and HTTP integration fixtures
 
 **Dependency gate:** Patch both plans with exact per-Bundle enums, error mappings, and drain-cleanup route before RED tests. Then implement Paykit Server routes first.
 
 **RED:** Test exact signed JSON, no `minimum_confirmations` leak, aggregate redaction, local application of confirmations, canceled/rejected/expired transitions, timely matched confirmation continuation, and retryable transport errors.
+
+**GREEN:** Freeze Paykit obligation identity, criterion, cutoff status, and authoritative invoice window in the deletion snapshot; persist the opaque drain token and aggregate under the deletion claim fence. Paykit aggregate progress is monotonic: `accepted_count` may only decrease to zero, `terminal_count` may only increase by the same amount, and `cancellation_enqueued_count` plus the opaque cleanup token remain immutable. `completed` requires `accepted_count == 0` and cannot regress to `active`. Locks persists each newer aggregate under the live deletion lease, but still requires every frozen local obligation to become terminal before phase advancement; aggregate completion never bypasses Locks-local confirmation or reorg reconciliation. Exclude ordinary verification workers for every surviving deletion snapshot. Immediately before external entitlement storage, an ordinary claimed worker durably marks entitlement publication under its exact lease. Deletion admission locks and owns every matching task row before snapshot/reset: a committed publication marker blocks deletion, while committed deletion ownership blocks publication and every ordinary claim/retry/terminal write. Ambiguous entitlement publication retains the marker until an ordinary retry reconciles an equivalent entitlement and terminalizes the task. Publish entitlements before terminalizing their task and reconcile only an equivalent existing entitlement. Compose the client and repository in `AppState`. Task 9 supplies the queue polling/supervision that invokes this phase use case.
 
 **Suggested commit:** `feat(paykit): drain deleting lock payments`
 
