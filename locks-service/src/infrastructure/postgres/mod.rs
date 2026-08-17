@@ -14,6 +14,7 @@ pub mod creator_connect_flows;
 pub mod errors;
 pub mod frontend_sessions;
 pub mod migrations;
+pub mod payment_drains;
 mod proof_admission;
 pub use proof_admission::{PaykitInvoiceWindow, PostgresPaykitTaskAdmissionRepository};
 #[cfg(test)]
@@ -29,5 +30,6 @@ pub use creator_connect_flows::PostgresCreatorConnectFlowStore;
 pub use errors::PostgresError;
 pub use frontend_sessions::{PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore};
 pub use migrations::run_migrations;
+pub use payment_drains::PostgresPaymentDrainRepository;
 pub use verification_task_claims::PostgresVerificationTaskClaimer;
 pub use verification_tasks::PostgresVerificationTaskRepository;
