@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, LockId};
@@ -14,6 +17,7 @@ use crate::application::{
     },
     ports::ContentLockDeletionRepository,
 };
+use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
 type JobKey = (CreatorPubky, LockId);
 
@@ -26,16 +30,34 @@ struct StoredJob {
 }
 
 /// In-memory deletion repository with the same lease-fencing semantics as PostgreSQL.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryContentLockDeletionRepository {
     jobs: RwLock<HashMap<JobKey, StoredJob>>,
     force_receipts: RwLock<HashSet<JobKey>>,
     publication_intents: RwLock<HashMap<JobKey, Uuid>>,
+    verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+}
+
+impl Default for InMemoryContentLockDeletionRepository {
+    fn default() -> Self {
+        Self::with_verification_task_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+    }
 }
 
 impl InMemoryContentLockDeletionRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_verification_task_fence(
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        Self {
+            jobs: RwLock::new(HashMap::new()),
+            force_receipts: RwLock::new(HashSet::new()),
+            publication_intents: RwLock::new(HashMap::new()),
+            verification_task_fence,
+        }
     }
 }
 
@@ -109,6 +131,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         job.validate_frozen_identity()?;
         job.validate_state(false)?;
         let key = (job.creator.clone(), job.lock_id.clone());
+        let mut verification_tasks = self.verification_task_fence.records.write().await;
         let intents = self.publication_intents.read().await;
         let mut jobs = self.jobs.write().await;
         let receipts = self.force_receipts.read().await;
@@ -119,6 +142,24 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             return Err(ApplicationError::DuplicateRecord {
                 record: "content_lock_deletion_job",
             });
+        }
+        let matching_task_ids = verification_tasks
+            .iter()
+            .filter_map(|(task_id, task)| {
+                (task.creator == job.creator && task.lock_id == job.lock_id).then_some(*task_id)
+            })
+            .collect::<Vec<_>>();
+        if matching_task_ids.iter().any(|task_id| {
+            verification_tasks
+                .get(task_id)
+                .is_some_and(|task| task.entitlement_publication_claim_token.is_some())
+        }) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        for task_id in matching_task_ids {
+            if let Some(task) = verification_tasks.get_mut(&task_id) {
+                task.deletion_job_id = Some(job.job_id);
+            }
         }
         jobs.insert(
             key,
@@ -293,6 +334,16 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         if intents.contains_key(&key) {
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
         }
+        let verification_tasks = self.verification_task_fence.records.read().await;
+        if verification_tasks.values().any(|task| {
+            task.creator == *creator
+                && task.lock_id == *lock_id
+                && task.deletion_job_id.is_some()
+                && task.entitlement_publication_claim_token.is_some()
+        }) {
+            return Ok(PrepareForceDeletionResult::PublicationInProgress);
+        }
+        drop(verification_tasks);
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         if receipts.contains(&key) {

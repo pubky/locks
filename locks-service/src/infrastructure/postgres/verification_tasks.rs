@@ -152,7 +152,11 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 terminal_reason = $10,
                 entitlement_to_publish = $11,
                 updated_at = now()
-            WHERE task_id = $1::uuid",
+            WHERE task_id = $1::uuid
+              AND NOT EXISTS (
+                  SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
+                  WHERE snapshot.verification_task_id = verification_tasks.task_id
+              )",
         )
         .bind(row.task_id)
         .bind(row.creator)
