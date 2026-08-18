@@ -333,6 +333,8 @@ Success returns `204 No Content`. Missing resources return `404 guarded_resource
 
 Requires the authenticated creator frontend session. With no query, or with `graceful=true`, it starts or replays the durable graceful deletion job. Queued and running work returns `202` with only `lock_id` and `status`; a completed-and-forgotten absent lock returns `200 { "lock_id": "...", "status": "completed" }`.
 
+Graceful withdrawal compares the current public lock bytes with the frozen canonical lock before publishing the tombstone. Pubky 0.9.3 does not provide an atomic conditional write, so this check and the tombstone `PUT` are not one operation. A replacement already visible to the check is preserved and fails the deletion closed, but an out-of-band creator replacement written after that check and before the `PUT` can be overwritten by the tombstone. This is an explicitly accepted limitation until Pubky supports conditional writes. Graceful cleanup does not delete replacement bytes; unconditional public deletion remains exclusive to `force=true`.
+
 `force=true` is explicit and cannot be combined with `graceful=true`. With no active graceful job, force deletion synchronously stores the permanent blocking receipt, removes the public lock/tombstone, and then best-effort deletes guarded resources. A terminal graceful job supplies its frozen manifest for this synchronous cleanup. It returns exactly `{ "lock_id": "...", "lock_deleted": true, "failed_resource_paths": ["..."] }`. With a queued or running graceful job, it revokes any current worker claim, durably requeues the job for force escalation, and returns that redacted job at `202`. An in-flight canonical publication returns redacted `409 content_lock_path_conflict`; force has not started and no receipt exists, so the creator may retry after publication reconciles.
 
 Unknown query keys, malformed or false booleans, and ambiguous modes return `400 invalid_request`. The accepted wire forms are exactly no query, `graceful=true`, or `force=true`.
@@ -341,7 +343,7 @@ Rust SDK callers use `CreatorLocks::delete_content_lock(DeleteContentLockRequest
 
 ### `GET /creator/content-locks/{lock_id}/deletion`
 
-Returns only `{ "lock_id": "...", "status": "queued|running|completed|failed", "failure_code"?: "..." }`. The optional failure vocabulary is closed to `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. If neither a job nor permanent force receipt exists, it returns `404 content_lock_deletion_not_found`.
+Returns only `{ "lock_id": "...", "status": "queued|running|completed|failed", "failure_code"?: "..." }`. The optional failure vocabulary is closed to `tombstone_missing`, `tombstone_replaced`, `resource_replaced`, `retry_exhausted`, and `state_corrupt`. If neither a job nor permanent force receipt exists, it returns `404 content_lock_deletion_not_found`.
 
 ### `POST /creator/content-locks`
 

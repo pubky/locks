@@ -234,6 +234,26 @@ fn rejects_zero_worker_poll_interval() {
 }
 
 #[test]
+fn rejects_zero_pkarr_republisher_interval_before_runtime_startup() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "key_republisher_interval_seconds = 3600",
+        "key_republisher_interval_seconds = 0",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPkarrRepublisherInterval
+    ));
+}
+
+#[test]
 fn rejects_removed_creator_repositories_section() {
     let temp_dir = tempdir().unwrap();
     let secret_path = temp_dir.path().join("secret.sess");
@@ -340,6 +360,49 @@ fn accepts_closed_deletion_defaults_and_runtime_master_key_contract() {
         900
     );
     assert_eq!(config.deletion.final_read_window_seconds, 900);
+    assert!(config.deletion_worker.enabled);
+    assert_eq!(config.deletion_worker.poll_interval_ms, 250);
+    assert_eq!(config.deletion_worker.claim_timeout_seconds, 60);
+    assert_eq!(config.deletion_worker.shutdown_timeout_seconds, 30);
+    assert_eq!(config.deletion_worker.worker_id, "deletion-worker");
+}
+
+#[test]
+fn rejects_non_positive_or_blank_deletion_worker_settings() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let base = minimal_config(&secret_path, &public_key, "development").replace(
+        "[runtime]",
+        "[deletion_worker]\nenabled = true\npoll_interval_ms = 250\nclaim_timeout_seconds = 60\nshutdown_timeout_seconds = 30\nworker_id = \"deletion-worker\"\n\n[runtime]",
+    );
+
+    for (name, from, to) in [
+        ("poll", "poll_interval_ms = 250", "poll_interval_ms = 0"),
+        (
+            "claim",
+            "claim_timeout_seconds = 60",
+            "claim_timeout_seconds = 0",
+        ),
+        (
+            "shutdown",
+            "shutdown_timeout_seconds = 30",
+            "shutdown_timeout_seconds = 0",
+        ),
+        (
+            "worker-id",
+            "worker_id = \"deletion-worker\"",
+            "worker_id = \"  \"",
+        ),
+    ] {
+        let config_path = temp_dir.path().join(format!("{name}.toml"));
+        std::fs::write(&config_path, base.replace(from, to)).unwrap();
+        let error = load_existing_config_from_path(&config_path).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidDeletionWorkerConfig),
+            "unexpected error for {name}: {error}"
+        );
+    }
 }
 
 #[test]

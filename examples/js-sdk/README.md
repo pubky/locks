@@ -211,6 +211,19 @@ npm --prefix examples/js-sdk run reset-paykit-demo
 
 Do not use `docker compose -f compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
 
+### Migrating version 1 Compose secrets
+
+Compose secret schema version 1 stored only the retired creator-authority encryption key. It cannot be reinterpreted as the runtime master key because the current server derives domain-specific keys from that root. The bootstrap therefore fails closed rather than starting with a different key and leaving encrypted state unreadable.
+
+If startup reports version 1 secrets, perform this **destructive** reset from the repository root:
+
+```bash
+docker compose -f compose.paykit-local-demo.yaml down --volumes --remove-orphans
+rm -f .local/compose-secrets.json .local/locks-server/compose.env
+```
+
+Then run the normal Compose startup command again. This intentionally deletes the local Lock Server identity, Locks and Paykit databases, encrypted runtime state, and disposable Bitcoin/Fulcrum volumes. Do not use this migration reset when any of that local state must be retained; there is no safe automatic key migration for version 1 state.
+
 ### Direct npm server
 
 ```bash

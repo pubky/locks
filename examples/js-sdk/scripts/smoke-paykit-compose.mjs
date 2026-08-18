@@ -179,9 +179,31 @@ try {
   const paykitEnvironment = await readFile(join(generatedRoot, 'paykit-server/paykit.env'), 'utf8');
   assert.match(paykitEnvironment, /^PAYKIT_DATABASE_URL=postgres:\/\/paykit:[A-Za-z0-9_-]+@paykit-postgres:5432\/paykit$/m);
   assert.match(paykitEnvironment, /^PAYKIT_MASTER_KEY=[A-Za-z0-9_-]{43}$/m);
+  const locksEnvironment = await readFile(join(generatedRoot, 'locks-server/compose.env'), 'utf8');
+  assert.match(locksEnvironment, /^PUBKY_LOCK_RUNTIME_MASTER_KEY=[A-Za-z0-9_-]{43}$/m);
+  assert.doesNotMatch(locksEnvironment, /PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY/);
   const firstSecrets = await readFile(join(generatedRoot, 'compose-secrets.json'), 'utf8');
+  const parsedSecrets = JSON.parse(firstSecrets);
+  assert.equal(parsedSecrets.version, 2);
+  assert.match(parsedSecrets.locksRuntimeMasterKey, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(Object.hasOwn(parsedSecrets, 'locksCreatorAuthKey'), false);
   await initializePaykitCompose({ root: generatedRoot });
   assert.equal(await readFile(join(generatedRoot, 'compose-secrets.json'), 'utf8'), firstSecrets);
+
+  const versionOneSecrets = { ...parsedSecrets, version: 1 };
+  versionOneSecrets.locksCreatorAuthKey = versionOneSecrets.locksRuntimeMasterKey;
+  delete versionOneSecrets.locksRuntimeMasterKey;
+  await writeFile(
+    join(generatedRoot, 'compose-secrets.json'),
+    `${JSON.stringify(versionOneSecrets)}\n`,
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    initializePaykitCompose({ root: generatedRoot }),
+    /version 1.*destructive runtime-key reset/,
+  );
+  await writeFile(join(generatedRoot, 'compose-secrets.json'), firstSecrets, { mode: 0o600 });
+
   await chmod(join(generatedRoot, 'compose-secrets.json'), 0o644);
   await assert.rejects(
     initializePaykitCompose({ root: generatedRoot }),

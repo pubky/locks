@@ -14,8 +14,8 @@ use locks_service::application::models::{CreatorAuthorityAuthKind, FrontendSessi
 use locks_service::application::ports::{CreatorAuthorityManager, CreatorAuthorityStatus};
 use locks_service::infrastructure::pubky::{
     AuthorizingPubkyHomeserverStorageClient, PubkyBytesResource, PubkyContentLockRepository,
-    PubkyEntitlementRepository, PubkyHomeserverStorageClient, PubkyLockServicePointerRepository,
-    PubkyPrivResourceRepository,
+    PubkyContentLockTombstoneRepository, PubkyEntitlementRepository, PubkyHomeserverStorageClient,
+    PubkyLockServicePointerRepository, PubkyPrivResourceRepository,
 };
 use serde_json::json;
 use support::creator_publishing_client::LocalCreatorPublishingClient;
@@ -39,6 +39,9 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
             storage.clone(),
             manager.clone(),
         ))),
+        Arc::new(PubkyContentLockTombstoneRepository::new(
+            authorizing_storage(storage.clone(), manager.clone()),
+        )),
         Arc::new(PubkyPrivResourceRepository::new(authorizing_storage(
             storage.clone(),
             manager.clone(),
@@ -162,6 +165,9 @@ async fn production_creator_publishing_http_returns_creator_authority_unavailabl
             storage.clone(),
             manager.clone(),
         ))),
+        Arc::new(PubkyContentLockTombstoneRepository::new(
+            authorizing_storage(storage.clone(), manager.clone()),
+        )),
         Arc::new(PubkyPrivResourceRepository::new(authorizing_storage(
             storage.clone(),
             manager.clone(),

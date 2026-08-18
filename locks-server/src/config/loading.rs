@@ -4,9 +4,9 @@ use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_
 use super::raw::RawConfig;
 use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    DatabaseConfig, DeletionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, WorkerConfig,
+    DatabaseConfig, DeletionConfig, DeletionWorkerConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
 
@@ -149,6 +149,7 @@ fn initialize_default_config(
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
         deletion: DeletionConfig::default(),
+        deletion_worker: DeletionWorkerConfig::default(),
         paykit: Some(PaykitConfig {
             server_url: "http://127.0.0.1:3001/".to_owned(),
             minimum_confirmations: 0,
@@ -199,6 +200,13 @@ retry_initial_backoff_seconds = {} # Initial durable retry delay; must be positi
 retry_max_backoff_seconds = {} # Maximum durable retry delay in seconds.
 final_credential_issuance_window_seconds = {} # Bounded final-credential issuance window; must be 1..=3600.
 final_read_window_seconds = {} # Bounded one-read-per-resource window; must be 1..=3600.
+
+[deletion_worker]
+enabled = {} # true enables the in-process deletion worker; false leaves deletion jobs for another worker process.
+poll_interval_ms = {} # Deletion queue polling interval in milliseconds. Must be > 0.
+claim_timeout_seconds = {} # Seconds before another deletion worker may reclaim a stuck job. Must be > 0.
+shutdown_timeout_seconds = {} # Maximum graceful deletion-worker shutdown wait in seconds. Must be > 0.
+worker_id = "{}" # Stable, non-blank deletion-worker identity. Use a unique value per worker process.
 
 [logging]
 level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or EnvFilter syntax. Higher verbosity may expose operational detail in logs.
@@ -257,6 +265,11 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.deletion.retry_max_backoff_seconds,
         config.deletion.final_credential_issuance_window_seconds,
         config.deletion.final_read_window_seconds,
+        config.deletion_worker.enabled,
+        config.deletion_worker.poll_interval_ms,
+        config.deletion_worker.claim_timeout_seconds,
+        config.deletion_worker.shutdown_timeout_seconds,
+        config.deletion_worker.worker_id,
         config.logging.level,
         config.pkdns.public_ip,
         config.pkdns.public_pubky_tls_port.unwrap_or(6287),

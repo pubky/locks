@@ -4,6 +4,14 @@ use locks_core::ids::{CreatorPubky, GuardedResourceHash};
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
 
+/// Closed, non-destructive classification of a frozen guarded-resource generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedResourceReadback {
+    Exact,
+    Missing,
+    Replaced,
+}
+
 /// Repository for guarded resource bytes used by the first retrieval/access slice.
 #[async_trait]
 pub trait GuardedResourceRepository: Send + Sync {
@@ -42,4 +50,20 @@ pub trait GuardedResourceRepository: Send + Sync {
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<bool, ApplicationError>;
+
+    /// Reads and classifies the current generation without deleting any bytes.
+    async fn read_guarded_resource_generation(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        expected_hash: &GuardedResourceHash,
+    ) -> Result<GuardedResourceReadback, ApplicationError> {
+        Ok(
+            match self.get_current_guarded_resource(creator, path).await? {
+                None => GuardedResourceReadback::Missing,
+                Some(record) if record.hash == *expected_hash => GuardedResourceReadback::Exact,
+                Some(_) => GuardedResourceReadback::Replaced,
+            },
+        )
+    }
 }
