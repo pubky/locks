@@ -245,6 +245,14 @@ mod tests {
         ) -> Result<Option<ContentLock>, ApplicationError> {
             Ok(self.0.clone())
         }
+
+        async fn delete_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _content_lock_path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!("validation must not delete content locks")
+        }
     }
 
     fn content_lock() -> ContentLock {
@@ -264,7 +272,8 @@ mod tests {
                 params: json!({
                     "recipient_pubky": CREATOR,
                     "amount": "50000",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }),
             }],
             lock_logic: LockLogic::All {

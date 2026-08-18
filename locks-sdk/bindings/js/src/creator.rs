@@ -8,7 +8,7 @@ use crate::session::{BrowserPkarrResolver, fetch_authorized_empty, fetch_authori
 #[cfg(any(test, target_arch = "wasm32"))]
 use crate::session::{JsAuthorizedRequestPlan, JsRequestBody};
 #[cfg(any(test, target_arch = "wasm32"))]
-use locks_core::ids::LockServerPubky;
+use locks_core::ids::{LockId, LockServerPubky};
 #[cfg(any(test, target_arch = "wasm32"))]
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
@@ -62,6 +62,32 @@ impl DeleteGuardedResourceOptions {
     #[wasm_bindgen(getter)]
     pub fn path(&self) -> String {
         self.path.clone()
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteContentLockMode {
+    DefaultGraceful,
+    ExplicitGraceful,
+    Force,
+}
+
+#[wasm_bindgen]
+pub struct DeleteContentLockOptions {
+    mode: DeleteContentLockMode,
+}
+
+#[wasm_bindgen]
+impl DeleteContentLockOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new(mode: DeleteContentLockMode) -> Self {
+        Self { mode }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn mode(&self) -> DeleteContentLockMode {
+        self.mode
     }
 }
 
@@ -213,6 +239,14 @@ impl CreateContentLockRequestBuilder {
             .criteria
             .as_ref()
             .ok_or_else(|| "content lock request requires criteria".to_owned())?;
+        let typed_criteria: Vec<locks_core::lock_policy::Criterion> =
+            serde_json::from_value(criteria.clone())
+                .map_err(|err| format!("invalid content lock criteria: {err}"))?;
+        for criterion in &typed_criteria {
+            criterion
+                .validate_params()
+                .map_err(|err| format!("invalid content lock criterion: {err}"))?;
+        }
         body.insert("criteria".to_owned(), criteria.clone());
         let lock_logic = state
             .lock_logic
@@ -358,6 +392,41 @@ impl Creator {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = deleteContentLock)]
+    pub async fn delete_content_lock(
+        &self,
+        lock_id: String,
+        options: Option<DeleteContentLockOptions>,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let request = self
+            .build_delete_content_lock_request(&lock_id, options.as_ref())
+            .map_err(crate::js_error::invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        fetch_authorized_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = contentLockDeletionStatus)]
+    pub async fn content_lock_deletion_status(
+        &self,
+        lock_id: String,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let request = self
+            .build_content_lock_deletion_status_request(&lock_id)
+            .map_err(crate::js_error::invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        fetch_authorized_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = setLockServicePointer)]
     pub async fn set_lock_service_pointer(
         &self,
@@ -408,6 +477,44 @@ impl Creator {
             },
         );
         self.authorized_request_plan(request)
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_delete_content_lock_request(
+        &self,
+        lock_id: &str,
+        options: Option<&DeleteContentLockOptions>,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
+        let lock_id = LockId::from_str(lock_id).map_err(|err| format!("invalid lock id: {err}"))?;
+        let mode = match options.map(|options| options.mode) {
+            None | Some(DeleteContentLockMode::DefaultGraceful) => {
+                locks_sdk::DeleteContentLockMode::DefaultGraceful
+            }
+            Some(DeleteContentLockMode::ExplicitGraceful) => {
+                locks_sdk::DeleteContentLockMode::ExplicitGraceful
+            }
+            Some(DeleteContentLockMode::Force) => locks_sdk::DeleteContentLockMode::Force,
+        };
+        Ok(self.authorized_request_plan(
+            self.session
+                .inner()
+                .creator()
+                .delete_content_lock(locks_sdk::DeleteContentLockRequest { lock_id, mode }),
+        ))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_content_lock_deletion_status_request(
+        &self,
+        lock_id: &str,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
+        let lock_id = LockId::from_str(lock_id).map_err(|err| format!("invalid lock id: {err}"))?;
+        Ok(self.authorized_request_plan(
+            self.session
+                .inner()
+                .creator()
+                .get_content_lock_deletion(lock_id),
+        ))
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -541,6 +648,52 @@ mod tests {
     }
 
     #[test]
+    fn content_lock_deletion_requests_delegate_to_closed_rust_sdk_routes() {
+        let creator = Creator::new(test_session());
+        let lock_id = LockId::from_hash(locks_core::ids::LockHash::from_bytes([9; 32]));
+
+        let graceful = creator
+            .build_delete_content_lock_request(&lock_id.to_string(), None)
+            .unwrap();
+        assert_eq!(graceful.method, "DELETE");
+        assert_eq!(graceful.path, format!("/creator/content-locks/{lock_id}"));
+        assert_eq!(graceful.authorization, "Bearer frontend-session-secret");
+
+        let explicit_graceful = creator
+            .build_delete_content_lock_request(
+                &lock_id.to_string(),
+                Some(&DeleteContentLockOptions::new(
+                    DeleteContentLockMode::ExplicitGraceful,
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            explicit_graceful.path,
+            format!("/creator/content-locks/{lock_id}?graceful=true")
+        );
+
+        let force = creator
+            .build_delete_content_lock_request(
+                &lock_id.to_string(),
+                Some(&DeleteContentLockOptions::new(DeleteContentLockMode::Force)),
+            )
+            .unwrap();
+        assert_eq!(
+            force.path,
+            format!("/creator/content-locks/{lock_id}?force=true")
+        );
+
+        let status = creator
+            .build_content_lock_deletion_status_request(&lock_id.to_string())
+            .unwrap();
+        assert_eq!(status.method, "GET");
+        assert_eq!(
+            status.path,
+            format!("/creator/content-locks/{lock_id}/deletion")
+        );
+    }
+
+    #[test]
     fn create_content_lock_request_builder_primary_only_build_succeeds() {
         let builder = complete_builder();
         let primary = resource("/priv/locks.app/content/example.txt", "hash", 13);
@@ -617,6 +770,31 @@ mod tests {
         let err = builder.build_value().unwrap_err();
 
         assert!(format!("{err:?}").contains("criteria"));
+    }
+
+    #[test]
+    fn create_content_lock_request_builder_rejects_invalid_paykit_payment_in() {
+        let builder = complete_builder();
+        builder.state.borrow_mut().primary_resource =
+            Some(resource("/priv/locks.app/content/example.txt", "hash", 13));
+        builder.state.borrow_mut().criteria = Some(serde_json::json!([{
+            "criterion_id": "payment",
+            "verifier_type": "paykit-payment",
+            "params": {
+                "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                "amount": "50000",
+                "asset": "BTC",
+                "payment_in": 0
+            }
+        }]));
+        builder.state.borrow_mut().lock_logic = Some(serde_json::json!({
+            "type": "all",
+            "criteria": ["payment"]
+        }));
+
+        let err = builder.build_value().unwrap_err();
+
+        assert!(err.contains("payment_in"));
     }
 
     #[test]

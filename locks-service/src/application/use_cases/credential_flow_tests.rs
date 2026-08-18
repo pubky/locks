@@ -502,6 +502,14 @@ impl ContentLockRepository for FakeContentLocks {
     ) -> Result<Option<ContentLock>, ApplicationError> {
         Ok(self.content_lock.lock().unwrap().clone())
     }
+
+    async fn delete_content_lock(
+        &self,
+        _creator: &CreatorPubky,
+        _content_lock_path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError> {
+        unreachable!("credential flow must not delete content locks")
+    }
 }
 
 struct FakeEntitlements {

@@ -1,4 +1,6 @@
 pub mod access_credentials;
+pub mod content_lock_deletions;
+pub mod content_lock_ownership;
 pub mod content_locks;
 pub mod entitlements;
 pub mod guarded_resources;

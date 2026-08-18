@@ -8,8 +8,9 @@ use crate::api::creator_authority::{
     exchange_frontend_session_code_route, frontend_session_signout_route,
 };
 use crate::api::creator_publishing::{
-    create_content_lock_for_authenticated_creator,
+    create_content_lock_for_authenticated_creator, delete_content_lock_for_authenticated_creator,
     delete_guarded_resource_for_authenticated_creator,
+    get_content_lock_deletion_status_for_authenticated_creator,
     register_guarded_resource_empty_tail_for_authenticated_creator,
     register_guarded_resource_for_authenticated_creator,
     set_lock_service_pointer_for_authenticated_creator,
@@ -64,6 +65,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/creator/content-locks",
             post(create_content_lock_for_authenticated_creator),
+        )
+        .route(
+            "/creator/content-locks/{lock_id}",
+            delete(delete_content_lock_for_authenticated_creator),
+        )
+        .route(
+            "/creator/content-locks/{lock_id}/deletion",
+            get(get_content_lock_deletion_status_for_authenticated_creator),
         )
         .route(
             "/creator/lock-service-config",

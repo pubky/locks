@@ -1,10 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
+use axum::routing::post;
 use locks_core::ids::{
     BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
 };
@@ -14,23 +18,28 @@ use locks_core::lock_policy::{
 };
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_server::api::routes::router;
-use locks_server::app_state::AppState;
+use locks_server::app_state::{AppState, ReaderPubkyResolver};
 use locks_server::config::{
     ContentLocksConfig, CreatorAuthorityAcquisitionConfig, DatabaseConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PkdnsConfig, PubkyConfig,
+    FilesystemLockServerIdentityProvider, LockServerCredentialsConfig, LockServerIdentityProvider,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
     RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::{
-    AccessCredential, AccessCredentialLookupKey, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
+    AccessCredential, AccessCredentialLookupKey, ContentLockDeletionJob,
+    ContentLockOwnershipStatus, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
     CreatorAuthoritySecret, VerificationTaskStatus,
 };
+use locks_service::application::ports::ContentLockDeletionRepository;
 use locks_service::infrastructure::memory::{
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
     lock_service_pointers::InMemoryLockServicePointerRepository,
 };
-use locks_service::infrastructure::postgres::{CreatorAuthoritySecretCipher, run_migrations};
+use locks_service::infrastructure::postgres::{
+    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository, run_migrations,
+};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
@@ -45,8 +54,20 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         return;
     };
     let content_lock = content_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let guarded_paths = vec![content_lock.primary_resource.as_ref().unwrap().path.clone()];
 
     let first_state = app_state(database.pool().clone());
+    first_state
+        .content_lock_ownership()
+        .reserve_paths(&creator(), &guarded_paths, &lock_id)
+        .await
+        .unwrap();
+    first_state
+        .content_lock_ownership()
+        .mark_paths_published(&creator(), &guarded_paths, &lock_id)
+        .await
+        .unwrap();
     seed_content_lock(&first_state, content_lock.clone()).await;
     let first_router = router(first_state.clone());
     submit_task(&first_router, submitted_proof_bundle_for(&content_lock)).await;
@@ -59,6 +80,14 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         .unwrap()
         .unwrap();
     assert_eq!(recreated_task.status, VerificationTaskStatus::Pending);
+    let ownership = recreated_state
+        .content_lock_ownership()
+        .get_path_ownership(&creator(), &guarded_paths[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ownership.lock_id, lock_id);
+    assert_eq!(ownership.status, ContentLockOwnershipStatus::Published);
 
     seed_content_lock(&recreated_state, content_lock.clone()).await;
     let worker = VerificationWorker::from_state(&recreated_state);
@@ -149,6 +178,212 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
         loaded.secret.expose_secret(),
         "legacy-cookie-session-secret"
     );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn deletion_first_proof_submission_returns_409_without_calling_paykit() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let invoice_calls = Arc::new(AtomicUsize::new(0));
+    let paykit_state = Arc::clone(&invoice_calls);
+    let paykit_app = axum::Router::new().route(
+        "/invoices",
+        post(move || {
+            let paykit_state = Arc::clone(&paykit_state);
+            async move {
+                paykit_state.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paykit_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, paykit_app).await.unwrap() });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let secret_path = temp_dir.path().join("lock-server.keypair-seed");
+    let public_key = FilesystemLockServerIdentityProvider
+        .generate_secret(&secret_path)
+        .unwrap();
+    let mut config = test_config();
+    config.credentials.lock_server_secret_key = secret_path;
+    config.credentials.lock_server_public_key = public_key;
+    config.paykit = Some(PaykitConfig {
+        server_url: paykit_url,
+        minimum_confirmations: 0,
+    });
+    let state = AppState::new_with_postgres_runtime_and_creator_repositories(
+        config,
+        database.pool().clone(),
+        CreatorAuthoritySecretCipher::new([7; 32]),
+        Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+    .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader));
+    let lock = paykit_content_lock();
+    seed_content_lock(&state, lock.clone()).await;
+    PostgresContentLockDeletionRepository::new(database.pool().clone())
+        .insert_job(
+            ContentLockDeletionJob::new(
+                uuid::Uuid::new_v4(),
+                lock.clone(),
+                datetime!(2026-08-12 06:00:00 UTC),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = router(state)
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": paykit_submission_for(&lock) }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "content_lock_deletion_in_progress",
+                "message": "content lock deletion is in progress"
+            }
+        })
+    );
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 0);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_resolution() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let invoice_calls = Arc::new(AtomicUsize::new(0));
+    let paykit_state = Arc::clone(&invoice_calls);
+    let paykit_app = axum::Router::new().route(
+        "/invoices",
+        post(move || {
+            let call = paykit_state.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paykit_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, paykit_app).await.unwrap() });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let secret_path = temp_dir.path().join("lock-server.keypair-seed");
+    let public_key = FilesystemLockServerIdentityProvider
+        .generate_secret(&secret_path)
+        .unwrap();
+    let mut config = test_config();
+    config.credentials.lock_server_secret_key = secret_path;
+    config.credentials.lock_server_public_key = public_key;
+    config.paykit = Some(PaykitConfig {
+        server_url: paykit_url,
+        minimum_confirmations: 0,
+    });
+    let initial_state = AppState::new_with_postgres_runtime_and_creator_repositories(
+        config.clone(),
+        database.pool().clone(),
+        CreatorAuthoritySecretCipher::new([7; 32]),
+        Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+    .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader));
+    let lock = paykit_content_lock();
+    let submitted = paykit_submission_for(&lock);
+    seed_content_lock(&initial_state, lock.clone()).await;
+
+    let first = router(initial_state)
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    PostgresContentLockDeletionRepository::new(database.pool().clone())
+        .insert_job(
+            ContentLockDeletionJob::new(
+                uuid::Uuid::new_v4(),
+                lock,
+                datetime!(2026-08-12 06:00:00 UTC),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let tombstoned_state = AppState::new_with_postgres_runtime_and_creator_repositories(
+        config,
+        database.pool().clone(),
+        CreatorAuthoritySecretCipher::new([7; 32]),
+        Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+    .with_reader_pubky_resolver(Arc::new(NeverResolvesReader));
+    let replay_router = router(tombstoned_state);
+    let replay = replay_router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_json(replay).await["status"], "pending");
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 2);
+
+    let ready_replay = replay_router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ready_replay.status(), StatusCode::OK);
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 2);
+
+    let mut changed = submitted;
+    changed.reader_public_key = Some(
+        CreatorPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+            .unwrap(),
+    );
+    let conflict = replay_router
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": changed }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 2);
 
     database.cleanup().await;
 }
@@ -373,6 +608,58 @@ fn content_lock() -> ContentLock {
             ),
         },
         created_at: datetime!(2026-05-29 12:00:00 UTC),
+    }
+}
+
+fn paykit_content_lock() -> ContentLock {
+    let mut lock = content_lock();
+    lock.criteria = vec![Criterion {
+        criterion_id: "criterion-1".to_owned(),
+        verifier_type: VerifierType::PaykitPayment,
+        params: json!({
+            "recipient_pubky": creator().to_string(),
+            "amount": "50000",
+            "asset": "BTC",
+            "payment_in": 24
+        }),
+    }];
+    lock
+}
+
+fn paykit_submission_for(content_lock: &ContentLock) -> SubmittedProofBundle {
+    SubmittedProofBundle {
+        version: SUBMITTED_PROOF_BUNDLE_VERSION,
+        bundle_id: bundle_id(),
+        pubky_lock_resource: PubkyLockResource::new(
+            content_lock.creator.clone(),
+            content_lock.content_lock_path().unwrap(),
+        ),
+        reader_public_key: Some(creator()),
+        proofs: vec![Proof {
+            criterion_id: "criterion-1".to_owned(),
+            verifier_type: VerifierType::PaykitPayment,
+            payload: json!({}),
+        }],
+    }
+}
+
+#[derive(Debug)]
+struct AlwaysResolvesReader;
+
+#[async_trait]
+impl ReaderPubkyResolver for AlwaysResolvesReader {
+    async fn reader_has_homeserver(&self, _reader: &CreatorPubky) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct NeverResolvesReader;
+
+#[async_trait]
+impl ReaderPubkyResolver for NeverResolvesReader {
+    async fn reader_has_homeserver(&self, _reader: &CreatorPubky) -> bool {
+        false
     }
 }
 

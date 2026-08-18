@@ -9,6 +9,7 @@ use locks_core::verification::SubmittedProofBundle;
 use crate::application::errors::ApplicationError;
 use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
 use crate::application::ports::VerificationTaskRepository;
+use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
 
 /// Postgres-backed repository for Lock Server private verification task state.
 #[derive(Debug, Clone)]
@@ -18,27 +19,27 @@ pub struct PostgresVerificationTaskRepository {
 
 #[derive(Debug, FromRow)]
 pub(super) struct VerificationTaskRow {
-    task_id: String,
-    creator: String,
-    bundle_id: String,
-    status: String,
-    submitted_proof_bundle: serde_json::Value,
-    submitted_at: time::OffsetDateTime,
-    started_at: Option<time::OffsetDateTime>,
-    completed_at: Option<time::OffsetDateTime>,
-    failure_message: Option<String>,
+    pub(super) task_id: String,
+    pub(super) creator: String,
+    pub(super) bundle_id: String,
+    pub(super) status: String,
+    pub(super) submitted_proof_bundle: serde_json::Value,
+    pub(super) submitted_at: time::OffsetDateTime,
+    pub(super) started_at: Option<time::OffsetDateTime>,
+    pub(super) completed_at: Option<time::OffsetDateTime>,
+    pub(super) failure_message: Option<String>,
 }
 
-struct VerificationTaskWriteRow {
-    task_id: String,
-    creator: String,
-    bundle_id: String,
-    status: &'static str,
-    submitted_proof_bundle: serde_json::Value,
-    submitted_at: time::OffsetDateTime,
-    started_at: Option<time::OffsetDateTime>,
-    completed_at: Option<time::OffsetDateTime>,
-    failure_message: Option<String>,
+pub(super) struct VerificationTaskWriteRow {
+    pub(super) task_id: String,
+    pub(super) creator: String,
+    pub(super) bundle_id: String,
+    pub(super) status: &'static str,
+    pub(super) submitted_proof_bundle: serde_json::Value,
+    pub(super) submitted_at: time::OffsetDateTime,
+    pub(super) started_at: Option<time::OffsetDateTime>,
+    pub(super) completed_at: Option<time::OffsetDateTime>,
+    pub(super) failure_message: Option<String>,
 }
 
 pub(super) const VERIFICATION_TASK_ROW_COLUMNS: &str = "
@@ -66,6 +67,40 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
         let row = VerificationTaskWriteRow::try_from(&task)?;
+        let lock_id = task.submitted_proof_bundle.pubky_lock_resource.lock_id();
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+
+        let handle_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM verification_tasks WHERE creator = $1 AND bundle_id = $2
+            )",
+        )
+        .bind(&row.creator)
+        .bind(&row.bundle_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if handle_exists {
+            return Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            });
+        }
+
+        let deletion_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM content_lock_deletion_jobs WHERE creator = $1 AND lock_id = $2
+            )",
+        )
+        .bind(&row.creator)
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if deletion_exists {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+
         let result = sqlx::query(
             "INSERT INTO verification_tasks (
                 task_id,
@@ -90,7 +125,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         .bind(row.started_at)
         .bind(row.completed_at)
         .bind(row.failure_message)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
 
@@ -100,7 +135,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
             });
         }
 
-        Ok(())
+        transaction.commit().await.map_err(storage_error)
     }
 
     async fn update_verification_task(
@@ -150,7 +185,12 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE task_id = $1::uuid"
+            WHERE task_id = $1::uuid
+              AND NOT EXISTS (
+                  SELECT 1 FROM paykit_task_admissions
+                  WHERE verification_task_id = verification_tasks.task_id
+                    AND ready = FALSE
+              )"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(task_id.to_string())
@@ -169,7 +209,12 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE creator = $1 AND bundle_id = $2"
+            WHERE creator = $1 AND bundle_id = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM paykit_task_admissions
+                  WHERE verification_task_id = verification_tasks.task_id
+                    AND ready = FALSE
+              )"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(creator.to_string())

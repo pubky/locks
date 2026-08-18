@@ -52,6 +52,14 @@ pub struct CreateContentLockHttpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentLockDeletionStatusHttpResponse {
+    pub lock_id: LockId,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetLockServicePointerHttpResponse {
     pub creator: CreatorPubky,
     pub path: &'static str,

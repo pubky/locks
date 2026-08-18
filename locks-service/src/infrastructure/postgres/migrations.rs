@@ -49,6 +49,12 @@ mod tests {
         assert_table_exists(&mut connection, "pending_creator_connect_flows").await;
         assert_table_exists(&mut connection, "frontend_session_codes").await;
         assert_table_exists(&mut connection, "frontend_sessions").await;
+        assert_table_exists(&mut connection, "content_lock_ownership").await;
+        assert_table_exists(&mut connection, "content_lock_deletion_jobs").await;
+        assert_table_exists(&mut connection, "content_lock_force_deletion_receipts").await;
+        assert_table_exists(&mut connection, "content_lock_publication_intents").await;
+        assert_table_exists(&mut connection, "content_lock_deletion_task_snapshot").await;
+        assert_table_exists(&mut connection, "paykit_task_admissions").await;
         assert_column_exists(&mut connection, "verification_tasks", "creator").await;
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;
@@ -70,10 +76,39 @@ mod tests {
         .await;
         assert_column_exists(&mut connection, "frontend_session_codes", "code_hash").await;
         assert_column_exists(&mut connection, "frontend_sessions", "token_hash").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "creator").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "guarded_path").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "lock_id").await;
+        assert_column_exists(&mut connection, "content_lock_ownership", "status").await;
+        assert_column_exists(
+            &mut connection,
+            "content_lock_deletion_jobs",
+            "frozen_content_lock",
+        )
+        .await;
+        assert_column_exists(&mut connection, "content_lock_deletion_jobs", "claim_token").await;
+        assert_column_exists(
+            &mut connection,
+            "content_lock_deletion_jobs",
+            "force_requested_at",
+        )
+        .await;
         assert_unique_constraint_exists(
             &mut connection,
             "verification_tasks",
             "verification_tasks_creator_bundle_unique",
+        )
+        .await;
+        assert_unique_constraint_exists(
+            &mut connection,
+            "content_lock_ownership",
+            "content_lock_ownership_creator_path_unique",
+        )
+        .await;
+        assert_unique_constraint_exists(
+            &mut connection,
+            "content_lock_deletion_jobs",
+            "content_lock_deletion_jobs_creator_lock_unique",
         )
         .await;
         drop(connection);

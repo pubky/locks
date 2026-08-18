@@ -27,13 +27,15 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 {
   "recipient_pubky": "pubky<creator>",
   "amount": "50000",
-  "asset": "BTC"
+  "asset": "BTC",
+  "payment_in": 24
 }
 ```
 
 - `recipient_pubky` must equal the canonical content-lock creator.
 - `amount` is a positive decimal integer string in the asset's base unit.
 - `asset` is an opaque, non-empty string to Locks. Paykit Server owns deployment-specific asset support and base-unit interpretation.
+- `payment_in` is a required, nonzero JSON `u64` number of whole hours in Locks policy.
 - V1 permits exactly one payment criterion, referenced exactly once by the lock logic, and exactly one submitted payment proof.
 - The submitted payment proof payload is `{}`. `reader_public_key` is top-level submission data.
 - Content-lock authoring does not require runtime Paykit configuration or availability.
@@ -44,14 +46,14 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 
 1. apply rate limiting;
 2. validate proof shape;
-3. load and validate the current canonical Lock Resource and payment policy;
-4. resolve the current reader through Pubky discovery;
-5. compare any persisted lifecycle under `{ creator, bundle_id }`;
-6. return an exact persisted replay or reject changed submitted proof material with `409 task_state_conflict`;
-7. require configured Paykit and create an invoice only for a new identity; and
-8. insert the verification task with post-invoice race reconciliation.
+3. compare any durable lifecycle or admission reservation under `{ creator, bundle_id }` before mutable Lock Resource lookup or reader discovery;
+4. return an exact ready replay, resume an exact unready reservation from its persisted submission fields, or reject changed submitted proof material with `409 task_state_conflict`;
+5. only for a genuinely new identity, load and validate the current canonical Lock Resource and payment policy and resolve the current reader through Pubky discovery;
+6. require configured Paykit and atomically persist a hidden, unclaimable admission reservation under the per-lock deletion/admission fence;
+7. create or idempotently replay the Paykit invoice; and
+8. mark the reservation ready so the verification task becomes publicly visible and worker-claimable.
 
-Exact and changed persisted replays do not call Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID.
+Exact ready replay does not call Paykit. Exact unready replay requires configured Paykit and repeats the same persisted idempotent invoice request before marking the reservation ready. Changed replay conflicts without calling Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID.
 
 ### Invoice request
 
@@ -67,7 +69,7 @@ For a new lifecycle identity, Locks sends RFC 8785 canonical JSON to `POST /invo
 
 Locks signs the exact canonical body bytes with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`.
 
-The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay must return the original generic success without repeating mutable lookups, allocation, address creation, or delivery side effects. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Locks accepts any Paykit 2xx response and ignores its body; other invoice failures return `502 paykit_invoice_creation_failed` without creating a new verification task.
+The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay must return the original generic success without repeating mutable lookups, allocation, address creation, or delivery side effects. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Locks accepts any Paykit 2xx response and ignores its body; other invoice failures return `502 paykit_invoice_creation_failed` while the internal Locks reservation remains hidden and unclaimable for exact retry.
 
 ### Status request and access policy
 
@@ -92,7 +94,7 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 
 ### Runtime boundary
 
-- A new payment lifecycle requires `[paykit]`; exact persisted replay does not.
+- A new payment lifecycle and exact unready reconciliation require `[paykit]`; exact ready replay does not.
 - Paykit HTTP connect timeout is 5 seconds and whole-request timeout is 20 seconds.
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
@@ -112,7 +114,7 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 
 - Both services must implement the same canonical-body signing contract.
 - Paykit must parse the public Locks payment criterion and therefore depends on its versioned shape.
-- Exact submission replay intentionally performs current canonical lock and reader preflight before returning persisted lifecycle state.
+- Incomplete admission reservations require durable reconciliation before deletion may start the Paykit drain.
 - Unpaid invoices and pending Locks tasks have no protocol expiry in v1 and therefore require operational retention policy outside the payment-status contract.
 
 ## Rejected alternatives
