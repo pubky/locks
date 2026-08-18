@@ -134,7 +134,7 @@ key_republisher_interval_seconds = 3600
 
 `public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pubky.pkarr_relays = ["http://127.0.0.1:15411"]`.
 
-PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds.
+PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds. Initial publication begins only after the HTTP listener binds successfully; it is cancellation-aware and bounded by `deletion_worker.shutdown_timeout_seconds`, the existing lifecycle deadline.
 
 `credentials.lock_server_secret_key` must contain:
 
@@ -221,6 +221,8 @@ Migration `0011_verification_terminal_reason` performs the approved staging-only
 Migration `0013_invoice_admission_foundation` adds Lock-Server-private, versioned invoice-admission intent, `invoice_pending`/`ready`/`failed` phase, database-time ten-minute deadline, due/attempt fields, and claim-token lease fencing to existing verification tasks. Existing tasks are marked `ready` because tasks created before this migration were already admitted. Verification claims exclude `invoice_pending` tasks. Current runtime wires new payment submission to this durable phase and runs invoice admission through its separately claimed worker before verification.
 
 Migration `0014_invoice_admission_retry_reason` adds the closed `reader_wallet_setup_needed` retry projection for pending invoice admission. It supports viewer-safe task polling while Reader wallet registry setup is retried; it does not grant entitlement or mark invoice admission ready.
+
+Migration `0023_content_lock_deleted_terminal_reason` extends the closed verification terminal-reason constraint with `content_lock_deleted`. Graceful deletion uses it when unresolved non-Paykit tasks are expired, preserving valid lifecycle timestamps and preventing untyped terminal state.
 
 Sensitive runtime material is encrypted before storage. A root key comes from an env var named by config:
 
@@ -325,6 +327,19 @@ For `paykit-payment`, valid request rejection/cancellation and proposal/payment 
 
 Scheduled retries and crash recovery are separate mechanisms. Expected retryable results explicitly release the current claim and set `next_attempt_at`. If a worker crashes while a task is `in_progress`, another worker may reclaim it only after `claim_expires_at`; only the worker that still owns an active claim may schedule its retry.
 
+The deletion worker has an independent closed runtime section:
+
+```toml
+[deletion_worker]
+enabled = true
+poll_interval_ms = 250
+claim_timeout_seconds = 60
+shutdown_timeout_seconds = 30
+worker_id = "deletion-worker"
+```
+
+All three numeric values must be positive and `worker_id` must be nonblank. Queue polling cadence is independent from durable deletion retry backoff. `shutdown_timeout_seconds` bounds coordinated worker and HTTP shutdown; once shutdown begins, the deletion worker must stop acquiring new claims.
+
 ## Health and readiness
 
 `GET /healthz` reports process liveness:
@@ -333,7 +348,7 @@ Scheduled retries and crash recovery are separate mechanisms. Expected retryable
 { "status": "ok" }
 ```
 
-`GET /readyz` reports runtime dependency readiness:
+`GET /readyz` reports runtime dependency and enabled-worker readiness:
 
 ```json
 {
@@ -344,3 +359,5 @@ Scheduled retries and crash recovery are separate mechanisms. Expected retryable
 ```
 
 Health/readiness responses must remain secret-free. They must not include database URLs, secret paths, worker IDs, task counts, public keys, credentials, raw errors, or submitted proof material.
+
+The response status is `not_ready` while an enabled worker is starting, stopping, or unexpectedly stopped. A transient deletion dependency failure reports `degraded` until successful dependency evidence. Ordinary pending deletion work, advisory-lock contention, and a correctly terminalized failed deletion job do not degrade readiness.

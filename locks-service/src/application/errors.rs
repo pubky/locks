@@ -54,6 +54,9 @@ pub enum ApplicationError {
     /// Paykit returned a malformed or unsupported payment-status response.
     #[error("invalid paykit payment status response")]
     PaykitPaymentStatusInvalidResponse,
+    /// A verification provider is transiently unavailable and should be retried later.
+    #[error("verification dependency unavailable")]
+    VerificationDependencyUnavailable,
     /// Submitted payment proof does not match its canonical content lock criterion.
     #[error("invalid paykit payment submission")]
     InvalidPaykitPaymentSubmission,

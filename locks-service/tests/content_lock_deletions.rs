@@ -18,17 +18,21 @@ use locks_service::{
     application::{
         models::{
             AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
-            ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-            ContentLockDeletionState, PrepareForceDeletionResult, VerificationTaskRecord,
-            VerificationTaskStatus,
+            AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
+            ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
+            FinalAccessWindows, InitializeFinalAccessWindowsResult, PrepareForceDeletionResult,
+            VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
         },
         ports::{
-            AccessCredentialStore, Clock, ContentLockDeletionRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
+            ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
+            ContentLockDeletionRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
+        use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
     infrastructure::memory::{
         access_credentials::InMemoryAccessCredentialStore,
+        content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
         content_lock_deletions::InMemoryContentLockDeletionRepository,
         verification_task_claims::InMemoryVerificationTaskClaimer,
         verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
@@ -38,6 +42,63 @@ use locks_service::{
 use serde_json::json;
 use time::macros::datetime;
 use uuid::Uuid;
+
+struct PausingVerificationTaskRepository {
+    inner: Arc<InMemoryVerificationTaskRepository>,
+    pause_next_get: std::sync::atomic::AtomicBool,
+    get_entered: tokio::sync::Notify,
+    release_get: tokio::sync::Notify,
+}
+
+impl PausingVerificationTaskRepository {
+    fn new(inner: Arc<InMemoryVerificationTaskRepository>) -> Self {
+        Self {
+            inner,
+            pause_next_get: std::sync::atomic::AtomicBool::new(true),
+            get_entered: tokio::sync::Notify::new(),
+            release_get: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl VerificationTaskRepository for PausingVerificationTaskRepository {
+    async fn insert_verification_task(
+        &self,
+        task: VerificationTaskRecord,
+    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+        self.inner.insert_verification_task(task).await
+    }
+
+    async fn update_verification_task(
+        &self,
+        task: VerificationTaskRecord,
+    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+        self.inner.update_verification_task(task).await
+    }
+
+    async fn get_verification_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<VerificationTaskRecord>, locks_service::application::errors::ApplicationError>
+    {
+        if self
+            .pause_next_get
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.get_entered.notify_one();
+            self.release_get.notified().await;
+        }
+        self.inner.get_verification_task(task_id).await
+    }
+
+    async fn delete_verification_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+        self.inner.delete_verification_task(task_id).await
+    }
+}
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const NOW: time::OffsetDateTime = datetime!(2026-08-12 05:00:00 UTC);
@@ -50,6 +111,104 @@ impl Clock for FixedClock {
     fn now(&self) -> time::OffsetDateTime {
         self.0
     }
+}
+
+#[derive(Debug)]
+struct MutableClock(std::sync::Mutex<time::OffsetDateTime>);
+
+impl MutableClock {
+    fn new(now: time::OffsetDateTime) -> Self {
+        Self(std::sync::Mutex::new(now))
+    }
+
+    fn set(&self, now: time::OffsetDateTime) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl Clock for MutableClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn in_memory_action_ownership_is_exclusive_and_reacquirable() {
+    let repository = Arc::new(
+        InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+            InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),
+        )),
+    );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job).await.unwrap();
+    let claimed = repository
+        .claim_next("worker", time::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let ownership = InMemoryContentLockDeletionActionOwnership::new(repository);
+    let request = || ContentLockDeletionActionClaim {
+        job_id: claimed.job.job_id,
+        worker_id: "worker",
+        claim_token: claimed.claim_token,
+        expected_phase: claimed.job.phase,
+        force: false,
+    };
+
+    let ContentLockDeletionActionAcquireResult::Acquired(first) =
+        ownership.try_acquire(request()).await.unwrap()
+    else {
+        panic!("live claim must acquire")
+    };
+    assert!(matches!(
+        ownership.try_acquire(request()).await.unwrap(),
+        ContentLockDeletionActionAcquireResult::Busy
+    ));
+
+    first.release().await.unwrap();
+    let ContentLockDeletionActionAcquireResult::Acquired(reacquired) =
+        ownership.try_acquire(request()).await.unwrap()
+    else {
+        panic!("released claim must reacquire")
+    };
+    drop(reacquired);
+    assert!(matches!(
+        ownership.try_acquire(request()).await.unwrap(),
+        ContentLockDeletionActionAcquireResult::Acquired(_)
+    ));
+}
+
+#[tokio::test]
+async fn in_memory_action_ownership_rejects_expired_claim_at_half_open_boundary() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let repository = Arc::new(
+        InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+            InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
+        )),
+    );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job).await.unwrap();
+    let claimed = repository
+        .claim_next("worker", time::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    clock.set(NOW + time::Duration::minutes(5));
+    let ownership = InMemoryContentLockDeletionActionOwnership::new(repository);
+    let result = ownership
+        .try_acquire(ContentLockDeletionActionClaim {
+            job_id: claimed.job.job_id,
+            worker_id: "worker",
+            claim_token: claimed.claim_token,
+            expected_phase: claimed.job.phase,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
 }
 
 #[tokio::test]
@@ -92,14 +251,15 @@ async fn frozen_manifest_identity_is_immutable_and_creator_lock_unique() {
 
 #[tokio::test]
 async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
+    let clock = Arc::new(MutableClock::new(NOW));
     let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
-        InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),
+        InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
     ));
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     repository.insert_job(job.clone()).await.unwrap();
 
     let first = repository
-        .claim_next("worker-a", NOW, LEASE_END)
+        .claim_next("worker-a", (LEASE_END) - (NOW))
         .await
         .unwrap()
         .unwrap();
@@ -107,17 +267,17 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
     assert_eq!(first.job.attempt_count, 1);
     assert!(
         repository
-            .claim_next("worker-b", NOW, LEASE_END)
+            .claim_next("worker-b", (LEASE_END) - (NOW))
             .await
             .unwrap()
             .is_none()
     );
 
+    clock.set(LEASE_END);
     let reclaimed = repository
         .claim_next(
             "worker-b",
-            datetime!(2026-08-12 05:05:01 UTC),
-            datetime!(2026-08-12 05:10:00 UTC),
+            (datetime!(2026-08-12 05:10:00 UTC)) - (datetime!(2026-08-12 05:05:01 UTC)),
         )
         .await
         .unwrap()
@@ -125,39 +285,39 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
     assert_ne!(first.claim_token, reclaimed.claim_token);
     assert_eq!(reclaimed.job.attempt_count, 2);
 
-    assert!(
+    assert_eq!(
         repository
             .advance_phase(
                 job.job_id,
                 "worker-a",
                 first.claim_token,
-                datetime!(2026-08-12 05:05:01 UTC),
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        AdvanceContentLockDeletionPhaseResult::ClaimLost
     );
+    clock.set(datetime!(2026-08-12 05:06:00 UTC));
     let advanced = repository
         .advance_phase(
             job.job_id,
             "worker-b",
             reclaimed.claim_token,
-            datetime!(2026-08-12 05:06:00 UTC),
             ContentLockDeletionPhase::StartPaymentDrain,
         )
         .await
         .unwrap()
-        .unwrap();
+        .advanced()
+        .expect("live claim should advance phase");
     assert_eq!(advanced.state, ContentLockDeletionState::Queued);
     assert_eq!(advanced.phase, ContentLockDeletionPhase::StartPaymentDrain);
     assert_eq!(advanced.attempt_count, 0);
 
+    clock.set(datetime!(2026-08-12 05:06:01 UTC));
     let next_claim = repository
         .claim_next(
             "worker-c",
-            datetime!(2026-08-12 05:06:01 UTC),
-            datetime!(2026-08-12 05:11:00 UTC),
+            (datetime!(2026-08-12 05:11:00 UTC)) - (datetime!(2026-08-12 05:06:01 UTC)),
         )
         .await
         .unwrap()
@@ -168,18 +328,17 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
                 job.job_id,
                 "worker-c",
                 next_claim.claim_token,
-                datetime!(2026-08-12 05:07:00 UTC),
                 ContentLockDeletionPhase::DeleteContent,
             )
             .await
             .is_err()
     );
+    clock.set(datetime!(2026-08-12 05:07:00 UTC));
     let failed = repository
         .finish(
             job.job_id,
             "worker-c",
             next_claim.claim_token,
-            datetime!(2026-08-12 05:07:00 UTC),
             Some(ContentLockDeletionFailureCode::TombstoneMissing),
         )
         .await
@@ -192,6 +351,84 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
     );
 }
 
+#[tokio::test]
+async fn healthy_defer_does_not_accumulate_transient_attempts_across_polls() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+        InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
+    ));
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+
+    let mut due_at = NOW;
+    for poll in 1..=3 {
+        let claimed = repository
+            .claim_next("worker-a", (due_at + time::Duration::minutes(5)) - (due_at))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job.attempt_count, 1, "healthy poll {poll}");
+
+        due_at += time::Duration::minutes(1);
+        let deferred = repository
+            .defer(
+                job.job_id,
+                "worker-a",
+                claimed.claim_token,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.state, ContentLockDeletionState::Queued);
+        assert_eq!(deferred.attempt_count, 0);
+        assert_eq!(deferred.next_attempt_at, Some(due_at));
+        clock.set(due_at);
+    }
+}
+
+#[tokio::test]
+async fn defer_is_fenced_by_the_live_claim_token() {
+    let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+        InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),
+    ));
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claimed = repository
+        .claim_next("worker-a", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    let next_poll = NOW + time::Duration::minutes(1);
+
+    assert!(
+        repository
+            .defer(job.job_id, "worker-a", Uuid::new_v4(), (next_poll) - (NOW))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let still_running = repository
+        .get_job(&job.creator, &job.lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_running.state, ContentLockDeletionState::Running);
+    assert_eq!(still_running.attempt_count, 1);
+
+    let deferred = repository
+        .defer(
+            job.job_id,
+            "worker-a",
+            claimed.claim_token,
+            (next_poll) - (NOW),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deferred.attempt_count, 0);
+}
+
 #[test]
 fn failure_codes_are_a_closed_stable_vocabulary() {
     for (code, wire) in [
@@ -202,6 +439,10 @@ fn failure_codes_are_a_closed_stable_vocabulary() {
         (
             ContentLockDeletionFailureCode::TombstoneReplaced,
             "tombstone_replaced",
+        ),
+        (
+            ContentLockDeletionFailureCode::ResourceReplaced,
+            "resource_replaced",
         ),
         (
             ContentLockDeletionFailureCode::RetryExhausted,
@@ -223,36 +464,51 @@ fn failure_codes_are_a_closed_stable_vocabulary() {
             .parse::<ContentLockDeletionFailureCode>()
             .is_err()
     );
+    assert!(
+        "final_credential_issuance_missed"
+            .parse::<ContentLockDeletionFailureCode>()
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
+    let clock = Arc::new(MutableClock::new(NOW));
     let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
-        InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),
+        InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
     ));
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     repository.insert_job(job.clone()).await.unwrap();
     let claimed = repository
-        .claim_next("worker-a", NOW, LEASE_END)
+        .claim_next("worker-a", (LEASE_END) - (NOW))
         .await
         .unwrap()
         .unwrap();
     let retry_at = datetime!(2026-08-12 05:06:00 UTC);
     repository
-        .schedule_retry(job.job_id, "worker-a", claimed.claim_token, NOW, retry_at)
+        .schedule_retry(
+            job.job_id,
+            "worker-a",
+            claimed.claim_token,
+            (retry_at) - (NOW),
+        )
         .await
         .unwrap()
         .unwrap();
     assert!(
         repository
-            .claim_next("worker-b", NOW, LEASE_END)
+            .claim_next("worker-b", (LEASE_END) - (NOW))
             .await
             .unwrap()
             .is_none()
     );
+    clock.set(retry_at);
     assert!(
         repository
-            .claim_next("worker-b", retry_at, datetime!(2026-08-12 05:11:00 UTC))
+            .claim_next(
+                "worker-b",
+                (datetime!(2026-08-12 05:11:00 UTC)) - (retry_at)
+            )
             .await
             .unwrap()
             .is_some()
@@ -260,11 +516,144 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
 
     assert!(matches!(
         repository
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Active(_)
     ));
+    assert!(
+        !repository
+            .has_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn in_memory_active_force_completion_is_exactly_fenced_and_permanently_blocks_publication() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+        InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
+    ));
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let revoked = repository
+        .claim_next("worker-old", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    let forced_at = NOW + time::Duration::seconds(1);
+    clock.set(forced_at);
+    assert!(matches!(
+        repository
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker-old", revoked.claim_token)
+            .await
+            .unwrap()
+    );
+
+    let expiring = repository
+        .claim_next(
+            "worker-expiring",
+            (forced_at + time::Duration::minutes(1)) - (forced_at),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker-expiring", Uuid::new_v4())
+            .await
+            .unwrap()
+    );
+    let reclaim_at = forced_at + time::Duration::minutes(2);
+    clock.set(reclaim_at);
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker-expiring", expiring.claim_token,)
+            .await
+            .unwrap()
+    );
+    let live = repository
+        .claim_next(
+            "worker-live",
+            (reclaim_at + time::Duration::minutes(5)) - (reclaim_at),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker-expiring", expiring.claim_token,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .complete_force_deletion(job.job_id, "worker-live", live.claim_token)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        repository
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .has_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker-live", live.claim_token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .begin_publication(&job.creator, &job.lock_id, Uuid::new_v4())
+            .await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
+async fn in_memory_unforced_claim_cannot_create_a_force_receipt() {
+    let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+        InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),
+    ));
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claim = repository
+        .claim_next("worker", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        !repository
+            .complete_force_deletion(job.job_id, "worker", claim.claim_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(
         !repository
             .has_force_receipt(&job.creator, &job.lock_id)
@@ -305,8 +694,7 @@ async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_lat
         .prepare_deletion_read(
             &ordinary_lookup,
             "/priv/app.locks/content/post.json",
-            NOW,
-            NOW + time::Duration::seconds(30),
+            time::Duration::seconds(30),
         )
         .await
         .unwrap()
@@ -315,8 +703,7 @@ async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_lat
         .prepare_deletion_read(
             &ordinary_lookup,
             "/priv/app.locks/content/post.json",
-            NOW + time::Duration::minutes(1),
-            NOW + time::Duration::minutes(2),
+            time::Duration::minutes(1),
         )
         .await
         .unwrap()
@@ -337,8 +724,7 @@ async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_lat
             .prepare_deletion_read(
                 &ordinary_lookup,
                 "/priv/app.locks/content/not-in-frozen-manifest.json",
-                NOW,
-                NOW + time::Duration::seconds(30),
+                time::Duration::seconds(30),
             )
             .await
             .unwrap()
@@ -373,18 +759,15 @@ async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_lat
                 job.job_id,
                 "worker-final",
                 drain_existing_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::IssueFinalCredentials,
             )
             .await,
-        Err(
-            locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
-        )
+        Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending)
     ));
 
     assert!(matches!(
         deletions
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Active(_)
@@ -534,7 +917,8 @@ async fn failed_access_registration_leaves_no_job_or_task_ownership() {
 
 #[tokio::test]
 async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fenced() {
-    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, access, deletions) = in_memory_access_stack_with_clock(clock.clone());
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     let completed = completed_verification_task(&job);
     let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
@@ -546,31 +930,36 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
     let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
     let issuance_deadline = NOW + time::Duration::minutes(15);
     let read_deadline = NOW + time::Duration::minutes(30);
-    assert!(
-        access
-            .initialize_final_access_windows(
-                job.job_id,
-                "worker-final",
-                claimed.claim_token,
-                NOW,
-                issuance_deadline,
-                read_deadline,
-            )
-            .await
-            .unwrap()
+    let initialized = access
+        .initialize_final_access_windows(
+            job.job_id,
+            "worker-final",
+            claimed.claim_token,
+            time::Duration::minutes(15),
+            time::Duration::minutes(15),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        initialized,
+        InitializeFinalAccessWindowsResult::Initialized(FinalAccessWindows {
+            issuance_started_at: NOW,
+            credential_issuance_deadline: issuance_deadline,
+            read_deadline,
+        })
     );
-    assert!(
+    assert_eq!(
         access
             .initialize_final_access_windows(
                 job.job_id,
                 "worker-final",
                 claimed.claim_token,
-                NOW,
-                NOW + time::Duration::minutes(20),
-                NOW + time::Duration::minutes(40),
+                time::Duration::minutes(20),
+                time::Duration::minutes(20),
             )
             .await
-            .unwrap()
+            .unwrap(),
+        initialized
     );
 
     let candidate = AccessCredential::new("final-secret-bearer");
@@ -610,12 +999,12 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
             job.job_id,
             "worker-final",
             claimed.claim_token,
-            NOW,
             ContentLockDeletionPhase::DrainFinalReads,
         )
         .await
         .unwrap()
-        .unwrap();
+        .advanced()
+        .expect("live claim should advance phase");
     assert_eq!(advanced.phase, ContentLockDeletionPhase::DrainFinalReads);
     let phase_replay = access
         .issue_or_replay_final_credential(
@@ -632,19 +1021,15 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
     let lookup = AccessCredentialLookupKey::derive(&first.credential);
     let path = "/priv/app.locks/content/post.json";
     let first_claim = access
-        .prepare_deletion_read(&lookup, path, NOW, NOW + time::Duration::minutes(1))
+        .prepare_deletion_read(&lookup, path, time::Duration::minutes(1))
         .await
         .unwrap()
         .unwrap()
         .claim_token
         .unwrap();
+    clock.set(NOW + time::Duration::seconds(30));
     let equality_reclaim = access
-        .prepare_deletion_read(
-            &lookup,
-            path,
-            NOW + time::Duration::seconds(30),
-            NOW + time::Duration::minutes(2),
-        )
+        .prepare_deletion_read(&lookup, path, time::Duration::seconds(90))
         .await
         .unwrap()
         .unwrap()
@@ -683,8 +1068,7 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .prepare_deletion_read(
             &lookup,
             path,
-            NOW + time::Duration::seconds(30),
-            NOW + time::Duration::hours(1),
+            time::Duration::minutes(59) + time::Duration::seconds(30),
         )
         .await
         .unwrap()
@@ -692,14 +1076,19 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .claim_token
         .unwrap();
     let reclaim_time = NOW + time::Duration::seconds(60);
+    clock.set(reclaim_time);
     assert!(
         !access
-            .consume_deletion_read(&lookup, path, stale_claim, reclaim_time)
+            .consume_deletion_read(&lookup, path, stale_claim)
             .await
             .unwrap()
     );
     let recovered_claim = access
-        .prepare_deletion_read(&lookup, path, reclaim_time, NOW + time::Duration::hours(1))
+        .prepare_deletion_read(
+            &lookup,
+            path,
+            (NOW + time::Duration::hours(1)) - reclaim_time,
+        )
         .await
         .unwrap()
         .unwrap()
@@ -707,24 +1096,20 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .unwrap();
     assert!(
         !access
-            .consume_deletion_read(&lookup, path, stale_claim, reclaim_time)
+            .consume_deletion_read(&lookup, path, stale_claim)
             .await
             .unwrap()
     );
     assert!(
         access
-            .consume_deletion_read(&lookup, path, recovered_claim, reclaim_time)
+            .consume_deletion_read(&lookup, path, recovered_claim)
             .await
             .unwrap()
     );
+    clock.set(NOW + time::Duration::minutes(3));
     assert!(
         access
-            .prepare_deletion_read(
-                &lookup,
-                path,
-                NOW + time::Duration::minutes(3),
-                NOW + time::Duration::minutes(4),
-            )
+            .prepare_deletion_read(&lookup, path, time::Duration::minutes(1))
             .await
             .unwrap()
             .is_none()
@@ -808,14 +1193,14 @@ async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot(
             job.job_id,
             "worker-final",
             drain_claim.claim_token,
-            NOW,
             ContentLockDeletionPhase::DrainExistingCredentials,
         )
         .await
         .unwrap()
-        .unwrap();
+        .advanced()
+        .expect("live claim should advance phase");
     let existing_drain_claim = deletions
-        .claim_next("worker-final", NOW, LEASE_END)
+        .claim_next("worker-final", (LEASE_END) - (NOW))
         .await
         .unwrap()
         .unwrap();
@@ -824,14 +1209,14 @@ async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot(
             job.job_id,
             "worker-final",
             existing_drain_claim.claim_token,
-            NOW,
             ContentLockDeletionPhase::IssueFinalCredentials,
         )
         .await
         .unwrap()
-        .unwrap();
+        .advanced()
+        .expect("live claim should advance phase");
     let final_claim = deletions
-        .claim_next("worker-final", NOW, LEASE_END)
+        .claim_next("worker-final", (LEASE_END) - (NOW))
         .await
         .unwrap()
         .unwrap();
@@ -840,9 +1225,8 @@ async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot(
             job.job_id,
             "worker-final",
             final_claim.claim_token,
-            NOW,
-            NOW + time::Duration::minutes(15),
-            NOW + time::Duration::minutes(30),
+            time::Duration::minutes(15),
+            time::Duration::minutes(15),
         )
         .await
         .unwrap();
@@ -858,8 +1242,11 @@ async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot(
 async fn in_memory_payment_drain_waits_for_pending_non_paykit_snapshot() {
     let (verification_tasks, access, deletions) = in_memory_access_stack();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
-    let mut pending = verification_task(&job, VerificationTaskStatus::Pending);
-    pending.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::DevStatic;
+    let pending = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Pending,
+        VerifierType::DevStatic,
+    );
     verification_tasks
         .insert_verification_task(pending)
         .await
@@ -880,12 +1267,370 @@ async fn in_memory_payment_drain_waits_for_pending_non_paykit_snapshot() {
                 job.job_id,
                 "worker-final",
                 drain_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::DrainExistingCredentials,
             ),
         )
         .await
         .expect("pending non-Paykit guard must not deadlock"),
+        Err(
+            locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
+        )
+    ));
+}
+
+#[tokio::test]
+async fn no_paykit_drain_expires_pending_task_and_advances_without_an_aggregate() {
+    let (verification_tasks, _access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let pending = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Pending,
+        VerifierType::DevStatic,
+    );
+    let task_id = pending.task_id;
+    verification_tasks
+        .insert_verification_task(pending)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+
+    let withdraw = deletions
+        .claim_next("worker", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    deletions
+        .advance_phase(
+            job.job_id,
+            "worker",
+            withdraw.claim_token,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        )
+        .await
+        .unwrap()
+        .advanced()
+        .expect("live claim should advance phase");
+
+    let use_case = NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW));
+    let start = deletions
+        .claim_next("worker", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(use_case.execute_claimed(start, "worker").await.unwrap());
+    let drain = deletions
+        .claim_next("worker", (LEASE_END) - (NOW))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(use_case.execute_claimed(drain, "worker").await.unwrap());
+
+    let expired = verification_tasks
+        .get_verification_task(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.status, VerificationTaskStatus::Expired);
+    assert_eq!(expired.started_at, Some(NOW));
+    assert_eq!(expired.completed_at, Some(NOW));
+    assert_eq!(
+        expired.terminal_reason,
+        Some(VerificationTerminalReason::ContentLockDeleted)
+    );
+    assert_eq!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        ContentLockDeletionPhase::DrainExistingCredentials
+    );
+}
+
+#[tokio::test]
+async fn no_paykit_drain_preserves_terminal_tasks() {
+    for status in [
+        VerificationTaskStatus::Completed,
+        VerificationTaskStatus::Failed,
+        VerificationTaskStatus::Expired,
+    ] {
+        let (verification_tasks, _access, deletions) = in_memory_access_stack();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        let mut task = verification_task_with_verifier(&job, status, VerifierType::DevStatic);
+        task.started_at = (status != VerificationTaskStatus::Expired).then_some(NOW);
+        task.completed_at = Some(NOW);
+        task.failure_message =
+            (status == VerificationTaskStatus::Failed).then(|| "closed failure".to_owned());
+        let task_id = task.task_id;
+        verification_tasks
+            .insert_verification_task(task)
+            .await
+            .unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        let withdraw = deletions
+            .claim_next("worker", (LEASE_END) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        deletions
+            .advance_phase(
+                job.job_id,
+                "worker",
+                withdraw.claim_token,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .advanced()
+            .expect("live claim should advance phase");
+        let claim = deletions
+            .claim_next("worker", (LEASE_END) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
+            .execute_claimed(claim, "worker")
+            .await
+            .unwrap();
+        assert_eq!(
+            verification_tasks
+                .get_verification_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            status
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_paykit_drain_fences_stale_claim() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, _access, deletions) = in_memory_access_stack_with_clock(clock.clone());
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Pending,
+        VerifierType::DevStatic,
+    );
+    let task_id = task.task_id;
+    verification_tasks
+        .insert_verification_task(task)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
+    clock.set(LEASE_END + time::Duration::seconds(1));
+    assert!(
+        !NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
+            .execute_claimed(claim, "worker")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        verification_tasks
+            .get_verification_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        VerificationTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn in_memory_payment_resolution_rejects_claim_at_expiry_equality() {
+    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task(&job, VerificationTaskStatus::Pending);
+    let task_id = task.task_id;
+    verification_tasks
+        .insert_verification_task(task)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_phase(
+        &deletions,
+        &access,
+        job.job_id,
+        ContentLockDeletionPhase::DrainPayments,
+    )
+    .await;
+
+    assert!(
+        !access
+            .resolve_deletion_payment(
+                job.job_id,
+                "worker-final",
+                claim.claim_token,
+                LEASE_END,
+                &task_id,
+                VerificationTaskStatus::Completed,
+            )
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn in_memory_payment_aggregate_completion_rejects_claim_at_expiry_equality() {
+    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    verification_tasks
+        .insert_verification_task(verification_task(&job, VerificationTaskStatus::Completed))
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_phase(
+        &deletions,
+        &access,
+        job.job_id,
+        ContentLockDeletionPhase::DrainPayments,
+    )
+    .await;
+
+    assert!(
+        !access
+            .complete_deletion_payment_aggregate(
+                job.job_id,
+                "worker-final",
+                claim.claim_token,
+                LEASE_END,
+            )
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn in_memory_non_paykit_expiry_rejects_claim_at_expiry_equality() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, _access, deletions) = in_memory_access_stack_with_clock(clock.clone());
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Pending,
+        VerifierType::DevStatic,
+    );
+    let task_id = task.task_id;
+    verification_tasks
+        .insert_verification_task(task)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
+
+    clock.set(LEASE_END);
+    assert!(
+        !deletions
+            .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim.claim_token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        verification_tasks
+            .get_verification_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        VerificationTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn no_paykit_task_expiry_serializes_with_force_claim_revocation() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let pausing_tasks = Arc::new(PausingVerificationTaskRepository::new(
+        verification_tasks.clone(),
+    ));
+    let access = Arc::new(
+        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            pausing_tasks.clone(),
+            Arc::clone(&fence),
+        ),
+    );
+    let deletions = Arc::new(
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access, fence,
+        ),
+    );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Pending,
+        VerifierType::DevStatic,
+    );
+    let task_id = task.task_id;
+    verification_tasks
+        .insert_verification_task(task)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
+
+    let expiry_repository = deletions.clone();
+    let job_id = job.job_id;
+    let expiry = tokio::spawn(async move {
+        expiry_repository
+            .expire_unresolved_non_paykit_tasks(job_id, "worker", claim.claim_token)
+            .await
+    });
+    pausing_tasks.get_entered.notified().await;
+
+    let force_repository = deletions.clone();
+    let creator = job.creator.clone();
+    let lock_id = job.lock_id.clone();
+    let mut force = tokio::spawn(async move {
+        force_repository
+            .prepare_force_deletion(&creator, &lock_id)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut force)
+            .await
+            .is_err(),
+        "force must wait until task and snapshot terminalization commits"
+    );
+
+    pausing_tasks.release_get.notify_one();
+    assert!(expiry.await.unwrap().unwrap());
+    assert!(matches!(
+        force.await.unwrap().unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
+    assert_eq!(
+        verification_tasks
+            .get_verification_task(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        VerificationTaskStatus::Expired
+    );
+}
+
+#[tokio::test]
+async fn no_paykit_drain_rejects_paykit_snapshot() {
+    let (verification_tasks, _access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    verification_tasks
+        .insert_verification_task(verification_task(&job, VerificationTaskStatus::Pending))
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
+    assert!(matches!(
+        NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
+            .execute_claimed(claim, "worker")
+            .await,
         Err(
             locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
         )
@@ -916,7 +1661,6 @@ async fn in_memory_payment_drain_waits_for_pending_paykit_snapshot() {
                 job.job_id,
                 "worker-final",
                 drain_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::DrainExistingCredentials,
             ),
         )
@@ -969,7 +1713,6 @@ async fn in_memory_payment_drain_waits_for_completed_aggregate() {
                 job.job_id,
                 "worker-final",
                 drain_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::DrainExistingCredentials,
             ),
         )
@@ -983,7 +1726,8 @@ async fn in_memory_payment_drain_waits_for_completed_aggregate() {
 
 #[tokio::test]
 async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations() {
-    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, access, deletions) = in_memory_access_stack_with_clock(clock.clone());
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     let completed = completed_verification_task(&job);
     let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
@@ -1005,18 +1749,17 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
             job.job_id,
             "worker-final",
             issue_claim.claim_token,
-            NOW,
-            NOW + time::Duration::minutes(15),
-            NOW + time::Duration::minutes(30),
+            time::Duration::minutes(15),
+            time::Duration::minutes(15),
         )
         .await
         .unwrap();
     let deadline = NOW + time::Duration::minutes(15);
+    clock.set(deadline);
     let deadline_claim = deletions
         .claim_next(
             "worker-final",
-            deadline,
-            deadline + time::Duration::minutes(5),
+            (deadline + time::Duration::minutes(5)) - (deadline),
         )
         .await
         .unwrap()
@@ -1027,13 +1770,12 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
                 job.job_id,
                 "worker-final",
                 deadline_claim.claim_token,
-                deadline,
                 ContentLockDeletionPhase::DrainFinalReads,
             )
             .await,
-        Err(
-            locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
-        )
+        Ok(AdvanceContentLockDeletionPhaseResult::TerminalFailure(
+            ContentLockDeletionFailureCode::StateCorrupt
+        ))
     ));
     assert!(
         access
@@ -1049,13 +1791,7 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
     );
     assert!(matches!(
         deletions
-            .finish(
-                job.job_id,
-                "worker-final",
-                deadline_claim.claim_token,
-                deadline,
-                None
-            )
+            .finish(job.job_id, "worker-final", deadline_claim.claim_token, None,)
             .await,
         Err(
             locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
@@ -1066,7 +1802,8 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
 #[tokio::test]
 async fn in_memory_final_credential_eligibility_does_not_change_when_cutoff_credential_is_deleted()
 {
-    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, access, deletions) = in_memory_access_stack_with_clock(clock.clone());
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     let completed = completed_verification_task(&job);
     let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
@@ -1098,31 +1835,29 @@ async fn in_memory_final_credential_eligibility_does_not_change_when_cutoff_cred
         ContentLockDeletionPhase::DrainExistingCredentials,
     )
     .await;
-    assert!(matches!(
+    assert_eq!(
         deletions
             .advance_phase(
                 job.job_id,
                 "worker-final",
                 drain_existing_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::IssueFinalCredentials,
             )
-            .await,
-        Err(
-            locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
-        )
-    ));
+            .await
+            .unwrap(),
+        AdvanceContentLockDeletionPhaseResult::ObligationsPending
+    );
 
     let after_expiry = original_expiry;
     access
         .delete_access_credential(&ordinary_lookup)
         .await
         .unwrap();
+    clock.set(after_expiry);
     let after_expiry_claim = deletions
         .claim_next(
             "worker-final",
-            after_expiry,
-            after_expiry + time::Duration::minutes(5),
+            (after_expiry + time::Duration::minutes(5)) - (after_expiry),
         )
         .await
         .unwrap()
@@ -1132,34 +1867,33 @@ async fn in_memory_final_credential_eligibility_does_not_change_when_cutoff_cred
             job.job_id,
             "worker-final",
             after_expiry_claim.claim_token,
-            after_expiry,
             ContentLockDeletionPhase::IssueFinalCredentials,
         )
         .await
         .unwrap()
-        .unwrap();
+        .advanced()
+        .expect("live claim should advance phase");
     let claimed = deletions
         .claim_next(
             "worker-final",
-            after_expiry,
-            after_expiry + time::Duration::minutes(5),
+            (after_expiry + time::Duration::minutes(5)) - (after_expiry),
         )
         .await
         .unwrap()
         .unwrap();
-    assert!(
+    assert!(matches!(
         access
             .initialize_final_access_windows(
                 job.job_id,
                 "worker-final",
                 claimed.claim_token,
-                after_expiry,
-                after_expiry + time::Duration::minutes(15),
-                after_expiry + time::Duration::minutes(30),
+                time::Duration::minutes(15),
+                time::Duration::minutes(15),
             )
             .await
-            .unwrap()
-    );
+            .unwrap(),
+        InitializeFinalAccessWindowsResult::Initialized(_)
+    ));
 
     access
         .delete_access_credential(&ordinary_lookup)
@@ -1205,19 +1939,19 @@ async fn in_memory_final_credential_rejects_completed_non_paykit_snapshot() {
         .unwrap();
     deletions.insert_job(job.clone()).await.unwrap();
     let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
-    assert!(
+    assert!(matches!(
         access
             .initialize_final_access_windows(
                 job.job_id,
                 "worker-final",
                 claimed.claim_token,
-                NOW,
-                NOW + time::Duration::minutes(15),
-                NOW + time::Duration::minutes(30),
+                time::Duration::minutes(15),
+                time::Duration::minutes(15),
             )
             .await
-            .unwrap()
-    );
+            .unwrap(),
+        InitializeFinalAccessWindowsResult::Initialized(_)
+    ));
 
     assert!(
         !access
@@ -1244,9 +1978,17 @@ fn in_memory_access_stack() -> (
     Arc<InMemoryAccessCredentialStore>,
     InMemoryContentLockDeletionRepository,
 ) {
-    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
-        FixedClock(NOW),
-    )));
+    in_memory_access_stack_with_clock(Arc::new(FixedClock(NOW)))
+}
+
+fn in_memory_access_stack_with_clock(
+    clock: Arc<dyn Clock>,
+) -> (
+    Arc<InMemoryVerificationTaskRepository>,
+    Arc<InMemoryAccessCredentialStore>,
+    InMemoryContentLockDeletionRepository,
+) {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(clock));
     let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
         Arc::clone(&fence),
     ));
@@ -1277,7 +2019,7 @@ async fn advance_to_phase(
         ContentLockDeletionPhase::IssueFinalCredentials,
     ] {
         let claimed = deletions
-            .claim_next("worker-final", NOW, LEASE_END)
+            .claim_next("worker-final", (LEASE_END) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -1295,19 +2037,47 @@ async fn advance_to_phase(
             );
         }
         deletions
-            .advance_phase(job_id, "worker-final", claimed.claim_token, NOW, next_phase)
+            .advance_phase(job_id, "worker-final", claimed.claim_token, next_phase)
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         if next_phase == target {
             return deletions
-                .claim_next("worker-final", NOW, LEASE_END)
+                .claim_next("worker-final", (LEASE_END) - (NOW))
                 .await
                 .unwrap()
                 .unwrap();
         }
     }
     panic!("unsupported test target phase");
+}
+
+async fn advance_to_start_payment_drain(
+    deletions: &InMemoryContentLockDeletionRepository,
+    job_id: Uuid,
+) -> locks_service::application::models::ClaimedContentLockDeletionJob {
+    let claimed = deletions
+        .claim_next("worker", LEASE_END - NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    deletions
+        .advance_phase(
+            job_id,
+            "worker",
+            claimed.claim_token,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        )
+        .await
+        .unwrap()
+        .advanced()
+        .expect("live claim should advance phase");
+    deletions
+        .claim_next("worker", LEASE_END - NOW)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 async fn advance_to_final_issuance(
@@ -1328,6 +2098,14 @@ fn verification_task(
     job: &ContentLockDeletionJob,
     status: VerificationTaskStatus,
 ) -> VerificationTaskRecord {
+    verification_task_with_verifier(job, status, VerifierType::PaykitPayment)
+}
+
+fn verification_task_with_verifier(
+    job: &ContentLockDeletionJob,
+    status: VerificationTaskStatus,
+    verifier_type: VerifierType,
+) -> VerificationTaskRecord {
     VerificationTaskRecord {
         task_id: TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap(),
         creator: job.creator.clone(),
@@ -1342,7 +2120,7 @@ fn verification_task(
             reader_public_key: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
-                verifier_type: VerifierType::PaykitPayment,
+                verifier_type,
                 payload: json!({}),
             }],
         },

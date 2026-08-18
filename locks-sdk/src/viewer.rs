@@ -51,6 +51,7 @@ pub enum VerificationTerminalReason {
     PaymentRequestCanceled,
     ProposalExpired,
     PaymentDeadlineExpired,
+    ContentLockDeleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

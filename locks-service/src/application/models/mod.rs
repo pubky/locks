@@ -386,6 +386,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_task_expires_for_content_lock_deletion_with_started_at() {
+        let expired_at = datetime!(2026-05-29 12:04:00 UTC);
+        let expired = pending_task()
+            .expire(VerificationTerminalReason::ContentLockDeleted, expired_at)
+            .unwrap();
+
+        assert_eq!(expired.status, VerificationTaskStatus::Expired);
+        assert_eq!(expired.started_at, Some(expired_at));
+        assert_eq!(expired.completed_at, Some(expired_at));
+        assert_eq!(expired.failure_message, None);
+        assert_eq!(
+            expired.terminal_reason,
+            Some(VerificationTerminalReason::ContentLockDeleted)
+        );
+    }
+
+    #[test]
     fn terminal_task_states_cannot_transition() {
         let completed = completed_task();
 

@@ -117,7 +117,7 @@ Handle lifecycle states as closed vocabulary:
 
 `status_message` is viewer-safe progress text, not proof of invoice readiness or entitlement. Current non-null value is exactly `Reader wallet setup needed`, projected while backend retries missing or malformed/oversized Reader wallet registry state inside original 10-minute admission deadline. Once observed it remains sticky across unrelated transient retries until ready or failed. `admission_deadline_at` is persisted DB-owned time exposed only while invoice admission is pending; an overdue value can indicate a stalled worker but does not mean worker ran or task failed. Keep polling. Browser/host clock skew makes local countdowns approximate.
 
-`expired` identifies a normal terminal payment-request outcome, unlike `failed`, which carries a safe verification failure message. Its exact `terminal_reason` wire values are:
+`expired` identifies a normal terminal no-entitlement outcome, unlike `failed`, which carries a safe verification failure message. Its exact `terminal_reason` wire values are:
 
 | Wire value | Meaning |
 | --- | --- |
@@ -125,8 +125,9 @@ Handle lifecycle states as closed vocabulary:
 | `payment_request_canceled` | Payment request was canceled. |
 | `proposal_expired` | Payment proposal expired before acceptance. |
 | `payment_deadline_expired` | Accepted payment request reached its payment deadline. |
+| `content_lock_deleted` | Content lock was deleted before verification completed. |
 
-All four outcomes are terminal: stop browser/Rust polling, issue no access credential, and grant no entitlement. To retry, submit a new attempt with a fresh Bundle ID and payment request; replaying same Bundle ID returns same terminal lifecycle.
+All five outcomes are terminal: stop browser/Rust polling, issue no access credential, and grant no entitlement. Payment retries require a fresh Bundle ID and payment request; replaying same Bundle ID returns same terminal lifecycle. A deleted content lock must be recreated before any new attempt.
 
 JS/WASM methods reject unknown statuses, unknown terminal reasons, extra private fields, and invalid tuples. Keep application handling closed too:
 
@@ -146,8 +147,9 @@ function nextAction(lifecycle) {
         case 'payment_request_canceled':
         case 'proposal_expired':
         case 'payment_deadline_expired':
+        case 'content_lock_deleted':
           throw new Error(
-            `${lifecycle.terminal_reason}; retry with a fresh Bundle ID and payment request`,
+            `${lifecycle.terminal_reason}; verification attempt cannot continue`,
           );
         default:
           throw new Error('invalid verification terminal reason');

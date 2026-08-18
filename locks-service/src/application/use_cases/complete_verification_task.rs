@@ -424,6 +424,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
+        | ApplicationError::VerificationDependencyUnavailable
         | ApplicationError::PaykitPaymentStatusConflict
         | ApplicationError::InvalidVerificationTaskState { .. }
         | ApplicationError::VerificationTaskClaimLost
