@@ -25,6 +25,14 @@ pub trait ContentLockRepository: Send + Sync {
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError>;
+
+    /// Deletes the public content lock at the canonical creator-owned path.
+    /// Returns true when a record existed and false when already absent.
+    async fn delete_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError>;
 }
 
 /// Repository for creator-owned Lock Service Pointer config objects.

@@ -24,6 +24,8 @@ pub enum ApiErrorCode {
     FrontendSessionExpired,
     FrontendSessionStateMismatch,
     ContentLockPathConflict,
+    ContentLockDeletionInProgress,
+    ContentLockDeletionNotFound,
     TaskStateConflict,
     UnsupportedVerifierType,
     PaykitNotConfigured,
@@ -55,6 +57,8 @@ impl ApiErrorCode {
             Self::FrontendSessionExpired => "frontend_session_expired",
             Self::FrontendSessionStateMismatch => "frontend_session_state_mismatch",
             Self::ContentLockPathConflict => "content_lock_path_conflict",
+            Self::ContentLockDeletionInProgress => "content_lock_deletion_in_progress",
+            Self::ContentLockDeletionNotFound => "content_lock_deletion_not_found",
             Self::TaskStateConflict => "task_state_conflict",
             Self::UnsupportedVerifierType => "unsupported_verifier_type",
             Self::PaykitNotConfigured => "paykit_not_configured",
@@ -76,6 +80,7 @@ impl ApiErrorCode {
             Self::VerificationTaskNotFound
             | Self::GuardedResourceNotFound
             | Self::ContentLockNotFound
+            | Self::ContentLockDeletionNotFound
             | Self::CreatorConnectFlowUnavailable
             | Self::FrontendSessionCodeUnavailable => StatusCode::NOT_FOUND,
             Self::CreatorAuthorityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -86,7 +91,9 @@ impl ApiErrorCode {
                 StatusCode::UNAUTHORIZED
             }
             Self::FrontendSessionStateMismatch => StatusCode::BAD_REQUEST,
-            Self::ContentLockPathConflict | Self::TaskStateConflict => StatusCode::CONFLICT,
+            Self::ContentLockPathConflict
+            | Self::ContentLockDeletionInProgress
+            | Self::TaskStateConflict => StatusCode::CONFLICT,
             Self::UnsupportedVerifierType
             | Self::PaykitNotConfigured
             | Self::ReaderPubkyUnresolvable => StatusCode::UNPROCESSABLE_ENTITY,
@@ -199,6 +206,10 @@ impl From<ApplicationError> for ApiError {
                 ApiErrorCode::ContentLockPathConflict,
                 "content lock path is already owned",
             ),
+            ApplicationError::ContentLockDeletionInProgress => Self::new(
+                ApiErrorCode::ContentLockDeletionInProgress,
+                "content lock deletion is in progress",
+            ),
             ApplicationError::InvalidGuardedResource { .. } => {
                 Self::new(ApiErrorCode::InvalidRequest, "invalid guarded resource")
             }
@@ -229,6 +240,7 @@ impl From<ApplicationError> for ApiError {
                 Self::new(ApiErrorCode::RateLimited, "rate limit exceeded")
             }
             ApplicationError::Storage { .. }
+            | ApplicationError::InvalidContentLockDeletionState { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }
             | ApplicationError::ContentLockCanonicalization { .. }
@@ -507,6 +519,22 @@ mod tests {
             })
         );
         assert!(!json.to_string().contains("already-owned.txt"));
+    }
+
+    #[test]
+    fn content_lock_deletion_cutoff_maps_to_409_stable_envelope() {
+        let api_error = ApiError::from(ApplicationError::ContentLockDeletionInProgress);
+
+        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(api_error.error_response()).unwrap(),
+            json!({
+                "error": {
+                    "code": "content_lock_deletion_in_progress",
+                    "message": "content lock deletion is in progress"
+                }
+            })
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub trait VerificationTaskRepository: Send + Sync {
     ///
     /// Returns `DuplicateRecord` if a task with the same Task ID or public
     /// verification attempt handle (`creator`, `bundle_id`) already exists.
+    /// PostgreSQL additionally returns `ContentLockDeletionInProgress` when the
+    /// authoritative deletion cutoff already exists for a new Bundle ID.
     async fn insert_verification_task(
         &self,
         task: VerificationTaskRecord,

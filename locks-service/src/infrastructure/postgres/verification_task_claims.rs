@@ -50,6 +50,11 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                 WHERE ((status = 'pending'
                         AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
                        OR (status = 'in_progress' AND claim_expires_at < $3))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM paykit_task_admissions
+                      WHERE verification_task_id = verification_tasks.task_id
+                        AND ready = FALSE
+                  )
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
                 ORDER BY submitted_at
@@ -226,6 +231,51 @@ mod tests {
         assert_eq!(claimed.task.task_id, older.task_id);
         assert_eq!(claimed.task.status, VerificationTaskStatus::InProgress);
         assert_eq!(claimed.task.started_at, Some(NOW));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn paykit_reservation_is_not_claimable_until_marked_ready() {
+        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
+
+        let database = TestDatabase::create().await;
+        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d15",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+
+        let first = admissions.reserve(pending.clone()).await.unwrap();
+        assert!(first.requires_paykit);
+        assert!(
+            claimer
+                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let replay = admissions.reserve(pending.clone()).await.unwrap();
+        assert!(replay.requires_paykit);
+        assert_eq!(replay.task, pending);
+
+        admissions.mark_ready(&pending).await.unwrap();
+        let ready_replay = admissions.reserve(pending.clone()).await.unwrap();
+        assert!(!ready_replay.requires_paykit);
+        assert_eq!(ready_replay.task, pending);
+        assert_eq!(
+            claimer
+                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap()
+                .unwrap()
+                .task
+                .task_id,
+            pending.task_id
+        );
 
         database.cleanup().await;
     }

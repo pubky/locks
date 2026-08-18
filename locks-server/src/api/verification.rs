@@ -20,6 +20,7 @@ use locks_service::application::use_cases::submit_proof_bundle::{
 use locks_service::application::use_cases::validate_paykit_payment_submission::{
     ValidatePaykitPaymentSubmissionRequest, ValidatePaykitPaymentSubmissionUseCase,
 };
+use locks_service::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
 use crate::api::dtos::{
@@ -111,6 +112,16 @@ async fn maybe_prepare_paykit_submission(
             "paykit-payment requires reader_public_key",
         )
     })?;
+    if let Some(pool) = state.postgres_pool() {
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(pool.clone());
+        if let Some(admission) = admissions.find_existing(submitted).await? {
+            if admission.requires_paykit {
+                create_paykit_invoice(state, &admission.task.submitted_proof_bundle).await?;
+                admissions.mark_ready(&admission.task).await?;
+            }
+            return Ok(Some(admission.task.into()));
+        }
+    }
     ValidatePaykitPaymentSubmissionUseCase::new(state.content_locks().as_ref())
         .execute(ValidatePaykitPaymentSubmissionRequest {
             submitted_proof_bundle: submitted.clone(),
@@ -125,6 +136,16 @@ async fn maybe_prepare_paykit_submission(
             ApiErrorCode::ReaderPubkyUnresolvable,
             "reader pubky is unresolvable",
         ));
+    }
+    if let Some(pool) = state.postgres_pool() {
+        let task = submit_use_case.prepare_task(submitted.clone()).await?;
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(pool.clone());
+        let admission = admissions.reserve(task).await?;
+        if admission.requires_paykit {
+            create_paykit_invoice(state, &admission.task.submitted_proof_bundle).await?;
+            admissions.mark_ready(&admission.task).await?;
+        }
+        return Ok(Some(admission.task.into()));
     }
     if let Some(existing) = submit_use_case.find_existing(submitted).await? {
         return Ok(Some(existing));
@@ -144,6 +165,33 @@ async fn maybe_prepare_paykit_submission(
         .await
         .map_err(map_paykit_invoice_error)?;
     Ok(None)
+}
+
+async fn create_paykit_invoice(
+    state: &AppState,
+    submitted: &SubmittedProofBundle,
+) -> Result<(), ApiError> {
+    let reader = submitted.reader_public_key.as_ref().ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "paykit-payment requires reader_public_key",
+        )
+    })?;
+    state
+        .paykit_http_client()
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::PaykitNotConfigured,
+                "paykit is not configured",
+            )
+        })?
+        .create_invoice(&PaykitInvoiceRequest {
+            bundle_id: submitted.bundle_id.to_string(),
+            lock_resource: submitted.pubky_lock_resource.to_string(),
+            reader: reader.to_string(),
+        })
+        .await
+        .map_err(map_paykit_invoice_error)
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {

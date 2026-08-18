@@ -17,26 +17,28 @@ use locks_service::{
         errors::ApplicationError,
         models::AccessCredentialPolicy,
         ports::{
-            AccessCredentialStore, Clock, ContentLockOwnershipRepository, ContentLockRepository,
-            CreatorAuthorityManager, CreatorAuthorityStore, CreatorConnectFlowStore,
-            EntitlementRepository, FrontendSessionCodeStore, FrontendSessionStore,
-            GuardedResourceRepository, LegacyCreatorConnectFlowClient,
-            LockServicePointerRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            AccessCredentialStore, Clock, ContentLockDeletionRepository,
+            ContentLockOwnershipRepository, ContentLockRepository, CreatorAuthorityManager,
+            CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
+            FrontendSessionCodeStore, FrontendSessionStore, GuardedResourceRepository,
+            LegacyCreatorConnectFlowClient, LockServicePointerRepository, VerificationTaskClaimer,
+            VerificationTaskRepository,
         },
     },
     infrastructure::{
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
+            content_lock_deletions::InMemoryContentLockDeletionRepository,
             content_lock_ownership::InMemoryContentLockOwnershipRepository,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_tasks::InMemoryVerificationTaskRepository,
         },
         postgres::{
             CreatorAuthoritySecretCipher, PostgresAccessCredentialStore,
-            PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
-            PostgresCreatorConnectFlowStore, PostgresFrontendSessionCodeStore,
-            PostgresFrontendSessionStore, PostgresVerificationTaskClaimer,
-            PostgresVerificationTaskRepository,
+            PostgresContentLockDeletionRepository, PostgresContentLockOwnershipRepository,
+            PostgresCreatorAuthorityStore, PostgresCreatorConnectFlowStore,
+            PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
+            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, LegacyCookieCreatorAuthorityManager,
@@ -150,6 +152,7 @@ pub struct AppState {
     guarded_resources: Arc<dyn GuardedResourceRepository>,
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
     content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
+    content_lock_deletions: Arc<dyn ContentLockDeletionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     entitlements: Arc<dyn EntitlementRepository>,
@@ -514,6 +517,11 @@ impl AppState {
                 ))
             })
         });
+        let content_lock_deletions: Arc<dyn ContentLockDeletionRepository> =
+            match postgres_pool.as_ref() {
+                Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
+                None => Arc::new(InMemoryContentLockDeletionRepository::new()),
+            };
 
         Self {
             config,
@@ -523,6 +531,7 @@ impl AppState {
             guarded_resources: creator_repositories.guarded_resources,
             lock_service_pointers: creator_repositories.lock_service_pointers,
             content_lock_ownership: private_runtime.content_lock_ownership,
+            content_lock_deletions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
             entitlements: creator_repositories.entitlements,
@@ -570,6 +579,10 @@ impl AppState {
 
     pub fn content_lock_ownership(&self) -> &Arc<dyn ContentLockOwnershipRepository> {
         &self.content_lock_ownership
+    }
+
+    pub fn content_lock_deletions(&self) -> &Arc<dyn ContentLockDeletionRepository> {
+        &self.content_lock_deletions
     }
 
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {
