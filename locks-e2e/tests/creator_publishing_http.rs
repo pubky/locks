@@ -827,6 +827,7 @@ impl FakePaykitServer {
             Some(json!({
                 "bundle_id": BUNDLE_ID,
                 "lock_resource": lock_resource,
+                "payment_in": 24,
                 "reader": creator().to_string(),
             }))
         );
@@ -872,14 +873,20 @@ async fn fake_invoice_handler(
     State(state): State<Arc<Mutex<FakePaykitState>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> (StatusCode, Json<serde_json::Value>) {
     let mut state = state.lock().await;
     state.invoice_count += 1;
     state.invoice_body = Some(serde_json::from_slice(&body).unwrap());
     state.invoice_signature = headers
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
-    StatusCode::CREATED
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "invoice_created_at": "2026-08-12T10:00:00Z",
+            "payment_deadline": "2026-08-13T10:00:00Z",
+        })),
+    )
 }
 
 async fn fake_status_handler(

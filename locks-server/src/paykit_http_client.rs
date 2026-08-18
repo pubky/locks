@@ -4,6 +4,10 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky};
+use locks_service::application::ports::{
+    PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError, PaymentDrainStatus,
+    PaymentDrainSummary, PaymentRequestState, PaymentRequestStatus, PaymentState,
+};
 use locks_service::infrastructure::verifiers::paykit_payment::{
     PaykitPaymentStatus, PaykitPaymentStatusClient, PaykitPaymentStatusError,
     PaykitPaymentStatusKind,
@@ -11,6 +15,8 @@ use locks_service::infrastructure::verifiers::paykit_payment::{
 use pubky_common::crypto::Keypair;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use url::Url;
 
 use crate::config::{
@@ -41,6 +47,8 @@ pub enum PaykitClientError {
     },
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
+    #[error("Paykit invoice response was invalid: {0}")]
+    InvalidInvoiceResponse(String),
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +62,47 @@ pub struct PaykitHttpClient {
 pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
+    pub payment_in: u64,
     pub reader: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaykitInvoiceResponse {
+    pub invoice_created_at: OffsetDateTime,
+    pub payment_deadline: OffsetDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaykitInvoiceResponseBody {
+    invoice_created_at: String,
+    payment_deadline: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentDrainRequest<'a> {
+    lock_resource: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentDrainResponseBody {
+    status: String,
+    accepted_count: u64,
+    terminal_count: u64,
+    cancellation_enqueued_count: u64,
+    cleanup_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentRequestStatusResponseBody {
+    request_state: String,
+    payment_state: String,
+    invoice_created_at: String,
+    payment_deadline: String,
+    confirmations: u32,
+    amount_matched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,17 +157,33 @@ impl PaykitHttpClient {
     pub async fn create_invoice(
         &self,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceResponse, PaykitClientError> {
         let response = self.signed_post("invoices", request).await?;
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(PaykitClientError::NonSuccess {
+        if !response.status().is_success() {
+            return Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
                 status: response.status(),
-            })
+            });
         }
+
+        let body = response
+            .json::<PaykitInvoiceResponseBody>()
+            .await
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        let invoice_created_at = OffsetDateTime::parse(&body.invoice_created_at, &Rfc3339)
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        let payment_deadline = OffsetDateTime::parse(&body.payment_deadline, &Rfc3339)
+            .map_err(|error| PaykitClientError::InvalidInvoiceResponse(error.to_string()))?;
+        if payment_deadline < invoice_created_at {
+            return Err(PaykitClientError::InvalidInvoiceResponse(
+                "payment_deadline precedes invoice_created_at".to_owned(),
+            ));
+        }
+        Ok(PaykitInvoiceResponse {
+            invoice_created_at,
+            payment_deadline,
+        })
     }
 
     pub async fn transaction_status(
@@ -139,6 +203,97 @@ impl PaykitHttpClient {
             .json::<PaykitTransactionStatus>()
             .await
             .map_err(PaykitClientError::InvalidStatusResponse)
+    }
+
+    pub async fn start_payment_drain(
+        &self,
+        lock_resource: &str,
+    ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+        self.payment_drain("payment-request-drains", lock_resource)
+            .await?
+            .ok_or(PaymentDrainClientError::NotFound)
+    }
+
+    pub async fn lookup_payment_drain(
+        &self,
+        lock_resource: &str,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+        self.payment_drain("payment-request-drain-lookups", lock_resource)
+            .await
+    }
+
+    pub async fn payment_request_status(
+        &self,
+        creator: &str,
+        bundle_id: &str,
+    ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+        let response = self
+            .signed_post(
+                "payment-requests/status",
+                &PaykitStatusRequest {
+                    creator: creator.to_owned(),
+                    bundle_id: bundle_id.to_owned(),
+                },
+            )
+            .await
+            .map_err(|_| PaymentDrainClientError::Transport)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        map_drain_error(response.status())?;
+        let body = response
+            .json::<PaymentRequestStatusResponseBody>()
+            .await
+            .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+        let invoice_created_at = OffsetDateTime::parse(&body.invoice_created_at, &Rfc3339)
+            .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+        let payment_deadline = OffsetDateTime::parse(&body.payment_deadline, &Rfc3339)
+            .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+        if payment_deadline < invoice_created_at {
+            return Err(PaymentDrainClientError::MalformedSuccess);
+        }
+        Ok(Some(PaymentRequestStatus {
+            request_state: PaymentRequestState::parse(&body.request_state)
+                .ok_or(PaymentDrainClientError::MalformedSuccess)?,
+            payment_state: PaymentState::parse(&body.payment_state)
+                .ok_or(PaymentDrainClientError::MalformedSuccess)?,
+            invoice_created_at,
+            payment_deadline,
+            confirmations: body.confirmations,
+            amount_matched: body.amount_matched,
+        }))
+    }
+
+    async fn payment_drain(
+        &self,
+        path: &str,
+        lock_resource: &str,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+        let response = self
+            .signed_post(path, &PaymentDrainRequest { lock_resource })
+            .await
+            .map_err(|_| PaymentDrainClientError::Transport)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        map_drain_error(response.status())?;
+        let body = response
+            .json::<PaymentDrainResponseBody>()
+            .await
+            .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+        let status = PaymentDrainStatus::parse(&body.status)
+            .ok_or(PaymentDrainClientError::MalformedSuccess)?;
+        if (status == PaymentDrainStatus::Completed) != (body.accepted_count == 0) {
+            return Err(PaymentDrainClientError::MalformedSuccess);
+        }
+        Ok(Some(PaymentDrainSummary {
+            status,
+            accepted_count: body.accepted_count,
+            terminal_count: body.terminal_count,
+            cancellation_enqueued_count: body.cancellation_enqueued_count,
+            cleanup_token: PaymentDrainCleanupToken::parse(&body.cleanup_token)
+                .ok_or(PaymentDrainClientError::MalformedSuccess)?,
+        }))
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -174,6 +329,15 @@ impl PaykitHttpClient {
     }
 }
 
+fn map_drain_error(status: StatusCode) -> Result<(), PaymentDrainClientError> {
+    match status {
+        status if status.is_success() => Ok(()),
+        StatusCode::CONFLICT => Err(PaymentDrainClientError::Conflict),
+        status if status.is_server_error() => Err(PaymentDrainClientError::Server),
+        _ => Err(PaymentDrainClientError::Server),
+    }
+}
+
 fn bounded_http_client(
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -183,6 +347,32 @@ fn bounded_http_client(
         .timeout(request_timeout)
         .build()
         .map_err(PaykitClientError::Http)
+}
+
+#[async_trait]
+impl PaymentDrainClient for PaykitHttpClient {
+    async fn start_payment_drain(
+        &self,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+    ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+        PaykitHttpClient::start_payment_drain(self, &lock_resource.to_string()).await
+    }
+
+    async fn lookup_payment_drain(
+        &self,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+        PaykitHttpClient::lookup_payment_drain(self, &lock_resource.to_string()).await
+    }
+
+    async fn payment_request_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+        PaykitHttpClient::payment_request_status(self, &creator.to_string(), &bundle_id.to_string())
+            .await
+    }
 }
 
 #[async_trait]
@@ -272,7 +462,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(body).unwrap(),
             format!(
-                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"reader\":\"{READER}\"}}"
+                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"payment_in\":24,\"reader\":\"{READER}\"}}"
             )
         );
     }
@@ -365,7 +555,16 @@ mod tests {
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
         let expected_signature = sign_body(&keypair, &expected_body);
 
-        client.create_invoice(&invoice_request()).await.unwrap();
+        let response = client.create_invoice(&invoice_request()).await.unwrap();
+
+        assert_eq!(
+            response.invoice_created_at,
+            time::macros::datetime!(2026-08-12 10:00:00 UTC)
+        );
+        assert_eq!(
+            response.payment_deadline,
+            time::macros::datetime!(2026-08-13 10:00:00 UTC)
+        );
 
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
@@ -408,6 +607,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_drain_calls_use_exact_signed_bodies_and_closed_responses() {
+        let captured = CapturedRequests::default();
+        let server_url = spawn_test_server(captured.clone()).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let started = client.start_payment_drain(LOCK_RESOURCE).await.unwrap();
+        assert_eq!(started.status, PaymentDrainStatus::Active);
+        assert_eq!(started.accepted_count, 1);
+        assert_eq!(
+            started.cleanup_token.as_str(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        let looked_up = client
+            .lookup_payment_drain(LOCK_RESOURCE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(looked_up, started);
+        let status = client
+            .payment_request_status(CREATOR, BUNDLE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.request_state, PaymentRequestState::Accepted);
+        assert_eq!(status.payment_state, PaymentState::Detected);
+        assert!(status.amount_matched);
+
+        let requests = captured.all();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/payment-request-drains");
+        assert_eq!(requests[1].path, "/payment-request-drain-lookups");
+        assert_eq!(requests[2].path, "/payment-requests/status");
+        assert_eq!(
+            String::from_utf8(requests[0].body.clone()).unwrap(),
+            format!("{{\"lock_resource\":\"{LOCK_RESOURCE}\"}}")
+        );
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(
+            String::from_utf8(requests[2].body.clone()).unwrap(),
+            format!("{{\"bundle_id\":\"{BUNDLE_ID}\",\"creator\":\"{CREATOR}\"}}")
+        );
+        assert!(requests.iter().all(|request| request.signature.is_some()));
+        assert!(requests.iter().all(|request| {
+            !String::from_utf8_lossy(&request.body).contains("minimum_confirmations")
+        }));
+    }
+
+    #[tokio::test]
+    async fn payment_drain_http_errors_preserve_not_found_conflict_and_server_failure() {
+        for (status, expected) in [
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                PaymentDrainClientError::NotFound,
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                PaymentDrainClientError::Conflict,
+            ),
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                PaymentDrainClientError::Server,
+            ),
+        ] {
+            let server_url = spawn_configured_drain_server(status, "{}").await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            assert_eq!(
+                client.start_payment_drain(LOCK_RESOURCE).await,
+                Err(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_drain_rejects_malformed_unknown_or_inconsistent_success_bodies() {
+        for body in [
+            "not-json",
+            r#"{"status":"active","accepted_count":0,"terminal_count":0,"cancellation_enqueued_count":0}"#,
+            r#"{"status":"complete","accepted_count":0,"terminal_count":0,"cancellation_enqueued_count":0,"cleanup_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            r#"{"status":"active","accepted_count":0,"terminal_count":0,"cancellation_enqueued_count":0,"cleanup_token":"short"}"#,
+            r#"{"status":"active","accepted_count":0,"terminal_count":0,"cancellation_enqueued_count":0,"cleanup_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","extra":true}"#,
+            r#"{"status":"completed","accepted_count":1,"terminal_count":0,"cancellation_enqueued_count":0,"cleanup_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        ] {
+            let server_url = spawn_configured_drain_server(axum::http::StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            assert_eq!(
+                client.start_payment_drain(LOCK_RESOURCE).await,
+                Err(PaymentDrainClientError::MalformedSuccess)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_drain_accepts_completed_cancellation_only_aggregate() {
+        let server_url = spawn_configured_drain_server(
+            axum::http::StatusCode::OK,
+            r#"{"status":"completed","accepted_count":0,"terminal_count":0,"cancellation_enqueued_count":1,"cleanup_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let summary = client.start_payment_drain(LOCK_RESOURCE).await.unwrap();
+        assert_eq!(summary.status, PaymentDrainStatus::Completed);
+        assert_eq!(summary.accepted_count, 0);
+        assert_eq!(summary.terminal_count, 0);
+        assert_eq!(summary.cancellation_enqueued_count, 1);
+    }
+
+    #[tokio::test]
+    async fn payment_drain_timeout_is_transport_failure() {
+        let server_url = spawn_hanging_test_server().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_millis(10), Duration::from_millis(25)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            client.start_payment_drain(LOCK_RESOURCE).await,
+            Err(PaymentDrainClientError::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_request_status_rejects_unknown_or_reversed_success_body() {
+        for body in [
+            r#"{"request_state":"unknown","payment_state":"detected","invoice_created_at":"2026-08-12T10:00:00Z","payment_deadline":"2026-08-13T10:00:00Z","confirmations":0,"amount_matched":true}"#,
+            r#"{"request_state":"accepted","payment_state":"unknown","invoice_created_at":"2026-08-12T10:00:00Z","payment_deadline":"2026-08-13T10:00:00Z","confirmations":0,"amount_matched":true}"#,
+            r#"{"request_state":"accepted","payment_state":"detected","invoice_created_at":"2026-08-13T10:00:00Z","payment_deadline":"2026-08-12T10:00:00Z","confirmations":0,"amount_matched":true}"#,
+        ] {
+            let server_url =
+                spawn_configured_payment_request_status_server(axum::http::StatusCode::OK, body)
+                    .await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            assert_eq!(
+                client.payment_request_status(CREATOR, BUNDLE_ID).await,
+                Err(PaymentDrainClientError::MalformedSuccess)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn create_invoice_times_out_when_paykit_does_not_respond() {
         let server_url = spawn_hanging_test_server().await;
         let client = PaykitHttpClient::from_parts(
@@ -444,6 +809,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_invoice_rejects_malformed_or_inconsistent_success_body() {
+        for body in [
+            r#"{"invoice_created_at":"2026-08-12T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"not-a-time","payment_deadline":"2026-08-13T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"2026-08-13T10:00:00Z","payment_deadline":"2026-08-12T10:00:00Z"}"#,
+            r#"{"invoice_created_at":"2026-08-12T10:00:00Z","payment_deadline":"2026-08-13T10:00:00Z","extra":true}"#,
+        ] {
+            let server_url =
+                spawn_configured_invoice_server(axum::http::StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                client.create_invoice(&invoice_request()).await,
+                Err(PaykitClientError::InvalidInvoiceResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn status_not_found_and_invalid_success_body_use_retryable_client_error() {
         for (status, body) in [
             (axum::http::StatusCode::NOT_FOUND, "not found"),
@@ -474,6 +863,7 @@ mod tests {
             bundle_id: BUNDLE_ID.to_owned(),
             lock_resource: LOCK_RESOURCE.to_owned(),
             reader: READER.to_owned(),
+            payment_in: 24,
         }
     }
 
@@ -490,6 +880,10 @@ mod tests {
             assert_eq!(requests.len(), 1);
             requests[0].clone()
         }
+
+        fn all(&self) -> Vec<CapturedRequest> {
+            self.0.lock().unwrap().clone()
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,6 +897,15 @@ mod tests {
         let app = Router::new()
             .route("/invoices", post(capture_invoice))
             .route("/transactions/status", post(capture_status))
+            .route("/payment-request-drains", post(capture_payment_drain))
+            .route(
+                "/payment-request-drain-lookups",
+                post(capture_payment_drain_lookup),
+            )
+            .route(
+                "/payment-requests/status",
+                post(capture_payment_request_status),
+            )
             .with_state(captured);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -515,7 +918,23 @@ mod tests {
     async fn spawn_hanging_test_server() -> String {
         let app = Router::new()
             .route("/invoices", post(hang))
-            .route("/transactions/status", post(hang));
+            .route("/transactions/status", post(hang))
+            .route("/payment-request-drains", post(hang));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_configured_invoice_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> String {
+        let app = Router::new()
+            .route("/invoices", post(configured_status))
+            .with_state(ConfiguredStatusResponse { status, body });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -536,6 +955,36 @@ mod tests {
     ) -> String {
         let app = Router::new()
             .route("/transactions/status", post(configured_status))
+            .with_state(ConfiguredStatusResponse { status, body });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_configured_drain_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> String {
+        let app = Router::new()
+            .route("/payment-request-drains", post(configured_status))
+            .with_state(ConfiguredStatusResponse { status, body });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_configured_payment_request_status_server(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> String {
+        let app = Router::new()
+            .route("/payment-requests/status", post(configured_status))
             .with_state(ConfiguredStatusResponse { status, body });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -568,7 +1017,10 @@ mod tests {
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        (axum::http::StatusCode::CREATED, "accepted")
+        Json(json!({
+            "invoice_created_at": "2026-08-12T10:00:00Z",
+            "payment_deadline": "2026-08-13T10:00:00Z",
+        }))
     }
 
     async fn capture_status(
@@ -587,6 +1039,60 @@ mod tests {
             "status": "detected",
             "confirmations": 0,
             "amount_matched": true,
+        }))
+    }
+
+    async fn capture_payment_drain(
+        State(captured): State<CapturedRequests>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        capture_request(&captured, &headers, body, "/payment-request-drains");
+        drain_response()
+    }
+
+    async fn capture_payment_drain_lookup(
+        State(captured): State<CapturedRequests>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        capture_request(&captured, &headers, body, "/payment-request-drain-lookups");
+        drain_response()
+    }
+
+    async fn capture_payment_request_status(
+        State(captured): State<CapturedRequests>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        capture_request(&captured, &headers, body, "/payment-requests/status");
+        Json(json!({
+            "request_state": "accepted",
+            "payment_state": "detected",
+            "invoice_created_at": "2026-08-12T10:00:00Z",
+            "payment_deadline": "2026-08-13T10:00:00Z",
+            "confirmations": 0,
+            "amount_matched": true,
+        }))
+    }
+
+    fn capture_request(captured: &CapturedRequests, headers: &HeaderMap, body: Bytes, path: &str) {
+        captured.push(CapturedRequest {
+            path: path.to_owned(),
+            signature: headers
+                .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            body: body.to_vec(),
+        });
+    }
+
+    fn drain_response() -> Json<serde_json::Value> {
+        Json(json!({
+            "status": "active",
+            "accepted_count": 1,
+            "terminal_count": 0,
+            "cancellation_enqueued_count": 0,
+            "cleanup_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         }))
     }
 }
