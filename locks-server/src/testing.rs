@@ -11,9 +11,11 @@ use locks_service::application::models::{
 };
 use locks_service::application::ports::LegacyCreatorConnectFlowClient;
 use locks_service::infrastructure::memory::{
+    content_lock_tombstones::InMemoryContentLockTombstoneRepository,
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
     lock_service_pointers::InMemoryLockServicePointerRepository,
+    public_content_locks::InMemoryPublicContentLockStore,
 };
 use locks_service::infrastructure::pubky::PubkyHomeserverStorageClient;
 use time::OffsetDateTime;
@@ -40,10 +42,16 @@ impl TestServerApp {
     }
 
     pub fn new_in_memory(config: LockServerRuntimeConfig) -> Self {
+        let public_content_locks = InMemoryPublicContentLockStore::new();
         Self {
             state: AppState::new_empty_in_memory_with_creator_repositories(
                 config,
-                Arc::new(InMemoryContentLockRepository::new()),
+                Arc::new(InMemoryContentLockRepository::with_public_store(
+                    public_content_locks.clone(),
+                )),
+                Arc::new(InMemoryContentLockTombstoneRepository::with_public_store(
+                    public_content_locks,
+                )),
                 Arc::new(InMemoryGuardedResourceRepository::new()),
                 Arc::new(InMemoryLockServicePointerRepository::new()),
                 Arc::new(InMemoryEntitlementRepository::new()),
@@ -101,6 +109,7 @@ impl TestServerApp {
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
             deletion: crate::config::DeletionConfig::default(),
+            deletion_worker: crate::config::DeletionWorkerConfig::default(),
             paykit: None,
         }
     }

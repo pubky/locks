@@ -2,7 +2,7 @@
 
 > **For Hermes:** Use subagent-driven-development to implement this plan one review-gated commit slice at a time. Stop after each slice; the user commits before the next slice.
 
-**Goal:** Add a bounded `paykit-payment` deadline and creator-authorized graceful content-lock deletion that withdraws the public lock immediately, drains accepted payment and access obligations durably, removes guarded content, and safely permits later republication after complete graceful cleanup.
+**Goal:** Add a bounded `paykit-payment` deadline and creator-authorized graceful content-lock deletion that withdraws the public lock immediately and drains accepted payment and access obligations durably. Graceful cleanup never deletes concurrent Pubky replacements, but tombstone publication has the explicitly accepted non-atomic overwrite limitation recorded below.
 
 **Architecture:** Locks owns the public tombstone, admission cutoff, verification tasks, credentials, guarded content, path ownership, and overall deletion job. Paykit Server owns invoice timestamps, Payment Request lifecycle classification, cancellation, Bitcoin observation, and a durable lock-wide payment drain. PostgreSQL stores retryable Locks workflow state; Pubky remains authoritative for public lock/tombstone and private guarded bytes.
 
@@ -57,20 +57,22 @@
 23. Exact credential issuance replay returns the same random bearer. Persist a versioned encrypted envelope using a domain-separated key derived from the existing runtime master key; bind creator, Bundle ID, deletion job, and envelope version as AEAD context.
 24. Deletion worker retries transient failures with durable exponential backoff: one second initial, five-minute cap, full jitter, ten attempts per phase by default. Attempts reset on phase advance.
 25. Creator-visible job status is only `queued|running|completed|failed`; failed responses include a stable secret-free `failure_code` only.
-26. Missing or replaced tombstone before destructive work halts as failed. Creator restores the exact tombstone and repeats graceful DELETE to resume the same job.
+26. Missing or replaced tombstone before final verification halts as failed. Creator restores the exact tombstone and repeats graceful DELETE to resume the same job.
 27. Guarded paths are exclusive to one managed lock. Enforce unique `(creator, guarded_path)` ownership in PostgreSQL. There is no historical backfill.
 28. Lock publication uses best-effort ownership compensation and a durable opaque per-lock publication intent under the same PostgreSQL fence as deletion admission. Graceful/force deletion cannot start while publication is in flight. The intent is cleared only after ownership is durably published or failed publication is safely compensated. Process death can leave operator-reconciled intent/ownership state; do not claim cross-system atomicity.
-29. Graceful final cleanup deletes guarded content first and tombstone last, purges Locks authorization/task/job state, asks Paykit to remove operational drain state, and releases path ownership. It forgets the deletion so the same canonical Lock ID may later be published fresh with new Bundle IDs.
+29. Graceful finalization non-destructively verifies every frozen guarded-resource generation and the exact tombstone, then purges Locks authorization/task/job state and asks Paykit to remove operational drain state. The tombstone and guarded bytes remain on Pubky because its unconditional DELETE API cannot safely remove an expected generation in the presence of out-of-band creator writes. Later republication requires an explicit follow-up design rather than an unsafe graceful delete.
 30. Paykit retains terminal financial invoice/payment history; delayed old lifecycle events cannot reactivate a fresh publication.
 31. New force deletion is synchronous: persist a permanent minimal blocking receipt, delete lock/tombstone first, then best-effort guarded resources. Do not drain Paykit/tasks/credentials. Return failed paths. A force-deleted Lock ID can never be republished.
 32. `force=true` against an active graceful job persists `force_requested`, revokes the current claim token/lease, requeues the same frozen job, and returns `202`; a fresh worker claim escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
 33. Graceful job insertion/resume and permanent force-receipt establishment acquire the same canonical per-lock PostgreSQL fence. The durable result is either an active graceful job or a permanent force receipt, never both. Failed graceful replay requeues the same job and frozen manifest. Force against a terminal job atomically replaces that operational row with the permanent receipt before synchronous external deletion.
-34. Any Content Lock fetched from Pubky for deletion must hash to the requested Lock ID and name the authenticated creator before its manifest is frozen or used for resource deletion.
+34. Any Content Lock fetched from Pubky for deletion must hash to the requested Lock ID and name the authenticated creator before its manifest is frozen or used for resource verification or force deletion.
 35. Runtime encryption uses one environment-only 32-byte unpadded-base64url master key selected by `secrets.runtime_master_key_env`. Creator-authority and final-credential encryption keys are derived from it with distinct fixed domain labels. The retired `creator_authority_key_env` key is rejected as unknown configuration; no compatibility alias is retained.
 36. The closed `[deletion]` configuration contract is `retry_max_attempts = 10`, `retry_initial_backoff_seconds = 1`, `retry_max_backoff_seconds = 300`, `final_credential_issuance_window_seconds = 900`, and `final_read_window_seconds = 900` by default. All values are positive; initial backoff cannot exceed maximum backoff; both credential windows are bounded to at most 3600 seconds. Retry jitter remains an implementation policy rather than a configurable field.
 37. Deletion admission immutably records whether each paid snapshot Bundle had any active credential at cutoff and enrolls every such ordinary credential with its original expiry. Enrolled ordinary credentials remain reusable against the frozen manifest until that expiry; they do not acquire one-shot resource-read rows. When the claimed job first enters `issue_final_credentials`, it persists `final_issuance_started_at`, `final_credential_issuance_deadline = final_issuance_started_at + final_credential_issuance_window`, and `final_read_deadline = final_credential_issuance_deadline + final_read_window` once; replay and later config changes never extend them. A paid snapshot resolved completed without an active ordinary credential at cutoff becomes durably final-credential eligible and receives exactly one encrypted replayable final credential expiring at `final_read_deadline`. Every final credential receives one claimable row per frozen manifest path. Final-read claims precede Pubky fetch, are released on pre-response failure, expire for crash recovery, and are consumed only after the complete HTTP response is constructed; consumption is permanent. Phase advancement waits until every enrolled ordinary credential is expired and every final resource is consumed or its credential/read window is expired.
 38. Ordinary credential insertion and deletion admission acquire the same canonical per-lock fence. Deletion-first rejects the insert; insertion-first is attached and classified at cutoff. Database lock order is canonical per-lock fence, deletion job row, snapshot/credential row, then resource-read row. No transaction spans Pubky I/O. Final read claims use fixed 30-second leases clamped to credential expiry; stale claim tokens cannot consume or release a reclaimed row.
 39. This pre-production migration intentionally has no creator-authority ciphertext compatibility path. Moving the same bytes to `runtime_master_key_env` changes the derived creator-authority key; existing local encrypted authority rows must be discarded and reacquired or the local database recreated.
+40. Deletion-worker runtime configuration is a separate closed `[deletion_worker]` section with `enabled`, `poll_interval_ms`, `claim_timeout_seconds`, `shutdown_timeout_seconds`, and `worker_id`. Defaults are `true`, `250`, `60`, `30`, and `"deletion-worker"`. Enabled verification and deletion workers are independently tracked: starting, stopping, or unexpected exit is `not_ready`; a transient deletion dependency failure is `degraded` until successful dependency evidence; ordinary pending work, advisory-lock contention, and a correctly terminalized failed job do not degrade readiness.
+41. **Accepted Pubky tombstone TOCTOU limitation:** the pinned Pubky 0.9.3 SDK exposes ETag metadata but no conditional write API, and the matching homeserver enforces `If-None-Match` for reads but not `If-Match` for writes. Graceful withdrawal therefore reads and compares the frozen canonical lock before an unconditional tombstone `PUT`. A replacement already visible at that read fails closed and is preserved; crash/reclaim replay also preserves any replacement it observes. However, an out-of-band creator replacement written after the comparison and before the `PUT` can be overwritten by the tombstone. Product explicitly accepts this race until Pubky provides atomic conditional writes. This exception does not authorize graceful deletion of replacement bytes; active force remains the only unconditional delete path.
 
 ### Source-derived constraints
 
@@ -260,7 +262,7 @@ Reject `force=true&graceful=true`, unknown fields, malformed booleans, and dupli
 GET /creator/content-locks/{lock_id}/deletion
 ```
 
-Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. The closed stable vocabulary is exactly `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
+Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. The closed stable vocabulary is exactly `tombstone_missing`, `tombstone_replaced`, `resource_replaced`, `retry_exhausted`, and `state_corrupt`. `resource_replaced` means a frozen guarded-resource path no longer contains the admitted generation and therefore graceful finalization failed closed without deleting the replacement. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
 
 If no job or force receipt exists, status returns `404 content_lock_deletion_not_found`. A permanent force receipt projects as `{ "lock_id": "...", "status": "completed" }` without exposing force mode.
 
@@ -274,8 +276,8 @@ Internal phase names are not public API. The implementation should represent at 
 4. `drain_existing_credentials`: wait for credentials active at cutoff to expire.
 5. `issue_final_credentials`: allow bounded issuance for eligible entitlements.
 6. `drain_final_reads`: enforce per-path claims/consumption and read deadlines.
-7. `delete_content`: idempotently delete every frozen resource while tombstone remains exact.
-8. `delete_tombstone`: persist intent-to-remove phase before external delete so missing-on-retry is success.
+7. `delete_content`: non-destructively verify every frozen resource generation while the tombstone remains exact.
+8. `delete_tombstone`: non-destructively verify that the exact tombstone remains published before the purge handoff.
 9. `purge_operational_state`: remove Paykit operational drain, then atomically purge Locks lock-scoped authorization/task/job state and release path ownership.
 
 Use separate durable `state`, `phase`, `attempt_count`, `next_attempt_at`, claim owner/token/expiry, and force-request fields. Use a per-job PostgreSQL advisory action lock where lease expiry must not permit overlapping external effects. SQLx advisory-lock connections must be close-on-drop and explicitly unlocked/closed.
@@ -469,7 +471,7 @@ cargo test --workspace --no-run
 
 ### Task 9: Implement and supervise the deletion worker
 
-**Objective:** Execute external phases retryably without overlapping destructive actions or breaking shutdown.
+**Objective:** Execute external phases retryably without overlapping external actions or breaking shutdown.
 
 **Files:**
 - Create: `locks-server/src/deletion_worker.rs`
@@ -479,17 +481,27 @@ cargo test --workspace --no-run
 - Modify: `locks-server/src/config/validation.rs`
 - Modify: `locks-server/src/app_state/readiness.rs`
 - Modify: `locks-server/src/api/runtime.rs`
+- Modify: deletion application ports/use cases and PostgreSQL/Pubky/in-memory adapters required for exact tombstone I/O, per-job advisory action ownership, non-failure deferral, and worker materialization of final credentials
 - Test: worker unit tests and `locks-e2e/tests/postgres_runtime.rs`
 
-**RED:** Crash/reclaim tests after every external side effect; advisory ownership exclusion; tombstone read-back/replacement failure; retry exhaustion/resume; force escalation; content-first/tombstone-last; missing tombstone allowed only after durable final-removal phase; readiness degradation; shutdown stops claims and bounds worker join.
+**RED:** Crash/reclaim tests after every external side effect; PostgreSQL advisory ownership exclusion; exact tombstone publication/read-back and failure on replacements observed before publication or during replay; retry exhaustion/resume; force escalation; non-destructive sorted/deduplicated verification of every frozen guarded-resource generation followed by exact retained-tombstone verification; missing or replaced frozen resources and missing or replaced tombstones fail closed; active force deletes the canonical public path before best-effort private cleanup; readiness degradation; shutdown stops claims before HTTP drain and bounds the complete worker/HTTP join. These tests do not claim atomic replacement safety across the accepted read-to-unconditional-`PUT` window in decision 41.
 
 **GREEN:** Reuse existing worker configuration conventions but keep queue cadence and retry due time separate. Never log manifest, resource paths, Bundle IDs, credentials, readers, or Paykit payloads.
+
+**Task 9 PostgreSQL crash/reclaim acceptance coverage map:**
+
+- Graceful public tombstone publication/read-back: `locks-e2e/tests/postgres_runtime.rs::postgres_graceful_withdraw_crash_reclaims_without_republishing_or_stale_advance` executes the production phase executor over the PostgreSQL job/lease repository, simulates process loss after publication, proves a fresh claim and advisory owner resume from exact read-back without a second publication, and fences the stale phase write. Exact missing/replaced byte classification remains covered by `locks-service/tests/content_lock_tombstones.rs` and the phase-executor failure tests.
+- Payment-drain start and reconciliation: `payment_drain_reclaim_reconciles_external_start_before_local_persistence` covers remote start before local persistence and fresh-claim lookup reconciliation; `start_phase_replay_persists_monotonic_progress_after_crash_before_phase_advance`, `reclaim_first_fences_stale_initial_payment_drain_store`, `concurrent_force_winner_fences_stale_payment_drain_reconciliation`, and `concurrent_reclaim_winner_fences_stale_terminal_obligation_persistence` cover persisted aggregate replay plus stale start/reconcile/task writes against real PostgreSQL.
+- Final credential generation/persistence/replay: `final_credentials_to_materialize_revalidates_exact_live_issue_claim_and_deadline` and `worker_final_issuance_is_exact_claim_fenced_in_winner_transaction` cover live-claim enumeration, fresh reclaimed ownership, stale/forced/deadline fencing, encrypted winner persistence, exact replay, and one-row cardinality against real PostgreSQL; `concurrent_final_issuers_replay_one_winner` independently covers concurrent winner replay.
+- Frozen guarded-resource generation and retained-tombstone verification: `locks-e2e/tests/postgres_runtime.rs::postgres_guarded_generation_verification_crash_reclaims_and_replays_without_deletion` demonstrates two distinct loss points: after a frozen generation read but before its phase advance, and after exact retained-tombstone read-back but before the purge-handoff advance. Each boundary drops advisory ownership, recreates the PostgreSQL repository/runtime executor, reclaims with a fresh token, fences the stale advance, and idempotently replays without deleting private bytes.
+- Active-force public-first/private cleanup: `locks-e2e/tests/postgres_runtime.rs::postgres_active_force_public_delete_crash_reclaims_before_private_cleanup` loses ownership immediately after canonical public deletion, before any private cleanup, then recreates the PostgreSQL repository/runtime executor, fences stale completion, replays public absence, performs private cleanup, and persists the terminal force receipt. `locks-e2e/tests/postgres_runtime.rs::postgres_active_force_private_delete_crash_reclaims_to_terminal_receipt` separately loses ownership after private deletion, then proves fresh-token reclaim, stale completion fencing, idempotent public/private replay, permanent receipt persistence, job removal, and no further claimable work. `execute_forced_content_lock_deletion::tests` supplies the sorted/deduplicated multi-resource and best-effort error matrix at the same production use-case seam.
+- Every composed E2E case above drops the detached PostgreSQL advisory guard as the crash boundary and proves a later independent acquisition succeeds; `postgres_deletion_action_ownership_excludes_overlap_and_reacquires_after_release` separately proves overlap exclusion.
 
 **Suggested commit:** `feat(server): run graceful deletion worker`
 
 ### Task 10: Purge graceful state and preserve force blocks
 
-**Objective:** Complete graceful forget/republication without reactivating old authority, while permanently blocking force-deleted Lock IDs.
+**Objective:** Purge graceful operational state without removing the durable external tombstone, while permanently blocking force-deleted Lock IDs.
 
 **Files:**
 - Create/modify: lock-scoped purge repository/use case in `locks-service/src/`
@@ -560,7 +572,7 @@ Cross-service acceptance must additionally prove:
 - deletion crash recovery after every remote effect;
 - exact tombstone replacement halt/resume;
 - existing/final credential drain and concurrent per-path consumption;
-- graceful same-ID republication with no old authorization revival;
+- graceful tombstone preservation with no old authorization revival;
 - permanent force same-ID block.
 
 ## Remaining implementation-contract gates

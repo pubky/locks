@@ -31,13 +31,22 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SELECT task_id FROM verification_tasks WHERE task_id = $1::uuid FOR UPDATE")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
         let updated = sqlx::query(
             "UPDATE verification_tasks
              SET entitlement_publication_claim_token = $3, updated_at = $4
              WHERE task_id = $1::uuid AND status = 'in_progress'
-               AND claimed_by = $2 AND claim_token = $3 AND claim_expires_at >= $4
+               AND claimed_by = $2 AND claim_token = $3 AND claim_expires_at > $4
                AND deletion_job_id IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
@@ -48,74 +57,85 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
         .bind(worker_id)
         .bind(claim_token)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
         Ok(updated.rows_affected() == 1)
     }
 
     async fn claim_next_verification_task(
         &self,
         worker_id: &str,
-        now: time::OffsetDateTime,
-        claim_expires_at: time::OffsetDateTime,
+        claim_ttl: time::Duration,
     ) -> Result<Option<ClaimedVerificationTask>, ApplicationError> {
         let claim_token = uuid::Uuid::new_v4();
-        let sql = format!(
-            "UPDATE verification_tasks
-            SET
-                status = 'in_progress',
-                claimed_by = $1,
-                claim_expires_at = $2,
-                claim_token = $4,
-                next_attempt_at = NULL,
-                started_at = COALESCE(started_at, $3),
-                attempt_count = attempt_count + 1,
-                updated_at = $3
-            WHERE task_id = (
-                SELECT task_id
-                FROM verification_tasks
-                WHERE ((status = 'pending'
-                        AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
-                       OR (status = 'in_progress' AND claim_expires_at < $3))
-                  AND deletion_job_id IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM paykit_task_admissions
-                      WHERE verification_task_id = verification_tasks.task_id
-                        AND (
-                            ready = FALSE
-                            OR payment_in_hours IS NULL
-                            OR payment_in_hours <= 0
-                            OR invoice_created_at IS NULL
-                            OR payment_deadline IS NULL
-                            OR invoice_created_at > payment_deadline
-                        )
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM content_lock_deletion_task_snapshot AS snapshot
-                      WHERE snapshot.verification_task_id = verification_tasks.task_id
-                  )
-                  AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
-                  AND bundle_id = submitted_proof_bundle->>'bundle_id'
-                ORDER BY submitted_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
-        );
-        let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
-            .bind(worker_id)
-            .bind(claim_expires_at)
-            .bind(now)
-            .bind(claim_token)
-            .fetch_optional(&self.pool)
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let candidates: Vec<(
+            uuid::Uuid,
+            String,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+        )> = sqlx::query_as(
+            "SELECT task_id, status, next_attempt_at, claim_expires_at
+                 FROM verification_tasks
+                 WHERE status IN ('pending', 'in_progress')
+                   AND deletion_job_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM paykit_task_admissions
+                       WHERE verification_task_id = verification_tasks.task_id
+                         AND (ready = FALSE OR payment_in_hours IS NULL OR payment_in_hours <= 0
+                              OR invoice_created_at IS NULL OR payment_deadline IS NULL
+                              OR invoice_created_at > payment_deadline)
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
+                       WHERE snapshot.verification_task_id = verification_tasks.task_id
+                   )
+                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
+                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
+                 ORDER BY submitted_at
+                 FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-
-        row.map(row_to_task)
-            .transpose()
-            .map(|task| task.map(|task| ClaimedVerificationTask { task, claim_token }))
+        let claim_expires_at =
+            now.checked_add(claim_ttl)
+                .ok_or_else(|| ApplicationError::Storage {
+                    message: "verification task claim expiry overflow".to_owned(),
+                })?;
+        let Some((task_id, _, _, _)) = candidates.into_iter().find(|(_, status, next, expiry)| {
+            (status == "pending" && next.is_none_or(|due| due <= now))
+                || (status == "in_progress" && expiry.is_some_and(|deadline| deadline <= now))
+        }) else {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(None);
+        };
+        let sql = format!(
+            "UPDATE verification_tasks
+             SET status = 'in_progress', claimed_by = $2, claim_expires_at = $3,
+                 claim_token = $4, next_attempt_at = NULL,
+                 started_at = COALESCE(started_at, $5), attempt_count = attempt_count + 1,
+                 updated_at = $5
+             WHERE task_id = $1
+             RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
+            .bind(task_id)
+            .bind(worker_id)
+            .bind(claim_expires_at)
+            .bind(claim_token)
+            .bind(now)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        row_to_task(row).map(|task| Some(ClaimedVerificationTask { task, claim_token }))
     }
 
     async fn schedule_verification_task_retry(
@@ -123,9 +143,23 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
-        next_attempt_at: time::OffsetDateTime,
+        retry_after: time::Duration,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SELECT task_id FROM verification_tasks WHERE task_id = $1::uuid FOR UPDATE")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        let next_attempt_at =
+            now.checked_add(retry_after)
+                .ok_or_else(|| ApplicationError::Storage {
+                    message: "verification task retry time overflow".to_owned(),
+                })?;
         let sql = format!(
             "UPDATE verification_tasks
             SET
@@ -143,7 +177,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
               AND status = 'in_progress'
               AND claimed_by = $2
               AND claim_token = $3
-              AND claim_expires_at >= $4
+              AND claim_expires_at > $4
               AND deletion_job_id IS NULL
               AND NOT EXISTS (
                   SELECT 1
@@ -158,11 +192,12 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
             .bind(claim_token)
             .bind(now)
             .bind(next_attempt_at)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?;
-
-        row.map(row_to_task).transpose()
+        let result = row.map(row_to_task).transpose()?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result)
     }
 
     async fn persist_claimed_verification_task_transition(
@@ -170,7 +205,6 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
         task: VerificationTaskRecord,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
         if !matches!(
             task.status,
@@ -182,6 +216,16 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                 message: "claimed task transition must be terminal".to_owned(),
             });
         }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SELECT task_id FROM verification_tasks WHERE task_id = $1::uuid FOR UPDATE")
+            .bind(task.task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
         let sql = format!(
             "UPDATE verification_tasks
              SET status = $5,
@@ -199,7 +243,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                AND status = 'in_progress'
                AND claimed_by = $2
                AND claim_token = $3
-               AND claim_expires_at >= $4
+               AND claim_expires_at > $4
                AND deletion_job_id IS NULL
                AND NOT EXISTS (
                    SELECT 1
@@ -217,11 +261,12 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
             .bind(task.started_at)
             .bind(task.completed_at)
             .bind(task.failure_message)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?;
-
-        row.map(row_to_task).transpose()
+        let result = row.map(row_to_task).transpose()?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result)
     }
 }
 
@@ -270,7 +315,7 @@ mod tests {
             .await
             .unwrap();
         let claim = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -287,7 +332,7 @@ mod tests {
         let claim_token = claim.claim_token;
         let publication = tokio::spawn(async move {
             waiting_claimer
-                .begin_claimed_entitlement_publication(&task_id, "worker-a", &claim_token, NOW)
+                .begin_claimed_entitlement_publication(&task_id, "worker-a", &claim_token)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -333,7 +378,7 @@ mod tests {
             .await
             .unwrap();
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -343,7 +388,6 @@ mod tests {
                     &pending.task_id,
                     "worker-a",
                     &first.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -354,8 +398,7 @@ mod tests {
                 &pending.task_id,
                 "worker-a",
                 &first.claim_token,
-                NOW,
-                retry_at,
+                (retry_at) - (NOW),
             )
             .await
             .unwrap()
@@ -372,11 +415,11 @@ mod tests {
         .unwrap();
         assert_eq!(retained, Some(first.claim_token));
 
+        mark_retry_due(database.pool(), &pending.task_id).await;
         let second = claimer
             .claim_next_verification_task(
                 "worker-b",
-                retry_at,
-                retry_at + time::Duration::minutes(5),
+                (retry_at + time::Duration::minutes(5)) - (retry_at),
             )
             .await
             .unwrap()
@@ -387,7 +430,6 @@ mod tests {
                     &pending.task_id,
                     "worker-b",
                     &second.claim_token,
-                    retry_at,
                 )
                 .await
                 .unwrap()
@@ -401,7 +443,6 @@ mod tests {
                 completed,
                 "worker-b",
                 &second.claim_token,
-                retry_at,
             )
             .await
             .unwrap()
@@ -442,15 +483,21 @@ mod tests {
             .await
             .unwrap();
 
+        let before_claim = database_time(database.pool()).await;
         let claimed = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .expect("oldest pending task is claimed");
 
         assert_eq!(claimed.task.task_id, older.task_id);
         assert_eq!(claimed.task.status, VerificationTaskStatus::InProgress);
-        assert_eq!(claimed.task.started_at, Some(NOW));
+        let after_claim = database_time(database.pool()).await;
+        assert!(
+            claimed.task.started_at.is_some_and(|started_at| {
+                before_claim <= started_at && started_at <= after_claim
+            })
+        );
 
         database.cleanup().await;
     }
@@ -472,7 +519,7 @@ mod tests {
         assert!(first.requires_paykit);
         assert!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap()
                 .is_none()
@@ -507,7 +554,7 @@ mod tests {
         assert_eq!(ready_replay.invoice_window, Some(invoice_window));
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap()
                 .unwrap()
@@ -554,7 +601,7 @@ mod tests {
         let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
         assert!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap()
                 .is_none()
@@ -587,7 +634,7 @@ mod tests {
 
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
@@ -616,7 +663,7 @@ mod tests {
         mark_claim_expired(database.pool(), &in_progress.task_id).await;
 
         let reclaimed = claimer
-            .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .expect("expired in-progress task is reclaimed");
@@ -649,7 +696,7 @@ mod tests {
 
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
@@ -675,8 +722,8 @@ mod tests {
             .unwrap();
 
         let (claim_a, claim_b) = tokio::join!(
-            claimer_a.claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT),
-            claimer_b.claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT),
+            claimer_a.claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW)),
+            claimer_b.claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW)),
         );
         let claimed = [claim_a.unwrap(), claim_b.unwrap()];
 
@@ -708,16 +755,16 @@ mod tests {
             .await
             .unwrap();
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
-        let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
+        expire_claim(database.pool(), &first.task.task_id).await;
+        let reclaimed_at = database_time(database.pool()).await;
         let second = claimer
             .claim_next_verification_task(
                 "worker-a",
-                reclaimed_at,
-                reclaimed_at + time::Duration::minutes(5),
+                (reclaimed_at + time::Duration::minutes(5)) - (reclaimed_at),
             )
             .await
             .unwrap()
@@ -730,8 +777,7 @@ mod tests {
                     &pending.task_id,
                     "worker-a",
                     &first.claim_token,
-                    reclaimed_at,
-                    reclaimed_at + time::Duration::seconds(10),
+                    (reclaimed_at + time::Duration::seconds(10)) - (reclaimed_at),
                 )
                 .await
                 .unwrap(),
@@ -743,8 +789,7 @@ mod tests {
                     &pending.task_id,
                     "worker-a",
                     &second.claim_token,
-                    reclaimed_at,
-                    reclaimed_at + time::Duration::seconds(10),
+                    (reclaimed_at + time::Duration::seconds(10)) - (reclaimed_at),
                 )
                 .await
                 .unwrap()
@@ -766,16 +811,16 @@ mod tests {
         );
         repository.insert_verification_task(pending).await.unwrap();
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
-        let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
+        expire_claim(database.pool(), &first.task.task_id).await;
+        let reclaimed_at = database_time(database.pool()).await;
         let second = claimer
             .claim_next_verification_task(
                 "worker-a",
-                reclaimed_at,
-                reclaimed_at + time::Duration::minutes(5),
+                (reclaimed_at + time::Duration::minutes(5)) - (reclaimed_at),
             )
             .await
             .unwrap()
@@ -806,7 +851,6 @@ mod tests {
                         terminal,
                         "worker-a",
                         &first.claim_token,
-                        reclaimed_at,
                     )
                     .await
                     .unwrap(),
@@ -819,7 +863,6 @@ mod tests {
                     completed.clone(),
                     "worker-a",
                     &second.claim_token,
-                    reclaimed_at,
                 )
                 .await
                 .unwrap(),
@@ -844,7 +887,7 @@ mod tests {
             .await
             .unwrap();
         let claim = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .expect("pending task is claimed");
@@ -856,21 +899,7 @@ mod tests {
                     &pending.task_id,
                     "worker-b",
                     &claim.claim_token,
-                    NOW,
-                    next_attempt_at,
-                )
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            claimer
-                .schedule_verification_task_retry(
-                    &pending.task_id,
-                    "worker-a",
-                    &claim.claim_token,
-                    CLAIM_EXPIRES_AT + time::Duration::milliseconds(1),
-                    next_attempt_at,
+                    (next_attempt_at) - (NOW),
                 )
                 .await
                 .unwrap(),
@@ -881,8 +910,7 @@ mod tests {
                 &pending.task_id,
                 "worker-a",
                 &claim.claim_token,
-                NOW,
-                next_attempt_at,
+                (next_attempt_at) - (NOW),
             )
             .await
             .unwrap()
@@ -896,19 +924,18 @@ mod tests {
             claimer
                 .claim_next_verification_task(
                     "worker-b",
-                    next_attempt_at - time::Duration::milliseconds(1),
-                    CLAIM_EXPIRES_AT,
+                    (CLAIM_EXPIRES_AT) - (next_attempt_at - time::Duration::milliseconds(1)),
                 )
                 .await
                 .unwrap(),
             None
         );
+        mark_retry_due(database.pool(), &pending.task_id).await;
         assert!(
             claimer
                 .claim_next_verification_task(
                     "worker-b",
-                    next_attempt_at,
-                    CLAIM_EXPIRES_AT + time::Duration::seconds(10),
+                    (CLAIM_EXPIRES_AT + time::Duration::seconds(10)) - (next_attempt_at),
                 )
                 .await
                 .unwrap()
@@ -930,11 +957,10 @@ mod tests {
     async fn mark_claim_expired(pool: &sqlx::PgPool, task_id: &TaskId) {
         sqlx::query(
             "UPDATE verification_tasks
-            SET claimed_by = 'worker-a', claim_expires_at = $2
+            SET claimed_by = 'worker-a', claim_expires_at = clock_timestamp()
             WHERE task_id = $1::uuid",
         )
         .bind(task_id.to_string())
-        .bind(datetime!(2026-05-29 12:05:00 UTC))
         .execute(pool)
         .await
         .expect("mark claim expired");
@@ -943,14 +969,45 @@ mod tests {
     async fn mark_claim_active(pool: &sqlx::PgPool, task_id: &TaskId) {
         sqlx::query(
             "UPDATE verification_tasks
-            SET claimed_by = 'worker-a', claim_expires_at = $2
+            SET claimed_by = 'worker-a',
+                claim_expires_at = clock_timestamp() + INTERVAL '5 minutes'
             WHERE task_id = $1::uuid",
         )
         .bind(task_id.to_string())
-        .bind(datetime!(2026-05-29 12:11:00 UTC))
         .execute(pool)
         .await
         .expect("mark claim active");
+    }
+
+    async fn expire_claim(pool: &sqlx::PgPool, task_id: &TaskId) {
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET claim_expires_at = clock_timestamp()
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task_id.to_string())
+        .execute(pool)
+        .await
+        .expect("expire claim at the database clock boundary");
+    }
+
+    async fn mark_retry_due(pool: &sqlx::PgPool, task_id: &TaskId) {
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET next_attempt_at = clock_timestamp()
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task_id.to_string())
+        .execute(pool)
+        .await
+        .expect("make retry due at the database clock boundary");
+    }
+
+    async fn database_time(pool: &sqlx::PgPool) -> time::OffsetDateTime {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .expect("sample database clock")
     }
 
     fn terminal_task(task_id: &str, status: VerificationTaskStatus) -> VerificationTaskRecord {

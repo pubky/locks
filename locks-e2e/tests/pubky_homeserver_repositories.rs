@@ -12,8 +12,9 @@ use locks_server::testing::TestServerApp;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::FrontendSessionToken;
 use locks_service::infrastructure::pubky::{
-    PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
-    PubkyHomeserverStorageClient, PubkyLockServicePointerRepository, PubkyPrivResourceRepository,
+    PubkyBytesResource, PubkyContentLockRepository, PubkyContentLockTombstoneRepository,
+    PubkyEntitlementRepository, PubkyHomeserverStorageClient, PubkyLockServicePointerRepository,
+    PubkyPrivResourceRepository,
 };
 use serde_json::json;
 use support::creator_publishing_client::{LocalCreatorPublishingClient, response_bytes};
@@ -31,6 +32,7 @@ async fn pubky_homeserver_repository_flow_writes_to_fake_homeserver_storage() {
     let state = AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(PubkyContentLockRepository::new(storage.clone())),
+        Arc::new(PubkyContentLockTombstoneRepository::new(storage.clone())),
         Arc::new(PubkyPrivResourceRepository::new(storage.clone())),
         Arc::new(PubkyLockServicePointerRepository::new(storage.clone())),
         Arc::new(PubkyEntitlementRepository::new(storage.clone())),

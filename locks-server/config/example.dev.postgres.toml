@@ -16,6 +16,13 @@ poll_interval_ms = 250
 claim_timeout_seconds = 60
 worker_id = "default-worker"
 
+[deletion_worker]
+enabled = true
+poll_interval_ms = 250
+claim_timeout_seconds = 60
+shutdown_timeout_seconds = 30
+worker_id = "deletion-worker"
+
 [runtime]
 environment = "development"
 

@@ -219,7 +219,7 @@ async fn force_delete_content_lock(
     }
     let content_lock = match state
         .content_lock_deletions()
-        .prepare_force_deletion(&creator, &lock_id, state.clock().now())
+        .prepare_force_deletion(&creator, &lock_id)
         .await?
     {
         PrepareForceDeletionResult::PublicationInProgress => {

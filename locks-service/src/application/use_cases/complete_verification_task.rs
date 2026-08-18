@@ -51,7 +51,6 @@ struct ClaimFencedTaskRepository<'a> {
     claim: ClaimedVerificationTask,
     claimer: &'a dyn VerificationTaskClaimer,
     worker_id: &'a str,
-    clock: &'a dyn Clock,
 }
 
 struct ClaimFencedEntitlementRepository<'a> {
@@ -59,7 +58,6 @@ struct ClaimFencedEntitlementRepository<'a> {
     claim: &'a ClaimedVerificationTask,
     claimer: &'a dyn VerificationTaskClaimer,
     worker_id: &'a str,
-    clock: &'a dyn Clock,
 }
 
 #[async_trait]
@@ -74,7 +72,6 @@ impl EntitlementRepository for ClaimFencedEntitlementRepository<'_> {
                 &self.claim.task.task_id,
                 self.worker_id,
                 &self.claim.claim_token,
-                self.clock.now(),
             )
             .await?
         {
@@ -122,7 +119,6 @@ impl VerificationTaskRepository for ClaimFencedTaskRepository<'_> {
                 task,
                 self.worker_id,
                 &self.claim.claim_token,
-                self.clock.now(),
             )
             .await?
             .ok_or(ApplicationError::VerificationTaskClaimLost)?;
@@ -205,7 +201,11 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         let verification_result = match self.verify_criteria(&task, &content_lock).await {
             Ok(verification_result) => verification_result,
             Err(error) => {
-                if matches!(error, ApplicationError::VerificationPending) {
+                if matches!(
+                    error,
+                    ApplicationError::VerificationPending
+                        | ApplicationError::VerificationDependencyUnavailable
+                ) {
                     return Err(error);
                 }
                 self.persist_failed_task(task, viewer_safe_failure_message(&error).to_owned())
@@ -299,14 +299,12 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
             claim: claim.clone(),
             claimer,
             worker_id,
-            clock: self.clock,
         };
         let fenced_entitlements = ClaimFencedEntitlementRepository {
             inner: self.entitlements,
             claim: &claim,
             claimer,
             worker_id,
-            clock: self.clock,
         };
         CompleteVerificationTaskUseCase::new(
             &fenced_tasks,
@@ -408,6 +406,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
+        | ApplicationError::VerificationDependencyUnavailable
         | ApplicationError::InvalidVerificationTaskState { .. }
         | ApplicationError::VerificationTaskClaimLost
         | ApplicationError::InvalidVerificationTaskFailureMessage
@@ -721,8 +720,7 @@ mod tests {
         let claim = claimer
             .claim_next_verification_task(
                 "worker-a",
-                datetime!(2026-05-29 12:04:00 UTC),
-                datetime!(2026-05-29 13:00:00 UTC),
+                (datetime!(2026-05-29 13:00:00 UTC)) - (datetime!(2026-05-29 12:04:00 UTC)),
             )
             .await
             .unwrap()
@@ -1237,7 +1235,6 @@ mod tests {
             _task_id: &TaskId,
             _worker_id: &str,
             _claim_token: &uuid::Uuid,
-            _now: time::OffsetDateTime,
         ) -> Result<bool, ApplicationError> {
             Ok(true)
         }
@@ -1245,8 +1242,7 @@ mod tests {
         async fn claim_next_verification_task(
             &self,
             _worker_id: &str,
-            _now: OffsetDateTime,
-            _claim_expires_at: OffsetDateTime,
+            _claim_ttl: time::Duration,
         ) -> Result<Option<ClaimedVerificationTask>, ApplicationError> {
             unreachable!("completion must not claim tasks")
         }
@@ -1256,8 +1252,7 @@ mod tests {
             _task_id: &TaskId,
             _worker_id: &str,
             _claim_token: &uuid::Uuid,
-            _now: OffsetDateTime,
-            _next_attempt_at: OffsetDateTime,
+            _retry_after: time::Duration,
         ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
             unreachable!("completion must not schedule retries")
         }
@@ -1267,7 +1262,6 @@ mod tests {
             _task: VerificationTaskRecord,
             _worker_id: &str,
             _claim_token: &uuid::Uuid,
-            _now: OffsetDateTime,
         ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
             Ok(None)
         }

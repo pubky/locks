@@ -51,6 +51,7 @@ use crate::config::{
     VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
+use locks_service::infrastructure::memory::content_lock_tombstones::InMemoryContentLockTombstoneRepository;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
@@ -130,8 +131,7 @@ impl AccessCredentialStore for ResponseBoundaryAccessCredentialStore {
         &self,
         _lookup_key: &AccessCredentialLookupKey,
         path: &str,
-        _now: time::OffsetDateTime,
-        _claim_expires_at: time::OffsetDateTime,
+        _claim_duration: time::Duration,
     ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
         Ok(Some(DeletionReadAuthorization {
             claim_token: Some(self.claim_token),
@@ -169,7 +169,6 @@ impl AccessCredentialStore for ResponseBoundaryAccessCredentialStore {
         _lookup_key: &AccessCredentialLookupKey,
         _path: &str,
         claim_token: Uuid,
-        _now: time::OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
         assert_eq!(claim_token, self.claim_token);
         self.consumes.fetch_add(1, Ordering::SeqCst);
@@ -647,7 +646,7 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
     let now = state.clock().now();
     let claimed = state
         .content_lock_deletions()
-        .claim_next("test-worker", now, now + time::Duration::minutes(1))
+        .claim_next("test-worker", (now + time::Duration::minutes(1)) - (now))
         .await
         .unwrap()
         .unwrap();
@@ -657,7 +656,6 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
             claimed.job.job_id,
             "test-worker",
             claimed.claim_token,
-            now,
             Some(ContentLockDeletionFailureCode::TombstoneMissing),
         )
         .await
@@ -736,7 +734,7 @@ async fn graceful_replay_of_failed_job_requeues_same_frozen_manifest() {
     let now = state.clock().now();
     let claimed = state
         .content_lock_deletions()
-        .claim_next("test-worker", now, now + time::Duration::minutes(1))
+        .claim_next("test-worker", (now + time::Duration::minutes(1)) - (now))
         .await
         .unwrap()
         .unwrap();
@@ -746,7 +744,6 @@ async fn graceful_replay_of_failed_job_requeues_same_frozen_manifest() {
             claimed.job.job_id,
             "test-worker",
             claimed.claim_token,
-            now,
             Some(ContentLockDeletionFailureCode::TombstoneMissing),
         )
         .await
@@ -889,8 +886,30 @@ async fn creator_content_lock_deletion_status_reports_job_and_absence() {
 }
 
 #[tokio::test]
-async fn readyz_returns_ready_for_ephemeral_runtime_without_secrets() {
-    let response = router(test_state())
+async fn readyz_requires_independent_ready_evidence_for_enabled_workers() {
+    let state = test_state();
+    let starting = router(state.clone())
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+    assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response_json(starting).await["status"], "not_ready");
+
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    let verification_only = router(state.clone())
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+    assert_eq!(verification_only.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    let response = router(state)
         .oneshot(empty_request("GET", "/readyz"))
         .await
         .unwrap();
@@ -923,6 +942,7 @@ async fn readyz_returns_ready_for_ephemeral_runtime_without_secrets() {
 async fn readyz_reports_worker_disabled_for_ephemeral_runtime() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.worker.enabled = false;
+    config.deletion_worker.enabled = false;
     let response = router(AppState::new_empty_in_memory(config))
         .oneshot(empty_request("GET", "/readyz"))
         .await
@@ -933,6 +953,31 @@ async fn readyz_reports_worker_disabled_for_ephemeral_runtime() {
     assert_eq!(body["status"], "ready");
     assert_eq!(body["runtime_storage"], "ephemeral");
     assert_eq!(body["worker_enabled"], false);
+    assert_eq!(body.as_object().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn readyz_reports_degraded_when_a_worker_dependency_is_degraded() {
+    let state = test_state();
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::TransientDependencyFailure,
+    );
+
+    let response = router(state)
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["runtime_storage"], "ephemeral");
+    assert_eq!(body["worker_enabled"], true);
     assert_eq!(body.as_object().unwrap().len(), 3);
 }
 
@@ -948,6 +993,14 @@ async fn readyz_returns_not_ready_for_persisted_runtime_when_pool_ping_fails() {
         pool,
         CreatorAuthoritySecretCipher::new([7; 32]),
         locks_service::infrastructure::final_credentials::FinalCredentialCipher::new([8; 32]),
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::TransientDependencyFailure,
     );
 
     let response = router(state)
@@ -1553,6 +1606,7 @@ async fn dev_pubky_homeserver_routes_mount_authenticated_creator_routes_and_manu
     let app = router(AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -3475,6 +3529,7 @@ fn test_state_with_runtime(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -3509,6 +3564,7 @@ fn test_state_with_content_lock_limits(content_locks: ContentLocksConfig) -> App
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -3523,6 +3579,7 @@ fn test_state_with_creator_repository_backend(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -3563,6 +3620,7 @@ fn test_config(
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
         deletion: crate::config::DeletionConfig::default(),
+        deletion_worker: crate::config::DeletionWorkerConfig::default(),
         paykit: None,
     }
 }

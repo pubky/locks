@@ -22,22 +22,29 @@ pub enum LockServerKeyRepublisherError {
     PacketBuild(String),
     #[error("failed to build PKARR client: {0}")]
     ClientBuild(String),
+    #[error("PKARR republisher interval must be greater than zero")]
+    InvalidInterval,
     #[error("failed to publish lock server PKARR packet: {0}")]
     Publish(String),
 }
 
-/// Background task that publishes and periodically republishes the Lock Server key's PKARR record.
+/// Owned task that publishes and periodically republishes the Lock Server key's PKARR record.
 #[derive(Debug)]
 pub struct LockServerKeyRepublisher {
-    join_handle: tokio::task::JoinHandle<()>,
+    client: pkarr::Client,
+    signed_packet: pkarr::SignedPacket,
+    interval: std::time::Duration,
 }
 
 impl LockServerKeyRepublisher {
-    pub async fn start_if_required(
+    pub fn build_if_required(
         config: &LockServerRuntimeConfig,
     ) -> Result<Option<Self>, LockServerKeyRepublisherError> {
         if !requires_lock_server_pkarr(config) {
             return Ok(None);
+        }
+        if config.pkdns.key_republisher_interval_seconds == 0 {
+            return Err(LockServerKeyRepublisherError::InvalidInterval);
         }
 
         let keypair = load_lock_server_keypair(&config.credentials)?;
@@ -51,30 +58,35 @@ impl LockServerKeyRepublisher {
         let client = builder
             .build()
             .map_err(|error| LockServerKeyRepublisherError::ClientBuild(error.to_string()))?;
-        publish_once(&client, &signed_packet).await?;
+        Ok(Some(Self {
+            client,
+            signed_packet,
+            interval: std::time::Duration::from_secs(config.pkdns.key_republisher_interval_seconds),
+        }))
+    }
 
-        let interval_seconds = config.pkdns.key_republisher_interval_seconds;
-        let join_handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let _ = publish_once(&client, &signed_packet).await;
+    pub async fn publish_initial(&self) -> Result<(), LockServerKeyRepublisherError> {
+        publish_once(&self.client, &self.signed_packet).await
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), LockServerKeyRepublisherError> {
+        let mut interval = tokio::time::interval(self.interval);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                _ = interval.tick() => {
+                    publish_once(&self.client, &self.signed_packet).await?;
+                }
             }
-        });
-
-        Ok(Some(Self { join_handle }))
-    }
-
-    pub fn stop(&self) {
-        self.join_handle.abort();
-    }
-}
-
-impl Drop for LockServerKeyRepublisher {
-    fn drop(&mut self) {
-        self.stop();
+        }
     }
 }
 
@@ -275,6 +287,20 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn zero_republisher_interval_is_rejected_before_secret_or_publication_work() {
+        let mut config = test_config();
+        config.creator_authority_acquisition.enabled = true;
+        config.pkdns.key_republisher_interval_seconds = 0;
+
+        let error = LockServerKeyRepublisher::build_if_required(&config).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LockServerKeyRepublisherError::InvalidInterval
+        ));
+    }
+
     #[test]
     fn pkarr_republisher_is_required_for_production_lock_server_identity() {
         let mut config = test_config();
@@ -330,6 +356,7 @@ mod tests {
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
             deletion: crate::config::DeletionConfig::default(),
+            deletion_worker: crate::config::DeletionWorkerConfig::default(),
             paykit: None,
         }
     }
