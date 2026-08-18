@@ -11,7 +11,7 @@ use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierR
 use tokio::sync::watch;
 use tracing::{debug, error, info};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, WorkerKind, WorkerReadiness, WorkerReadinessEvidence};
 
 mod invoice;
 pub use invoice::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, OsFullJitter};
@@ -233,6 +233,46 @@ impl<'a> VerificationWorker<'a> {
                 WorkerTick::Completed(_)
                 | WorkerTick::RetryScheduled(_)
                 | WorkerTick::Failed(_) => {}
+            }
+        }
+    }
+
+    pub async fn run_until_shutdown_with_readiness(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+        readiness: &WorkerReadiness,
+    ) -> Result<(), ApplicationError> {
+        loop {
+            if *shutdown.borrow() {
+                readiness.record(WorkerKind::Verification, WorkerReadinessEvidence::Stopped);
+                return Ok(());
+            }
+
+            match self.run_once().await {
+                Ok(tick) => {
+                    readiness.record(WorkerKind::Verification, WorkerReadinessEvidence::Ready);
+                    if tick == WorkerTick::Idle {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    readiness.record(
+                                        WorkerKind::Verification,
+                                        WorkerReadinessEvidence::Stopped,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                            _ = tokio::time::sleep(self.poll_interval) => {}
+                        }
+                    }
+                }
+                Err(error) => {
+                    readiness.record(
+                        WorkerKind::Verification,
+                        WorkerReadinessEvidence::UnexpectedExit,
+                    );
+                    return Err(error);
+                }
             }
         }
     }
@@ -893,6 +933,7 @@ mod tests {
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
             deletion: crate::config::DeletionConfig::default(),
+            deletion_worker: crate::config::DeletionWorkerConfig::default(),
             paykit: None,
         }
     }

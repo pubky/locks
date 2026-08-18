@@ -1,13 +1,24 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, LockId};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord, DeletionReadAuthorization,
-    IssuedDeletionCredential,
+    FinalCredentialMaterialization, InitializeFinalAccessWindowsResult, IssuedDeletionCredential,
 };
+
+/// Exact worker ownership and candidate material for one final-credential winner operation.
+pub struct FinalCredentialWorkerIssueRequest<'a> {
+    pub deletion_job_id: Uuid,
+    pub worker_id: &'a str,
+    pub claim_token: Uuid,
+    pub creator: &'a CreatorPubky,
+    pub bundle_id: &'a BundleId,
+    pub now: OffsetDateTime,
+    pub candidate: AccessCredential,
+}
 
 /// Store for issued opaque access credentials.
 #[async_trait]
@@ -43,11 +54,22 @@ pub trait AccessCredentialStore: Send + Sync {
         _deletion_job_id: Uuid,
         _worker_id: &str,
         _claim_token: Uuid,
-        _now: OffsetDateTime,
-        _issuance_deadline: OffsetDateTime,
-        _read_deadline: OffsetDateTime,
-    ) -> Result<bool, ApplicationError> {
-        Ok(false)
+        _issuance_window: Duration,
+        _read_window: Duration,
+    ) -> Result<InitializeFinalAccessWindowsResult, ApplicationError> {
+        Ok(InitializeFinalAccessWindowsResult::ClaimLost)
+    }
+
+    /// Enumerates eligible snapshots awaiting final credential materialization under an exact
+    /// live deletion-worker claim. Implementations return deterministic bundle ordering.
+    async fn final_credentials_to_materialize(
+        &self,
+        _deletion_job_id: Uuid,
+        _worker_id: &str,
+        _claim_token: Uuid,
+        _limit: usize,
+    ) -> Result<Vec<FinalCredentialMaterialization>, ApplicationError> {
+        Ok(Vec::new())
     }
 
     async fn issue_or_replay_final_credential(
@@ -56,6 +78,15 @@ pub trait AccessCredentialStore: Send + Sync {
         _bundle_id: &BundleId,
         _now: OffsetDateTime,
         _candidate: AccessCredential,
+    ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
+        Ok(None)
+    }
+
+    /// Issues or replays one final credential only while the exact deletion-worker claim remains
+    /// live. Implementations revalidate ownership and fresh time in the winner transaction.
+    async fn issue_or_replay_final_credential_for_worker(
+        &self,
+        _request: FinalCredentialWorkerIssueRequest<'_>,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
         Ok(None)
     }
@@ -74,8 +105,7 @@ pub trait AccessCredentialStore: Send + Sync {
         &self,
         _lookup_key: &AccessCredentialLookupKey,
         _path: &str,
-        _now: OffsetDateTime,
-        _claim_expires_at: OffsetDateTime,
+        _claim_duration: Duration,
     ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
         Ok(None)
     }
@@ -104,7 +134,6 @@ pub trait AccessCredentialStore: Send + Sync {
         _lookup_key: &AccessCredentialLookupKey,
         _path: &str,
         _claim_token: Uuid,
-        _now: OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
         Ok(false)
     }

@@ -1,26 +1,27 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 
 use locks_core::ids::{ContentLockPath, CreatorPubky};
 use locks_core::lock_policy::ContentLock;
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::ContentLockRepository;
-
-type ContentLockKey = (CreatorPubky, ContentLockPath);
+use crate::infrastructure::memory::public_content_locks::InMemoryPublicContentLockStore;
 
 /// In-memory content lock repository for the first retrieval/access slice.
 #[derive(Debug, Default)]
 pub struct InMemoryContentLockRepository {
-    records: RwLock<HashMap<ContentLockKey, ContentLock>>,
+    public_store: InMemoryPublicContentLockStore,
 }
 
 impl InMemoryContentLockRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a typed adapter over shared canonical public-path storage.
+    pub fn with_public_store(public_store: InMemoryPublicContentLockStore) -> Self {
+        Self { public_store }
     }
 }
 
@@ -32,10 +33,15 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         content_lock_path: ContentLockPath,
         content_lock: ContentLock,
     ) -> Result<(), ApplicationError> {
-        self.records
-            .write()
-            .await
-            .insert((creator, content_lock_path), content_lock);
+        let bytes =
+            content_lock
+                .canonical_json_bytes()
+                .map_err(|error| ApplicationError::Storage {
+                    message: format!("failed to serialize in-memory content lock: {error}"),
+                })?;
+        self.public_store
+            .put(creator, content_lock_path, bytes)
+            .await;
         Ok(())
     }
 
@@ -44,12 +50,15 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError> {
-        Ok(self
-            .records
-            .read()
+        self.public_store
+            .get(creator, content_lock_path)
             .await
-            .get(&(creator.clone(), content_lock_path.clone()))
-            .cloned())
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| ApplicationError::Storage {
+                    message: format!("failed to deserialize in-memory content lock: {error}"),
+                })
+            })
+            .transpose()
     }
 
     async fn delete_content_lock(
@@ -58,10 +67,9 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         content_lock_path: &ContentLockPath,
     ) -> Result<bool, ApplicationError> {
         Ok(self
-            .records
-            .write()
+            .public_store
+            .remove(creator, content_lock_path)
             .await
-            .remove(&(creator.clone(), content_lock_path.clone()))
             .is_some())
     }
 }

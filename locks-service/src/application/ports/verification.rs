@@ -92,6 +92,28 @@ pub trait VerificationTaskRepository: Send + Sync {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError>;
 
+    /// Atomically updates a prevalidated set of verification tasks.
+    ///
+    /// Repositories that support multi-record updates must either apply every update or none.
+    /// The default supports the trivially atomic single-record case only.
+    async fn update_verification_tasks_atomically(
+        &self,
+        mut tasks: Vec<VerificationTaskRecord>,
+    ) -> Result<(), ApplicationError> {
+        if tasks.len() == 1 {
+            return self
+                .update_verification_task(tasks.pop().expect("length checked"))
+                .await;
+        }
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        Err(ApplicationError::Storage {
+            message: "atomic verification task batch update is not implemented by this repository"
+                .to_owned(),
+        })
+    }
+
     /// Loads a verification task by task ID.
     ///
     /// Returns `Ok(None)` when no task exists.

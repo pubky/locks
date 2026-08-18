@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -22,7 +23,7 @@ use locks_core::verification::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     AccessCredential, AccessCredentialLookupKey, AccessCredentialPolicy, AccessCredentialRecord,
-    GuardedResourceRecord, VerificationTaskRecord,
+    GuardedResourceRecord, IssuedDeletionCredential, VerificationTaskRecord,
 };
 use crate::application::ports::{
     AccessCredentialGenerator, AccessCredentialStore, Clock, ContentLockRepository,
@@ -36,6 +37,36 @@ use crate::application::use_cases::validate_access_credential::{
 };
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+
+#[tokio::test]
+async fn final_credential_winner_uses_fresh_time_after_generation() {
+    let before_generation = datetime!(2026-05-29 12:00:00 UTC);
+    let after_generation = datetime!(2026-05-29 12:00:01 UTC);
+    let entitlements = FakeEntitlements::new(None);
+    let content_locks = FakeContentLocks::new(None);
+    let store = FakeAccessCredentialStore::with_final_credential();
+    let generator = FakeGenerator::new(AccessCredential::new("final-bearer"));
+    let clock = SequenceClock::new([before_generation, after_generation]);
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+
+    let issued = use_case
+        .execute(IssueAccessCredentialRequest {
+            creator: creator(),
+            bundle_id: bundle_id(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(issued.credential.as_str(), "final-bearer");
+    assert_eq!(store.final_issue_time(), Some(after_generation));
+}
 
 #[tokio::test]
 async fn issue_access_credential_rechecks_entitlement_and_stores_lookup_key() {
@@ -556,6 +587,8 @@ impl EntitlementRepository for FakeEntitlements {
 struct FakeAccessCredentialStore {
     record: Mutex<Option<(AccessCredentialLookupKey, AccessCredentialRecord)>>,
     deleted: Mutex<Option<AccessCredentialLookupKey>>,
+    final_available: bool,
+    final_issue_time: Mutex<Option<OffsetDateTime>>,
 }
 
 impl FakeAccessCredentialStore {
@@ -563,7 +596,20 @@ impl FakeAccessCredentialStore {
         Self {
             record: Mutex::new(Some((lookup_key, record))),
             deleted: Mutex::new(None),
+            final_available: false,
+            final_issue_time: Mutex::new(None),
         }
+    }
+
+    fn with_final_credential() -> Self {
+        Self {
+            final_available: true,
+            ..Self::default()
+        }
+    }
+
+    fn final_issue_time(&self) -> Option<OffsetDateTime> {
+        *self.final_issue_time.lock().unwrap()
     }
 
     fn stored_record(&self) -> (AccessCredentialLookupKey, AccessCredentialRecord) {
@@ -612,6 +658,29 @@ impl AccessCredentialStore for FakeAccessCredentialStore {
         *self.record.lock().unwrap() = None;
         Ok(())
     }
+
+    async fn final_credential_available(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
+        _now: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self.final_available)
+    }
+
+    async fn issue_or_replay_final_credential(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
+        now: OffsetDateTime,
+        candidate: AccessCredential,
+    ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
+        *self.final_issue_time.lock().unwrap() = Some(now);
+        Ok(Some(IssuedDeletionCredential {
+            credential: candidate,
+            expires_at: now + time::Duration::minutes(1),
+        }))
+    }
 }
 
 struct FakeGenerator {
@@ -653,6 +722,28 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now(&self) -> OffsetDateTime {
         self.now
+    }
+}
+
+struct SequenceClock {
+    values: Mutex<VecDeque<OffsetDateTime>>,
+}
+
+impl SequenceClock {
+    fn new(values: impl IntoIterator<Item = OffsetDateTime>) -> Self {
+        Self {
+            values: Mutex::new(values.into_iter().collect()),
+        }
+    }
+}
+
+impl Clock for SequenceClock {
+    fn now(&self) -> OffsetDateTime {
+        self.values
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("sequence clock exhausted")
     }
 }
 

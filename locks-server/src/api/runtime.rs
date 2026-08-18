@@ -6,48 +6,46 @@ use axum::response::{IntoResponse, Response};
 use crate::api::dtos::{
     HealthHttpResponse, ReadinessHttpResponse, WellKnownLocksServerHttpResponse,
 };
-use crate::app_state::{AppState, RuntimeStorageKind};
+use crate::app_state::{AppState, ReadinessStatus, RuntimeStorageKind};
 
 pub(super) async fn healthz() -> Json<HealthHttpResponse> {
     Json(HealthHttpResponse { status: "ok" })
 }
 
 pub(super) async fn readyz(State(state): State<AppState>) -> Response {
-    let worker_enabled = state.config().worker.enabled;
-    match state.private_runtime_storage_kind() {
-        RuntimeStorageKind::InMemory => Json(ReadinessHttpResponse {
-            status: "ready",
-            runtime_storage: "ephemeral",
-            worker_enabled,
-        })
-        .into_response(),
+    let worker_enabled = state.config().worker.enabled || state.config().deletion_worker.enabled;
+    let (runtime_storage, database_ready) = match state.private_runtime_storage_kind() {
+        RuntimeStorageKind::InMemory => ("ephemeral", true),
         RuntimeStorageKind::Postgres => {
-            let is_ready = match state.postgres_pool() {
+            let database_ready = match state.postgres_pool() {
                 Some(pool) => sqlx::query_scalar::<_, i32>("SELECT 1")
                     .fetch_one(pool)
                     .await
                     .is_ok(),
                 None => false,
             };
-            if is_ready {
-                Json(ReadinessHttpResponse {
-                    status: "ready",
-                    runtime_storage: "persisted",
-                    worker_enabled,
-                })
-                .into_response()
-            } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ReadinessHttpResponse {
-                        status: "not_ready",
-                        runtime_storage: "persisted",
-                        worker_enabled,
-                    }),
-                )
-                    .into_response()
-            }
+            ("persisted", database_ready)
         }
+    };
+
+    let status = if !database_ready {
+        ReadinessStatus::NotReady
+    } else {
+        state.worker_readiness_status()
+    };
+    let response = Json(ReadinessHttpResponse {
+        status: match status {
+            ReadinessStatus::Ready => "ready",
+            ReadinessStatus::Degraded => "degraded",
+            ReadinessStatus::NotReady => "not_ready",
+        },
+        runtime_storage,
+        worker_enabled,
+    });
+
+    match status {
+        ReadinessStatus::Ready | ReadinessStatus::Degraded => response.into_response(),
+        ReadinessStatus::NotReady => (StatusCode::SERVICE_UNAVAILABLE, response).into_response(),
     }
 }
 

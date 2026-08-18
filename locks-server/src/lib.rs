@@ -1,6 +1,7 @@
 pub mod api;
 pub mod app_state;
 pub mod config;
+pub mod deletion_worker;
 pub mod paykit_http_client;
 pub mod pkdns;
 pub mod rate_limit;

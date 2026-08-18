@@ -148,13 +148,14 @@ pub enum VerificationTaskStatus {
     Expired,
 }
 
-/// Canonical reason a Paykit-backed verification attempt ended without entitlement.
+/// Canonical reason a verification attempt ended without entitlement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationTerminalReason {
     PaymentRequestRejected,
     PaymentRequestCanceled,
     ProposalExpired,
     PaymentDeadlineExpired,
+    ContentLockDeleted,
 }
 
 impl VerificationTerminalReason {
@@ -164,6 +165,7 @@ impl VerificationTerminalReason {
             Self::PaymentRequestCanceled => "payment_request_canceled",
             Self::ProposalExpired => "proposal_expired",
             Self::PaymentDeadlineExpired => "payment_deadline_expired",
+            Self::ContentLockDeleted => "content_lock_deleted",
         }
     }
 
@@ -173,6 +175,7 @@ impl VerificationTerminalReason {
             "payment_request_canceled" => Some(Self::PaymentRequestCanceled),
             "proposal_expired" => Some(Self::ProposalExpired),
             "payment_deadline_expired" => Some(Self::PaymentDeadlineExpired),
+            "content_lock_deleted" => Some(Self::ContentLockDeleted),
             _ => None,
         }
     }
@@ -205,7 +208,7 @@ pub struct VerificationTaskRecord {
     pub completed_at: Option<OffsetDateTime>,
     /// Non-empty failure detail for failed tasks only.
     pub failure_message: Option<String>,
-    /// Typed no-entitlement reason for expired Paykit attempts only.
+    /// Typed no-entitlement reason for expired verification attempts.
     pub terminal_reason: Option<VerificationTerminalReason>,
     /// Exact durable payload replayed while entitlement publication is pending.
     pub entitlement_to_publish: Option<VerifiedProofBundle>,
@@ -293,7 +296,7 @@ impl VerificationTaskRecord {
         self.transition_to(VerificationTaskStatus::Completed, at, None)
     }
 
-    /// Terminalizes an actively running Paykit attempt without entitlement or failure.
+    /// Terminalizes an active attempt without entitlement or failure.
     pub fn expire(
         &self,
         reason: VerificationTerminalReason,
@@ -301,13 +304,18 @@ impl VerificationTaskRecord {
     ) -> Result<Self, ApplicationError> {
         self.validate_state()?;
         self.validate_transition(VerificationTaskStatus::Expired)?;
-        if self.status != VerificationTaskStatus::InProgress {
+        if !matches!(
+            self.status,
+            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
+        ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "only an in-progress task can expire with a terminal reason".to_owned(),
+                message: "only a pending or in-progress task can expire with a terminal reason"
+                    .to_owned(),
             });
         }
         let mut transitioned = self.clone();
         transitioned.status = VerificationTaskStatus::Expired;
+        transitioned.started_at.get_or_insert(at);
         transitioned.completed_at = Some(at);
         transitioned.failure_message = None;
         transitioned.terminal_reason = Some(reason);

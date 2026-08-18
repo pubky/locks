@@ -129,6 +129,10 @@ fn public_api_parses_every_terminal_reason_and_valid_terminal_tuple() {
             "payment_deadline_expired",
             VerificationTerminalReason::PaymentDeadlineExpired,
         ),
+        (
+            "content_lock_deleted",
+            VerificationTerminalReason::ContentLockDeleted,
+        ),
     ] {
         let response = ViewerLocks::parse_lifecycle_response(json!({
             "creator": CREATOR,

@@ -17,11 +17,12 @@ use locks_service::{
         errors::ApplicationError,
         models::AccessCredentialPolicy,
         ports::{
-            AccessCredentialStore, Clock, ContentLockDeletionRepository,
-            ContentLockOwnershipRepository, ContentLockRepository, CreatorAuthorityManager,
-            CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
-            FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
-            GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
+            AccessCredentialStore, Clock, ContentLockDeletionActionOwnership,
+            ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
+            ContentLockTombstoneRepository, CreatorAuthorityManager, CreatorAuthorityStore,
+            CreatorConnectFlowStore, EntitlementRepository, FrontendSessionCodeStore,
+            FrontendSessionStore, GrantCreatorConnectFlowClient, GuardedResourceRepository,
+            InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
             LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
             VerificationTaskClaimer, VerificationTaskRepository,
         },
@@ -31,28 +32,32 @@ use locks_service::{
         final_credentials::FinalCredentialCipher,
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
+            content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
             content_lock_deletions::InMemoryContentLockDeletionRepository,
             content_lock_ownership::InMemoryContentLockOwnershipRepository,
+            content_lock_tombstones::InMemoryContentLockTombstoneRepository,
+            content_locks::InMemoryContentLockRepository,
+            public_content_locks::InMemoryPublicContentLockStore,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
             verification_tasks::InMemoryVerificationTaskRepository,
         },
         postgres::{
             CreatorAuthoritySecretCipher, PostgresAccessCredentialStore,
-            PostgresContentLockDeletionRepository, PostgresContentLockOwnershipRepository,
-            PostgresCreatorAuthorityStore, PostgresCreatorConnectFlowStore,
-            PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
-            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
-            PostgresVerificationTaskRepository,
+            PostgresContentLockDeletionActionOwnership, PostgresContentLockDeletionRepository,
+            PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
+            PostgresCreatorConnectFlowStore, PostgresFrontendSessionCodeStore,
+            PostgresFrontendSessionStore, PostgresPaymentDrainRepository,
+            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
             GrantSessionCache, LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys,
-            PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
-            PubkyGrantCreatorConnectFlowClient, PubkyHomeserverStorageClient,
-            PubkyLegacyCookieSessionImporter, PubkyLegacyCookieSessionRevalidator,
-            PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
-            PubkyPrivResourceRepository, PubkyResourceMetadata,
+            PubkyBytesResource, PubkyContentLockRepository, PubkyContentLockTombstoneRepository,
+            PubkyEntitlementRepository, PubkyGrantCreatorConnectFlowClient,
+            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionImporter,
+            PubkyLegacyCookieSessionRevalidator, PubkyLegacyCreatorConnectFlowClient,
+            PubkyLockServicePointerRepository, PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
         verifiers::dev_static::DevStaticVerifier,
         verifiers::paykit_payment::PaykitPaymentVerifier,
@@ -78,7 +83,10 @@ pub(crate) use crate::app_state::pubky_clients::configure_pkarr_builder;
 use crate::app_state::pubky_clients::{
     build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
 };
-pub use crate::app_state::readiness::RuntimeStorageKind;
+pub use crate::app_state::readiness::{
+    ReadinessStatus, RuntimeStorageKind, WorkerKind, WorkerReadiness, WorkerReadinessEvidence,
+    WorkerReadinessState,
+};
 use crate::config::{
     CreatorAuthorityAcquisitionMethod, LockServerRuntimeConfig, load_lock_server_signing_keypair,
 };
@@ -246,11 +254,14 @@ pub struct AppState {
     config: LockServerRuntimeConfig,
     private_runtime_storage_kind: RuntimeStorageKind,
     postgres_pool: Option<PgPool>,
+    worker_readiness: WorkerReadiness,
     content_locks: Arc<dyn ContentLockRepository>,
+    content_lock_tombstones: Arc<dyn ContentLockTombstoneRepository>,
     guarded_resources: Arc<dyn GuardedResourceRepository>,
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
     content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
     content_lock_deletions: Arc<dyn ContentLockDeletionRepository>,
+    content_lock_deletion_action_ownership: Arc<dyn ContentLockDeletionActionOwnership>,
     payment_drains: Option<Arc<dyn PaymentDrainRepository>>,
     invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
@@ -356,22 +367,37 @@ impl AppState {
             creator_authority_store,
             NoopLegacyCookieSessionRevalidator,
         ));
-        let unavailable_storage = UnavailablePubkyHomeserverStorageClient;
+        let unavailable_storage: Arc<dyn PubkyHomeserverStorageClient> =
+            Arc::new(UnavailablePubkyHomeserverStorageClient);
+        let public_content_locks = InMemoryPublicContentLockStore::new();
         let creator_repositories = CreatorRepositoryAdapters::new(
-            Arc::new(PubkyContentLockRepository::new(unavailable_storage)),
-            Arc::new(PubkyPrivResourceRepository::new(unavailable_storage)),
-            Arc::new(PubkyLockServicePointerRepository::new(unavailable_storage)),
+            Arc::new(InMemoryContentLockRepository::with_public_store(
+                public_content_locks.clone(),
+            )),
+            Arc::new(InMemoryContentLockTombstoneRepository::with_public_store(
+                public_content_locks,
+            )),
+            Arc::new(PubkyPrivResourceRepository::new(
+                unavailable_storage.clone(),
+            )),
+            Arc::new(PubkyLockServicePointerRepository::new(
+                unavailable_storage.clone(),
+            )),
             Arc::new(PubkyEntitlementRepository::new(unavailable_storage)),
         );
 
+        let content_lock_deletions = Arc::new(
+            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                Arc::clone(&access_credentials),
+                verification_task_deletion_fence,
+            ),
+        );
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
-            content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
-                    Arc::clone(&access_credentials),
-                    verification_task_deletion_fence,
-                ),
+            content_lock_deletions: content_lock_deletions.clone(),
+            content_lock_deletion_action_ownership: Arc::new(
+                InMemoryContentLockDeletionActionOwnership::new(content_lock_deletions),
             ),
             verification_tasks,
             verification_task_claimer,
@@ -397,6 +423,7 @@ impl AppState {
     pub fn new_empty_in_memory_with_creator_repositories(
         config: LockServerRuntimeConfig,
         content_locks: Arc<dyn ContentLockRepository>,
+        content_lock_tombstones: Arc<dyn ContentLockTombstoneRepository>,
         guarded_resources: Arc<dyn GuardedResourceRepository>,
         lock_service_pointers: Arc<dyn LockServicePointerRepository>,
         entitlements: Arc<dyn EntitlementRepository>,
@@ -427,19 +454,24 @@ impl AppState {
         ));
         let creator_repositories = CreatorRepositoryAdapters::new(
             content_locks,
+            content_lock_tombstones,
             guarded_resources,
             lock_service_pointers,
             entitlements,
         );
 
+        let content_lock_deletions = Arc::new(
+            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                Arc::clone(&access_credentials),
+                verification_task_deletion_fence,
+            ),
+        );
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
-            content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
-                    Arc::clone(&access_credentials),
-                    verification_task_deletion_fence,
-                ),
+            content_lock_deletions: content_lock_deletions.clone(),
+            content_lock_deletion_action_ownership: Arc::new(
+                InMemoryContentLockDeletionActionOwnership::new(content_lock_deletions),
             ),
             verification_tasks,
             verification_task_claimer,
@@ -493,38 +525,40 @@ impl AppState {
             creator_authority_store.clone(),
             NoopLegacyCookieSessionRevalidator,
         ));
-        let authorizing_storage = |storage: S| {
-            AuthorizingPubkyHomeserverStorageClient::new(
+        let authorizing_storage: Arc<dyn PubkyHomeserverStorageClient> =
+            Arc::new(AuthorizingPubkyHomeserverStorageClient::new(
                 storage,
                 LegacyCookieCreatorAuthorityManager::new(
                     creator_authority_store.clone(),
                     NoopLegacyCookieSessionRevalidator,
                 ),
-            )
-        };
+            ));
         let creator_repositories = CreatorRepositoryAdapters::new(
-            Arc::new(PubkyContentLockRepository::new(authorizing_storage(
-                storage.clone(),
-            ))),
-            Arc::new(PubkyPrivResourceRepository::new(authorizing_storage(
-                storage.clone(),
-            ))),
-            Arc::new(PubkyLockServicePointerRepository::new(authorizing_storage(
-                storage.clone(),
-            ))),
-            Arc::new(PubkyEntitlementRepository::new(authorizing_storage(
-                storage,
-            ))),
+            Arc::new(PubkyContentLockRepository::new(authorizing_storage.clone())),
+            Arc::new(PubkyContentLockTombstoneRepository::new(
+                authorizing_storage.clone(),
+            )),
+            Arc::new(PubkyPrivResourceRepository::new(
+                authorizing_storage.clone(),
+            )),
+            Arc::new(PubkyLockServicePointerRepository::new(
+                authorizing_storage.clone(),
+            )),
+            Arc::new(PubkyEntitlementRepository::new(authorizing_storage)),
         );
 
+        let content_lock_deletions = Arc::new(
+            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                Arc::clone(&access_credentials),
+                verification_task_deletion_fence,
+            ),
+        );
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
-            content_lock_deletions: Arc::new(
-                InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
-                    Arc::clone(&access_credentials),
-                    verification_task_deletion_fence,
-                ),
+            content_lock_deletions: content_lock_deletions.clone(),
+            content_lock_deletion_action_ownership: Arc::new(
+                InMemoryContentLockDeletionActionOwnership::new(content_lock_deletions),
             ),
             verification_tasks,
             verification_task_claimer,
@@ -585,6 +619,9 @@ impl AppState {
                 pool.clone(),
             )),
             invoice_admissions: verification_tasks.clone(),
+            content_lock_deletion_action_ownership: Arc::new(
+                PostgresContentLockDeletionActionOwnership::new(pool.clone()),
+            ),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -606,11 +643,13 @@ impl AppState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_postgres_runtime_and_creator_repositories(
         config: LockServerRuntimeConfig,
         pool: PgPool,
         ciphers: RuntimeSecretCiphers,
         content_locks: Arc<dyn ContentLockRepository>,
+        content_lock_tombstones: Arc<dyn ContentLockTombstoneRepository>,
         guarded_resources: Arc<dyn GuardedResourceRepository>,
         lock_service_pointers: Arc<dyn LockServicePointerRepository>,
         entitlements: Arc<dyn EntitlementRepository>,
@@ -635,6 +674,7 @@ impl AppState {
         ) = creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
         let creator_repositories = CreatorRepositoryAdapters::new(
             content_locks,
+            content_lock_tombstones,
             guarded_resources,
             lock_service_pointers,
             entitlements,
@@ -647,6 +687,9 @@ impl AppState {
                 pool.clone(),
             )),
             invoice_admissions: verification_tasks.clone(),
+            content_lock_deletion_action_ownership: Arc::new(
+                PostgresContentLockDeletionActionOwnership::new(pool.clone()),
+            ),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -676,6 +719,8 @@ impl AppState {
         private_runtime: PrivateRuntimeAdapters,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let worker_readiness =
+            WorkerReadiness::new(config.worker.enabled, config.deletion_worker.enabled);
         let access_credential_policy =
             AccessCredentialPolicy::new(config.credentials.max_ttl_seconds);
         let verification_submission_rate_limiter =
@@ -725,11 +770,15 @@ impl AppState {
             config,
             private_runtime_storage_kind,
             postgres_pool,
+            worker_readiness,
             content_locks: creator_repositories.content_locks,
+            content_lock_tombstones: creator_repositories.content_lock_tombstones,
             guarded_resources: creator_repositories.guarded_resources,
             lock_service_pointers: creator_repositories.lock_service_pointers,
             content_lock_ownership: private_runtime.content_lock_ownership,
             content_lock_deletions: private_runtime.content_lock_deletions,
+            content_lock_deletion_action_ownership: private_runtime
+                .content_lock_deletion_action_ownership,
             payment_drains,
             invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
@@ -774,8 +823,24 @@ impl AppState {
         self.postgres_pool.as_ref()
     }
 
+    pub fn worker_readiness(&self) -> &WorkerReadiness {
+        &self.worker_readiness
+    }
+
+    pub fn worker_readiness_status(&self) -> ReadinessStatus {
+        self.worker_readiness.status()
+    }
+
+    pub fn record_worker_readiness(&self, worker: WorkerKind, evidence: WorkerReadinessEvidence) {
+        self.worker_readiness.record(worker, evidence);
+    }
+
     pub fn content_locks(&self) -> &Arc<dyn ContentLockRepository> {
         &self.content_locks
+    }
+
+    pub fn content_lock_tombstones(&self) -> &Arc<dyn ContentLockTombstoneRepository> {
+        &self.content_lock_tombstones
     }
 
     pub fn guarded_resources(&self) -> &Arc<dyn GuardedResourceRepository> {
@@ -788,6 +853,12 @@ impl AppState {
 
     pub fn content_lock_deletions(&self) -> &Arc<dyn ContentLockDeletionRepository> {
         &self.content_lock_deletions
+    }
+
+    pub fn content_lock_deletion_action_ownership(
+        &self,
+    ) -> &Arc<dyn ContentLockDeletionActionOwnership> {
+        &self.content_lock_deletion_action_ownership
     }
 
     pub fn payment_drains(&self) -> Option<&Arc<dyn PaymentDrainRepository>> {
