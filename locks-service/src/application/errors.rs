@@ -48,6 +48,9 @@ pub enum ApplicationError {
     /// Criterion verifier is not terminal yet and should be retried later.
     #[error("verification pending")]
     VerificationPending,
+    /// A verification provider is transiently unavailable and should be retried later.
+    #[error("verification dependency unavailable")]
+    VerificationDependencyUnavailable,
     /// Submitted payment proof does not match its canonical content lock criterion.
     #[error("invalid paykit payment submission")]
     InvalidPaykitPaymentSubmission,

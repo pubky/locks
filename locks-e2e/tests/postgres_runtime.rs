@@ -1,16 +1,19 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
+use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{
-    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
+    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockServerPubky,
+    PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
@@ -25,32 +28,677 @@ use locks_server::config::{
     LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
     RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
+use locks_server::deletion_worker::{ClaimedDeletionExecutor, RuntimeClaimedDeletionExecutor};
+use locks_server::testing::TestServerApp;
 use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::{
-    AccessCredential, AccessCredentialLookupKey, ContentLockDeletionJob,
+    AccessCredential, AccessCredentialLookupKey, ClaimedContentLockDeletionJob,
+    ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
     ContentLockOwnershipStatus, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret, VerificationTaskRecord, VerificationTaskStatus,
+    CreatorAuthoritySecret, FrontendSessionToken, GuardedResourceRecord,
+    PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
 };
 use locks_service::application::ports::{
-    ContentLockDeletionRepository, VerificationTaskRepository,
+    ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
+    ContentLockDeletionActionGuard, ContentLockDeletionActionOwnership,
+    ContentLockDeletionRepository, ContentLockTombstoneRepository, GuardedResourceReadback,
+    GuardedResourceRepository, TombstoneReadback, VerificationTaskRepository,
 };
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
 use locks_service::infrastructure::memory::{
+    content_lock_tombstones::InMemoryContentLockTombstoneRepository,
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
     lock_service_pointers::InMemoryLockServicePointerRepository,
 };
 use locks_service::infrastructure::postgres::{
-    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository,
-    PostgresVerificationTaskRepository, run_migrations,
+    CreatorAuthoritySecretCipher, PostgresContentLockDeletionActionOwnership,
+    PostgresContentLockDeletionRepository, PostgresVerificationTaskRepository, run_migrations,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
-use time::macros::datetime;
+use time::{OffsetDateTime, macros::datetime};
 use tower::ServiceExt;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+
+#[tokio::test]
+async fn postgres_deletion_action_ownership_excludes_overlap_and_reacquires_after_release() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let first_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let second_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let job = ContentLockDeletionJob::new(
+        uuid::Uuid::new_v4(),
+        content_lock(),
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    deletions.insert_job(job).await.unwrap();
+    let claimed = deletions
+        .claim_next("ownership-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let first_guard = expect_action_acquired(
+        first_owner
+            .try_acquire(deletion_action_claim(&claimed, "ownership-worker", false))
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        second_owner
+            .try_acquire(deletion_action_claim(&claimed, "ownership-worker", false,))
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::Busy
+    ));
+
+    first_guard.release().await.unwrap();
+    let replacement_guard = expect_action_acquired(
+        second_owner
+            .try_acquire(deletion_action_claim(&claimed, "ownership-worker", false))
+            .await
+            .unwrap(),
+    );
+    replacement_guard.release().await.unwrap();
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_missed_final_issuance_terminalizes_with_closed_creator_failure_without_external_action()
+ {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let lock = content_lock();
+    let external = Arc::new(CrashExternalRepository::with_tombstone_and_resources(&lock));
+    let state = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+    let now = OffsetDateTime::now_utc();
+    let mut task = VerificationTaskRecord {
+        task_id: TaskId::from_str(&uuid::Uuid::new_v4().to_string()).unwrap(),
+        creator: lock.creator.clone(),
+        submitted_proof_bundle: submitted_proof_bundle_for(&lock),
+        status: VerificationTaskStatus::Completed,
+        submitted_at: now - time::Duration::hours(1),
+        started_at: Some(now - time::Duration::hours(1)),
+        completed_at: Some(now - time::Duration::minutes(30)),
+        failure_message: None,
+    };
+    task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+    tasks.insert_verification_task(task).await.unwrap();
+
+    let job = ContentLockDeletionJob::new(uuid::Uuid::new_v4(), lock, now).unwrap();
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    deletions.insert_job(job.clone()).await.unwrap();
+    sqlx::query(
+        "UPDATE content_lock_deletion_task_snapshot
+         SET resolved_status = 'completed', resolved_at = $2,
+             final_credential_eligible_at = $2
+         WHERE deletion_job_id = $1",
+    )
+    .bind(job.job_id)
+    .bind(now - time::Duration::minutes(30))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE content_lock_deletion_jobs
+         SET phase = 'issue_final_credentials', final_issuance_started_at = $2,
+             final_credential_issuance_deadline = $3, final_read_deadline = $4
+         WHERE job_id = $1",
+    )
+    .bind(job.job_id)
+    .bind(now - time::Duration::minutes(20))
+    .bind(now - time::Duration::minutes(5))
+    .bind(now + time::Duration::minutes(10))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = deletions
+        .claim_next(
+            "missed-issuance-worker",
+            (now + time::Duration::minutes(5)) - (now),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(state.clone())
+            .execute_claimed(claim, "missed-issuance-worker")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::TerminalFailed
+    );
+    let failed = deletions
+        .get_job(&job.creator, &job.lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.state, ContentLockDeletionState::Failed);
+    assert_eq!(
+        failed.failure_code.map(|code| code.as_str()),
+        Some("state_corrupt")
+    );
+    assert!(external.operations().is_empty());
+    assert_eq!(external.resource_read_count(), 0);
+    assert_eq!(external.resource_delete_count(), 0);
+
+    let app = TestServerApp::from_state(state);
+    let token = "missed-issuance-creator-session";
+    app.insert_frontend_session_for_test(
+        FrontendSessionToken::new(token),
+        job.creator.clone(),
+        now + time::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let response = app
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/creator/content-locks/{}/deletion", job.lock_id))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": job.lock_id,
+            "status": "failed",
+            "failure_code": "state_corrupt"
+        })
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_graceful_withdraw_crash_reclaims_without_republishing_or_stale_advance() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let external = Arc::new(CrashExternalRepository::with_original(content_lock()));
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let ownership = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let now = OffsetDateTime::now_utc();
+    let job = ContentLockDeletionJob::new(uuid::Uuid::new_v4(), content_lock(), now).unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+
+    let stale = deletions
+        .claim_next(
+            "withdraw-crashed",
+            (now + time::Duration::seconds(1)) - (now),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let crash_guard = expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(&stale, "withdraw-crashed", false))
+            .await
+            .unwrap(),
+    );
+    let tombstone = ContentLockDeletionTombstone::new(job.lock_id.clone(), now);
+    assert_eq!(
+        external
+            .withdraw_content_lock(
+                job.creator.clone(),
+                ContentLockPath::from_lock_id(job.lock_id.clone()),
+                &job.frozen_content_lock,
+                &tombstone,
+            )
+            .await
+            .unwrap(),
+        TombstoneReadback::Exact
+    );
+    drop(crash_guard);
+
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    let fresh = deletions
+        .claim_next("withdraw-reclaimed", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(fresh.claim_token, stale.claim_token);
+    assert!(matches!(
+        deletions
+            .advance_phase(
+                job.job_id,
+                "withdraw-crashed",
+                stale.claim_token,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap(),
+        locks_service::application::models::AdvanceContentLockDeletionPhaseResult::ClaimLost
+    ));
+
+    let recreated = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(recreated)
+            .execute_claimed(fresh, "withdraw-reclaimed")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::Progressed
+    );
+    assert_eq!(external.tombstone_write_count(), 1);
+    assert_eq!(external.withdraw_call_count(), 2);
+    assert_eq!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        ContentLockDeletionPhase::StartPaymentDrain
+    );
+    let release_check = deletions
+        .claim_next("withdraw-release-check", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(
+                &release_check,
+                "withdraw-release-check",
+                false,
+            ))
+            .await
+            .unwrap(),
+    )
+    .release()
+    .await
+    .unwrap();
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_guarded_generation_verification_crash_reclaims_and_replays_without_deletion() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let lock = content_lock();
+    let external = Arc::new(CrashExternalRepository::with_tombstone_and_resources(&lock));
+    let state = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let ownership = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let now = OffsetDateTime::now_utc();
+    let job = ContentLockDeletionJob::new(uuid::Uuid::new_v4(), lock.clone(), now).unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    set_deletion_phase(database.pool(), job.job_id, "delete_content").await;
+
+    let stale = deletions
+        .claim_next("verify-crashed", (now + time::Duration::seconds(1)) - (now))
+        .await
+        .unwrap()
+        .unwrap();
+    let crash_guard = expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(&stale, "verify-crashed", false))
+            .await
+            .unwrap(),
+    );
+    let primary = lock.primary_resource.as_ref().unwrap();
+    assert_eq!(
+        external
+            .read_guarded_resource_generation(&job.creator, &primary.path, &primary.hash)
+            .await
+            .unwrap(),
+        GuardedResourceReadback::Exact
+    );
+    drop(crash_guard);
+
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    let fresh = deletions
+        .claim_next("verify-reclaimed", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        deletions
+            .advance_phase(
+                job.job_id,
+                "verify-crashed",
+                stale.claim_token,
+                ContentLockDeletionPhase::DeleteTombstone,
+            )
+            .await
+            .unwrap(),
+        locks_service::application::models::AdvanceContentLockDeletionPhaseResult::ClaimLost
+    ));
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(state)
+            .execute_claimed(fresh, "verify-reclaimed")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::Progressed
+    );
+    assert_eq!(external.resource_delete_count(), 0);
+    assert_eq!(external.resource_read_count(), 2);
+    assert_eq!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        ContentLockDeletionPhase::DeleteTombstone
+    );
+
+    let tombstone_crashed = deletions
+        .claim_next("tombstone-crashed", time::Duration::seconds(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let tombstone_crash_guard = expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(
+                &tombstone_crashed,
+                "tombstone-crashed",
+                false,
+            ))
+            .await
+            .unwrap(),
+    );
+    let tombstone = ContentLockDeletionTombstone::new(job.lock_id.clone(), job.deletion_started_at);
+    assert_eq!(
+        external
+            .read_tombstone(
+                &job.creator,
+                &ContentLockPath::from_lock_id(job.lock_id.clone()),
+                &tombstone,
+            )
+            .await
+            .unwrap(),
+        TombstoneReadback::Exact
+    );
+    drop(tombstone_crash_guard);
+
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    let recreated_deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let retained_tombstone_claim = recreated_deletions
+        .claim_next("tombstone-reclaimed", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        retained_tombstone_claim.claim_token,
+        tombstone_crashed.claim_token
+    );
+    assert!(matches!(
+        recreated_deletions
+            .advance_phase(
+                job.job_id,
+                "tombstone-crashed",
+                tombstone_crashed.claim_token,
+                ContentLockDeletionPhase::PurgeOperationalState,
+            )
+            .await
+            .unwrap(),
+        locks_service::application::models::AdvanceContentLockDeletionPhaseResult::ClaimLost
+    ));
+    let recreated = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(recreated)
+            .execute_claimed(retained_tombstone_claim, "tombstone-reclaimed")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::Progressed
+    );
+    assert_eq!(external.tombstone_read_count(), 4);
+    assert_eq!(external.resource_delete_count(), 0);
+    assert_eq!(
+        recreated_deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        ContentLockDeletionPhase::PurgeOperationalState
+    );
+    let release_check = recreated_deletions
+        .claim_next("tombstone-release-check", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(
+                &release_check,
+                "tombstone-release-check",
+                false,
+            ))
+            .await
+            .unwrap(),
+    )
+    .release()
+    .await
+    .unwrap();
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_active_force_public_delete_crash_reclaims_before_private_cleanup() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let lock = content_lock();
+    let external = Arc::new(CrashExternalRepository::with_original_and_resources(&lock));
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let ownership = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let now = OffsetDateTime::now_utc();
+    let job = ContentLockDeletionJob::new(uuid::Uuid::new_v4(), lock, now).unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
+
+    let stale = deletions
+        .claim_next("public-crashed", (now + time::Duration::seconds(1)) - (now))
+        .await
+        .unwrap()
+        .unwrap();
+    let crash_guard = expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(&stale, "public-crashed", true))
+            .await
+            .unwrap(),
+    );
+    external
+        .force_delete_content_lock_and_verify_absent(
+            &job.creator,
+            &ContentLockPath::from_lock_id(job.lock_id.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(external.operations(), vec!["public"]);
+    drop(crash_guard);
+
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    let recreated_deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let fresh = recreated_deletions
+        .claim_next("public-reclaimed", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let fresh_action_claim = fresh.clone();
+    assert_ne!(fresh.claim_token, stale.claim_token);
+    assert!(
+        !deletions
+            .complete_force_deletion(job.job_id, "public-crashed", stale.claim_token,)
+            .await
+            .unwrap()
+    );
+
+    let recreated = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(recreated)
+            .execute_claimed(fresh, "public-reclaimed")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::Progressed
+    );
+    assert!(
+        recreated_deletions
+            .has_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        recreated_deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(external.operations(), vec!["public", "public", "private"]);
+    assert_eq!(external.resource_delete_count(), 1);
+    assert!(matches!(
+        ownership
+            .try_acquire(deletion_action_claim(
+                &fresh_action_claim,
+                "public-reclaimed",
+                true,
+            ))
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_active_force_private_delete_crash_reclaims_to_terminal_receipt() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let lock = content_lock();
+    let external = Arc::new(CrashExternalRepository::with_original_and_resources(&lock));
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let ownership = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let now = OffsetDateTime::now_utc();
+    let job = ContentLockDeletionJob::new(uuid::Uuid::new_v4(), lock.clone(), now).unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
+
+    let stale = deletions
+        .claim_next(
+            "private-crashed",
+            (now + time::Duration::seconds(1)) - (now),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let crash_guard = expect_action_acquired(
+        ownership
+            .try_acquire(deletion_action_claim(&stale, "private-crashed", true))
+            .await
+            .unwrap(),
+    );
+    external
+        .force_delete_content_lock_and_verify_absent(
+            &job.creator,
+            &ContentLockPath::from_lock_id(job.lock_id.clone()),
+        )
+        .await
+        .unwrap();
+    external
+        .delete_guarded_resource(&job.creator, &lock.primary_resource.as_ref().unwrap().path)
+        .await
+        .unwrap();
+    assert_eq!(external.operations(), vec!["public", "private"]);
+    drop(crash_guard);
+
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    let recreated_deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let fresh = recreated_deletions
+        .claim_next("private-reclaimed", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let fresh_action_claim = fresh.clone();
+    assert_ne!(fresh.claim_token, stale.claim_token);
+    assert!(
+        !deletions
+            .complete_force_deletion(job.job_id, "private-crashed", stale.claim_token,)
+            .await
+            .unwrap()
+    );
+
+    let recreated = deletion_app_state(database.pool().clone(), Arc::clone(&external));
+    assert_eq!(
+        RuntimeClaimedDeletionExecutor::new(recreated)
+            .execute_claimed(fresh, "private-reclaimed")
+            .await
+            .outcome,
+        locks_service::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome::Progressed
+    );
+    assert!(
+        recreated_deletions
+            .has_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        recreated_deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        recreated_deletions
+            .claim_next("after-terminal", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        external.operations(),
+        vec!["public", "private", "public", "private"]
+    );
+    assert_eq!(external.resource_delete_count(), 2);
+    assert!(matches!(
+        ownership
+            .try_acquire(deletion_action_claim(
+                &fresh_action_claim,
+                "private-reclaimed",
+                true,
+            ))
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
+
+    database.cleanup().await;
+}
 
 #[tokio::test]
 async fn postgres_runtime_state_survives_app_state_recreation() {
@@ -176,6 +824,14 @@ async fn postgres_runtime_readyz_returns_ready_without_leaking_runtime_details()
         return;
     };
     let state = app_state(database.pool().clone());
+    state.record_worker_readiness(
+        locks_server::app_state::WorkerKind::Verification,
+        locks_server::app_state::WorkerReadinessEvidence::Ready,
+    );
+    state.record_worker_readiness(
+        locks_server::app_state::WorkerKind::Deletion,
+        locks_server::app_state::WorkerReadinessEvidence::Ready,
+    );
     let response = router(state)
         .oneshot(empty_request("GET", "/readyz"))
         .await
@@ -282,6 +938,7 @@ async fn deletion_first_proof_submission_returns_409_without_calling_paykit() {
             FinalCredentialCipher::new([8; 32]),
         ),
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -377,6 +1034,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
             FinalCredentialCipher::new([8; 32]),
         ),
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -415,6 +1073,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
             FinalCredentialCipher::new([8; 32]),
         ),
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -463,6 +1122,250 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
     assert_eq!(invoice_calls.load(Ordering::SeqCst), 2);
 
     database.cleanup().await;
+}
+
+#[derive(Debug)]
+struct CrashExternalRepository {
+    // 0 = frozen original, 1 = exact tombstone, 2 = absent, 3 = replacement.
+    public_state: AtomicUsize,
+    tombstone_writes: AtomicUsize,
+    withdraw_calls: AtomicUsize,
+    tombstone_reads: AtomicUsize,
+    resource_reads: AtomicUsize,
+    resource_deletes: AtomicUsize,
+    resources: Mutex<HashMap<String, GuardedResourceRecord>>,
+    operations: Mutex<Vec<&'static str>>,
+}
+
+impl CrashExternalRepository {
+    fn with_original(_lock: ContentLock) -> Self {
+        Self::new(0, None)
+    }
+
+    fn with_tombstone_and_resources(lock: &ContentLock) -> Self {
+        Self::new(1, Some(lock))
+    }
+
+    fn with_original_and_resources(lock: &ContentLock) -> Self {
+        Self::new(0, Some(lock))
+    }
+
+    fn new(public_state: usize, lock: Option<&ContentLock>) -> Self {
+        let mut resources = HashMap::new();
+        if let Some(lock) = lock
+            && let Some(primary) = &lock.primary_resource
+        {
+            resources.insert(
+                primary.path.clone(),
+                GuardedResourceRecord {
+                    creator: lock.creator.clone(),
+                    path: primary.path.clone(),
+                    hash: primary.hash,
+                    content_type: primary.content_type.clone(),
+                    size: primary.size,
+                    bytes: vec![7; primary.size as usize],
+                },
+            );
+        }
+        Self {
+            public_state: AtomicUsize::new(public_state),
+            tombstone_writes: AtomicUsize::new(0),
+            withdraw_calls: AtomicUsize::new(0),
+            tombstone_reads: AtomicUsize::new(0),
+            resource_reads: AtomicUsize::new(0),
+            resource_deletes: AtomicUsize::new(0),
+            resources: Mutex::new(resources),
+            operations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn tombstone_write_count(&self) -> usize {
+        self.tombstone_writes.load(Ordering::SeqCst)
+    }
+
+    fn withdraw_call_count(&self) -> usize {
+        self.withdraw_calls.load(Ordering::SeqCst)
+    }
+
+    fn tombstone_read_count(&self) -> usize {
+        self.tombstone_reads.load(Ordering::SeqCst)
+    }
+
+    fn resource_read_count(&self) -> usize {
+        self.resource_reads.load(Ordering::SeqCst)
+    }
+
+    fn resource_delete_count(&self) -> usize {
+        self.resource_deletes.load(Ordering::SeqCst)
+    }
+
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.lock().unwrap().clone()
+    }
+
+    fn tombstone_readback(&self) -> TombstoneReadback {
+        match self.public_state.load(Ordering::SeqCst) {
+            1 => TombstoneReadback::Exact,
+            2 => TombstoneReadback::Missing,
+            _ => TombstoneReadback::Replaced,
+        }
+    }
+}
+
+#[async_trait]
+impl ContentLockTombstoneRepository for CrashExternalRepository {
+    async fn withdraw_content_lock(
+        &self,
+        _creator: CreatorPubky,
+        _content_lock_path: ContentLockPath,
+        _frozen_original: &ContentLock,
+        _tombstone: &ContentLockDeletionTombstone,
+    ) -> Result<TombstoneReadback, locks_service::application::errors::ApplicationError> {
+        self.withdraw_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .public_state
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.tombstone_writes.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(self.tombstone_readback())
+    }
+
+    async fn read_tombstone(
+        &self,
+        _creator: &CreatorPubky,
+        _content_lock_path: &ContentLockPath,
+        _expected: &ContentLockDeletionTombstone,
+    ) -> Result<TombstoneReadback, locks_service::application::errors::ApplicationError> {
+        self.tombstone_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.tombstone_readback())
+    }
+
+    async fn force_delete_content_lock_and_verify_absent(
+        &self,
+        _creator: &CreatorPubky,
+        _content_lock_path: &ContentLockPath,
+    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+        self.operations.lock().unwrap().push("public");
+        self.public_state.store(2, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GuardedResourceRepository for CrashExternalRepository {
+    async fn upsert_guarded_resource(
+        &self,
+        resource: GuardedResourceRecord,
+    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+        self.resources
+            .lock()
+            .unwrap()
+            .insert(resource.path.clone(), resource);
+        Ok(())
+    }
+
+    async fn get_guarded_resource(
+        &self,
+        _creator: &CreatorPubky,
+        path: &str,
+        hash: &GuardedResourceHash,
+    ) -> Result<Option<GuardedResourceRecord>, locks_service::application::errors::ApplicationError>
+    {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .get(path)
+            .filter(|record| record.hash == *hash)
+            .cloned())
+    }
+
+    async fn get_current_guarded_resource(
+        &self,
+        _creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<GuardedResourceRecord>, locks_service::application::errors::ApplicationError>
+    {
+        self.resource_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.resources.lock().unwrap().get(path).cloned())
+    }
+
+    async fn delete_guarded_resource(
+        &self,
+        _creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<bool, locks_service::application::errors::ApplicationError> {
+        self.operations.lock().unwrap().push("private");
+        self.resource_deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(self.resources.lock().unwrap().remove(path).is_some())
+    }
+}
+
+fn deletion_action_claim<'a>(
+    claimed: &ClaimedContentLockDeletionJob,
+    worker_id: &'a str,
+    force: bool,
+) -> ContentLockDeletionActionClaim<'a> {
+    ContentLockDeletionActionClaim {
+        job_id: claimed.job.job_id,
+        worker_id,
+        claim_token: claimed.claim_token,
+        expected_phase: claimed.job.phase,
+        force,
+    }
+}
+
+fn expect_action_acquired(
+    result: ContentLockDeletionActionAcquireResult,
+) -> Box<dyn ContentLockDeletionActionGuard> {
+    match result {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        ContentLockDeletionActionAcquireResult::Busy => {
+            panic!("live deletion action claim was unexpectedly contended")
+        }
+        ContentLockDeletionActionAcquireResult::ClaimLost => {
+            panic!("live deletion action claim was unexpectedly lost")
+        }
+    }
+}
+
+async fn set_deletion_phase(pool: &PgPool, job_id: uuid::Uuid, phase: &str) {
+    sqlx::query("UPDATE content_lock_deletion_jobs SET phase = $2 WHERE job_id = $1")
+        .bind(job_id)
+        .bind(phase)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn expire_deletion_claim(pool: &PgPool, job_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE content_lock_deletion_jobs
+         SET claim_expires_at = clock_timestamp() - interval '1 second'
+         WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn deletion_app_state(pool: PgPool, external: Arc<CrashExternalRepository>) -> AppState {
+    AppState::new_with_postgres_runtime_and_creator_repositories(
+        test_config(),
+        pool,
+        RuntimeSecretCiphers::new(
+            CreatorAuthoritySecretCipher::new([7; 32]),
+            FinalCredentialCipher::new([8; 32]),
+        ),
+        Arc::new(InMemoryContentLockRepository::new()),
+        external.clone(),
+        external,
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
 }
 
 struct TestDatabase {
@@ -537,6 +1440,7 @@ fn app_state(pool: PgPool) -> AppState {
             FinalCredentialCipher::new([8; 32]),
         ),
         std::sync::Arc::new(InMemoryContentLockRepository::new()),
+        std::sync::Arc::new(InMemoryContentLockTombstoneRepository::new()),
         std::sync::Arc::new(InMemoryGuardedResourceRepository::new()),
         std::sync::Arc::new(InMemoryLockServicePointerRepository::new()),
         std::sync::Arc::new(InMemoryEntitlementRepository::new()),
@@ -574,6 +1478,7 @@ fn test_config() -> LockServerRuntimeConfig {
             run_migrations_on_startup: true,
         },
         deletion: DeletionConfig::default(),
+        deletion_worker: locks_server::config::DeletionWorkerConfig::default(),
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,

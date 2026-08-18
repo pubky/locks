@@ -75,12 +75,13 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
                 .credential_generator
                 .generate_access_credential()
                 .await?;
+            let final_issue_now = self.clock.now();
             if let Some(final_credential) = self
                 .credential_store
                 .issue_or_replay_final_credential(
                     &request.creator,
                     &request.bundle_id,
-                    now,
+                    final_issue_now,
                     candidate,
                 )
                 .await?

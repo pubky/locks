@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use locks_core::ids::{CreatorPubky, LockServerPubky};
+use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
+use locks_core::ids::{ContentLockPath, CreatorPubky, LockId, LockServerPubky};
 use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
 
@@ -19,9 +20,12 @@ use crate::config::{
 };
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
+use locks_service::application::models::ContentLockDeletionPhase;
 use locks_service::application::ports::{
+    ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
+    ContentLockDeletionActionOwnership, ContentLockTombstoneRepository,
     CreatorConnectFlowIdGenerator, FrontendSessionCodeGenerator, FrontendSessionTokenGenerator,
-    VerificationTaskIdGenerator,
+    TombstoneReadback, VerificationTaskIdGenerator,
 };
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
@@ -53,7 +57,85 @@ async fn postgres_state_uses_postgres_for_private_runtime_adapters() {
         state.private_runtime_storage_kind(),
         RuntimeStorageKind::Postgres
     );
+    assert_action_ownership_adapter(state.content_lock_deletion_action_ownership().as_ref());
+    assert_tombstone_adapter(state.content_lock_tombstones().as_ref());
 }
+
+#[tokio::test]
+async fn in_memory_state_exposes_callable_deletion_action_and_tombstone_adapters() {
+    let state = AppState::new_empty_in_memory(test_config());
+    let result = state
+        .content_lock_deletion_action_ownership()
+        .try_acquire(ContentLockDeletionActionClaim {
+            job_id: uuid::Uuid::new_v4(),
+            worker_id: "test-worker",
+            claim_token: uuid::Uuid::new_v4(),
+            expected_phase: ContentLockDeletionPhase::Withdraw,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
+
+    let lock_id = LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+    let path = ContentLockPath::from_lock_id(lock_id.clone());
+    let tombstone = ContentLockDeletionTombstone::new(lock_id, datetime!(2026-08-12 05:00:00 UTC));
+    assert_eq!(
+        state
+            .content_lock_tombstones()
+            .read_tombstone(&rate_limit_key().creator, &path, &tombstone)
+            .await
+            .unwrap(),
+        TombstoneReadback::Missing
+    );
+
+    let creator = rate_limit_key().creator;
+    let content_lock: locks_core::lock_policy::ContentLock =
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "creator": creator,
+            "primary_resource": null,
+            "secondary_resources": {},
+            "criteria": [],
+            "lock_logic": { "type": "all", "criteria": [] },
+            "access_policy": { "requested_credential_ttl_seconds": 900 },
+            "lock_server": { "override": null },
+            "created_at": "2026-08-12T04:00:00Z"
+        }))
+        .unwrap();
+    state
+        .content_locks()
+        .upsert_content_lock(creator.clone(), path.clone(), content_lock.clone())
+        .await
+        .unwrap();
+    state
+        .content_lock_tombstones()
+        .withdraw_content_lock(creator.clone(), path.clone(), &content_lock, &tombstone)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator, &path)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .content_lock_tombstones()
+            .read_tombstone(&creator, &path, &tombstone)
+            .await
+            .unwrap(),
+        TombstoneReadback::Exact
+    );
+}
+
+fn assert_action_ownership_adapter(_: &dyn ContentLockDeletionActionOwnership) {}
+
+fn assert_tombstone_adapter(_: &dyn ContentLockTombstoneRepository) {}
 
 #[tokio::test]
 async fn postgres_state_wires_legacy_connect_flow_runtime_state() {
@@ -320,6 +402,7 @@ fn test_config() -> LockServerRuntimeConfig {
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
         deletion: crate::config::DeletionConfig::default(),
+        deletion_worker: crate::config::DeletionWorkerConfig::default(),
         paykit: None,
     }
 }

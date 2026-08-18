@@ -20,6 +20,7 @@ use locks_server::testing::TestServerApp;
 use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::FrontendSessionToken;
 use locks_service::application::ports::CriterionVerifier;
+use locks_service::infrastructure::memory::content_lock_tombstones::InMemoryContentLockTombstoneRepository;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
@@ -41,6 +42,7 @@ async fn creator_publishing_http_flow_registers_locks_verifies_and_proxy_reads_g
         TestServerApp::from_state(AppState::new_empty_in_memory_with_creator_repositories(
             config,
             Arc::new(InMemoryContentLockRepository::new()),
+            Arc::new(InMemoryContentLockTombstoneRepository::new()),
             Arc::new(InMemoryGuardedResourceRepository::new()),
             Arc::new(InMemoryLockServicePointerRepository::new()),
             Arc::new(InMemoryEntitlementRepository::new()),
@@ -335,6 +337,7 @@ async fn creator_publishing_http_rejects_invalid_guarded_path_before_lock_creati
         TestServerApp::from_state(AppState::new_empty_in_memory_with_creator_repositories(
             config,
             Arc::new(InMemoryContentLockRepository::new()),
+            Arc::new(InMemoryContentLockTombstoneRepository::new()),
             Arc::new(InMemoryGuardedResourceRepository::new()),
             Arc::new(InMemoryLockServicePointerRepository::new()),
             Arc::new(InMemoryEntitlementRepository::new()),
@@ -486,6 +489,7 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     let state = AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -628,6 +632,7 @@ async fn creator_publishing_client() -> (TestServerApp, LocalCreatorPublishingCl
         TestServerApp::from_state(AppState::new_empty_in_memory_with_creator_repositories(
             config,
             Arc::new(InMemoryContentLockRepository::new()),
+            Arc::new(InMemoryContentLockTombstoneRepository::new()),
             Arc::new(InMemoryGuardedResourceRepository::new()),
             Arc::new(InMemoryLockServicePointerRepository::new()),
             Arc::new(InMemoryEntitlementRepository::new()),

@@ -9,12 +9,15 @@ use url::Url;
 
 use super::defaults::{
     DEFAULT_DELETION_RETRY_INITIAL_BACKOFF_SECONDS, DEFAULT_DELETION_RETRY_MAX_ATTEMPTS,
-    DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS, DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS,
-    DEFAULT_FINAL_READ_WINDOW_SECONDS, DEFAULT_RUNTIME_MASTER_KEY_ENV, PUBLIC_KEY_PLACEHOLDER,
+    DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS, DEFAULT_DELETION_WORKER_CLAIM_TIMEOUT_SECONDS,
+    DEFAULT_DELETION_WORKER_ID, DEFAULT_DELETION_WORKER_POLL_INTERVAL_MS,
+    DEFAULT_DELETION_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS, DEFAULT_FINAL_READ_WINDOW_SECONDS,
+    DEFAULT_RUNTIME_MASTER_KEY_ENV, PUBLIC_KEY_PLACEHOLDER,
 };
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
     LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
     LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS, PAYKIT_REQUEST_TIMEOUT_SECONDS,
     PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork, RateLimitsConfig, RuntimeConfig,
@@ -45,6 +48,8 @@ pub(super) struct RawConfig {
     content_locks: RawContentLocksConfig,
     #[serde(default)]
     deletion: RawDeletionConfig,
+    #[serde(default)]
+    deletion_worker: RawDeletionWorkerConfig,
     #[serde(default)]
     paykit: Option<RawPaykitConfig>,
 }
@@ -129,6 +134,9 @@ impl Default for RawPkdnsConfig {
 
 impl RawPkdnsConfig {
     fn into_pkdns_config(self) -> Result<PkdnsConfig, ConfigError> {
+        if self.key_republisher_interval_seconds == 0 {
+            return Err(ConfigError::InvalidPkarrRepublisherInterval);
+        }
         Ok(PkdnsConfig {
             public_ip: self.public_ip,
             public_pubky_tls_port: self.public_pubky_tls_port,
@@ -296,6 +304,72 @@ impl Default for RawDeletionConfig {
             final_read_window_seconds: default_final_read_window_seconds(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeletionWorkerConfig {
+    #[serde(default = "default_deletion_worker_enabled")]
+    enabled: bool,
+    #[serde(default = "default_deletion_worker_poll_interval_ms")]
+    poll_interval_ms: u64,
+    #[serde(default = "default_deletion_worker_claim_timeout_seconds")]
+    claim_timeout_seconds: u64,
+    #[serde(default = "default_deletion_worker_shutdown_timeout_seconds")]
+    shutdown_timeout_seconds: u64,
+    #[serde(default = "default_deletion_worker_id")]
+    worker_id: String,
+}
+
+impl Default for RawDeletionWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_deletion_worker_enabled(),
+            poll_interval_ms: default_deletion_worker_poll_interval_ms(),
+            claim_timeout_seconds: default_deletion_worker_claim_timeout_seconds(),
+            shutdown_timeout_seconds: default_deletion_worker_shutdown_timeout_seconds(),
+            worker_id: default_deletion_worker_id(),
+        }
+    }
+}
+
+impl RawDeletionWorkerConfig {
+    fn into_deletion_worker_config(self) -> Result<DeletionWorkerConfig, ConfigError> {
+        if self.poll_interval_ms == 0
+            || self.claim_timeout_seconds == 0
+            || self.shutdown_timeout_seconds == 0
+            || self.worker_id.trim().is_empty()
+        {
+            return Err(ConfigError::InvalidDeletionWorkerConfig);
+        }
+        Ok(DeletionWorkerConfig {
+            enabled: self.enabled,
+            poll_interval_ms: self.poll_interval_ms,
+            claim_timeout_seconds: self.claim_timeout_seconds,
+            shutdown_timeout_seconds: self.shutdown_timeout_seconds,
+            worker_id: self.worker_id,
+        })
+    }
+}
+
+fn default_deletion_worker_enabled() -> bool {
+    true
+}
+
+fn default_deletion_worker_poll_interval_ms() -> u64 {
+    DEFAULT_DELETION_WORKER_POLL_INTERVAL_MS
+}
+
+fn default_deletion_worker_claim_timeout_seconds() -> u64 {
+    DEFAULT_DELETION_WORKER_CLAIM_TIMEOUT_SECONDS
+}
+
+fn default_deletion_worker_shutdown_timeout_seconds() -> u64 {
+    DEFAULT_DELETION_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+}
+
+fn default_deletion_worker_id() -> String {
+    DEFAULT_DELETION_WORKER_ID.to_owned()
 }
 
 fn default_deletion_retry_max_attempts() -> u32 {
@@ -594,6 +668,7 @@ impl RawConfig {
         let rate_limits = self.rate_limits.into_rate_limits_config()?;
         let content_locks = self.content_locks.into_content_locks_config()?;
         let deletion = self.deletion.into_deletion_config()?;
+        let deletion_worker = self.deletion_worker.into_deletion_worker_config()?;
         let paykit = self
             .paykit
             .map(RawPaykitConfig::into_paykit_config)
@@ -638,6 +713,7 @@ impl RawConfig {
             rate_limits,
             content_locks,
             deletion,
+            deletion_worker,
             paykit,
         })
     }

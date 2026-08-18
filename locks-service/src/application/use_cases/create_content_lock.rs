@@ -336,7 +336,7 @@ mod tests {
         let lock_id = content_lock.lock_id().unwrap();
         fixture
             .content_lock_deletions
-            .prepare_force_deletion(&request.creator, &lock_id, fixture.clock.now())
+            .prepare_force_deletion(&request.creator, &lock_id)
             .await
             .unwrap();
 
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &lock_id, fixture.clock.now())
+                .prepare_force_deletion(&creator(), &lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -664,7 +664,6 @@ mod tests {
         let fixture = Fixture::seeded().await;
         let probe = PublicationRaceProbe {
             deletions: &fixture.content_lock_deletions,
-            now: fixture.clock.now(),
         };
         let use_case = CreateContentLockUseCase::new(
             &probe,
@@ -682,7 +681,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &created.lock_id, fixture.clock.now())
+                .prepare_force_deletion(&creator(), &created.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(None)
@@ -691,7 +690,6 @@ mod tests {
 
     struct PublicationRaceProbe<'a> {
         deletions: &'a InMemoryContentLockDeletionRepository,
-        now: OffsetDateTime,
     }
 
     #[async_trait]
@@ -705,7 +703,7 @@ mod tests {
             let lock_id = content_lock.lock_id().unwrap();
             assert_eq!(
                 self.deletions
-                    .prepare_force_deletion(&creator, &lock_id, self.now)
+                    .prepare_force_deletion(&creator, &lock_id)
                     .await?,
                 PrepareForceDeletionResult::PublicationInProgress
             );

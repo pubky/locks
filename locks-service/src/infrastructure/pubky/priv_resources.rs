@@ -138,7 +138,10 @@ fn record_from_resource(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
     use locks_core::ids::{CreatorPubky, GuardedResourceHash};
@@ -334,6 +337,7 @@ mod tests {
         bytes_read: Mutex<Option<PubkyBytesResource>>,
         last_bytes: Mutex<Option<Vec<u8>>>,
         operations: Mutex<Vec<String>>,
+        fail_get: AtomicBool,
     }
 
     impl FakeStorageClient {
@@ -394,6 +398,11 @@ mod tests {
             creator: &CreatorPubky,
             path: &str,
         ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(ApplicationError::InvalidGuardedResource {
+                    message: "storage read failed".to_owned(),
+                });
+            }
             self.operations
                 .lock()
                 .unwrap()
@@ -410,6 +419,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("delete {creator} {path}"));
+            *self.bytes_read.lock().unwrap() = None;
             Ok(())
         }
     }

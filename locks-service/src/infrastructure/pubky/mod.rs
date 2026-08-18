@@ -1,3 +1,4 @@
+pub mod content_lock_tombstones;
 pub mod content_locks;
 pub mod entitlements;
 pub mod legacy_connect_flow;
@@ -6,6 +7,7 @@ pub mod lock_service_pointers;
 pub mod priv_resources;
 pub mod storage_client;
 
+pub use content_lock_tombstones::PubkyContentLockTombstoneRepository;
 pub use content_locks::PubkyContentLockRepository;
 pub use entitlements::PubkyEntitlementRepository;
 pub use legacy_connect_flow::{

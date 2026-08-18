@@ -81,6 +81,16 @@ impl InMemoryVerificationTaskClaimer {
     pub fn with_claimed_tasks(
         records: Vec<(VerificationTaskRecord, String, time::OffsetDateTime)>,
     ) -> Self {
+        Self::with_claimed_tasks_and_clock(
+            records,
+            Arc::new(crate::infrastructure::memory::verification_task_deletion_fence::SystemClock),
+        )
+    }
+
+    fn with_claimed_tasks_and_clock(
+        records: Vec<(VerificationTaskRecord, String, time::OffsetDateTime)>,
+        clock: Arc<dyn crate::application::ports::Clock>,
+    ) -> Self {
         let tasks = records
             .iter()
             .map(|(task, _, _)| task.clone())
@@ -101,7 +111,9 @@ impl InMemoryVerificationTaskClaimer {
                     .collect(),
             ),
             task_repository: None,
-            deletion_fence: Arc::new(InMemoryVerificationTaskDeletionFence::from_tasks(&tasks)),
+            deletion_fence: Arc::new(
+                InMemoryVerificationTaskDeletionFence::from_tasks_with_clock(&tasks, clock),
+            ),
         }
     }
 }
@@ -113,18 +125,16 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
         let mut fence_records = self.deletion_fence.records.write().await;
         let records = self.records.read().await;
+        let now = self.deletion_fence.authoritative_cutoff();
         let owned = records.iter().any(|record| {
             record.task.task_id == *task_id
                 && record.task.status == VerificationTaskStatus::InProgress
                 && record.claimed_by.as_deref() == Some(worker_id)
                 && record.claim_token.as_ref() == Some(claim_token)
-                && record
-                    .claim_expires_at
-                    .is_some_and(|expires| expires >= now)
+                && record.claim_expires_at.is_some_and(|expires| now < expires)
         });
         let Some(fence) = fence_records.get_mut(task_id) else {
             return Ok(false);
@@ -139,11 +149,16 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
     async fn claim_next_verification_task(
         &self,
         worker_id: &str,
-        now: time::OffsetDateTime,
-        claim_expires_at: time::OffsetDateTime,
+        claim_ttl: time::Duration,
     ) -> Result<Option<ClaimedVerificationTask>, ApplicationError> {
         let fence_records = self.deletion_fence.records.read().await;
         let mut records = self.records.write().await;
+        let now = self.deletion_fence.authoritative_cutoff();
+        let claim_expires_at =
+            now.checked_add(claim_ttl)
+                .ok_or_else(|| ApplicationError::Storage {
+                    message: "verification task claim expiry overflow".to_owned(),
+                })?;
         let Some(index) = records.iter().position(|record| {
             record.is_claimable_at(now)
                 && fence_records
@@ -183,8 +198,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
-        next_attempt_at: time::OffsetDateTime,
+        retry_after: time::Duration,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
         let fence_records = self.deletion_fence.records.read().await;
         if fence_records
@@ -194,6 +208,12 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
             return Ok(None);
         }
         let mut records = self.records.write().await;
+        let now = self.deletion_fence.authoritative_cutoff();
+        let next_attempt_at =
+            now.checked_add(retry_after)
+                .ok_or_else(|| ApplicationError::Storage {
+                    message: "verification task retry time overflow".to_owned(),
+                })?;
         let Some(record) = records.iter_mut().find(|record| {
             record.task.task_id == *task_id
                 && record.task.status == VerificationTaskStatus::InProgress
@@ -201,7 +221,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 && record.claim_token.as_ref() == Some(claim_token)
                 && record
                     .claim_expires_at
-                    .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                    .is_some_and(|claim_expires_at| now < claim_expires_at)
         }) else {
             return Ok(None);
         };
@@ -227,7 +247,6 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         task: VerificationTaskRecord,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
         if !matches!(
             task.status,
@@ -247,6 +266,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
             return Ok(None);
         }
         let mut records = self.records.write().await;
+        let now = self.deletion_fence.authoritative_cutoff();
         let Some(record) = records.iter_mut().find(|record| {
             record.task.task_id == task.task_id
                 && record.task.status == VerificationTaskStatus::InProgress
@@ -254,7 +274,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 && record.claim_token.as_ref() == Some(claim_token)
                 && record
                     .claim_expires_at
-                    .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                    .is_some_and(|claim_expires_at| now < claim_expires_at)
         }) else {
             return Ok(None);
         };
@@ -283,7 +303,7 @@ impl ClaimableVerificationTask {
                 .is_none_or(|next_attempt_at| next_attempt_at <= now),
             VerificationTaskStatus::InProgress => self
                 .claim_expires_at
-                .is_some_and(|claim_expires_at| claim_expires_at < now),
+                .is_some_and(|claim_expires_at| claim_expires_at <= now),
             VerificationTaskStatus::Completed
             | VerificationTaskStatus::Failed
             | VerificationTaskStatus::Expired => false,
@@ -293,7 +313,11 @@ impl ClaimableVerificationTask {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
 
     use serde_json::json;
     use time::macros::datetime;
@@ -314,7 +338,7 @@ mod tests {
         VerificationTaskStatus,
     };
     use crate::application::ports::{
-        ContentLockDeletionRepository, VerificationTaskClaimer, VerificationTaskRepository,
+        Clock, ContentLockDeletionRepository, VerificationTaskClaimer, VerificationTaskRepository,
     };
     use crate::infrastructure::memory::content_lock_deletions::InMemoryContentLockDeletionRepository;
     use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
@@ -324,13 +348,49 @@ mod tests {
     const NOW: time::OffsetDateTime = datetime!(2026-05-29 12:10:00 UTC);
     const CLAIM_EXPIRES_AT: time::OffsetDateTime = datetime!(2026-05-29 12:15:00 UTC);
 
+    #[derive(Debug)]
+    struct MutableClock(Mutex<time::OffsetDateTime>);
+
+    impl MutableClock {
+        fn new(now: time::OffsetDateTime) -> Self {
+            Self(Mutex::new(now))
+        }
+
+        fn set(&self, now: time::OffsetDateTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> time::OffsetDateTime {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn claimer_with_clock(
+        records: Vec<VerificationTaskRecord>,
+    ) -> (InMemoryVerificationTaskClaimer, Arc<MutableClock>) {
+        let clock = Arc::new(MutableClock::new(NOW));
+        let fence = Arc::new(
+            InMemoryVerificationTaskDeletionFence::from_tasks_with_clock(&records, clock.clone()),
+        );
+        (
+            InMemoryVerificationTaskClaimer::with_deletion_fence(records, fence),
+            clock,
+        )
+    }
+
+    fn claimer_at_now(records: Vec<VerificationTaskRecord>) -> InMemoryVerificationTaskClaimer {
+        claimer_with_clock(records).0
+    }
+
     #[tokio::test]
     async fn no_pending_or_expired_in_progress_task_returns_none() {
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![]);
+        let claimer = claimer_at_now(vec![]);
 
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
@@ -352,7 +412,7 @@ mod tests {
             InMemoryVerificationTaskClaimer::with_deletion_fence(vec![task], Arc::clone(&fence));
         let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
         let claimed = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -362,7 +422,6 @@ mod tests {
                     &claimed.task.task_id,
                     "worker-a",
                     &claimed.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -389,7 +448,7 @@ mod tests {
             InMemoryVerificationTaskClaimer::with_deletion_fence(vec![task], Arc::clone(&fence));
         let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
         let claimed = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -401,7 +460,6 @@ mod tests {
                     &claimed.task.task_id,
                     "worker-a",
                     &claimed.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -416,7 +474,6 @@ mod tests {
                     completed,
                     "worker-a",
                     &claimed.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap(),
@@ -448,7 +505,7 @@ mod tests {
 
         assert_eq!(
             deletions
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -472,14 +529,18 @@ mod tests {
             VerificationTaskStatus::Pending,
             &job.lock_id,
         );
-        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::from_tasks(
-            std::slice::from_ref(&task),
-        ));
+        let clock = Arc::new(MutableClock::new(NOW));
+        let fence = Arc::new(
+            InMemoryVerificationTaskDeletionFence::from_tasks_with_clock(
+                std::slice::from_ref(&task),
+                clock.clone(),
+            ),
+        );
         let claimer =
             InMemoryVerificationTaskClaimer::with_deletion_fence(vec![task], Arc::clone(&fence));
         let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -489,7 +550,6 @@ mod tests {
                     &first.task.task_id,
                     "worker-a",
                     &first.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -500,8 +560,7 @@ mod tests {
                 &first.task.task_id,
                 "worker-a",
                 &first.claim_token,
-                NOW,
-                retry_at,
+                (retry_at) - (NOW),
             )
             .await
             .unwrap()
@@ -512,11 +571,11 @@ mod tests {
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
 
+        clock.set(retry_at);
         let second = claimer
             .claim_next_verification_task(
                 "worker-b",
-                retry_at,
-                retry_at + time::Duration::minutes(5),
+                (retry_at + time::Duration::minutes(5)) - (retry_at),
             )
             .await
             .unwrap()
@@ -527,7 +586,6 @@ mod tests {
                     &second.task.task_id,
                     "worker-b",
                     &second.claim_token,
-                    retry_at,
                 )
                 .await
                 .unwrap()
@@ -541,7 +599,6 @@ mod tests {
                 completed,
                 "worker-b",
                 &second.claim_token,
-                retry_at,
             )
             .await
             .unwrap()
@@ -556,10 +613,10 @@ mod tests {
             "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
             VerificationTaskStatus::Pending,
         );
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending.clone()]);
+        let claimer = claimer_at_now(vec![pending.clone()]);
 
         let claimed = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .expect("pending task is claimed");
@@ -571,7 +628,7 @@ mod tests {
         assert_eq!(claimed.task.failure_message, None);
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
@@ -595,7 +652,7 @@ mod tests {
         );
 
         claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -625,7 +682,7 @@ mod tests {
 
         assert!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .is_err()
         );
@@ -633,7 +690,7 @@ mod tests {
 
         assert!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap()
                 .is_some()
@@ -647,18 +704,18 @@ mod tests {
             VerificationTaskStatus::Pending,
         );
         let task_id = pending.task_id;
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending]);
+        let (claimer, clock) = claimer_with_clock(vec![pending]);
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
         let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
+        clock.set(reclaimed_at);
         let second = claimer
             .claim_next_verification_task(
                 "worker-a",
-                reclaimed_at,
-                reclaimed_at + time::Duration::minutes(5),
+                (reclaimed_at + time::Duration::minutes(5)) - (reclaimed_at),
             )
             .await
             .unwrap()
@@ -671,8 +728,7 @@ mod tests {
                     &task_id,
                     "worker-a",
                     &first.claim_token,
-                    reclaimed_at,
-                    reclaimed_at + time::Duration::seconds(10),
+                    (reclaimed_at + time::Duration::seconds(10)) - (reclaimed_at),
                 )
                 .await
                 .unwrap(),
@@ -684,8 +740,7 @@ mod tests {
                     &task_id,
                     "worker-a",
                     &second.claim_token,
-                    reclaimed_at,
-                    reclaimed_at + time::Duration::seconds(10),
+                    (reclaimed_at + time::Duration::seconds(10)) - (reclaimed_at),
                 )
                 .await
                 .unwrap()
@@ -699,18 +754,18 @@ mod tests {
             "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
             VerificationTaskStatus::Pending,
         );
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending]);
+        let (claimer, clock) = claimer_with_clock(vec![pending]);
         let first = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
         let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
+        clock.set(reclaimed_at);
         let second = claimer
             .claim_next_verification_task(
                 "worker-a",
-                reclaimed_at,
-                reclaimed_at + time::Duration::minutes(5),
+                (reclaimed_at + time::Duration::minutes(5)) - (reclaimed_at),
             )
             .await
             .unwrap()
@@ -741,7 +796,6 @@ mod tests {
                         terminal,
                         "worker-a",
                         &first.claim_token,
-                        reclaimed_at,
                     )
                     .await
                     .unwrap(),
@@ -754,7 +808,6 @@ mod tests {
                     completed.clone(),
                     "worker-a",
                     &second.claim_token,
-                    reclaimed_at,
                 )
                 .await
                 .unwrap(),
@@ -769,9 +822,9 @@ mod tests {
             VerificationTaskStatus::Pending,
         );
         let task_id = pending.task_id;
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending]);
+        let (claimer, clock) = claimer_with_clock(vec![pending]);
         let claim = claimer
-            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -783,21 +836,7 @@ mod tests {
                     &task_id,
                     "worker-b",
                     &claim.claim_token,
-                    NOW,
-                    next_attempt_at,
-                )
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            claimer
-                .schedule_verification_task_retry(
-                    &task_id,
-                    "worker-a",
-                    &claim.claim_token,
-                    CLAIM_EXPIRES_AT + time::Duration::nanoseconds(1),
-                    next_attempt_at,
+                    (next_attempt_at) - (NOW),
                 )
                 .await
                 .unwrap(),
@@ -808,8 +847,7 @@ mod tests {
                 &task_id,
                 "worker-a",
                 &claim.claim_token,
-                NOW,
-                next_attempt_at,
+                (next_attempt_at) - (NOW),
             )
             .await
             .unwrap()
@@ -823,19 +861,18 @@ mod tests {
             claimer
                 .claim_next_verification_task(
                     "worker-b",
-                    NOW + time::Duration::seconds(9),
-                    CLAIM_EXPIRES_AT,
+                    (CLAIM_EXPIRES_AT) - (NOW + time::Duration::seconds(9)),
                 )
                 .await
                 .unwrap(),
             None
         );
+        clock.set(next_attempt_at);
         assert!(
             claimer
                 .claim_next_verification_task(
                     "worker-b",
-                    next_attempt_at,
-                    CLAIM_EXPIRES_AT + time::Duration::seconds(10),
+                    (CLAIM_EXPIRES_AT + time::Duration::seconds(10)) - (next_attempt_at),
                 )
                 .await
                 .unwrap()
@@ -875,11 +912,11 @@ mod tests {
         )
         .transition_to(VerificationTaskStatus::Expired, NOW, None)
         .unwrap();
-        let claimer = InMemoryVerificationTaskClaimer::new(vec![completed, failed, expired]);
+        let claimer = claimer_at_now(vec![completed, failed, expired]);
 
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-a", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
@@ -898,14 +935,17 @@ mod tests {
             None,
         )
         .unwrap();
-        let claimer = InMemoryVerificationTaskClaimer::with_claimed_tasks(vec![(
-            in_progress.clone(),
-            "worker-a".to_owned(),
-            datetime!(2026-05-29 12:05:00 UTC),
-        )]);
+        let claimer = InMemoryVerificationTaskClaimer::with_claimed_tasks_and_clock(
+            vec![(
+                in_progress.clone(),
+                "worker-a".to_owned(),
+                datetime!(2026-05-29 12:05:00 UTC),
+            )],
+            Arc::new(MutableClock::new(NOW)),
+        );
 
         let reclaimed = claimer
-            .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+            .claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW))
             .await
             .unwrap()
             .expect("expired in-progress claim is reclaimed");
@@ -927,15 +967,18 @@ mod tests {
             None,
         )
         .unwrap();
-        let claimer = InMemoryVerificationTaskClaimer::with_claimed_tasks(vec![(
-            in_progress,
-            "worker-a".to_owned(),
-            datetime!(2026-05-29 12:11:00 UTC),
-        )]);
+        let claimer = InMemoryVerificationTaskClaimer::with_claimed_tasks_and_clock(
+            vec![(
+                in_progress,
+                "worker-a".to_owned(),
+                datetime!(2026-05-29 12:11:00 UTC),
+            )],
+            Arc::new(MutableClock::new(NOW)),
+        );
 
         assert_eq!(
             claimer
-                .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+                .claim_next_verification_task("worker-b", (CLAIM_EXPIRES_AT) - (NOW))
                 .await
                 .unwrap(),
             None
