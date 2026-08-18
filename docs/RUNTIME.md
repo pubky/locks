@@ -156,14 +156,33 @@ Operator-facing readiness uses semantic storage labels:
 
 Postgres is private runtime storage for verification tasks, task claiming, access credentials, frontend sessions, and creator-granted homeserver session material. It is not storage for Pubky-owned content locks, guarded resources, Lock Service Pointers, or verified proof bundles.
 
-Creator-granted session material is encrypted before storage. The server-side encryption key comes from an env var named by config:
+Sensitive runtime material is encrypted before storage. A root key comes from an env var named by config:
 
 ```toml
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
 ```
 
-The named env var must contain a 32-byte key encoded as base64url without padding:
+The named env var must contain a 32-byte key encoded as base64url without padding. Locks derives separate fixed-domain keys for creator-authority material and replayable final deletion credentials; the root key is never used directly as an AEAD key. Rotating it requires an explicit data migration. In the local Compose flow, an explicitly supplied `PUBKY_LOCK_RUNTIME_MASTER_KEY` is validated and persisted only when `.pubky-lock/runtime-master-key` does not yet exist. Once persisted, an override must match those exact bytes or startup fails closed; later starts without the override reuse the persisted key. Changing the key therefore requires an explicit encrypted-data migration or an intentional reset that discards the dependent ciphertext and its old key together.
+
+Migration `0016_content_lock_access_drains` fails closed when an older database contains a resumable `queued`, `running`, or `failed` deletion job, because Task 7 rows do not contain enough information to reconstruct cutoff credential classification safely. Failed jobs are resumable by graceful-deletion replay, so they cannot be treated as terminal for this upgrade. Before upgrading, stop new writes and check:
+
+```sql
+SELECT job_id, state, phase
+FROM content_lock_deletion_jobs
+WHERE state IN ('queued', 'running', 'failed');
+```
+
+If rows are returned, resume/retry them on the pre-0016 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
+
+The runtime-master-key cutover intentionally cannot decrypt creator-authority rows written with the retired Compose `creator-authority-encryption-key`. An existing Compose volume containing that file fails startup instead of silently stranding encrypted authority. To upgrade a local stack:
+
+1. Stop the stack and back up any data that must be retained.
+2. Either discard the existing creator-authority rows and reacquire authority after restart, or recreate the local PostgreSQL database/volume.
+3. Remove `.pubky-lock/creator-authority-encryption-key` from the Locks service volume.
+4. Restart. Compose creates `.pubky-lock/runtime-master-key`; keep that file stable with the database.
+
+Removing only the retired key file while retaining its encrypted creator-authority rows is unsupported.
 
 ```bash
 python3 - <<'PY'
@@ -171,6 +190,19 @@ import base64, os
 print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
 PY
 ```
+
+Deletion retry and final-access bounds are a closed configuration section:
+
+```toml
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
+```
+
+All values must be positive, initial backoff cannot exceed maximum backoff, and both final-access windows must be at most 3600 seconds.
 
 ## Development integration shape
 

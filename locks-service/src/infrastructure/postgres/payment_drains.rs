@@ -45,6 +45,22 @@ struct DrainRow {
     cleanup_token: String,
 }
 
+#[derive(FromRow)]
+struct DeletionOwnershipRow {
+    state: String,
+    phase: String,
+    force_requested_at: Option<OffsetDateTime>,
+    claimed_by: Option<String>,
+    claim_token: Option<Uuid>,
+    claim_expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(FromRow)]
+struct ObligationFenceRow {
+    paykit_admission_required: Option<bool>,
+    resolved_status: Option<String>,
+}
+
 #[async_trait]
 impl PaymentDrainRepository for PostgresPaymentDrainRepository {
     async fn store_payment_drain(
@@ -57,22 +73,14 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
     ) -> Result<bool, ApplicationError> {
         let counts = summary_counts(summary)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let owns_claim: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1 FROM content_lock_deletion_jobs
-                WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-                  AND claim_token = $3 AND claim_expires_at >= $4
-                  AND phase = 'start_payment_drain' AND force_requested_at IS NULL
-            )",
-        )
-        .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(now)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        if !owns_claim {
+        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "start_payment_drain",
+        ) {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(false);
         }
@@ -154,35 +162,41 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         summary: &PaymentDrainSummary,
     ) -> Result<bool, ApplicationError> {
         let counts = summary_counts(summary)?;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
         let updated = sqlx::query(
-            "UPDATE content_lock_payment_drains AS drain
-             SET status = $5, accepted_count = $6, terminal_count = $7, updated_at = $4
-             FROM content_lock_deletion_jobs AS deletion
-             WHERE deletion.job_id = $1 AND deletion.state = 'running'
-               AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $4 AND deletion.phase = 'drain_payments'
-               AND deletion.force_requested_at IS NULL
-               AND drain.deletion_job_id = deletion.job_id
-               AND drain.cleanup_token = $8
-               AND drain.cancellation_enqueued_count = $9
-               AND drain.accepted_count >= $6
-               AND drain.terminal_count <= $7
-               AND drain.accepted_count - $6 = $7 - drain.terminal_count
-               AND NOT (drain.status = 'completed' AND $5 <> 'completed')
-               AND (($5 = 'completed' AND $6 = 0) OR ($5 = 'active' AND $6 > 0))",
+            "UPDATE content_lock_payment_drains
+             SET status = $3, accepted_count = $4, terminal_count = $5, updated_at = $2
+             WHERE deletion_job_id = $1
+               AND cleanup_token = $6
+               AND cancellation_enqueued_count = $7
+               AND accepted_count >= $4
+               AND terminal_count <= $5
+               AND accepted_count - $4 = $5 - terminal_count
+               AND NOT (status = 'completed' AND $3 <> 'completed')
+               AND (($3 = 'completed' AND $4 = 0) OR ($3 = 'active' AND $4 > 0))",
         )
         .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
         .bind(now)
         .bind(drain_status_to_database(summary.status))
         .bind(counts.0)
         .bind(counts.1)
         .bind(summary.cleanup_token.as_str())
         .bind(counts.2)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -293,33 +307,54 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             });
         }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let snapshot = sqlx::query_as::<_, ObligationFenceRow>(
+            "SELECT paykit_admission_required, resolved_status
+             FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1 AND verification_task_id = $2::uuid
+             FOR UPDATE",
+        )
+        .bind(deletion_job_id)
+        .bind(task_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if !matches!(
+            snapshot,
+            Some(ObligationFenceRow {
+                paykit_admission_required: Some(true),
+                resolved_status: None,
+            })
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
         let updated = sqlx::query(
-            "UPDATE verification_tasks AS task
-             SET status = $6, started_at = COALESCE(started_at, $5), completed_at = $5,
+            "UPDATE verification_tasks
+             SET status = $3, started_at = COALESCE(started_at, $2), completed_at = $2,
                  failure_message = NULL, claimed_by = NULL, claim_token = NULL,
                  claim_expires_at = NULL, next_attempt_at = NULL,
                  last_attempt_error = NULL, entitlement_publication_claim_token = NULL,
-                 updated_at = $5
-             FROM content_lock_deletion_jobs AS deletion,
-                  content_lock_deletion_task_snapshot AS snapshot
-             WHERE deletion.job_id = $1 AND deletion.state = 'running'
-               AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
-               AND deletion.force_requested_at IS NULL
-               AND snapshot.deletion_job_id = deletion.job_id
-               AND snapshot.verification_task_id = task.task_id
-               AND snapshot.paykit_admission_required = TRUE
-               AND snapshot.resolved_status IS NULL
-               AND task.task_id = $4::uuid
-               AND task.status IN ('pending', 'in_progress')
-               AND task.entitlement_publication_claim_token IS NOT DISTINCT FROM $7",
+                 updated_at = $2
+             WHERE task_id = $1::uuid
+               AND deletion_job_id = $4
+               AND status IN ('pending', 'in_progress')
+               AND entitlement_publication_claim_token IS NOT DISTINCT FROM $5",
         )
-        .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
         .bind(task_id.to_string())
         .bind(now)
         .bind(status_to_database(status))
+        .bind(deletion_job_id)
         .bind(entitlement_publication_token)
         .execute(&mut *transaction)
         .await
@@ -330,7 +365,14 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         }
         let resolved = sqlx::query(
             "UPDATE content_lock_deletion_task_snapshot
-             SET resolved_status = $3, resolved_at = $4
+             SET resolved_status = $3, resolved_at = $4,
+                 final_credential_eligible_at = CASE
+                     WHEN $3 = 'completed'
+                      AND paykit_admission_required
+                      AND NOT had_active_credential_at_cutoff
+                     THEN $4
+                     ELSE NULL
+                 END
              WHERE deletion_job_id = $1 AND verification_task_id = $2::uuid
                AND resolved_status IS NULL",
         )
@@ -368,6 +410,41 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         .await
         .map_err(storage_error)
     }
+}
+
+async fn lock_deletion_ownership(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deletion_job_id: Uuid,
+) -> Result<Option<DeletionOwnershipRow>, ApplicationError> {
+    sqlx::query_as::<_, DeletionOwnershipRow>(
+        "SELECT state, phase, force_requested_at, claimed_by, claim_token, claim_expires_at
+         FROM content_lock_deletion_jobs
+         WHERE job_id = $1
+         FOR UPDATE",
+    )
+    .bind(deletion_job_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)
+}
+
+fn owns_live_drain_claim(
+    ownership: Option<&DeletionOwnershipRow>,
+    worker_id: &str,
+    claim_token: Uuid,
+    now: OffsetDateTime,
+    phase: &str,
+) -> bool {
+    ownership.is_some_and(|ownership| {
+        ownership.state == "running"
+            && ownership.phase == phase
+            && ownership.force_requested_at.is_none()
+            && ownership.claimed_by.as_deref() == Some(worker_id)
+            && ownership.claim_token == Some(claim_token)
+            && ownership
+                .claim_expires_at
+                .is_some_and(|claim_expires_at| claim_expires_at >= now)
+    })
 }
 
 fn row_to_obligation(row: ObligationRow) -> Result<PaymentDrainObligation, ApplicationError> {
@@ -471,13 +548,18 @@ fn storage_display(error: impl std::fmt::Display) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use locks_core::ids::TaskId;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
+    use crate::application::models::VerificationTaskStatus;
     use crate::application::ports::{
         PaymentDrainCleanupToken, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
+        PaymentDrainTerminalTransition,
     };
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -631,5 +713,381 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn force_first_fences_stale_initial_payment_drain_store() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let stale_claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        insert_start_drain_job(database.pool(), job_id, stale_claim_token, now).await;
+
+        let mut force = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *force)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET force_requested_at = $2, state = 'queued', claimed_by = NULL,
+                 claim_token = NULL, claim_expires_at = NULL
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *force)
+        .await
+        .unwrap();
+
+        let summary = PaymentDrainSummary {
+            status: PaymentDrainStatus::Active,
+            accepted_count: 1,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            cleanup_token: PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([10_u8; 32]))
+                .unwrap(),
+        };
+        let stale = tokio::spawn(async move {
+            repository
+                .store_payment_drain(job_id, "worker", stale_claim_token, now, &summary)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stale.is_finished(),
+            "initial drain persistence must wait for the deletion-job ownership row"
+        );
+
+        force.commit().await.unwrap();
+        assert!(!stale.await.unwrap().unwrap());
+        assert_eq!(
+            PostgresPaymentDrainRepository::new(database.pool().clone())
+                .get_payment_drain(job_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn reclaim_first_fences_stale_initial_payment_drain_store() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let stale_claim_token = Uuid::new_v4();
+        let replacement_claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        insert_start_drain_job(database.pool(), job_id, stale_claim_token, now).await;
+
+        let mut reclaim = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *reclaim)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claimed_by = 'replacement-worker', claim_token = $2,
+                 claim_expires_at = $3
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(replacement_claim_token)
+        .bind(now + time::Duration::minutes(10))
+        .execute(&mut *reclaim)
+        .await
+        .unwrap();
+
+        let summary = PaymentDrainSummary {
+            status: PaymentDrainStatus::Active,
+            accepted_count: 1,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            cleanup_token: PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([11_u8; 32]))
+                .unwrap(),
+        };
+        let stale = tokio::spawn(async move {
+            repository
+                .store_payment_drain(job_id, "worker", stale_claim_token, now, &summary)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stale.is_finished(),
+            "initial drain persistence must wait for the deletion-job ownership row"
+        );
+
+        reclaim.commit().await.unwrap();
+        assert!(!stale.await.unwrap().unwrap());
+        assert_eq!(
+            PostgresPaymentDrainRepository::new(database.pool().clone())
+                .get_payment_drain(job_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_force_winner_fences_stale_payment_drain_reconciliation() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let stale_claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        let cleanup_token =
+            PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([9_u8; 32])).unwrap();
+        insert_drain_job(
+            database.pool(),
+            job_id,
+            stale_claim_token,
+            now,
+            cleanup_token.as_str(),
+        )
+        .await;
+
+        let mut force = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *force)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET force_requested_at = $2, state = 'queued', claimed_by = NULL,
+                 claim_token = NULL, claim_expires_at = NULL
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *force)
+        .await
+        .unwrap();
+
+        let completed = PaymentDrainSummary {
+            status: PaymentDrainStatus::Completed,
+            accepted_count: 0,
+            terminal_count: 1,
+            cancellation_enqueued_count: 0,
+            cleanup_token: cleanup_token.clone(),
+        };
+        let stale = tokio::spawn(async move {
+            repository
+                .reconcile_payment_drain(job_id, "worker", stale_claim_token, now, &completed)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stale.is_finished(),
+            "reconciliation must wait for the deletion-job ownership row"
+        );
+
+        force.commit().await.unwrap();
+        assert!(!stale.await.unwrap().unwrap());
+        assert_eq!(
+            PostgresPaymentDrainRepository::new(database.pool().clone())
+                .get_payment_drain(job_id)
+                .await
+                .unwrap(),
+            Some(PaymentDrainSummary {
+                status: PaymentDrainStatus::Active,
+                accepted_count: 1,
+                terminal_count: 0,
+                cancellation_enqueued_count: 0,
+                cleanup_token,
+            })
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_reclaim_winner_fences_stale_terminal_obligation_persistence() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let task_uuid = Uuid::new_v4();
+        let task_id = TaskId::from_str(&task_uuid.to_string()).unwrap();
+        let stale_claim_token = Uuid::new_v4();
+        let replacement_claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        insert_terminal_obligation(database.pool(), job_id, task_uuid, stale_claim_token, now)
+            .await;
+
+        let mut reclaim = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *reclaim)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claimed_by = 'replacement-worker', claim_token = $2,
+                 claim_expires_at = $3
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(replacement_claim_token)
+        .bind(now + time::Duration::minutes(10))
+        .execute(&mut *reclaim)
+        .await
+        .unwrap();
+
+        let stale = tokio::spawn(async move {
+            repository
+                .persist_terminal_obligation(
+                    job_id,
+                    "worker",
+                    stale_claim_token,
+                    now,
+                    &task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: None,
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stale.is_finished(),
+            "terminal persistence must wait for the deletion-job ownership row"
+        );
+
+        reclaim.commit().await.unwrap();
+        assert!(!stale.await.unwrap().unwrap());
+        let task_status: String =
+            sqlx::query_scalar("SELECT status FROM verification_tasks WHERE task_id = $1")
+                .bind(task_uuid)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let resolved_status: Option<String> = sqlx::query_scalar(
+            "SELECT resolved_status FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1 AND verification_task_id = $2",
+        )
+        .bind(job_id)
+        .bind(task_uuid)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(task_status, "pending");
+        assert_eq!(resolved_status, None);
+        database.cleanup().await;
+    }
+
+    async fn insert_start_drain_job(
+        pool: &sqlx::PgPool,
+        job_id: Uuid,
+        claim_token: Uuid,
+        now: OffsetDateTime,
+    ) {
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, 'creator', 'lock', '{}'::jsonb, $2,
+                     'running', 'start_payment_drain', 'worker', $3, $4)",
+        )
+        .bind(job_id)
+        .bind(now)
+        .bind(claim_token)
+        .bind(now + time::Duration::minutes(5))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_drain_job(
+        pool: &sqlx::PgPool,
+        job_id: Uuid,
+        claim_token: Uuid,
+        now: OffsetDateTime,
+        cleanup_token: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, 'creator', 'lock', '{}'::jsonb, $2,
+                     'running', 'drain_payments', 'worker', $3, $4)",
+        )
+        .bind(job_id)
+        .bind(now)
+        .bind(claim_token)
+        .bind(now + time::Duration::minutes(5))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_payment_drains
+                 (deletion_job_id, status, accepted_count, terminal_count,
+                  cancellation_enqueued_count, cleanup_token, created_at, updated_at)
+             VALUES ($1, 'active', 1, 0, 0, $2, $3, $3)",
+        )
+        .bind(job_id)
+        .bind(cleanup_token)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_terminal_obligation(
+        pool: &sqlx::PgPool,
+        job_id: Uuid,
+        task_id: Uuid,
+        claim_token: Uuid,
+        now: OffsetDateTime,
+    ) {
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, 'creator', 'lock', '{}'::jsonb, $2,
+                     'running', 'drain_payments', 'worker', $3, $4)",
+        )
+        .bind(job_id)
+        .bind(now)
+        .bind(claim_token)
+        .bind(now + time::Duration::minutes(5))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id,
+                  deletion_job_id)
+             VALUES ($1, 'pending', '{}'::jsonb, $2, 'creator', 'bundle', $3)",
+        )
+        .bind(task_id)
+        .bind(now)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, criterion_id, status_at_cutoff,
+                  paykit_admission_required, payment_in_hours,
+                  invoice_created_at, payment_deadline)
+             VALUES ($1, $2, 'creator', 'bundle', 'pubkycreator/pub/locks.app/lock.json',
+                     'payment', 'pending', TRUE, 1, $3, $4)",
+        )
+        .bind(job_id)
+        .bind(task_id)
+        .bind(now)
+        .bind(now + time::Duration::hours(1))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }

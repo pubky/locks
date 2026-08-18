@@ -33,7 +33,14 @@ frontend_session_code_ttl_seconds = 120
 allowed_return_origins = ["http://localhost:3000"]
 
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
+
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
 
 [logging]
 level = "info"
