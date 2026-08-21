@@ -286,8 +286,8 @@ function hasExactKeys(value, expected) {
 }
 
 function canonicalPaymentCommandMatches(value) {
-  const payment = /^docker compose --file \.\/compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf="\$BITCOIN_DATA\/bitcoin\.conf" -regtest -rpcwallet=miner sendtoaddress "([^"]+)" "((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)"'$/.exec(value.payment_command);
-  const mining = "docker compose --file ./compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'";
+  const payment = /^docker compose --file compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\/home\/bitcoin\/\.bitcoin\/bitcoin\.conf -regtest -rpcwallet=miner sendtoaddress (bcrt1[02-9ac-hj-np-z]{8,86}) ((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)'$/.exec(value.payment_command);
+  const mining = "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'";
   return Boolean(payment)
     && payment[1] === value.address
     && browserBtcToSats(payment[2]) === BigInt(value.amount_sats)

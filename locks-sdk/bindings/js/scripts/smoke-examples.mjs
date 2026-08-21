@@ -58,6 +58,8 @@ const required = {
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
     'npm --prefix examples/js-sdk run authenticate -- --role content-creator',
+    'docker compose --file compose.paykit-local-demo.yaml up -d --build',
+    'http://localhost:8080/examples/js-sdk/',
     'npm --prefix examples/js-sdk run start-server',
     'npm --prefix examples/js-sdk run start-reader-server',
     './.local/demo-config/config.json',
@@ -1039,8 +1041,8 @@ const receivedOutput = {
 const operatorReceivedOutput = {
   ...receivedOutput,
   asset: 'BTC',
-  payment_command: receivedOutput.payment_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
-  optional_mining_command: receivedOutput.optional_mining_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
+  payment_command: `docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress ${receivedOutput.address} 0.00050000'`,
+  optional_mining_command: "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'",
 };
 assert.deepEqual(parseReaderHelperSuccess({
   operation: 'receive',

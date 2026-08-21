@@ -57,11 +57,20 @@ Verified browser-facing defaults are:
 - reader demo: <http://127.0.0.1:8081/reader/>
 
 For the opt-in payment-lock demonstration, including Paykit Server, Bitcoin regtest,
-and Fulcrum, use the separate Compose definition:
+and Fulcrum:
+
+1. Build and start the complete stack from the repository root:
 
 ```bash
-docker compose -f compose.paykit-local-demo.yaml up --build
+docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
+
+2. Open the content-creator demo at <http://localhost:8080/examples/js-sdk/>.
+
+3. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...`
+   commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit`
+   in `docker compose exec`; those wrappers load private role state on the host and bridge
+   only the bounded native-helper request into the demo container.
 
 Its external build contexts use anonymously reachable public repositories pinned to
 immutable commits; no sibling Paykit or Pubky checkout is required. The full demo adds

@@ -178,20 +178,37 @@ Replacing the content-creator identity clears any persisted demo-auth session fo
 
 ## Run the demo server
 
-### Complete local Compose stack
+### Complete local Compose stack: quickstart
 
-Build and start the complete stack:
+1. From the repository root, build and start the complete stack in the background:
 
 ```bash
-docker compose -f compose.paykit-local-demo.yaml up --build
+docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
+
+2. Open the content-creator demo:
+
+```text
+http://localhost:8080/examples/js-sdk/
+```
+
+3. Approve browser requests with the external wallet under test. When using the local
+   recovery-file fallback, run authentication commands from the repository host:
+
+```bash
+npm --prefix examples/js-sdk run authenticate -- --role content-creator
+npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+```
+
+Do not wrap these commands in `docker compose exec`. The host wrappers load private role
+state locally and bridge only bounded helper input into the relevant container.
 
 The Paykit Server, Paykit Rust, Locks, and Pubky Core build inputs are fetched from
 anonymous public Git URLs pinned to immutable commits. The active Locks checkout is
 used only for the Locks and browser-demo images being developed. No sibling repository
 checkout is required.
 
-`compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose -f compose.paykit-local-demo.yaml config --no-env-resolution` model.
+`compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
 This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`, the Homegate bridge at `http://localhost:6288`, and Fulcrum at `tcp://localhost:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
 
@@ -203,13 +220,21 @@ Reader:  http://localhost:8088/reader/
 Paykit:  http://localhost:3001/setup
 ```
 
+The reader displays directly runnable Bitcoin commands without JSON-style escaped quotes.
+The generated send command has this shape, with the current request address and amount
+substituted for `BCRT_ADDRESS` and `BTC_AMOUNT`:
+
+```bash
+docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress BCRT_ADDRESS BTC_AMOUNT'
+```
+
 The Compose reader process still listens on container port `8081`; only its host mapping is `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
 
 ```bash
 npm --prefix examples/js-sdk run reset-paykit-demo
 ```
 
-Do not use `docker compose -f compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
+Do not use `docker compose --file compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
 
 ### Direct npm server
 
