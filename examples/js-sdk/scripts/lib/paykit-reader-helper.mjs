@@ -131,7 +131,7 @@ export function parseReaderHelperSuccess({ operation, stdout }) {
     || value.status !== 'received'
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.payment_request_id)
     || !/^bcrt1[02-9ac-hj-np-z]{8,86}$/.test(value.address)
-    || value.asset !== 'BTC'
+    || value.asset !== 'btc'
     || !/^[1-9][0-9]*$/.test(value.amount_sats)
     || value.optional_mining_command !== MINING_COMMAND
   ) {
@@ -147,6 +147,7 @@ export function parseReaderHelperSuccess({ operation, stdout }) {
   }
   return {
     ...value,
+    asset: 'BTC',
     payment_command: `${COMPOSE_COMMAND}${value.payment_command.slice('docker compose'.length)}`,
     optional_mining_command: `${COMPOSE_COMMAND}${value.optional_mining_command.slice('docker compose'.length)}`,
   };
@@ -167,6 +168,7 @@ export function validateReaderOperatorResult(value) {
     operation: 'receive',
     stdout: `${JSON.stringify({
       ...value,
+      asset: 'btc',
       payment_command: `docker compose${value.payment_command.slice(COMPOSE_COMMAND.length)}`,
       optional_mining_command: `docker compose${value.optional_mining_command.slice(COMPOSE_COMMAND.length)}`,
     })}\n`,

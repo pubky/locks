@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +10,7 @@ import { parseArgs, requiredRole } from './lib/paths.mjs';
 import { loadRoleSecret } from './lib/pubky.mjs';
 
 const DEFAULT_HELPER_PATH = '/usr/local/bin/paykit-companion-auth';
+const COMPOSE_HELPER_PATH = fileURLToPath(new URL('./paykit-companion-auth-compose.sh', import.meta.url));
 const DEFAULT_TIMEOUT_MS = 240_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const MAX_INPUT_BYTES = 16 * 1024;
@@ -119,6 +121,18 @@ export function companionResultCategory(result) {
     return { exitCode: 1, stream: 'stderr', message: 'Paykit companion authentication timed out.' };
   }
   return { exitCode: 1, stream: 'stderr', message: 'Paykit companion authentication failed.' };
+}
+
+export function resolveCompanionHelperPath({
+  env = process.env,
+  nativeHelperPath = DEFAULT_HELPER_PATH,
+  composeHelperPath = COMPOSE_HELPER_PATH,
+  nativeHelperAvailable = existsSync,
+} = {}) {
+  if (typeof env.PAYKIT_COMPANION_AUTH_BIN === 'string' && env.PAYKIT_COMPANION_AUTH_BIN) {
+    return env.PAYKIT_COMPANION_AUTH_BIN;
+  }
+  return nativeHelperAvailable(nativeHelperPath) ? nativeHelperPath : composeHelperPath;
 }
 
 export async function runBoundedHelper({
@@ -265,7 +279,7 @@ export async function runBoundedHelper({
 }
 
 export async function runCompanionHelper({
-  helperPath = process.env.PAYKIT_COMPANION_AUTH_BIN || DEFAULT_HELPER_PATH,
+  helperPath = resolveCompanionHelperPath(),
   input,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   killGraceMs = DEFAULT_KILL_GRACE_MS,

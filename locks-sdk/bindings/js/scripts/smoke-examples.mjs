@@ -27,6 +27,7 @@ const files = {
   createUser: join(examplesDir, 'scripts', 'create-user.mjs'),
   authenticate: join(examplesDir, 'scripts', 'authenticate.mjs'),
   authenticatePaykit: join(examplesDir, 'scripts', 'authenticate-paykit.mjs'),
+  composeCompanionHelper: join(examplesDir, 'scripts', 'paykit-companion-auth-compose.sh'),
   preparePaykitReader: join(examplesDir, 'scripts', 'prepare-paykit-reader.mjs'),
   receivePaykitRequest: join(examplesDir, 'scripts', 'receive-paykit-request.mjs'),
   registerPaykitReader: join(examplesDir, 'scripts', 'register-paykit-reader.mjs'),
@@ -76,7 +77,7 @@ const required = {
     'Paykit browser  = http://localhost:3001',
     'opens `GET http://localhost:3001/setup` in a Paykit-origin iframe',
     'exact iframe window and origin with the pending state',
-    'docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'Non-TTY stdin is exactly those three ordered lines',
     'in-process Paykit reader worker starts with `reader-demo`',
     'sole mutable owner of `./.local/paykit-reader/state.v1`',
@@ -112,6 +113,7 @@ const required = {
     "from './creator-complete-flow.js'",
     'POST /api/demo-auth/start',
     'GET /api/demo-auth/status',
+    'const returnTo = `${window.location.origin}/auth/lock-server/callback`',
     "deliveryUrl.searchParams.set('delivery', 'postmessage')",
     'openLockAuthIframe(deliveryUrl.toString())',
     'frame.src = connectUrl',
@@ -153,7 +155,7 @@ const required = {
     'el.paykitPaymentFields.hidden = !paymentSelected',
     'el.paykitAmountSats.required = paymentSelected',
     'openPaykitSetupIframe',
-    'docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'acceptPaykitSetupEvent',
     'state.paykitSetupComplete = true',
     "el.paykitSetupStatus.className = 'ok'",
@@ -177,6 +179,7 @@ const required = {
   authenticatePaykit: [
     'PAYKIT_COMPANION_AUTH_BIN',
     '/usr/local/bin/paykit-companion-auth',
+    'paykit-companion-auth-compose.sh',
     'loadRoleSecret',
     'content-creator',
     'version: 1',
@@ -190,6 +193,11 @@ const required = {
     "child.stdin.end",
     "child.kill('SIGTERM')",
     "child.kill('SIGKILL')",
+  ],
+  composeCompanionHelper: [
+    'compose.paykit-local-demo.yaml',
+    'exec -T creator-demo',
+    '/usr/local/bin/paykit-companion-auth',
   ],
   preparePaykitReader: ['runReaderOperation', "operation: 'prepare'", 'content-viewer', 'writePreparedReaderStatus', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
   receivePaykitRequest: ['runReaderOperation', "operation: 'receive'", 'content-viewer', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
@@ -1023,13 +1031,14 @@ const receivedOutput = {
   status: 'received',
   payment_request_id: 'b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab33',
   address: 'bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202',
-  asset: 'BTC',
+  asset: 'btc',
   amount_sats: '50000',
   payment_command: "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner sendtoaddress \"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202\" \"0.00050000\"'",
   optional_mining_command: "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'",
 };
 const operatorReceivedOutput = {
   ...receivedOutput,
+  asset: 'BTC',
   payment_command: receivedOutput.payment_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
   optional_mining_command: receivedOutput.optional_mining_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
 };
@@ -1039,6 +1048,7 @@ assert.deepEqual(parseReaderHelperSuccess({
 }), operatorReceivedOutput);
 for (const invalid of [
   `${JSON.stringify({ ...receivedOutput, extra: true })}\n`,
+  `${JSON.stringify({ ...receivedOutput, asset: 'BTC' })}\n`,
   `${JSON.stringify({ ...receivedOutput, payment_command: 'echo unsafe' })}\n`,
   `${JSON.stringify({
     ...receivedOutput,
@@ -1063,12 +1073,29 @@ const {
   collectPaykitInputs,
   parsePaykitInputLines,
   requirePaykitCreatorRole,
+  resolveCompanionHelperPath,
   runCompanionHelper,
 } = await import(pathToFileURL(files.authenticatePaykit).href);
 const { Keypair, secretFromRecoveryFile } = await import(pathToFileURL(files.pubkyLib).href);
 
 const authUrl = 'pubkyauth://signin?secret=test-auth-secret';
 const accountXpub = 'tpub-test-account-xpub';
+assert.equal(resolveCompanionHelperPath({
+  env: {},
+  nativeHelperPath: '/native/helper',
+  composeHelperPath: '/compose/helper',
+  nativeHelperAvailable: () => false,
+}), '/compose/helper');
+assert.equal(resolveCompanionHelperPath({
+  env: {},
+  nativeHelperPath: '/native/helper',
+  composeHelperPath: '/compose/helper',
+  nativeHelperAvailable: () => true,
+}), '/native/helper');
+assert.equal(resolveCompanionHelperPath({
+  env: { PAYKIT_COMPANION_AUTH_BIN: '/override/helper' },
+  nativeHelperAvailable: () => false,
+}), '/override/helper');
 const parsedLines = parsePaykitInputLines(`${authUrl}\n${accountXpub}\n7\n`);
 assert.deepEqual(parsedLines, { authUrl, accountXpub, accountIndex: 7 });
 for (const invalid of [

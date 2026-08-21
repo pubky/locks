@@ -346,10 +346,10 @@ npm --prefix examples/js-sdk run generate-paykit-account-tpub
 This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. In the external-wallet flow, scan or paste the Paykit authorization request into the same wallet. For direct npm development with a generated creator recovery file, the companion-auth wrapper remains available:
 
 ```bash
-docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 ```
 
-The command loads the existing encrypted content-creator recovery file and starts `/usr/local/bin/paykit-companion-auth` directly with no arguments. `PAYKIT_COMPANION_AUTH_BIN` may override that executable path for local testing. Interactive input prompts for the Paykit auth URL, account xpub/tpub, and account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline. Sensitive inputs are sent only through the helper's stdin and are never forwarded in wrapper output.
+Run this command from the repository host, where the encrypted content-creator recovery file is stored. The wrapper loads that local identity and streams one bounded JSON request over stdin to `/usr/local/bin/paykit-companion-auth` in the running `creator-demo` container; private role files are not mounted into the container. `PAYKIT_COMPANION_AUTH_BIN` may override the helper executable path for local testing. Interactive input prompts for the Paykit auth URL, account xpub/tpub, and account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline. Sensitive inputs are sent only through helper stdin and are never forwarded in process arguments, environment variables, or wrapper output.
 
 The browser uses the Locks JS/WASM SDK for publishing:
 
