@@ -257,7 +257,8 @@ mod tests {
                 params: json!({
                     "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
                     "amount": "50000",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }),
             },
             proof: Proof {

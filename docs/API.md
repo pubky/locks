@@ -24,6 +24,7 @@ The Lock Server has one non-production route family and one authenticated creato
   - Can run in `development`, `staging`, or `production`.
   - Require `Authorization: Bearer <frontend_session_token>`.
   - Derive creator identity from the frontend session. Request-body `creator` is rejected for authenticated routes.
+  - A guarded path can be owned by only one managed Content Lock for that creator. Creating a different Lock ID for an owned path returns `409 content_lock_path_conflict`.
   - Missing/unknown/expired frontend sessions use the JSON error envelope (`401 frontend_session_unavailable` or `401 frontend_session_expired`).
   - Missing/revoked creator-granted homeserver authority remains a separate operational error (`503 creator_authority_unavailable`).
 - Creator authority status route: `GET /creator/authority-status`
@@ -46,7 +47,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | --- | --- | --- | --- | --- |
 | `PUT /creator/priv-resources/content/<path>` | `200` JSON guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; MIME from `Content-Type`. | No bearer secrets or raw bytes in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
 | `DELETE /creator/priv-resources/content/<path>` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets or raw bytes in response. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `503 creator_authority_unavailable` |
-| `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `404 guarded_resource_not_found`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
+| `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `409 content_lock_path_conflict`, `503 creator_authority_unavailable` |
 | `POST /creator/lock-service-config` | `200` JSON lock-service pointer | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
 | `GET /connect` | `200` HTML Lock-Server-hosted connect shell | No bearer auth. Mounted when `[creator_authority_acquisition].enabled = true`; `return_to` must match `allowed_return_origins` or explicit wildcard policy. | HTML intentionally contains the secret-bearing Pubky authorization URL on Lock Server origin; response must not contain frontend session token, one-time code, or creator authority secret. | `400 invalid_request`, `503 creator_authority_unavailable`, `404` when route gated off |
 | `POST /connect/{flow_id}/complete` | `303` redirect to stored `return_to` | No bearer auth. Mounted when `[creator_authority_acquisition].enabled = true`; stored `return_to` is revalidated before redirect. | `Location` contains only callback `state` and one-time `code`; no authorization URL, frontend session token, or creator authority secret. | `400 invalid_request`, `404 creator_connect_flow_unavailable`, `410 creator_connect_flow_expired`, `503 creator_authority_unavailable`, `404` when route gated off |
@@ -98,6 +99,7 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `frontend_session_expired` | 401 | Frontend session token existed but expired. |
 | `frontend_session_state_mismatch` | 400 | One-time code exchange state did not match. |
 | `creator_authority_unavailable` | 503 | Creator-granted homeserver authority is unavailable or could not be revalidated. |
+| `content_lock_path_conflict` | 409 | The creator-scoped guarded path already has an in-flight or published Content Lock owner. |
 | `task_state_conflict` | 409 | Submission or completion conflicts with existing task state. |
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
@@ -348,11 +350,12 @@ Every referenced guarded resource must currently exist for the same creator/path
 {
   "recipient_pubky": "pubky<recipient>",
   "amount": "50000",
-  "asset": "BTC"
+  "asset": "BTC",
+  "payment_in": 24
 }
 ```
 
-`recipient_pubky` must be a valid Pubky public key string equal to the content-lock creator, `amount` must be a positive base-unit integer encoded as a string, and `asset` must be a non-empty string. The lock params do not include Paykit server URLs, account IDs, memos, expiry, payment references, or reader identity. A v1 content lock that uses `paykit-payment` must contain exactly that one criterion, and its `all` or `any` lock logic must reference that criterion exactly once. Mixed criteria, multiple payment criteria, recipient/creator mismatch, and duplicate or mismatched logic references return `400 invalid_request`.
+`recipient_pubky` must be a valid Pubky public key string equal to the content-lock creator, `amount` must be a positive base-unit integer encoded as a string, `asset` must be a non-empty string, and `payment_in` must be a positive whole-hour JSON `u64`. The lock params do not include Paykit server URLs, account IDs, memos, expiry, payment references, or reader identity. A v1 content lock that uses `paykit-payment` must contain exactly that one criterion, and its `all` or `any` lock logic must reference that criterion exactly once. Mixed criteria, multiple payment criteria, recipient/creator mismatch, and duplicate or mismatched logic references return `400 invalid_request`.
 
 #### Request
 

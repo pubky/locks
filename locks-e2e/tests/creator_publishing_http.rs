@@ -377,7 +377,8 @@ async fn creator_publishing_http_rejects_invalid_paykit_payment_params() {
                 "params": {
                     "recipient_pubky": creator().to_string(),
                     "amount": "0",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }
             }]),
             standard_lock_logic(),
@@ -399,7 +400,8 @@ async fn creator_publishing_http_rejects_invalid_paykit_payment_params() {
                 "params": {
                     "recipient_pubky": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
                     "amount": "50000",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }
             }]),
             standard_lock_logic(),
@@ -515,7 +517,8 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
                 "params": {
                     "recipient_pubky": creator().to_string(),
                     "amount": "50000",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }
             }]),
             standard_lock_logic(),
@@ -757,7 +760,8 @@ fn paykit_criterion_json(criterion_id: &str) -> serde_json::Value {
         "params": {
             "recipient_pubky": creator().to_string(),
             "amount": "50000",
-            "asset": "BTC"
+            "asset": "BTC",
+            "payment_in": 24
         }
     })
 }

@@ -27,13 +27,15 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 {
   "recipient_pubky": "pubky<creator>",
   "amount": "50000",
-  "asset": "BTC"
+  "asset": "BTC",
+  "payment_in": 24
 }
 ```
 
 - `recipient_pubky` must equal the canonical content-lock creator.
 - `amount` is a positive decimal integer string in the asset's base unit.
 - `asset` is an opaque, non-empty string to Locks. Paykit Server owns deployment-specific asset support and base-unit interpretation.
+- `payment_in` is a required, nonzero JSON `u64` number of whole hours in Locks policy.
 - V1 permits exactly one payment criterion, referenced exactly once by the lock logic, and exactly one submitted payment proof.
 - The submitted payment proof payload is `{}`. `reader_public_key` is top-level submission data.
 - Content-lock authoring does not require runtime Paykit configuration or availability.

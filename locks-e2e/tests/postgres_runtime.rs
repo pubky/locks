@@ -22,8 +22,9 @@ use locks_server::config::{
 };
 use locks_server::worker::{VerificationWorker, WorkerTick};
 use locks_service::application::models::{
-    AccessCredential, AccessCredentialLookupKey, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret, VerificationTaskStatus,
+    AccessCredential, AccessCredentialLookupKey, ContentLockOwnershipStatus,
+    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    VerificationTaskStatus,
 };
 use locks_service::infrastructure::memory::{
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
@@ -45,8 +46,20 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         return;
     };
     let content_lock = content_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let guarded_paths = vec![content_lock.primary_resource.as_ref().unwrap().path.clone()];
 
     let first_state = app_state(database.pool().clone());
+    first_state
+        .content_lock_ownership()
+        .reserve_paths(&creator(), &guarded_paths, &lock_id)
+        .await
+        .unwrap();
+    first_state
+        .content_lock_ownership()
+        .mark_paths_published(&creator(), &guarded_paths, &lock_id)
+        .await
+        .unwrap();
     seed_content_lock(&first_state, content_lock.clone()).await;
     let first_router = router(first_state.clone());
     submit_task(&first_router, submitted_proof_bundle_for(&content_lock)).await;
@@ -59,6 +72,14 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         .unwrap()
         .unwrap();
     assert_eq!(recreated_task.status, VerificationTaskStatus::Pending);
+    let ownership = recreated_state
+        .content_lock_ownership()
+        .get_path_ownership(&creator(), &guarded_paths[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ownership.lock_id, lock_id);
+    assert_eq!(ownership.status, ContentLockOwnershipStatus::Published);
 
     seed_content_lock(&recreated_state, content_lock.clone()).await;
     let worker = VerificationWorker::from_state(&recreated_state);
