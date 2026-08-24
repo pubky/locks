@@ -96,6 +96,9 @@ export function validatePaykitReaderWorkerStatus(value) {
   if (value.state === 'starting' && exactKeys(value, ['version', 'state'])) {
     return Object.freeze({ ...value });
   }
+  if (value.state === 'waiting_for_creator' && exactKeys(value, ['version', 'state'])) {
+    return Object.freeze({ ...value });
+  }
   if (
     value.state === 'waiting'
     && exactKeys(value, ['version', 'state', 'reader_pubky'])
@@ -165,7 +168,12 @@ export async function readPaykitReaderWorkerStatus(path = paykitReaderWorkerStat
   }
 }
 
-export function buildPaykitReaderBrowserStatus(worker, profile, { currentOwner = false } = {}) {
+export function buildPaykitReaderBrowserStatus(
+  worker,
+  profile,
+  { currentOwner = false, waitingForCreator = false } = {},
+) {
+  if (waitingForCreator) return { version: 1, state: 'waiting_for_creator' };
   if (!currentOwner) return { version: 1, state: 'starting' };
   if (!worker) return { version: 1, state: 'starting' };
   if (

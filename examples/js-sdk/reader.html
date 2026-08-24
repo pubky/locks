@@ -11,6 +11,7 @@
       input, select, button, textarea { font: inherit; }
       input[type="text"], textarea { width: 100%; box-sizing: border-box; }
       pre { background: #f7f7f7; padding: 0.75rem; overflow: auto; white-space: pre-wrap; }
+      #read-output img { display: block; max-width: 100%; height: auto; }
       .ok { color: #067d17; }
       .error { color: #a40000; }
       .muted { color: #666; }
@@ -58,9 +59,9 @@
         </select>
       </label>
       <section id="paykit-reader-commands" hidden>
-        <p>The Paykit reader worker runs automatically inside the reader demo.</p>
+        <p>The Paykit reader identity is prepared automatically by the local demo.</p>
         <button id="refresh-paykit-reader" type="button">Refresh Paykit reader</button>
-        <p id="paykit-reader-status" class="muted">Waiting for the Paykit reader worker.</p>
+        <p id="paykit-reader-status" class="muted">Waiting for the Paykit reader.</p>
         <label>
           Reader Pubky
           <input id="reader-public-key" readonly />
@@ -101,7 +102,7 @@
       <button id="read-content" disabled hidden>Read selected guarded content</button>
       <p id="read-status" class="muted">Waiting for access credential.</p>
       <h3>Content</h3>
-      <pre id="read-output"></pre>
+      <div id="read-output"></div>
     </section>
 
     <script type="module" src="/reader-app.js"></script>

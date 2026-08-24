@@ -255,7 +255,7 @@ function openPaykitSetupIframe(setupUrl) {
   description.style.cssText = 'margin:0;';
 
   const companionCommand = document.createElement('code');
-  companionCommand.textContent = 'docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator';
+  companionCommand.textContent = 'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator';
   companionCommand.style.cssText = 'display:block;overflow-wrap:anywhere;';
 
   const frame = document.createElement('iframe');
@@ -312,7 +312,7 @@ async function bootstrap() {
     lockServerUrl: state.config.lockServer.url,
     pkarrRelay: state.config.testnet.pkarrRelay,
     httpRelay: state.config.testnet.httpRelay,
-    callback: state.config.paths.lockServerCallback,
+    callback: `${window.location.origin}/auth/lock-server/callback`,
     hasLockSession: Boolean(state.feLockSessionToken),
   });
   await refreshDemoAuthStatus();
@@ -329,7 +329,7 @@ el.startDemoAuth.addEventListener('click', async () => {
       await refreshDemoAuthStatus();
       return;
     }
-    el.demoAuthCommand.textContent = `${result.authorizationUrl}\n\n${result.command}`;
+    el.demoAuthCommand.textContent = [result.authorizationUrl, result.command].filter(Boolean).join('\n\n');
   } catch (error) {
     showError(el.demoAuthStatus, error);
   }
@@ -341,7 +341,7 @@ el.startLockAuth.addEventListener('click', async () => {
     state.pendingConnectState = connectState;
     // return_to only supplies the postMessage target origin (this app's origin); no callback page
     // is navigated to. The server posts { state, code } to origin(return_to).
-    const returnTo = state.config.paths.lockServerCallback;
+    const returnTo = `${window.location.origin}/auth/lock-server/callback`;
     await postClientLog('info', 'lock-auth-start-clicked', {
       lockServerPubky: state.config.lockServer.pubky,
       returnTo,

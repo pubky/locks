@@ -6,9 +6,11 @@ import { extname, join, normalize } from 'node:path';
 import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
 import { examplesRoot, parseArgs, readJson, repoRoot, roleProfilePath } from './lib/paths.mjs';
 import { resolveExistingPathWithin } from './lib/creator-static-path.mjs';
+import { readReaderCreatorProfile } from './lib/paykit-reader-helper.mjs';
 import {
   runPaykitReaderWorker,
   supervisePaykitReaderWorker,
+  waitForCreatorProfile,
 } from './lib/paykit-reader-worker.mjs';
 import {
   buildPaykitReaderBrowserStatus,
@@ -24,9 +26,14 @@ const readerUrl = new URL(config.demoServer.url);
 readerUrl.port = String(args.port ?? 8081);
 const readerServerUrl = readerUrl.toString().replace(/\/$/, '');
 const preflightStatus = await runPreflight(serviceConfig);
-const workerEnabled = process.env.PAYKIT_READER_WORKER_ENABLED === '1';
+const externalReaderPubky = process.env.PAYKIT_EXTERNAL_READER_PUBKY?.trim() ?? '';
+if (externalReaderPubky && !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(externalReaderPubky)) {
+  throw new Error('PAYKIT_EXTERNAL_READER_PUBKY must be a canonical Pubky');
+}
+const workerEnabled = !externalReaderPubky && process.env.PAYKIT_READER_WORKER_ENABLED === '1';
 const workerController = new AbortController();
 let workerOwnsState = false;
+let workerWaitingForCreator = workerEnabled;
 
 logStartupDiagnostics(config, preflightStatus);
 
@@ -62,6 +69,7 @@ const server = createServer(async (request, response) => {
     if (request.method === 'GET' && url.pathname === '/api/paykit-reader/status') {
       const status = await publicPaykitReaderStatus({
         currentOwner: workerEnabled && workerOwnsState,
+        waitingForCreator: workerWaitingForCreator,
       });
       return sendJson(response, status, ['starting', 'failed'].includes(status.state) ? 503 : 200);
     }
@@ -96,11 +104,7 @@ server.listen(Number(readerUrl.port), () => {
 
 const workerTask = workerEnabled
   ? supervisePaykitReaderWorker(
-    runPaykitReaderWorker({
-      signal: workerController.signal,
-      writeWorkerStatus: writePaykitReaderWorkerStatus,
-      onOwnershipChange: (owned) => { workerOwnsState = owned; },
-    }),
+    runWorkerAfterCreatorProfile(),
     { onTerminalFailure: handleTerminalWorkerFailure },
   )
   : Promise.resolve({ status: 'stopped' });
@@ -118,16 +122,34 @@ function publicBrowserConfig(source) {
   };
 }
 
+async function runWorkerAfterCreatorProfile() {
+  await waitForCreatorProfile({
+    signal: workerController.signal,
+    readProfile: readReaderCreatorProfile,
+  });
+  if (workerController.signal.aborted) return { status: 'stopped' };
+  workerWaitingForCreator = false;
+  return runPaykitReaderWorker({
+    signal: workerController.signal,
+    writeWorkerStatus: writePaykitReaderWorkerStatus,
+    onOwnershipChange: (owned) => { workerOwnsState = owned; },
+  });
+}
+
 export async function publicPaykitReaderStatus({
   readWorker = readPaykitReaderWorkerStatus,
   readProfile = () => readJson(roleProfilePath('content-viewer')),
   currentOwner = false,
+  waitingForCreator = false,
 } = {}) {
+  if (externalReaderPubky) {
+    return { version: 1, state: 'waiting', reader_pubky: externalReaderPubky };
+  }
   const [worker, profile] = await Promise.all([
     Promise.resolve().then(readWorker).catch(() => null),
     Promise.resolve().then(readProfile).catch(() => null),
   ]);
-  return buildPaykitReaderBrowserStatus(worker, profile, { currentOwner });
+  return buildPaykitReaderBrowserStatus(worker, profile, { currentOwner, waitingForCreator });
 }
 
 async function handleTerminalWorkerFailure(error) {
@@ -176,6 +198,8 @@ async function runPreflight(source) {
   } catch (error) {
     checks.push({ name: 'config', ok: false, message: error.message });
   }
+  const wasmPackage = join(repoRoot, 'locks-sdk/bindings/js/pkg/locks_sdk_wasm_bg.wasm');
+  checks.push({ name: 'WASM package', ok: existsSync(wasmPackage), message: existsSync(wasmPackage) ? 'present' : 'missing' });
   await checkHttp(`${source.lockServer.url}/healthz`, 'lock-server /healthz', checks, (status) => status === 200);
   await checkHttp(`${source.lockServer.url}/readyz`, 'lock-server /readyz', checks, (status) => status === 200);
   await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status === 200 || status === 404);

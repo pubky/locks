@@ -26,7 +26,8 @@ services:
           .local/pubky-homeserver \
           .local/locks-server \
           .local/paykit-server \
-          .local/paykit-config
+          .local/paykit-config \
+          .local/homegate-bridge
         chmod 0600 .local/paykit-server/paykit.env
     volumes:
       - ./examples/js-sdk:/workspace/examples/js-sdk:ro
@@ -141,6 +142,8 @@ services:
     depends_on:
       bitcoin-bootstrap:
         condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001"
 
   electrum-readiness:
     image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
@@ -165,7 +168,6 @@ services:
       - "127.0.0.1:${LOCKS_HTTP_RELAY_PORT:-15412}:15412"
       - "127.0.0.1:${LOCKS_HOMESERVER_HTTP_PORT:-6286}:6286"
       - "127.0.0.1:${LOCKS_HOMESERVER_PUBKY_PORT:-6287}:6287"
-      - "127.0.0.1:${LOCKS_HOMESERVER_ADMIN_PORT:-6288}:6288"
       - "127.0.0.1:${LOCKS_SERVER_PORT:-3000}:3000"
       - "127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001"
       - "127.0.0.1:${LOCKS_CREATOR_DEMO_PORT:-8080}:8080"
@@ -176,6 +178,38 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  homegate-bridge:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "1000:1000"
+    working_dir: /workspace
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        set -a
+        . /run/compose-local/homegate-bridge/homegate.env
+        set +a
+        exec node examples/js-sdk/scripts/homegate-bridge.mjs
+    environment:
+      HOMEGATE_BRIDGE_CONFIG: /run/compose-local/demo-config/config.json
+      HOMEGATE_BRIDGE_HOMESERVER_ADMIN_URL: http://pubky-testnet:6288
+    ports:
+      - "127.0.0.1:${LOCKS_HOMEGATE_PORT:-6288}:8082"
+    volumes:
+      - ./examples/js-sdk:/workspace/examples/js-sdk:ro
+      - ./.local/demo-config:/run/compose-local/demo-config:ro
+      - ./.local/homegate-bridge:/run/compose-local/homegate-bridge:ro
+    depends_on:
+      pubky-testnet:
+        condition: service_started
+      demo-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8082/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   locks-server:
     build:
@@ -247,11 +281,11 @@ services:
   paykit-server:
     image: pubky-locks-paykit-server:local
     build:
-      context: "https://github.com/pubky/paykit-server.git#f38c7915e6b9b104e040773e78438f8aa984c46c"
+      context: "https://github.com/pubky/paykit-server.git#5ed3e8e849a16045c26c37a75068625dda333785"
       dockerfile: Dockerfile.local
       additional_contexts:
-        paykit-lib: "https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-lib"
-        paykit-sdk: "https://github.com/pubky/paykit-rs.git#52a852995bfc457b78d32f5a45f6741766a89bba:paykit-sdk"
+        paykit-lib: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-lib"
+        paykit-sdk: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk"
         locks: "https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a"
 
     depends_on:
@@ -320,19 +354,16 @@ services:
       PAYKIT_COMPANION_AUTH_BIN: /usr/local/bin/paykit-companion-auth
       PUBKY_LOCK_DEBUG: ${PUBKY_LOCK_DEBUG:-0}
     volumes:
-      - ./locks-sdk/bindings/js/pkg:/workspace/locks-sdk/bindings/js/pkg:ro
       - ./.local/demo-config:/workspace/.local/demo-config:ro
       - ./.local/js-sdk-demo:/workspace/.local/js-sdk-demo
-      - ./.local/content-creator:/workspace/.local/content-creator
       - ./.local/creator-public:/workspace/.local/creator-public
     command:
       - sh
       - -lc
       - |
         set -eu
-        npm --prefix examples/js-sdk run create-user -- --role content-creator
-        npm --prefix examples/js-sdk run publish-creator-profile
-        npm --prefix examples/js-sdk run start-server -- --allow-unhealthy
+        rm -f /workspace/.local/creator-public/profile.json
+        npm --prefix examples/js-sdk run start-server -- --external-wallet
 
   reader-demo:
     restart: unless-stopped
@@ -363,9 +394,9 @@ services:
       PAYKIT_READER_RECEIVER_PATH: bitkit/wallet
       PAYKIT_READER_SERVER_PATH: bitkit/server
       PAYKIT_READER_WORKER_ENABLED: "1"
+      PAYKIT_EXTERNAL_READER_PUBKY: ${PAYKIT_EXTERNAL_READER_PUBKY:-}
       PUBKY_LOCK_DEBUG: ${PUBKY_LOCK_DEBUG:-0}
     volumes:
-      - ./locks-sdk/bindings/js/pkg:/workspace/locks-sdk/bindings/js/pkg:ro
       - ./.local/demo-config:/workspace/.local/demo-config:ro
       - ./.local/creator-public:/workspace/.local/creator-public:ro
       - ./.local/content-viewer:/workspace/.local/content-viewer
@@ -374,8 +405,10 @@ services:
       - sh
       - -euc
       - |
-        npm --prefix examples/js-sdk run create-user -- --role content-viewer
-        exec node examples/js-sdk/scripts/start-reader-demo-server.mjs --allow-unhealthy
+        if [ -z "$PAYKIT_EXTERNAL_READER_PUBKY" ]; then
+          npm --prefix examples/js-sdk run create-user -- --role content-viewer
+        fi
+        exec node examples/js-sdk/scripts/start-reader-demo-server.mjs
     healthcheck:
       test:
         - CMD

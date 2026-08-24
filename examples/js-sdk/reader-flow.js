@@ -222,6 +222,9 @@ export function parsePaykitReaderBrowserStatus(value) {
   if (value.state === 'starting' && hasExactKeys(value, ['version', 'state'])) {
     return Object.freeze({ ...value });
   }
+  if (value.state === 'waiting_for_creator' && hasExactKeys(value, ['version', 'state'])) {
+    return Object.freeze({ ...value });
+  }
   if (
     value.state === 'waiting'
     && hasExactKeys(value, ['version', 'state', 'reader_pubky'])
@@ -283,8 +286,8 @@ function hasExactKeys(value, expected) {
 }
 
 function canonicalPaymentCommandMatches(value) {
-  const payment = /^docker compose --file \.\/compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf="\$BITCOIN_DATA\/bitcoin\.conf" -regtest -rpcwallet=miner sendtoaddress "([^"]+)" "((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)"'$/.exec(value.payment_command);
-  const mining = "docker compose --file ./compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'";
+  const payment = /^docker compose --file compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\/home\/bitcoin\/\.bitcoin\/bitcoin\.conf -regtest -rpcwallet=miner sendtoaddress (bcrt1[02-9ac-hj-np-z]{8,86}) ((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)'$/.exec(value.payment_command);
+  const mining = "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'";
   return Boolean(payment)
     && payment[1] === value.address
     && browserBtcToSats(payment[2]) === BigInt(value.amount_sats)
@@ -307,10 +310,17 @@ export async function decodeGuardedContentResponse(response) {
   if (!(response instanceof Response)) throw new Error('guarded resource read returned a non-Response value');
   const contentType = response.headers.get('content-type') || 'application/octet-stream';
   const array = new Uint8Array(await response.arrayBuffer());
+  const mediaType = contentType.split(';', 1)[0].trim().toLowerCase();
+  const kind = mediaType.startsWith('text/') || mediaType === 'application/json' || mediaType.endsWith('+json')
+    ? 'text'
+    : mediaType.startsWith('image/')
+      ? 'image'
+      : 'binary';
   return {
     response,
     bytes: array,
-    text: new TextDecoder().decode(array),
+    kind,
+    text: kind === 'text' ? new TextDecoder().decode(array) : null,
     size: array.byteLength,
     contentType,
   };

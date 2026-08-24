@@ -86,6 +86,7 @@ function generatedPaths(root) {
     paykitConfig: join(root, 'paykit-config', 'config.toml'),
     bitcoinRpc: join(root, 'bitcoin-rpc', 'bitcoin-rpc.env'),
     pubkyHomeserver: join(root, 'pubky-homeserver', 'config.toml'),
+    homegateBridge: join(root, 'homegate-bridge', 'homegate.env'),
   };
 }
 
@@ -116,6 +117,7 @@ export async function initializePaykitCompose({
     'pubky-homeserver',
     'paykit-server',
     'paykit-config',
+    'homegate-bridge',
   ].map(async (directory) => {
     const path = join(root, directory);
     await mkdir(path, { recursive: true, mode: 0o700 });
@@ -149,6 +151,7 @@ export async function initializePaykitCompose({
       databasePassword: secrets.locksPostgresPassword,
       adminPassword: secrets.pubkyHomeserverAdminPassword,
     })),
+    writeSecure(paths.homegateBridge, `PUBKY_HOMESERVER_ADMIN_PASSWORD=${secrets.pubkyHomeserverAdminPassword}\n`),
   ]);
 
   if (lockConfigPath) {

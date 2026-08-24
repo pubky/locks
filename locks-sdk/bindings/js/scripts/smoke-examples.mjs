@@ -27,6 +27,7 @@ const files = {
   createUser: join(examplesDir, 'scripts', 'create-user.mjs'),
   authenticate: join(examplesDir, 'scripts', 'authenticate.mjs'),
   authenticatePaykit: join(examplesDir, 'scripts', 'authenticate-paykit.mjs'),
+  composeCompanionHelper: join(examplesDir, 'scripts', 'paykit-companion-auth-compose.sh'),
   preparePaykitReader: join(examplesDir, 'scripts', 'prepare-paykit-reader.mjs'),
   receivePaykitRequest: join(examplesDir, 'scripts', 'receive-paykit-request.mjs'),
   registerPaykitReader: join(examplesDir, 'scripts', 'register-paykit-reader.mjs'),
@@ -57,6 +58,8 @@ const required = {
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
     'npm --prefix examples/js-sdk run authenticate -- --role content-creator',
+    'docker compose --file compose.paykit-local-demo.yaml up -d --build',
+    'http://localhost:8080/examples/js-sdk/',
     'npm --prefix examples/js-sdk run start-server',
     'npm --prefix examples/js-sdk run start-reader-server',
     './.local/demo-config/config.json',
@@ -76,7 +79,7 @@ const required = {
     'Paykit browser  = http://localhost:3001',
     'opens `GET http://localhost:3001/setup` in a Paykit-origin iframe',
     'exact iframe window and origin with the pending state',
-    'docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'Non-TTY stdin is exactly those three ordered lines',
     'in-process Paykit reader worker starts with `reader-demo`',
     'sole mutable owner of `./.local/paykit-reader/state.v1`',
@@ -112,6 +115,7 @@ const required = {
     "from './creator-complete-flow.js'",
     'POST /api/demo-auth/start',
     'GET /api/demo-auth/status',
+    'const returnTo = `${window.location.origin}/auth/lock-server/callback`',
     "deliveryUrl.searchParams.set('delivery', 'postmessage')",
     'openLockAuthIframe(deliveryUrl.toString())',
     'frame.src = connectUrl',
@@ -153,7 +157,7 @@ const required = {
     'el.paykitPaymentFields.hidden = !paymentSelected',
     'el.paykitAmountSats.required = paymentSelected',
     'openPaykitSetupIframe',
-    'docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'acceptPaykitSetupEvent',
     'state.paykitSetupComplete = true',
     "el.paykitSetupStatus.className = 'ok'",
@@ -170,13 +174,14 @@ const required = {
   index: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app.js', 'Select primary file', 'id="primary-content-file"', 'Select secondary files', 'id="secondary-content-files"', 'multiple', 'id="selected-resources"', 'id="selected-resource-list"', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
   iframe: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app-iframe.js', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
   flows: ['Both creator pages use iframe auth', '/examples/js-sdk/', '/examples/js-sdk/iframe.html'],
-  readerHtml: ['id="content-lock-resource"', 'id="lock-resources"', 'id="primary-resource-list"', 'id="secondary-resource-list"', 'id="reset-reader-state"', 'id="read-content"', 'id="reader-public-key" readonly', 'id="refresh-paykit-reader"', 'id="paykit-reader-status"', 'id="paykit-reader-payment"', 'id="paykit-reader-commands"', 'id="poll-payment"', 'paykit-payment', 'Paykit reader worker runs automatically', '/reader-app.js'],
-  initConfig: ['~/.pubky-lock/config.toml', './.local/demo-config/config.json', 'lock_server_public_key', 'http://localhost:15411', 'http://localhost:15412', 'localhost:6881'],
+  readerHtml: ['id="content-lock-resource"', 'id="lock-resources"', 'id="primary-resource-list"', 'id="secondary-resource-list"', 'id="reset-reader-state"', 'id="read-content"', 'id="reader-public-key" readonly', 'id="refresh-paykit-reader"', 'id="paykit-reader-status"', 'id="paykit-reader-payment"', 'id="paykit-reader-commands"', 'id="poll-payment"', 'paykit-payment', 'Paykit reader identity is prepared automatically', '/reader-app.js'],
+  initConfig: ['~/.pubky-lock/config.toml', './.local/demo-config/config.json', 'lock_server_public_key', 'http://127.0.0.1:15411', 'http://127.0.0.1:15412', '127.0.0.1:6881'],
   createUser: ['requiredRole', 'Keypair.random()', 'createRecoveryFile', 'profile.json', '--force', 'content-creator', 'content-viewer', 'lock-server', 'clearPreparedReaderStatus', 'clearCreatorDemoSession'],
   authenticate: ['requiredRole', 'readAuthFromPrompt', 'signer.signup', 'approveAuthRequest', '--auth', 'already'],
   authenticatePaykit: [
     'PAYKIT_COMPANION_AUTH_BIN',
     '/usr/local/bin/paykit-companion-auth',
+    'paykit-companion-auth-compose.sh',
     'loadRoleSecret',
     'content-creator',
     'version: 1',
@@ -190,6 +195,11 @@ const required = {
     "child.stdin.end",
     "child.kill('SIGTERM')",
     "child.kill('SIGKILL')",
+  ],
+  composeCompanionHelper: [
+    'compose.paykit-local-demo.yaml',
+    'exec -T creator-demo',
+    '/usr/local/bin/paykit-companion-auth',
   ],
   preparePaykitReader: ['runReaderOperation', "operation: 'prepare'", 'content-viewer', 'writePreparedReaderStatus', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
   receivePaykitRequest: ['runReaderOperation', "operation: 'receive'", 'content-viewer', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
@@ -214,7 +224,7 @@ const required = {
   startServer: ['createServer', '--allow-unhealthy', 'pubkyAuthRelayInboxUrl', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
   startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8081', 'never proxy'],
   pathsLib: ['localPath', 'roleDir', 'demoConfigPath', 'contentCreatorSessionPath', 'paykitReaderPreparedPath', 'paykitReaderOwnershipPath', 'prepared.v1.json', 'owner.lock'],
-  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://localhost:3001'", "['paykit', 'url']"],
+  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
   pubkyLib: ["from '@synonymdev/pubky'", 'Pubky.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
   creator: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
@@ -385,14 +395,16 @@ const {
 const creatorSessionTestDir = mkdtempSync(join(tmpdir(), 'locks-creator-session-'));
 const creatorSessionTestPath = join(creatorSessionTestDir, 'content-creator-session.json');
 const creatorProfileTestPath = join(creatorSessionTestDir, 'profile.json');
+const firstCreatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
+const secondCreatorPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 try {
   writeFileSync(creatorSessionTestPath, '{"exported_session":"sensitive"}');
   await clearCreatorDemoSession(creatorSessionTestPath);
   assert.equal(existsSync(creatorSessionTestPath), false);
   await clearCreatorDemoSession(creatorSessionTestPath);
 
-  writeFileSync(creatorProfileTestPath, JSON.stringify({ role: 'content-creator', pubky: 'creator-b' }));
-  writeFileSync(creatorSessionTestPath, JSON.stringify({ role: 'content-creator', pubky: 'creator-a', exported_session: 'old-secret' }));
+  writeFileSync(creatorProfileTestPath, JSON.stringify({ role: 'content-creator', pubky: secondCreatorPubky }));
+  writeFileSync(creatorSessionTestPath, JSON.stringify({ role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'old-secret' }));
   assert.equal(await readCreatorDemoSessionForCurrentRole({
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -401,14 +413,14 @@ try {
 
   await assert.rejects(
     writeCreatorDemoSessionForCurrentRole(
-      { role: 'content-creator', pubky: 'creator-a', exported_session: 'late-old-secret' },
+      { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'late-old-secret' },
       { sessionPath: creatorSessionTestPath, profilePath: creatorProfileTestPath },
     ),
     /creator identity changed during demo authentication/,
   );
   assert.equal(existsSync(creatorSessionTestPath), false);
 
-  const currentSession = { role: 'content-creator', pubky: 'creator-b', exported_session: 'current-secret' };
+  const currentSession = { role: 'content-creator', pubky: secondCreatorPubky, exported_session: 'current-secret' };
   await writeCreatorDemoSessionForCurrentRole(currentSession, {
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -421,6 +433,18 @@ try {
     currentSession,
   );
   assert.equal(statSync(creatorSessionTestPath).mode & 0o777, 0o600);
+  const externalSession = { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'external-secret' };
+  await writeCreatorDemoSessionForCurrentRole(externalSession, {
+    sessionPath: creatorSessionTestPath,
+    profilePath: null,
+  });
+  assert.deepEqual(
+    await readCreatorDemoSessionForCurrentRole({
+      sessionPath: creatorSessionTestPath,
+      profilePath: null,
+    }),
+    externalSession,
+  );
 } finally {
   rmSync(creatorSessionTestDir, { recursive: true, force: true });
 }
@@ -965,8 +989,15 @@ const guardedResponse = new Response(new TextEncoder().encode('payment unlocked'
 });
 const decodedGuarded = await decodeGuardedContentResponse(guardedResponse);
 assert.equal(decodedGuarded.contentType, 'text/plain; charset=utf-8');
+assert.equal(decodedGuarded.kind, 'text');
 assert.equal(decodedGuarded.text, 'payment unlocked');
 assert.equal(decodedGuarded.size, 16);
+const decodedImage = await decodeGuardedContentResponse(new Response(Uint8Array.of(1, 2, 3), {
+  headers: { 'content-type': 'image/png' },
+}));
+assert.equal(decodedImage.kind, 'image');
+assert.equal(decodedImage.text, null);
+assert.deepEqual([...decodedImage.bytes], [1, 2, 3]);
 
 const {
   buildReaderHelperInput,
@@ -1002,15 +1033,16 @@ const receivedOutput = {
   status: 'received',
   payment_request_id: 'b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab33',
   address: 'bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202',
-  asset: 'BTC',
+  asset: 'btc',
   amount_sats: '50000',
   payment_command: "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner sendtoaddress \"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202\" \"0.00050000\"'",
   optional_mining_command: "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'",
 };
 const operatorReceivedOutput = {
   ...receivedOutput,
-  payment_command: receivedOutput.payment_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
-  optional_mining_command: receivedOutput.optional_mining_command.replace('docker compose', 'docker compose --file ./compose.paykit-local-demo.yaml'),
+  asset: 'BTC',
+  payment_command: `docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress ${receivedOutput.address} 0.00050000'`,
+  optional_mining_command: "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'",
 };
 assert.deepEqual(parseReaderHelperSuccess({
   operation: 'receive',
@@ -1018,6 +1050,7 @@ assert.deepEqual(parseReaderHelperSuccess({
 }), operatorReceivedOutput);
 for (const invalid of [
   `${JSON.stringify({ ...receivedOutput, extra: true })}\n`,
+  `${JSON.stringify({ ...receivedOutput, asset: 'BTC' })}\n`,
   `${JSON.stringify({ ...receivedOutput, payment_command: 'echo unsafe' })}\n`,
   `${JSON.stringify({
     ...receivedOutput,
@@ -1042,12 +1075,29 @@ const {
   collectPaykitInputs,
   parsePaykitInputLines,
   requirePaykitCreatorRole,
+  resolveCompanionHelperPath,
   runCompanionHelper,
 } = await import(pathToFileURL(files.authenticatePaykit).href);
 const { Keypair, secretFromRecoveryFile } = await import(pathToFileURL(files.pubkyLib).href);
 
 const authUrl = 'pubkyauth://signin?secret=test-auth-secret';
 const accountXpub = 'tpub-test-account-xpub';
+assert.equal(resolveCompanionHelperPath({
+  env: {},
+  nativeHelperPath: '/native/helper',
+  composeHelperPath: '/compose/helper',
+  nativeHelperAvailable: () => false,
+}), '/compose/helper');
+assert.equal(resolveCompanionHelperPath({
+  env: {},
+  nativeHelperPath: '/native/helper',
+  composeHelperPath: '/compose/helper',
+  nativeHelperAvailable: () => true,
+}), '/native/helper');
+assert.equal(resolveCompanionHelperPath({
+  env: { PAYKIT_COMPANION_AUTH_BIN: '/override/helper' },
+  nativeHelperAvailable: () => false,
+}), '/override/helper');
 const parsedLines = parsePaykitInputLines(`${authUrl}\n${accountXpub}\n7\n`);
 assert.deepEqual(parsedLines, { authUrl, accountXpub, accountIndex: 7 });
 for (const invalid of [

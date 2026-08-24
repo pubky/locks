@@ -18,8 +18,9 @@ const PREPARE_TIMEOUT_MS = 120_000;
 const RECEIVE_TIMEOUT_MS = 310_000;
 const REGISTRATION_TIMEOUT_MS = 30_000;
 const REGISTRATION_SCRIPT = fileURLToPath(new URL('../register-paykit-reader.mjs', import.meta.url));
-const COMPOSE_FILE = './compose.paykit-local-demo.yaml';
+const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
 const COMPOSE_COMMAND = `docker compose --file ${COMPOSE_FILE}`;
+const OPERATOR_BITCOIN_CLI = 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner';
 const REQUIRED_ENV = [
   'PAYKIT_READER_STATE_PATH',
   'PAYKIT_READER_PUBKY_TESTNET_HOST',
@@ -28,6 +29,7 @@ const REQUIRED_ENV = [
   'PAYKIT_READER_SERVER_PATH',
 ];
 const MINING_COMMAND = "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'";
+const OPERATOR_MINING_COMMAND = `${COMPOSE_COMMAND} exec -T bitcoin sh -ec '${OPERATOR_BITCOIN_CLI} generatetoaddress 6 $(${OPERATOR_BITCOIN_CLI} getnewaddress)'`;
 const FAILURE_CODES = new Set([
   'invalid_input',
   'invalid_config',
@@ -131,7 +133,7 @@ export function parseReaderHelperSuccess({ operation, stdout }) {
     || value.status !== 'received'
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.payment_request_id)
     || !/^bcrt1[02-9ac-hj-np-z]{8,86}$/.test(value.address)
-    || value.asset !== 'BTC'
+    || value.asset !== 'btc'
     || !/^[1-9][0-9]*$/.test(value.amount_sats)
     || value.optional_mining_command !== MINING_COMMAND
   ) {
@@ -147,30 +149,23 @@ export function parseReaderHelperSuccess({ operation, stdout }) {
   }
   return {
     ...value,
-    payment_command: `${COMPOSE_COMMAND}${value.payment_command.slice('docker compose'.length)}`,
-    optional_mining_command: `${COMPOSE_COMMAND}${value.optional_mining_command.slice('docker compose'.length)}`,
+    asset: 'BTC',
+    payment_command: `${COMPOSE_COMMAND} exec -T bitcoin sh -ec '${OPERATOR_BITCOIN_CLI} sendtoaddress ${value.address} ${paymentMatch[2]}'`,
+    optional_mining_command: OPERATOR_MINING_COMMAND,
   };
 }
 
 export function validateReaderOperatorResult(value) {
-  const commandPrefix = `${COMPOSE_COMMAND} exec`;
+  const payment = /^docker compose --file compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\/home\/bitcoin\/\.bitcoin\/bitcoin\.conf -regtest -rpcwallet=miner sendtoaddress (bcrt1[02-9ac-hj-np-z]{8,86}) ((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)'$/.exec(value?.payment_command);
   if (
     !value
-    || typeof value.payment_command !== 'string'
-    || typeof value.optional_mining_command !== 'string'
-    || !value.payment_command.startsWith(commandPrefix)
-    || !value.optional_mining_command.startsWith(commandPrefix)
+    || !payment
+    || payment[1] !== value.address
+    || btcToSats(payment[2]) !== BigInt(value.amount_sats)
+    || value.optional_mining_command !== OPERATOR_MINING_COMMAND
   ) {
     throw new Error('invalid reader helper output');
   }
-  parseReaderHelperSuccess({
-    operation: 'receive',
-    stdout: `${JSON.stringify({
-      ...value,
-      payment_command: `docker compose${value.payment_command.slice(COMPOSE_COMMAND.length)}`,
-      optional_mining_command: `docker compose${value.optional_mining_command.slice(COMPOSE_COMMAND.length)}`,
-    })}\n`,
-  });
   return value;
 }
 
@@ -191,15 +186,23 @@ export function requireReaderEnvironment(env = process.env) {
   }
 }
 
+export async function readReaderCreatorProfile({
+  env = process.env,
+  readProfile = readJson,
+  loadProfile = loadRoleProfile,
+} = {}) {
+  return env.PAYKIT_READER_CREATOR_PROFILE_PATH
+    ? readProfile(env.PAYKIT_READER_CREATOR_PROFILE_PATH)
+    : loadProfile('content-creator');
+}
+
 export async function resolveReaderEnvironment({
   env = process.env,
   loadProfile = loadRoleProfile,
 } = {}) {
   const resolved = { ...env };
   if (!resolved.PAYKIT_READER_SERVER_PUBKY) {
-    const profile = resolved.PAYKIT_READER_CREATOR_PROFILE_PATH
-      ? await readJson(resolved.PAYKIT_READER_CREATOR_PROFILE_PATH).catch(() => undefined)
-      : await loadProfile('content-creator').catch(() => undefined);
+    const profile = await readReaderCreatorProfile({ env: resolved, loadProfile }).catch(() => undefined);
     if (profile?.role !== 'content-creator' || !isCanonicalPubky(profile.pubky)) {
       throw new Error('valid content-creator profile is required for Paykit reader setup');
     }
