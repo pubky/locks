@@ -56,10 +56,10 @@ Required tools/services:
 - Postgres reachable by the Lock Server.
 - A local Pubky testnet exposing:
   ```text
-  PKARR relay      http://localhost:15411
-  HTTP/auth relay  http://localhost:15412
-  Auth inbox       http://localhost:15412/inbox/
-  DHT bootstrap    localhost:6881
+  PKARR relay      http://127.0.0.1:15411
+  HTTP/auth relay  http://127.0.0.1:15412
+  Auth inbox       http://127.0.0.1:15412/inbox/
+  DHT bootstrap    127.0.0.1:6881
   ```
 
 For direct npm development, build the local WASM SDK package first:
@@ -105,9 +105,9 @@ The compose stack starts:
 
 - Postgres on host port `55433`
 - Pubky testnet on `15411`, `15412`, `6881`, homeserver HTTP on `6286`, and homeserver admin on `6288`
-- Lock Server on `http://localhost:3000`
-- creator demo on `http://localhost:8080/examples/js-sdk/`
-- reader demo on `http://localhost:8081/reader/`
+- Lock Server on `http://127.0.0.1:3000`
+- creator demo on `http://127.0.0.1:8080/examples/js-sdk/`
+- reader demo on `http://127.0.0.1:8081/reader/`
 
 The Pubky testnet image is built from the public `pubky/pubky-core` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
@@ -126,7 +126,7 @@ If writer authentication fails after a local testnet restart with a malformed or
 docker compose exec creator-demo npm --prefix examples/js-sdk run create-user -- --role content-creator --force
 ```
 
-The browser-facing demo config still uses `localhost`; container-internal health checks/auth use Docker service names through `LOCKS_INTERNAL_*` environment overrides.
+The browser-facing demo config uses `127.0.0.1`; container-internal health checks/auth use explicit loopback or Docker service names through `LOCKS_INTERNAL_*` environment overrides.
 
 ## Local Pubky testnet defaults
 
@@ -189,7 +189,7 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
 2. Open the content-creator demo:
 
 ```text
-http://localhost:8080/examples/js-sdk/
+http://127.0.0.1:8080/examples/js-sdk/
 ```
 
 3. Approve browser requests with the external wallet under test. When using the local
@@ -210,14 +210,14 @@ checkout is required.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
-This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`, the Homegate bridge at `http://localhost:6288`, and Fulcrum at `tcp://localhost:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
+This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://127.0.0.1:3001`, the Homegate bridge at `http://127.0.0.1:6288`, and Fulcrum at `tcp://127.0.0.1:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
 
 Open:
 
 ```text
-Creator: http://localhost:8080/examples/js-sdk/
-Reader:  http://localhost:8088/reader/
-Paykit:  http://localhost:3001/setup
+Creator: http://127.0.0.1:8080/examples/js-sdk/
+Reader:  http://127.0.0.1:8088/reader/
+Paykit:  http://127.0.0.1:3001/setup
 ```
 
 The reader displays directly runnable Bitcoin commands without JSON-style escaped quotes.
@@ -251,7 +251,7 @@ npm --prefix examples/js-sdk run start-server -- --allow-unhealthy
 Open:
 
 ```text
-http://localhost:8080/examples/js-sdk/
+http://127.0.0.1:8080/examples/js-sdk/
 ```
 
 ## Run the reader demo server
@@ -271,7 +271,7 @@ npm --prefix examples/js-sdk run start-reader-server -- --allow-unhealthy
 Open:
 
 ```text
-http://localhost:8081/reader/
+http://127.0.0.1:8081/reader/
 ```
 
 Reader-server responsibilities are intentionally narrow:
@@ -324,7 +324,7 @@ Both creator pages open the Lock Server `/connect` shell in an iframe modal. The
 The shell returns `{ state, code }` directly to the parent with `postMessage`. The parent accepts the result only from the exact Lock Server origin and iframe window, then validates the state before exchanging the one-time code. The configured callback URL supplies the parent target origin; the browser does not navigate to it:
 
 ```text
-http://localhost:8080/auth/lock-server/callback
+http://127.0.0.1:8080/auth/lock-server/callback
 ```
 
 Approve the Lock Server auth string with the same identity. In Compose, scan or paste it into the same external wallet. For direct npm development, use:
@@ -358,7 +358,7 @@ Rules:
 - payment recipient is the authenticated content creator; it is not user-editable
 - payment is the content lock's sole criterion and the lock logic references exactly that criterion
 - payment publishing is rejected until Paykit setup succeeds for the current authenticated creator
-- selecting `paykit-payment` opens `GET http://localhost:3001/setup` in a Paykit-origin iframe
+- selecting `paykit-payment` opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe
 - the parent accepts completion only from that exact iframe window and origin with the pending state
 - the success callback is only `{ type: "paykit-setup-callback", state }`; failures add only `error: "setup-failed"`, and account data stays inside Paykit
 

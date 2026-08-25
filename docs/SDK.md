@@ -47,7 +47,7 @@ python3 -m http.server 8080 --directory locks-sdk/bindings/js
 Open:
 
 ```text
-http://localhost:8080/demo/
+http://127.0.0.1:8080/demo/
 ```
 
 The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working `legacy-connect` creator acquisition.
@@ -130,7 +130,7 @@ For local Pubky testnet browser development, configure the local PKARR relay exp
 import { Locks, LocksOptions } from "locks-sdk-wasm";
 
 const options = new LocksOptions();
-options.addPkarrRelay("http://localhost:15411");
+options.addPkarrRelay("http://127.0.0.1:15411");
 
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
@@ -138,9 +138,9 @@ const locks = Locks.forServerWithOptions("pubky...", options);
 Local `pubky-core/pubky-testnet` defaults are:
 
 ```text
-PKARR relay     = http://localhost:15411
-HTTP/auth relay = http://localhost:15412
-DHT bootstrap   = localhost:6881
+PKARR relay     = http://127.0.0.1:15411
+HTTP/auth relay = http://127.0.0.1:15412
+DHT bootstrap   = 127.0.0.1:6881
 ```
 
 This remains the stable browser path.

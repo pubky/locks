@@ -223,7 +223,7 @@ fn testnet_creator_connect_uses_local_pubky_auth_relay() {
         pubky_auth_relay_for_network(PubkyNetwork::Testnet)
             .unwrap()
             .as_str(),
-        "http://localhost:15412/inbox/"
+        "http://127.0.0.1:15412/inbox/"
     );
 }
 

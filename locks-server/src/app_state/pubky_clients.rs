@@ -36,7 +36,7 @@ pub(super) fn pubky_auth_relay_for_network(network: PubkyNetwork) -> Option<url:
     match network {
         PubkyNetwork::Mainnet => None,
         PubkyNetwork::Testnet => Some(
-            "http://localhost:15412/inbox/"
+            "http://127.0.0.1:15412/inbox/"
                 .parse()
                 .expect("local testnet auth relay URL must be valid"),
         ),
