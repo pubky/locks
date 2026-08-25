@@ -580,7 +580,7 @@ function showError(target, error) {
   target.className = 'error';
 }
 
-async function postClientLog(level) {
+async function postClientLog(level, _event, _details) {
   try {
     await fetch('/api/client-log', {
       method: 'POST',
