@@ -65,7 +65,7 @@ and Fulcrum:
 docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
 
-2. Open the content-creator demo at <http://localhost:8080/examples/js-sdk/>.
+2. Open the content-creator demo at <http://127.0.0.1:8080/examples/js-sdk/>.
 
 3. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...`
    commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit`
