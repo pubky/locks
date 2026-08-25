@@ -133,11 +133,11 @@ The browser-facing demo config still uses `localhost`; container-internal health
 `pubky-core/pubky-testnet` local static development uses:
 
 ```text
-PKARR relay     = http://localhost:15411
-HTTP/auth relay = http://localhost:15412
-Pubky Auth inbox = http://localhost:15412/inbox/
-DHT bootstrap   = localhost:6881
-Paykit browser  = http://localhost:3001
+PKARR relay     = http://127.0.0.1:15411
+HTTP/auth relay = http://127.0.0.1:15412
+Pubky Auth inbox = http://127.0.0.1:15412/inbox/
+DHT bootstrap   = 127.0.0.1:6881
+Paykit browser  = http://127.0.0.1:3001
 ```
 
 These values are written to:
