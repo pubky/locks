@@ -8,6 +8,8 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
+PAYKIT_EXTERNAL_READER_PUBKY=${PAYKIT_EXTERNAL_READER_PUBKY:-}
+export PAYKIT_EXTERNAL_READER_PUBKY
 
 exec docker compose \
     --project-directory "$repo_root" \

@@ -171,7 +171,7 @@ services:
       - "127.0.0.1:${LOCKS_SERVER_PORT:-3000}:3000"
       - "127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001"
       - "127.0.0.1:${LOCKS_CREATOR_DEMO_PORT:-8080}:8080"
-      - "127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8081"
+      - "127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088"
     volumes:
       - ./.local/pubky-homeserver:/run/compose-local/pubky-homeserver:ro
     command: ["pubky-testnet", "--homeserver-config", "/run/compose-local/pubky-homeserver/config.toml"]
@@ -414,7 +414,7 @@ services:
         - CMD
         - node
         - -e
-        - fetch('http://127.0.0.1:8081/api/paykit-reader/status').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))
+        - fetch('http://127.0.0.1:8088/api/paykit-reader/status').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))
       interval: 2s
       timeout: 2s
       retries: 30

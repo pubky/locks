@@ -107,7 +107,7 @@ The compose stack starts:
 - Pubky testnet on `15411`, `15412`, `6881`, homeserver HTTP on `6286`, and homeserver admin on `6288`
 - Lock Server on `http://127.0.0.1:3000`
 - creator demo on `http://127.0.0.1:8080/examples/js-sdk/`
-- reader demo on `http://127.0.0.1:8081/reader/`
+- reader demo on `http://127.0.0.1:8088/reader/`
 
 The Pubky testnet image is built from the public `pubky/pubky-core` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
@@ -174,6 +174,14 @@ Existing keypairs are reused. To regenerate one role:
 npm --prefix examples/js-sdk run create-user -- --role content-creator --force
 ```
 
+Deleting `.local` deletes the local recovery-file identities as well as disposable demo state.
+Authentication never silently regenerates a missing identity because that would approve as a
+different Pubky. Recreate the fallback identity explicitly before authenticating:
+
+```bash
+npm --prefix examples/js-sdk run create-user -- --role content-creator
+```
+
 Replacing the content-creator identity clears any persisted demo-auth session for the old key before and after rotation. The demo server also validates persisted and newly approved sessions against the current role profile, so an approval that completes during rotation cannot restore the old identity. Authenticate the demo again before continuing.
 
 ## Run the demo server
@@ -220,6 +228,8 @@ Reader:  http://127.0.0.1:8088/reader/
 Paykit:  http://127.0.0.1:3001/setup
 ```
 
+The reader uses port `8088` for both direct npm and Compose; there is no host/container remap.
+
 The reader displays directly runnable Bitcoin commands without JSON-style escaped quotes.
 The generated send command has this shape, with the current request address and amount
 substituted for `BCRT_ADDRESS` and `BTC_AMOUNT`:
@@ -228,7 +238,7 @@ substituted for `BCRT_ADDRESS` and `BTC_AMOUNT`:
 docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress BCRT_ADDRESS BTC_AMOUNT'
 ```
 
-The Compose reader process still listens on container port `8081`; only its host mapping is `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
+The Compose reader process listens on port `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
 
 ```bash
 npm --prefix examples/js-sdk run reset-paykit-demo
@@ -254,9 +264,10 @@ Open:
 http://127.0.0.1:8080/examples/js-sdk/
 ```
 
-## Run the reader demo server
+## Run the reader demo server directly with npm
 
-The reader demo is a separate static/debug server on port `8081` inside the same package:
+Outside the Paykit Compose flow, the reader demo is a separate static/debug server on the
+same port `8088` inside the same package:
 
 ```bash
 npm --prefix examples/js-sdk run start-reader-server
@@ -271,7 +282,7 @@ npm --prefix examples/js-sdk run start-reader-server -- --allow-unhealthy
 Open:
 
 ```text
-http://127.0.0.1:8081/reader/
+http://127.0.0.1:8088/reader/
 ```
 
 Reader-server responsibilities are intentionally narrow:

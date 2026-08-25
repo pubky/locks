@@ -65,7 +65,7 @@ const required = {
     './.local/demo-config/config.json',
     './.local/content-creator/recovery_file',
     'http://127.0.0.1:15411',
-    'http://127.0.0.1:8081/reader/',
+    'http://127.0.0.1:8088/reader/',
     '/priv/locks.app/content/',
     'Viewer content lock resource',
     'Reset reader state',
@@ -198,6 +198,7 @@ const required = {
   ],
   composeCompanionHelper: [
     'compose.paykit-local-demo.yaml',
+    'PAYKIT_EXTERNAL_READER_PUBKY',
     'exec -T creator-demo',
     '/usr/local/bin/paykit-companion-auth',
   ],
@@ -222,7 +223,7 @@ const required = {
   registerPaykitReader: ['signupReaderBestEffort', "request.operation !== 'register'", 'registration_failed'],
   creatorSessionState: ['clearCreatorDemoSession', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', 'contentCreatorSessionPath', 'rm'],
   startServer: ['createServer', '--allow-unhealthy', 'pubkyAuthRelayInboxUrl', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
-  startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8081', 'never proxy'],
+  startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8088', 'never proxy'],
   pathsLib: ['localPath', 'roleDir', 'demoConfigPath', 'contentCreatorSessionPath', 'paykitReaderPreparedPath', 'paykitReaderOwnershipPath', 'prepared.v1.json', 'owner.lock'],
   configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
   pubkyLib: ["from '@synonymdev/pubky'", 'Pubky.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
@@ -328,6 +329,10 @@ for (const [label, snippets] of Object.entries(required)) {
       throw new Error(`${label} missing expected snippet: ${snippet}`);
     }
   }
+}
+
+if (texts.startReaderServer.includes('8081')) {
+  throw new Error('reader demo server must use the canonical port 8088');
 }
 
 const readerElementMapStart = texts.readerApp.indexOf('const el = {');
@@ -1078,7 +1083,24 @@ const {
   resolveCompanionHelperPath,
   runCompanionHelper,
 } = await import(pathToFileURL(files.authenticatePaykit).href);
-const { Keypair, secretFromRecoveryFile } = await import(pathToFileURL(files.pubkyLib).href);
+const {
+  Keypair,
+  loadRoleKeypair,
+  loadRoleSecret,
+  secretFromRecoveryFile,
+} = await import(pathToFileURL(files.pubkyLib).href);
+
+const missingRoleFile = async () => {
+  const error = new Error('missing role file');
+  error.code = 'ENOENT';
+  throw error;
+};
+for (const loadIdentity of [loadRoleKeypair, loadRoleSecret]) {
+  await assert.rejects(
+    loadIdentity('content-creator', { readFile: missingRoleFile }),
+    /missing local identity for content-creator; run `npm --prefix examples\/js-sdk run create-user -- --role content-creator` before authentication/,
+  );
+}
 
 const authUrl = 'pubkyauth://signin?secret=test-auth-secret';
 const accountXpub = 'tpub-test-account-xpub';

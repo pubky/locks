@@ -20,9 +20,9 @@ export function randomPassphrase() {
   return randomBytes(32).toString('base64url');
 }
 
-export async function loadRoleKeypair(role) {
-  const passphrase = (await readFile(rolePassphrasePath(role), 'utf8')).trim();
-  const recoveryFile = await readFile(roleRecoveryFilePath(role));
+export async function loadRoleKeypair(role, { readFile: read = readFile } = {}) {
+  const passphrase = (await readRoleIdentityFile(rolePassphrasePath(role), role, read, 'utf8')).trim();
+  const recoveryFile = await readRoleIdentityFile(roleRecoveryFilePath(role), role, read);
   return Keypair.fromRecoveryFile(new Uint8Array(recoveryFile), passphrase);
 }
 
@@ -39,10 +39,23 @@ export function secretFromRecoveryFile(recoveryFile, passphrase) {
   }
 }
 
-export async function loadRoleSecret(role) {
-  const passphrase = (await readFile(rolePassphrasePath(role), 'utf8')).trim();
-  const recoveryFile = await readFile(roleRecoveryFilePath(role));
+export async function loadRoleSecret(role, { readFile: read = readFile } = {}) {
+  const passphrase = (await readRoleIdentityFile(rolePassphrasePath(role), role, read, 'utf8')).trim();
+  const recoveryFile = await readRoleIdentityFile(roleRecoveryFilePath(role), role, read);
   return secretFromRecoveryFile(recoveryFile, passphrase);
+}
+
+async function readRoleIdentityFile(path, role, read, encoding) {
+  try {
+    return await read(path, encoding);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    const missing = new Error(
+      `missing local identity for ${role}; run \`npm --prefix examples/js-sdk run create-user -- --role ${role}\` before authentication`,
+    );
+    missing.code = 'ROLE_IDENTITY_MISSING';
+    throw missing;
+  }
 }
 
 export async function loadRoleProfile(role) {

@@ -304,7 +304,7 @@ for (const required of [
   'https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk',
   'https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
-  '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8081',
+  '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
   '127.0.0.1:${LOCKS_HOMEGATE_PORT:-6288}:8082',
   'bitcoin-cli -conf=\\"$${BITCOIN_DATA}/bitcoin.conf\\" -regtest getblockchaininfo',
@@ -365,7 +365,8 @@ assert.ok(readerService.includes('npm --prefix examples/js-sdk run create-user -
 assert.ok(readerService.includes('exec node examples/js-sdk/scripts/start-reader-demo-server.mjs'), 'reader server must replace its bootstrap shell as PID 1');
 assert.ok(!readerService.includes('--allow-unhealthy'), 'reader preflight must fail closed');
 assert.ok(readerService.includes('healthcheck:'), 'reader must expose worker-aware Compose health');
-assert.ok(readerService.includes('http://127.0.0.1:8081/api/paykit-reader/status'), 'reader health must use the closed worker status endpoint');
+assert.ok(readerService.includes('http://127.0.0.1:8088/api/paykit-reader/status'), 'reader health must use the closed worker status endpoint');
+assert.ok(!readerService.includes('8081'), 'reader container must use the canonical port 8088 without remapping');
 assert.ok(readerService.includes('restart: unless-stopped'), 'reader worker must have an explicit restart policy');
 assert.ok(!compose.includes('POSTGRES_PASSWORD: locks'), 'database credentials must not be committed inline');
 assert.ok(!compose.includes('./locks-sdk/bindings/js/pkg:/workspace/locks-sdk/bindings/js/pkg'), 'demo images must provide their own WASM package');

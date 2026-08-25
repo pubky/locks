@@ -23,7 +23,7 @@ const allowUnhealthy = args['allow-unhealthy'] === true;
 const config = await readDemoConfig();
 const serviceConfig = withInternalServiceUrls(config);
 const readerUrl = new URL(config.demoServer.url);
-readerUrl.port = String(args.port ?? 8081);
+readerUrl.port = String(args.port ?? 8088);
 const readerServerUrl = readerUrl.toString().replace(/\/$/, '');
 const preflightStatus = await runPreflight(serviceConfig);
 const externalReaderPubky = process.env.PAYKIT_EXTERNAL_READER_PUBKY?.trim() ?? '';
