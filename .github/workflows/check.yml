@@ -16,13 +16,122 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5433/locks_test
 
 jobs:
-  checks:
-    name: Checks
+  style:
+    name: Style / Compose
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Compose bootstrap regression
+        run: ./scripts/test-compose-bootstrap.sh
+
+      - name: Whitespace check
+        run: git diff --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Unit and integration tests
+        run: |
+          cargo nextest run --workspace --exclude locks-e2e --exclude locks-service --exclude locks-sdk-wasm
+          cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres
+          cargo nextest run -p locks-e2e --test creator_publishing_http
+          cargo nextest run -p locks-e2e --test retrieval_access_http
+          cargo nextest run -p locks-e2e --test production_creator_publishing_http
+          cargo nextest run -p locks-e2e --test production_creator_authority_acquisition
+          cargo nextest run -p locks-e2e --test legacy_connect_shell_http
+          cargo nextest run -p locks-e2e --test pubky_homeserver_repositories
+
+  js-wasm:
+    name: JS / WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/js-sdk/package-lock.json
+
+      - name: Install JS example dependencies
+        run: npm --prefix examples/js-sdk ci
+
+      - name: JS/WASM SDK tests
+        run: npm --prefix locks-sdk/bindings/js run test
+
+  postgres:
+    name: PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5433/locks_test
 
     services:
       postgres:
@@ -43,30 +152,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
-        with:
-          components: clippy,rustfmt
-          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.13.1 --locked
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '22'
 
       - name: Wait for Postgres
         env:
@@ -81,38 +174,23 @@ jobs:
           echo "Postgres did not become ready" >&2
           exit 1
 
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Compose bootstrap regression
-        run: ./scripts/test-compose-bootstrap.sh
-
-      - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Unit tests
+      - name: PostgreSQL-backed tests
         run: |
-          cargo nextest run --workspace --exclude locks-e2e --exclude locks-service --exclude locks-sdk-wasm
-          cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres
-
-      - name: E2E tests
-        run: |
-          cargo nextest run -p locks-e2e --test creator_publishing_http
-          cargo nextest run -p locks-e2e --test retrieval_access_http
-          cargo nextest run -p locks-e2e --test production_creator_publishing_http
-          cargo nextest run -p locks-e2e --test production_creator_authority_acquisition
-
-      - name: JS/WASM SDK tests
-        run: npm --prefix locks-sdk/bindings/js run test
-
-      - name: Postgres-backed tests
-        run: cargo nextest run -p locks-service --lib infrastructure::postgres
-
-      - name: Additional integration tests
-        run: |
-          cargo nextest run -p locks-e2e --test legacy_connect_shell_http
+          cargo nextest run -p locks-service --lib infrastructure::postgres
           cargo nextest run -p locks-e2e --test postgres_runtime
-          cargo nextest run -p locks-e2e --test pubky_homeserver_repositories
 
-      - name: Whitespace check
-        run: git diff --check
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [style, clippy, rust-tests, js-wasm, postgres]
+    if: always()
+
+    steps:
+      - name: Require successful lanes
+        run: |
+          test "${{ needs.style.result }}" = "success"
+          test "${{ needs.clippy.result }}" = "success"
+          test "${{ needs['rust-tests'].result }}" = "success"
+          test "${{ needs['js-wasm'].result }}" = "success"
+          test "${{ needs.postgres.result }}" = "success"

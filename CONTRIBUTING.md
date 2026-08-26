@@ -27,8 +27,22 @@ npm --prefix locks-sdk/bindings/js run test
 git diff --check
 ```
 
-PostgreSQL and E2E tests require `TEST_DATABASE_URL`; CI uses an ephemeral local
-PostgreSQL service. Do not claim the full suite passed when only a subset ran.
+CI runs five lanes in parallel:
+
+| Lane | Ownership |
+| --- | --- |
+| `Style / Compose` | Formatting, Compose bootstrap regression, and whitespace |
+| `Clippy` | Workspace lint across all targets and features |
+| `Rust tests` | Non-PostgreSQL Rust tests and fake/in-memory E2E tests |
+| `JS / WASM` | Native bindings, wasm target, generated package, demo, and example smokes |
+| `PostgreSQL` | PostgreSQL-backed service tests and runtime E2E |
+
+The required `Checks` result aggregates all five lanes. `scripts/check` remains the
+sequential local umbrella.
+
+PostgreSQL-backed tests and `postgres_runtime` require `TEST_DATABASE_URL`; CI uses an
+ephemeral local PostgreSQL service. Do not claim the full suite passed when only a subset
+ran.
 
 ## Pull requests
 
