@@ -132,6 +132,73 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
 }
 
 #[tokio::test]
+async fn production_creator_publishing_uses_storage_content_type_for_extensionless_svg_lock() {
+    let storage =
+        FakePubkyHomeserverStorage::with_canonical_content_type("application/octet-stream");
+    let manager = FakeCreatorAuthorityManager::authorized();
+    let mut config = TestServerApp::default_in_memory_config();
+    config.runtime.environment = RuntimeEnvironment::Production;
+    let state = AppState::new_empty_in_memory_with_creator_repositories(
+        config,
+        Arc::new(PubkyContentLockRepository::new(authorizing_storage(
+            storage.clone(),
+            manager.clone(),
+        ))),
+        Arc::new(PubkyPrivResourceRepository::new(authorizing_storage(
+            storage,
+            manager.clone(),
+        ))),
+        Arc::new(PubkyLockServicePointerRepository::new(authorizing_storage(
+            FakePubkyHomeserverStorage::default(),
+            manager.clone(),
+        ))),
+        Arc::new(PubkyEntitlementRepository::new(authorizing_storage(
+            FakePubkyHomeserverStorage::default(),
+            manager,
+        ))),
+    );
+    let test_app = TestServerApp::from_state(state);
+    test_app
+        .insert_frontend_session_for_test(
+            FrontendSessionToken::new(FRONTEND_SESSION_TOKEN),
+            creator(),
+            time::OffsetDateTime::now_utc() + Duration::hours(12),
+        )
+        .await
+        .unwrap();
+    let client = LocalCreatorPublishingClient::new(test_app.router())
+        .with_frontend_session_token(FRONTEND_SESSION_TOKEN);
+
+    let guarded_json = client
+        .register_guarded_resource(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "image/svg+xml",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
+        )
+        .await
+        .unwrap();
+    let guarded_resource = guarded_json["guarded_resource"].clone();
+    assert_eq!(guarded_resource["content_type"], "application/octet-stream");
+
+    let content_lock = client
+        .create_content_lock(
+            guarded_resource,
+            json!([{
+                "criterion_id": "criterion-1",
+                "verifier_type": "dev-static",
+                "params": { "satisfied": true }
+            }]),
+            json!({ "type": "all", "criteria": ["criterion-1"] }),
+            json!({ "requested_credential_ttl_seconds": 900 }),
+            json!({ "override": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo" }),
+        )
+        .await
+        .unwrap();
+
+    assert!(content_lock["content_lock_path"].is_string());
+}
+
+#[tokio::test]
 async fn production_creator_publishing_http_returns_creator_authority_unavailable_before_pubky_storage_write()
  {
     let storage = FakePubkyHomeserverStorage::default();
@@ -272,6 +339,15 @@ struct FakePubkyHomeserverStorage {
 }
 
 impl FakePubkyHomeserverStorage {
+    fn with_canonical_content_type(content_type: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FakePubkyHomeserverStorageInner {
+                canonical_content_type: Some(content_type.to_owned()),
+                ..FakePubkyHomeserverStorageInner::default()
+            })),
+        }
+    }
+
     fn operations(&self) -> Vec<String> {
         self.inner.lock().unwrap().operations.clone()
     }
@@ -282,6 +358,7 @@ struct FakePubkyHomeserverStorageInner {
     operations: Vec<String>,
     json: std::collections::BTreeMap<(String, String), serde_json::Value>,
     bytes: std::collections::BTreeMap<(String, String), PubkyBytesResource>,
+    canonical_content_type: Option<String>,
 }
 
 #[async_trait]
@@ -324,11 +401,15 @@ impl PubkyHomeserverStorageClient for FakePubkyHomeserverStorage {
         inner
             .operations
             .push(format!("put_bytes {creator} {path} {content_type}"));
+        let stored_content_type = inner
+            .canonical_content_type
+            .clone()
+            .unwrap_or_else(|| content_type.to_owned());
         inner.bytes.insert(
             (creator.to_string(), path.to_owned()),
             PubkyBytesResource {
                 bytes,
-                content_type: Some(content_type.to_owned()),
+                content_type: Some(stored_content_type),
             },
         );
         Ok(())
