@@ -44,6 +44,14 @@ PostgreSQL-backed tests and `postgres_runtime` require `TEST_DATABASE_URL`; CI u
 ephemeral local PostgreSQL service. Do not claim the full suite passed when only a subset
 ran.
 
+`./scripts/check` preserves a caller-provided `TEST_DATABASE_URL`. When it is unset, the
+script runs the non-database checks and skips the full PostgreSQL-backed workspace run. To
+use the repository's default Compose database, run:
+
+```bash
+TEST_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test' ./scripts/check
+```
+
 ## Pull requests
 
 - Keep changes focused and explain user-visible and persisted-data implications.

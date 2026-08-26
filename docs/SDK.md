@@ -424,7 +424,7 @@ cargo check -p locks-sdk-wasm --target wasm32-unknown-unknown
 Full workspace verification additionally requires the local Postgres test database:
 
 ```bash
-TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/locks_test' cargo test --workspace
+TEST_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test' cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```

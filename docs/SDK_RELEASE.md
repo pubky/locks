@@ -61,7 +61,7 @@ npm --prefix locks-sdk/bindings/js publish --dry-run
 
 ```bash
 cargo fmt
-TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/locks_test' cargo test --workspace
+TEST_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test' cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
