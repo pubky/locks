@@ -168,7 +168,7 @@ function hasExactKeys(value, expected) {
   return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]);
 }
 
-window.addEventListener('message', (event) => {
+window.addEventListener('message', async (event) => {
   const result = acceptPaykitSetupEvent({
     event,
     expectedOrigin: state.paykitSetupOrigin,
@@ -187,11 +187,9 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  state.paykitSetupComplete = true;
+  state.paykitSetupComplete = false;
   closePaykitSetupIframe();
-  el.retryPaykitSetup.hidden = true;
-  el.paykitSetupStatus.textContent = 'Paykit setup complete for this creator.';
-  el.paykitSetupStatus.className = 'ok';
+  await refreshPaykitSetupReadiness({ openSetupWhenRequired: false });
 });
 
 // Open the Lock Server /connect page inside an iframe overlay. The demo draws the modal CARD
@@ -543,7 +541,7 @@ async function refreshLockTypeFields() {
   await refreshPaykitSetupReadiness();
 }
 
-async function refreshPaykitSetupReadiness() {
+async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}) {
   if (
     el.lockType.value !== 'paykit-payment'
     || !state.creatorPubky
@@ -585,7 +583,12 @@ async function refreshPaykitSetupReadiness() {
       el.paykitSetupStatus.className = 'error';
       return;
     }
-    if (decision.openSetup) startPaykitSetup();
+    if (decision.openSetup && openSetupWhenRequired) startPaykitSetup();
+    if (decision.openSetup && !openSetupWhenRequired) {
+      el.retryPaykitSetup.hidden = false;
+      el.paykitSetupStatus.textContent = 'Paykit setup is not ready for this creator. Retry to check again.';
+      el.paykitSetupStatus.className = 'error';
+    }
   } catch {
     if (
       requestId !== state.paykitSetupStatusRequestId

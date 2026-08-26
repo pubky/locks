@@ -167,7 +167,7 @@ const required = {
     'refreshPaykitSetupReadiness',
     'state.paykitSetupStatusRequestId',
     'decision.openSetup',
-    'state.paykitSetupComplete = true',
+    'await refreshPaykitSetupReadiness({ openSetupWhenRequired: false })',
     "el.paykitSetupStatus.className = 'ok'",
     'paykitUrl: state.config.paykit.url',
     'returnTo: window.location.origin',
@@ -816,12 +816,12 @@ if (
   throw new Error('creator identity changes must reset Paykit setup before replacing the identity');
 }
 
-const readinessStartIndex = texts.appIframe.indexOf('async function refreshPaykitSetupReadiness()');
+const readinessStartIndex = texts.appIframe.indexOf('async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {})');
 const readinessEndIndex = texts.appIframe.indexOf('\nfunction startPaykitSetup()', readinessStartIndex);
 const readinessBody = texts.appIframe.slice(readinessStartIndex, readinessEndIndex);
 const readinessQueryIndex = readinessBody.indexOf('await queryPaykitSetupStatus({');
 const readinessDecisionIndex = readinessBody.indexOf('decidePaykitSetupReadiness(result)');
-const readinessSetupOpenIndex = readinessBody.indexOf('if (decision.openSetup) startPaykitSetup();');
+const readinessSetupOpenIndex = readinessBody.indexOf('if (decision.openSetup && openSetupWhenRequired) startPaykitSetup();');
 if (
   readinessStartIndex < 0
   || readinessEndIndex < 0
@@ -882,13 +882,21 @@ for (const binding of [
 
 const setupAcceptanceIndex = texts.appIframe.indexOf('const result = acceptPaykitSetupEvent({');
 const setupAcceptedGuardIndex = texts.appIframe.indexOf('if (!result) return;', setupAcceptanceIndex);
-const setupCompleteIndex = texts.appIframe.indexOf('state.paykitSetupComplete = true', setupAcceptanceIndex);
+const setupCallbackEndIndex = texts.appIframe.indexOf('// Open the Lock Server /connect page', setupAcceptanceIndex);
+const setupCallbackBody = texts.appIframe.slice(setupAcceptanceIndex, setupCallbackEndIndex);
+const setupConfirmationSequence = [
+  'state.paykitSetupComplete = false;',
+  'closePaykitSetupIframe();',
+  'await refreshPaykitSetupReadiness({ openSetupWhenRequired: false });',
+].join('\n  ');
 if (
   setupAcceptanceIndex < 0
   || setupAcceptedGuardIndex < setupAcceptanceIndex
-  || setupCompleteIndex < setupAcceptedGuardIndex
+  || setupCallbackEndIndex < setupAcceptedGuardIndex
+  || !setupCallbackBody.includes(setupConfirmationSequence)
+  || setupCallbackBody.includes('state.paykitSetupComplete = true')
 ) {
-  throw new Error('Paykit setup must mark completion only after exact callback acceptance');
+  throw new Error('Paykit callback must confirm creator-scoped readiness without optimistic completion');
 }
 
 const setupCloseIndex = texts.appIframe.indexOf('function closePaykitSetupIframe()');
