@@ -30,6 +30,10 @@ The Lock Server has one non-production route family and one authenticated creato
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives creator from the Locks-local frontend session.
   - Returns secret-free missing/present creator authority status.
+- Paykit setup readiness route: `GET /creator/paykit/setup-status`
+  - Requires `Authorization: Bearer <frontend_session_token>`.
+  - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.
+  - Returns only `ready`, `setup_required`, or `unavailable`.
 - Hosted legacy creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
   - Mount when explicit `[creator_authority_acquisition].enabled = true`.
   - `DELETE /frontend-sessions/current` requires `Authorization: Bearer <frontend_session_token>` and revokes the current frontend session.
@@ -54,6 +58,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `DELETE /frontend-sessions/current` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. Mounted with creator authority acquisition. | Token is request-only and is deleted from the frontend session store. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` when route gated off |
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
+| `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
 | `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. A new `paykit-payment` lifecycle identity requires `[paykit]` runtime config; an exact persisted replay does not. | No bearer secrets, invoice data, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
@@ -252,6 +257,43 @@ Error cases:
 
 - Missing/malformed frontend session bearer: `401 frontend_session_unavailable`.
 - Expired frontend session: `401 frontend_session_expired`.
+
+## Paykit setup readiness route
+
+### `GET /creator/paykit/setup-status`
+
+Returns whether the authenticated Creator already has usable authority configured on Paykit
+Server. Creator identity comes only from the Locks frontend session.
+
+```http
+GET /creator/paykit/setup-status
+Authorization: Bearer <frontend_session_token>
+```
+
+The request has no query parameters and no body. Success is always a closed one-field object:
+
+```json
+{"status":"ready"}
+```
+
+```json
+{"status":"setup_required"}
+```
+
+```json
+{"status":"unavailable"}
+```
+
+- `ready`: skip Paykit authorization.
+- `setup_required`: launch the Paykit setup iframe.
+- `unavailable`: show a retry/degraded state. **Never** treat this as `setup_required` and never
+  launch authorization from it.
+
+For authenticated requests, missing Paykit configuration, timeout/network failure, non-success
+Paykit responses, and malformed/unsupported Paykit success bodies all project to
+`{"status":"unavailable"}`. Frontend-session failures retain the existing `401` error envelope.
+The browser response never exposes Paykit failure details, configured URLs, Creator authority
+details, or credentials.
 
 ## Creator publishing routes
 

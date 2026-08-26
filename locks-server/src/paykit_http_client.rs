@@ -63,6 +63,41 @@ pub struct PaykitStatusRequest {
     pub bundle_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaykitSetupStatusRequest {
+    pub creator: CreatorPubky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaykitSetupStatusKind {
+    Ready,
+    SetupRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitSetupStatus {
+    pub status: PaykitSetupStatusKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaykitSetupStatusProviderError {
+    Timeout,
+    NonSuccess,
+    InvalidResponse,
+    Unavailable,
+}
+
+#[async_trait]
+pub trait PaykitSetupStatusProvider: Send + Sync {
+    async fn setup_status(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PaykitTransactionStatusKind {
@@ -141,6 +176,25 @@ impl PaykitHttpClient {
             .map_err(PaykitClientError::InvalidStatusResponse)
     }
 
+    pub async fn setup_status(
+        &self,
+        request: &PaykitSetupStatusRequest,
+    ) -> Result<PaykitSetupStatus, PaykitClientError> {
+        let response = self.signed_post("setup/status", request).await?;
+
+        if !response.status().is_success() {
+            return Err(PaykitClientError::NonSuccess {
+                operation: "setup status",
+                status: response.status(),
+            });
+        }
+
+        response
+            .json::<PaykitSetupStatus>()
+            .await
+            .map_err(PaykitClientError::InvalidStatusResponse)
+    }
+
     fn endpoint(&self, path: &str) -> Url {
         let mut endpoint = self.server_url.clone();
         endpoint.set_query(None);
@@ -210,6 +264,33 @@ impl PaykitPaymentStatusClient for PaykitHttpClient {
             },
             confirmations: status.confirmations,
             amount_matched: status.amount_matched,
+        })
+    }
+}
+
+#[async_trait]
+impl PaykitSetupStatusProvider for PaykitHttpClient {
+    async fn setup_status(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
+        PaykitHttpClient::setup_status(
+            self,
+            &PaykitSetupStatusRequest {
+                creator: creator.clone(),
+            },
+        )
+        .await
+        .map(|response| response.status)
+        .map_err(|error| match error {
+            PaykitClientError::Http(error) if error.is_timeout() => {
+                PaykitSetupStatusProviderError::Timeout
+            }
+            PaykitClientError::NonSuccess { .. } => PaykitSetupStatusProviderError::NonSuccess,
+            PaykitClientError::InvalidStatusResponse(_) => {
+                PaykitSetupStatusProviderError::InvalidResponse
+            }
+            _ => PaykitSetupStatusProviderError::Unavailable,
         })
     }
 }
@@ -588,5 +669,256 @@ mod tests {
             "confirmations": 0,
             "amount_matched": true,
         }))
+    }
+}
+
+#[cfg(test)]
+mod setup_status_tests {
+    use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn canonical_setup_status_body_and_signature_match_exact_contract() {
+        let request = setup_status_request();
+        let body = canonical_body_bytes(&request).unwrap();
+        let keypair = Keypair::from_secret(&[9_u8; 32]);
+        let signature = sign_body(&keypair, &body);
+
+        assert_eq!(
+            String::from_utf8(body.clone()).unwrap(),
+            format!("{{\"creator\":\"{CREATOR}\"}}")
+        );
+        assert_eq!(
+            signature,
+            URL_SAFE_NO_PAD.encode(keypair.sign(&body).to_bytes())
+        );
+        assert!(!signature.contains('='));
+    }
+
+    #[test]
+    fn setup_status_endpoint_preserves_server_url_prefix() {
+        for server_url in [
+            "https://paykit.example",
+            "https://paykit.example/services/paykit",
+            "https://paykit.example/services/paykit/",
+        ] {
+            let client = PaykitHttpClient::from_parts(
+                server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            let expected = if server_url.contains("services/paykit") {
+                "https://paykit.example/services/paykit/setup/status"
+            } else {
+                "https://paykit.example/setup/status"
+            };
+            assert_eq!(client.endpoint("setup/status").as_str(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_status_posts_signed_creator_and_parses_ready() {
+        let captured = CapturedSetupRequests::default();
+        let server_url =
+            spawn_setup_server(StatusCode::OK, "{\"status\":\"ready\"}", captured.clone()).await;
+        let keypair = Keypair::from_secret(&[9_u8; 32]);
+        let client =
+            PaykitHttpClient::from_parts(&server_url, reqwest::Client::new(), keypair.clone())
+                .unwrap();
+        let expected_body = canonical_body_bytes(&setup_status_request()).unwrap();
+
+        let status = client.setup_status(&setup_status_request()).await.unwrap();
+
+        assert_eq!(
+            status,
+            PaykitSetupStatus {
+                status: PaykitSetupStatusKind::Ready,
+            }
+        );
+        let request = captured.single();
+        assert_eq!(request.path, "/setup/status");
+        assert_eq!(request.body, expected_body);
+        assert_eq!(request.signature, Some(sign_body(&keypair, &request.body)));
+    }
+
+    #[tokio::test]
+    async fn setup_status_parses_all_supported_values() {
+        for (body, expected) in [
+            ("{\"status\":\"ready\"}", PaykitSetupStatusKind::Ready),
+            (
+                "{\"status\":\"setup_required\"}",
+                PaykitSetupStatusKind::SetupRequired,
+            ),
+            (
+                "{\"status\":\"unavailable\"}",
+                PaykitSetupStatusKind::Unavailable,
+            ),
+        ] {
+            let server_url =
+                spawn_setup_server(StatusCode::OK, body, CapturedSetupRequests::default()).await;
+            let client = test_client(&server_url, reqwest::Client::new());
+
+            assert_eq!(
+                client.setup_status(&setup_status_request()).await.unwrap(),
+                PaykitSetupStatus { status: expected }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_status_rejects_unknown_fields_values_and_malformed_success() {
+        for body in [
+            "{\"status\":\"future\"}",
+            "{\"status\":\"ready\",\"extra\":true}",
+            "not-json",
+        ] {
+            let server_url =
+                spawn_setup_server(StatusCode::OK, body, CapturedSetupRequests::default()).await;
+            let client = test_client(&server_url, reqwest::Client::new());
+
+            assert!(matches!(
+                client
+                    .setup_status(&setup_status_request())
+                    .await
+                    .unwrap_err(),
+                PaykitClientError::InvalidStatusResponse(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_status_non_success_remains_client_error() {
+        let server_url = spawn_setup_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            CapturedSetupRequests::default(),
+        )
+        .await;
+        let client = test_client(&server_url, reqwest::Client::new());
+
+        assert!(matches!(
+            client
+                .setup_status(&setup_status_request())
+                .await
+                .unwrap_err(),
+            PaykitClientError::NonSuccess {
+                operation: "setup status",
+                status: StatusCode::SERVICE_UNAVAILABLE,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_status_timeout_remains_client_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/setup/status",
+                    post(|| async { std::future::pending::<()>().await }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = test_client(
+            &format!("http://{addr}"),
+            bounded_http_client(Duration::from_millis(10), Duration::from_millis(25)).unwrap(),
+        );
+
+        assert!(matches!(
+            client.setup_status(&setup_status_request()).await.unwrap_err(),
+            PaykitClientError::Http(error) if error.is_timeout()
+        ));
+    }
+
+    fn setup_status_request() -> PaykitSetupStatusRequest {
+        PaykitSetupStatusRequest {
+            creator: CreatorPubky::from_str(CREATOR).unwrap(),
+        }
+    }
+
+    fn test_client(server_url: &str, http: reqwest::Client) -> PaykitHttpClient {
+        PaykitHttpClient::from_parts(server_url, http, Keypair::from_secret(&[9_u8; 32])).unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedSetupRequests(Arc<Mutex<Vec<CapturedSetupRequest>>>);
+
+    impl CapturedSetupRequests {
+        fn push(&self, request: CapturedSetupRequest) {
+            self.0.lock().unwrap().push(request);
+        }
+
+        fn single(&self) -> CapturedSetupRequest {
+            let requests = self.0.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            requests[0].clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedSetupRequest {
+        path: String,
+        signature: Option<String>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct SetupResponse {
+        status: StatusCode,
+        body: &'static str,
+        captured: CapturedSetupRequests,
+    }
+
+    async fn spawn_setup_server(
+        status: StatusCode,
+        body: &'static str,
+        captured: CapturedSetupRequests,
+    ) -> String {
+        let app = Router::new()
+            .route("/setup/status", post(setup_status_handler))
+            .with_state(SetupResponse {
+                status,
+                body,
+                captured,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn setup_status_handler(
+        State(response): State<SetupResponse>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        response.captured.push(CapturedSetupRequest {
+            path: "/setup/status".to_owned(),
+            signature: headers
+                .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            body: body.to_vec(),
+        });
+        (response.status, response.body)
     }
 }

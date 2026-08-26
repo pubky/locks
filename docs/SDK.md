@@ -332,6 +332,29 @@ Request body:
 }
 ```
 
+### Check Paykit setup readiness
+
+```ts
+const result = await session.creator.paykitSetupStatus();
+
+switch (result.status) {
+  case "ready":
+    // Skip Paykit authorization.
+    break;
+  case "setup_required":
+    // Launch the Paykit setup iframe.
+    break;
+  case "unavailable":
+    // Show retry/degraded state. Do not launch authorization.
+    break;
+}
+```
+
+`paykitSetupStatus()` takes no Creator argument. It uses the current Locks frontend-session bearer
+and calls `GET /creator/paykit/setup-status` with no body. The Lock Server derives the Creator from
+that session. The returned object contains only `status: "ready" | "setup_required" |
+"unavailable"`; malformed responses reject instead of being interpreted as setup readiness.
+
 ## Viewer/access APIs
 
 Viewer calls do not require a Pubky identity in v0. Callers choose and durably store a `BundleId`; treat it as bearer-like recovery state.
