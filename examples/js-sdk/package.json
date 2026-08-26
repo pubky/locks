@@ -23,6 +23,6 @@
     "check": "node --check scripts/init-config.mjs && node --check scripts/init-paykit-compose.mjs && node --check scripts/homegate-bridge.mjs && node --check scripts/generate-paykit-account-tpub.mjs && node --check scripts/reset-paykit-demo.mjs && node --check scripts/validate-paykit-compose.mjs && node --check scripts/electrum-readiness.mjs && node --check scripts/smoke-paykit-compose.mjs && node --check scripts/test-paykit-reader-worker.mjs && node --check scripts/create-user.mjs && node --check scripts/publish-creator-profile.mjs && node --check scripts/authenticate.mjs && node --check scripts/authenticate-paykit.mjs && node --check scripts/register-paykit-reader.mjs && node --check scripts/prepare-paykit-reader.mjs && node --check scripts/receive-paykit-request.mjs && node --check scripts/lib/creator-session-state.mjs && node --check scripts/lib/creator-static-path.mjs && node --check scripts/lib/paykit-reader-helper.mjs && node --check scripts/lib/paykit-reader-status.mjs && node --check scripts/lib/paykit-reader-worker.mjs && node --check scripts/start-demo-server.mjs && node --check scripts/start-reader-demo-server.mjs && node --check app.js && node --check app-iframe.js && node --check creator-identity.js && node --check creator-lock-policy.js && node --check paykit-setup.js && node --check creator-complete-flow.js && node --check reader-app.js && node --check reader-flow.js"
   },
   "dependencies": {
-    "@synonymdev/pubky": "^0.9.3"
+    "@synonymdev/pubky": "^0.10.0"
   }
 }
