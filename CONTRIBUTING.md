@@ -27,8 +27,33 @@ npm --prefix locks-sdk/bindings/js run test
 git diff --check
 ```
 
-PostgreSQL and E2E tests require `TEST_DATABASE_URL`; CI uses an ephemeral local
-PostgreSQL service. Do not claim the full suite passed when only a subset ran.
+CI runs five lanes in parallel:
+
+| Lane | Ownership |
+| --- | --- |
+| `Style / Compose` | Formatting, Compose bootstrap regression, and whitespace |
+| `Clippy` | Workspace lint across all targets and features |
+| `Rust tests` | Non-PostgreSQL Rust tests and fake/in-memory E2E tests |
+| `JS / WASM` | Native bindings, wasm target, generated package, demo, and example smokes |
+| `PostgreSQL` | PostgreSQL-backed service tests and runtime E2E |
+
+The `Checks` result aggregates all five lanes. The effective `master` ruleset currently
+requires one approving review but does not enforce status checks, so a failing `Checks`
+result does not by itself block a merge. Maintainers should add `Checks` as a required
+status before treating it as a merge gate. `scripts/check` remains the sequential local
+umbrella.
+
+PostgreSQL-backed tests and `postgres_runtime` require `TEST_DATABASE_URL`; CI uses an
+ephemeral local PostgreSQL service. Do not claim the full suite passed when only a subset
+ran.
+
+`./scripts/check` preserves a caller-provided `TEST_DATABASE_URL`. When it is unset, the
+script runs the non-database checks and skips the full PostgreSQL-backed workspace run. To
+use the repository's default Compose database, run:
+
+```bash
+TEST_DATABASE_URL='postgres://locks:locks@localhost:55433/locks_test' ./scripts/check
+```
 
 ## Pull requests
 
