@@ -91,6 +91,7 @@ pub(super) async fn connect_shell_start(
         .allowed_return_origins;
     let return_to = validate_return_to_url(&query.return_to, allowed_origins)?;
     let delivery = ConnectDeliveryMode::from_query(query.delivery.as_deref());
+    let callback_state = query.state.clone();
     // Guaranteed `Some` because `validate_return_to_url` already parsed the origin.
     let target_origin = origin_from_return_to(&return_to).ok_or_else(invalid_return_to_url)?;
 
@@ -106,21 +107,12 @@ pub(super) async fn connect_shell_start(
     )
     .await?;
 
-    // Local dev only: the shell shows the Pubky authorization URL solely as a QR, which a desktop
-    // tester without a phone cannot use. Emit the secret-bearing URL to the server log so it can be
-    // opened directly. Gated to Development so it never lands in a shared staging/production log.
-    if state.config().runtime.environment.is_development() {
-        tracing::info!(
-            authorization_url = response.authorization_url.expose_url(),
-            "dev: legacy-connect authorization URL"
-        );
-    }
-
     let html = render_connect_shell_html(
         response.flow_id.as_str(),
         response.authorization_url.expose_url(),
         delivery,
         &target_origin,
+        &callback_state,
     );
 
     // Scope framing to this flow's validated return origin — the exact origin that will also
@@ -191,6 +183,7 @@ fn render_connect_shell_html(
     authorization_url: &str,
     delivery: ConnectDeliveryMode,
     target_origin: &str,
+    callback_state: &str,
 ) -> String {
     let escaped_flow_id = escape_html(flow_id);
     let escaped_authorization_url = escape_html(authorization_url);
@@ -223,7 +216,7 @@ fn render_connect_shell_html(
     match delivery {
         // Embedded in the parent app's modal: render only the QR, transparent, no card/title/close.
         ConnectDeliveryMode::PostMessage => {
-            let script = render_postmessage_script(flow_id, target_origin);
+            let script = render_postmessage_script(flow_id, target_origin, callback_state);
             format!(
                 r#"<!doctype html>
 <html lang="en">
@@ -259,19 +252,21 @@ fn render_connect_shell_html(
 /// approval). Before approval the endpoint is effectively idempotent (the pending flow still
 /// exists), so transient failures — a dropped connection or a gateway timeout from a proxy that
 /// capped the idle long-poll — are retried with capped exponential backoff. A definitive error
-/// (expired/rejected flow) is surfaced to the parent as `{ type, error }` so the embedder is never
+/// (expired/rejected flow) is surfaced as a closed `{ type, state, error }` message so the embedder is never
 /// left hanging. On success it posts `{ type, state, code }` and stops.
-fn render_postmessage_script(flow_id: &str, target_origin: &str) -> String {
+fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state: &str) -> String {
     let flow_id_js = js_string_literal(flow_id);
     let target_origin_js = js_string_literal(target_origin);
     let type_js = js_string_literal(POSTMESSAGE_CALLBACK_TYPE);
     let resize_type_js = js_string_literal(POSTMESSAGE_RESIZE_TYPE);
+    let callback_state_js = js_string_literal(callback_state);
     format!(
         r#"<script>
     (async () => {{
       const TARGET_ORIGIN = {target_origin_js};
       const CALLBACK_TYPE = {type_js};
       const RESIZE_TYPE = {resize_type_js};
+      const CALLBACK_STATE = {callback_state_js};
       const COMPLETE_URL = "/connect/" + encodeURIComponent({flow_id_js}) + "/complete?delivery=postmessage";
       // Report content height so the embedder can size the iframe to fit (QR vs mobile button).
       // Re-fires on layout changes (media-query flip, font load) via ResizeObserver.
@@ -301,7 +296,7 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str) -> String {
             const {{ state, code }} = await res.json();
             post({{ type: CALLBACK_TYPE, state, code }});
           }} catch (_e) {{
-            post({{ type: CALLBACK_TYPE, error: "invalid-response" }});
+            post({{ type: CALLBACK_TYPE, state: CALLBACK_STATE, error: "invalid-response" }});
           }}
           return;
         }}
@@ -310,7 +305,7 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str) -> String {
           continue;
         }}
         // Definitive server error (flow expired/rejected) — tell the parent instead of hanging.
-        post({{ type: CALLBACK_TYPE, error: "connect-failed-" + res.status }});
+        post({{ type: CALLBACK_TYPE, state: CALLBACK_STATE, error: "connect-failed" }});
         return;
       }}
     }})();

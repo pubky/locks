@@ -115,7 +115,7 @@ pkarr_relays = []
 key_republisher_interval_seconds = 3600
 ```
 
-`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pkarr_relays = ["http://localhost:15411"]`.
+`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pkarr_relays = ["http://127.0.0.1:15411"]`.
 
 PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds.
 

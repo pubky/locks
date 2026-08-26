@@ -7,6 +7,7 @@ import init, {
   RegisterGuardedResourceOptions,
   SetLockServicePointerOptions,
 } from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
+import { enforceCreatorIdentityMatch } from './creator-identity.js';
 
 export function buildLocksOptions({ pkarrRelays = [] } = {}) {
   const options = new LocksOptions();
@@ -41,7 +42,13 @@ export async function startCreatorConnect({ lockServer, returnTo, state, pkarrRe
  * The returned session secret is bearer-equivalent; store it according to the
  * host application's security model.
  */
-export async function completeCreatorConnect({ lockServer, callbackUrl, expectedState, pkarrRelays = [] }) {
+export async function completeCreatorConnect({
+  lockServer,
+  callbackUrl,
+  expectedState,
+  expectedCreatorPubky,
+  pkarrRelays = [],
+}) {
   await init();
 
   const callback = Locks.parseConnectCallback(callbackUrl);
@@ -50,6 +57,7 @@ export async function completeCreatorConnect({ lockServer, callbackUrl, expected
     code: callback.code,
     state: callback.state,
     expectedState,
+    expectedCreatorPubky,
     pkarrRelays,
   });
 }
@@ -62,7 +70,14 @@ export async function completeCreatorConnect({ lockServer, callbackUrl, expected
  * flow — the CSRF binding is always enforced (fail closed). The returned session secret is
  * bearer-equivalent.
  */
-export async function exchangeCreatorConnectCode({ lockServer, code, state, expectedState, pkarrRelays = [] }) {
+export async function exchangeCreatorConnectCode({
+  lockServer,
+  code,
+  state,
+  expectedState,
+  expectedCreatorPubky,
+  pkarrRelays = [],
+}) {
   await init();
 
   if (state !== expectedState) {
@@ -73,7 +88,7 @@ export async function exchangeCreatorConnectCode({ lockServer, code, state, expe
   const session = await locks.exchangeFrontendSessionCode(
     new ExchangeFrontendSessionCodeOptions(code, state),
   );
-
+  await enforceCreatorIdentityMatch({ session, expectedCreatorPubky });
   return {
     session,
     sessionSecret: session.exportSecret(),
@@ -113,6 +128,7 @@ export async function publishLockedContent({
   contentType,
   bytes,
   criteria,
+  lockLogic,
   accessTtlSeconds = 3600,
   pkarrRelays = [],
 }) {
@@ -134,7 +150,7 @@ export async function publishLockedContent({
   let builder = new CreateContentLockRequestBuilder()
     .primaryResource(primaryResource)
     .criteria(criteria)
-    .lockLogic({ type: 'all', criteria: criteria.map((criterion) => criterion.criterion_id) })
+    .lockLogic(lockLogic)
     .accessPolicy({ requested_credential_ttl_seconds: accessTtlSeconds })
     .lockServer({ override: lockServer });
 

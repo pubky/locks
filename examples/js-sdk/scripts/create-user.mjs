@@ -13,6 +13,8 @@ import {
   writeSecret,
 } from './lib/paths.mjs';
 import { readDemoConfig } from './lib/config.mjs';
+import { clearCreatorDemoSession } from './lib/creator-session-state.mjs';
+import { clearPreparedReaderStatus } from './lib/paykit-reader-status.mjs';
 import { Keypair, publicKeyString, randomPassphrase } from './lib/pubky.mjs';
 
 // Creates ./.local/<role>/passphrase, ./.local/<role>/recovery_file, and ./.local/<role>/profile.json.
@@ -40,6 +42,9 @@ try {
     process.exit(0);
   }
 
+  if (role === 'content-creator') await clearCreatorDemoSession();
+  if (role === 'content-viewer') await clearPreparedReaderStatus();
+
   const config = await readDemoConfig().catch(() => undefined);
   await ensureDir(roleDir(role));
 
@@ -57,6 +62,7 @@ try {
   await writeSecret(passphraseFile, `${passphrase}\n`);
   await writeSecret(recoveryFile, Buffer.from(recoveryBytes));
   await writeJson(profileFile, profile);
+  if (role === 'content-creator') await clearCreatorDemoSession();
 
   console.log(JSON.stringify({ ok: true, reused: false, forced: force, role, pubky, profile: profileFile }, null, 2));
 } catch (error) {

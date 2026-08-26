@@ -158,6 +158,10 @@ async fn connect_shell_postmessage_mode_returns_json_and_frames_allowed_parent()
     // the callback message type, and drops the manual approval button.
     assert!(shell_html.contains("locks-auth-callback"));
     assert!(shell_html.contains("TARGET_ORIGIN = \"https://pubky.app\""));
+    assert!(shell_html.contains("CALLBACK_STATE = \"opaque-state\""));
+    assert!(shell_html.contains("error: \"invalid-response\""));
+    assert!(shell_html.contains("error: \"connect-failed\""));
+    assert!(!shell_html.contains("connect-failed-\" + res.status"));
     assert!(!shell_html.contains("I approved this connection"));
     assert!(!shell_html.contains("<form"));
     assert!(!shell_html.contains("fake-legacy-session-secret"));

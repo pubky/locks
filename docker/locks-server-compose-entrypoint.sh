@@ -6,6 +6,7 @@ generated_config="$service_home/config.toml"
 compose_config="${LOCKS_COMPOSE_CONFIG:-/var/lib/pubky-lock/config.compose.toml}"
 secret_path="$service_home/secret.sess"
 creator_authority_key_path="$service_home/creator-authority-encryption-key"
+public_config="${LOCKS_PUBLIC_CONFIG:-/run/locks-public/config.toml}"
 
 mkdir -p "$service_home"
 
@@ -46,6 +47,12 @@ if [ -z "$lock_server_public_key" ] || [ "$lock_server_public_key" = "<derived-o
   exit 1
 fi
 
+mkdir -p "$(dirname "$public_config")"
+public_config_tmp="$public_config.tmp.$$"
+printf 'lock_server_public_key = "%s"\n' "$lock_server_public_key" > "$public_config_tmp"
+chmod 0644 "$public_config_tmp"
+mv "$public_config_tmp" "$public_config"
+
 cat > "$compose_config" <<EOF
 bind_addr = "0.0.0.0:3000"
 
@@ -58,6 +65,10 @@ max_ttl_seconds = 900
 url_env = "PUBKY_LOCK_DATABASE_URL"
 max_connections = 10
 run_migrations_on_startup = true
+
+[paykit]
+server_url = "http://127.0.0.1:3001"
+minimum_confirmations = 0
 
 [worker]
 enabled = true
@@ -75,13 +86,13 @@ frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
 [creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://localhost:8080"]
+allowed_return_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
 
 [secrets]
 creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
 
 [logging]
-level = "info"
+level = "info,pubky::actors::session=warn"
 
 [pubky]
 network = "testnet"
@@ -90,8 +101,8 @@ network = "testnet"
 public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 3000
-icann_domain = "localhost"
-pkarr_relays = ["http://localhost:15411"]
+icann_domain = "127.0.0.1"
+pkarr_relays = ["http://127.0.0.1:15411"]
 key_republisher_interval_seconds = 86400
 
 [rate_limits.verification_submission]

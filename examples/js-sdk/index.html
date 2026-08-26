@@ -21,8 +21,8 @@
   <body>
     <h1>Pubky Locks JS SDK creator demo</h1>
     <p style="background:#eef3ff;border:1px solid #c7d6ff;border-radius:8px;padding:0.5rem 0.75rem;">
-      Authorizing the Lock Server uses a <strong>full-page redirect</strong>. &nbsp;→
-      <a href="/examples/js-sdk/iframe.html">Switch to iframe flow</a> &nbsp;·&nbsp;
+      Authorizing the Lock Server uses an <strong>iframe modal</strong> (no full-page navigation). &nbsp;→
+      <a href="/examples/js-sdk/iframe.html">Open alternate creator page</a> &nbsp;·&nbsp;
       <a href="/examples/js-sdk/flows.html">All flows</a></p>
     <p>This local testnet demo exercises the browser JS/WASM SDK against a configured Lock Server.</p>
 
@@ -34,7 +34,7 @@
     </section>
 
     <section id="lock-server-auth">
-      <h2>2. Authenticate creator to Lock Server</h2>
+      <h2>2. Authenticate creator to Lock Server (iframe)</h2>
       <p id="lock-auth-status" class="muted">Waiting for demo auth.</p>
       <button id="start-lock-auth" disabled>Authenticate to Lock Server</button>
     </section>
@@ -68,22 +68,34 @@
           <span class="muted">Secondary guarded resource paths are derived from each secondary file name. Use distinct file names.</span>
         </label>
         <label>
-          Verifier type
-          <select id="verifier-type">
+          Lock type
+          <select id="lock-type">
             <option value="dev-static">dev-static</option>
+            <option value="paykit-payment">paykit-payment</option>
           </select>
         </label>
         <label>
           Criterion ID
           <input id="criterion-id" type="text" value="criterion-1" required />
         </label>
-        <label>
-          Dev-static satisfied
-          <select id="criterion-satisfied">
-            <option value="true">true</option>
-            <option value="false">false</option>
-          </select>
-        </label>
+        <div id="dev-static-fields">
+          <label>
+            Dev-static satisfied
+            <select id="criterion-satisfied">
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </label>
+        </div>
+        <div id="paykit-payment-fields" hidden>
+          <label>
+            Amount (sats)
+            <input id="paykit-amount-sats" type="text" inputmode="numeric" pattern="[0-9]+" autocomplete="off" />
+          </label>
+          <p class="muted">Asset is fixed to BTC. Recipient is the authenticated content creator.</p>
+          <p id="paykit-setup-status" class="muted">Paykit setup is required for this creator.</p>
+          <button id="retry-paykit-setup" type="button" hidden>Retry Paykit setup</button>
+        </div>
         <label>
           Access credential TTL seconds
           <input id="access-ttl" type="number" min="1" value="900" required />

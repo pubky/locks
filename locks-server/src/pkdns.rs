@@ -120,7 +120,11 @@ pub fn create_signed_packet(
         let mut svcb = SVCB::new(10, root_name.clone());
         if let Some(port) = config.public_icann_http_port {
             let http_port_be_bytes = port.to_be_bytes();
-            if domain == "localhost" {
+            if domain == "localhost"
+                || domain
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+            {
                 svcb.set_param(SVCParam::Unknown(
                     pubky_common::constants::reserved_param_keys::HTTP_PORT,
                     Cow::Owned(http_port_be_bytes.to_vec()),
@@ -210,6 +214,39 @@ mod tests {
             }
             _ => false,
         }));
+    }
+
+    #[test]
+    fn create_signed_packet_publishes_http_port_for_loopback_ip_domain() {
+        let keypair = Keypair::from_secret(&[9_u8; 32]);
+        let config = PkdnsConfig {
+            public_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            public_pubky_tls_port: Some(6287),
+            public_icann_http_port: Some(3000),
+            icann_domain: Some("127.0.0.1".to_owned()),
+            pkarr_relays: Vec::new(),
+            key_republisher_interval_seconds: 3600,
+        };
+
+        let packet = create_signed_packet(&config, &keypair).unwrap();
+        let http_endpoint = packet
+            .all_resource_records()
+            .find_map(|record| match &record.rdata {
+                RData::HTTPS(https) if https.0.target.to_string().contains("127.0.0.1") => {
+                    Some(https)
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            http_endpoint
+                .0
+                .iter_params()
+                .find(|param| param.key_code()
+                    == pubky_common::constants::reserved_param_keys::HTTP_PORT),
+            Some(SVCParam::Unknown(_, value)) if value.as_ref() == 3000_u16.to_be_bytes()
+        ));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use crate::error::{LocksSdkError, Result};
 use url::Url;
@@ -51,7 +52,11 @@ fn apply_endpoint_to_url(
         .domain
         .as_deref()
         .ok_or(LocksSdkError::MissingBrowserEndpointDomain)?;
-    let is_testnet_domain = domain == "localhost" || testnet_host == Some(domain);
+    let is_testnet_domain = domain == "localhost"
+        || domain
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+        || testnet_host == Some(domain);
 
     if is_testnet_domain {
         url.set_scheme("http")
@@ -169,6 +174,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.url.as_str(), "http://localhost:55433/connect");
+    }
+
+    #[test]
+    fn browser_request_rewrite_uses_http_port_for_loopback_ip_endpoint() {
+        let mut params = BTreeMap::new();
+        params.insert(HTTP_PORT_PARAM, 55433);
+        let endpoint = BrowserEndpoint {
+            domain: Some("127.0.0.1".to_owned()),
+            port: Some(443),
+            params,
+        };
+
+        let request = rewrite_browser_request(
+            "https://_pubky.pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo/connect",
+            &endpoint,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.url.as_str(), "http://127.0.0.1:55433/connect");
     }
 
     #[test]
