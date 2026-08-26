@@ -1,10 +1,9 @@
 FROM rust:1.89.0-bookworm AS builder
 
-ARG PUBKY_CORE_REV=75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b
+ARG PUBKY_CORE_REF=v0.10.0
 WORKDIR /usr/src/pubky-core
-RUN git clone --filter=blob:none https://github.com/pubky/pubky-core.git . \
-    && git checkout --detach "${PUBKY_CORE_REV}"
-# The pinned Pubky Core revision locks quinn-proto 0.11.14, affected by
+RUN git clone --branch "${PUBKY_CORE_REF}" --depth 1 https://github.com/pubky/pubky-core.git .
+# The Pubky v0.10.0 lockfile pins quinn-proto 0.11.14, affected by
 # RUSTSEC-2026-0185. Keep this precise override until its lockfile advances.
 RUN cargo update -p quinn-proto --precise 0.11.15 \
     && cargo build --release -p pubky-testnet --bin pubky-testnet

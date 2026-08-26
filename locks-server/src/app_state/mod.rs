@@ -86,7 +86,10 @@ impl ReaderPubkyResolver for PubkyReaderPubkyResolver {
         let Ok(public_key) = pubky_common::crypto::PublicKey::from_str(&reader.to_string()) else {
             return false;
         };
-        self.client.get_homeserver_of(&public_key).await.is_some()
+        self.client
+            .get_homeserver_of(&public_key)
+            .await
+            .is_ok_and(|homeserver| homeserver.is_some())
     }
 }
 

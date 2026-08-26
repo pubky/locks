@@ -60,7 +60,7 @@ Existing Lock-Server-local access credential records may remain until their own 
 
 Until grant-based auth is available in Pubky-Core and integrated into `pubky.app`, Locks has an interim backend authority slice for legacy cookie sessions. The application model is intentionally generic: `creator_authorities.auth_kind` currently accepts `legacy_cookie` and `grant`, and the secret-bearing value is stored as Lock-Server-private Postgres runtime state.
 
-For the legacy-cookie implementation, crates.io `pubky` 0.9.x restores/revalidates stored session material through `PubkySession::import_secret(...)`. Browser connect-flow creation still must be Lock-Server-owned because `PubkyAuthFlow` / `AuthFlowKind::signin()` authorization URLs carry client secret material. `pubky.app` must not start that flow or forward the resulting session secret.
+For the legacy-cookie implementation, crates.io `pubky` 0.10.x restores/revalidates stored session material through `PubkySession::import_secret(...)`. Browser connect-flow creation still must be Lock-Server-owned because `PubkyCookieAuthFlow` / `AuthFlowKind::signin()` authorization URLs carry client secret material. `pubky.app` must not start that flow or forward the resulting session secret.
 
 The implemented stable API error for missing/invalid/revoked creator authority is secret-free `503 creator_authority_unavailable`.
 

@@ -6,6 +6,31 @@ export async function enforceCreatorIdentityMatch({ session, expectedCreatorPubk
   throw new Error('Lock Server creator does not match the demo creator; authenticate both flows with the same identity');
 }
 
+export async function commitIdentityScopedCreatorSession({
+  state,
+  sessionSecret,
+  expectedCreatorPubky,
+  expectedIdentityGeneration,
+  expectedConnectState,
+  revokeSession,
+}) {
+  const stale = state.creatorPubky !== expectedCreatorPubky
+    || state.creatorIdentityGeneration !== expectedIdentityGeneration
+    || state.pendingConnectState !== expectedConnectState;
+  if (stale) {
+    try {
+      await revokeSession(sessionSecret);
+      return { accepted: false, revoked: true };
+    } catch {
+      return { accepted: false, revoked: false };
+    }
+  }
+
+  state.feLockSessionToken = sessionSecret;
+  state.lockAuthenticated = true;
+  return { accepted: true, revoked: false };
+}
+
 export async function invalidateIdentityScopedCreatorState({ state, revokeSession }) {
   const sessionSecret = state.feLockSessionToken;
   state.feLockSessionToken = null;

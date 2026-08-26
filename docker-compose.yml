@@ -21,7 +21,7 @@ services:
       context: .
       dockerfile: docker/pubky-testnet.Dockerfile
       args:
-        PUBKY_CORE_REV: 75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b
+        PUBKY_CORE_REF: v0.10.0
     ports:
       - "${LOCKS_DHT_PORT:-6881}:6881/udp"
       - "${LOCKS_DHT_PORT:-6881}:6881/tcp"

@@ -45,7 +45,7 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22"
-pubky-common = "0.9.0"
+pubky-common = "0.10.0"
 EOF
 
 mkdir -p "${tmp_dir}/src"

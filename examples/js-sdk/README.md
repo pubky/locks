@@ -211,10 +211,10 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server, Paykit Rust, Locks, and Pubky Core build inputs are fetched from
-anonymous public Git URLs pinned to immutable commits. The active Locks checkout is
-used only for the Locks and browser-demo images being developed. No sibling repository
-checkout is required.
+The Paykit Server and compatible Locks build contexts follow their public `master`
+branches, Paykit Rust uses the `v0.1.0-rc47` tag, and Pubky Core uses the `v0.10.0`
+tag. The active Locks checkout is used only for the Locks and browser-demo images being
+developed. No sibling repository checkout is required.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
@@ -369,7 +369,8 @@ Rules:
 - payment recipient is the authenticated content creator; it is not user-editable
 - payment is the content lock's sole criterion and the lock logic references exactly that criterion
 - payment publishing is rejected until Paykit setup succeeds for the current authenticated creator
-- selecting `paykit-payment` opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe
+- selecting `paykit-payment` queries setup readiness through the current authenticated Locks frontend session
+- `ready` skips authorization, `setup_required` opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe, and `unavailable` shows a retry state without opening authorization
 - the parent accepts completion only from that exact iframe window and origin with the pending state
 - the success callback is only `{ type: "paykit-setup-callback", state }`; failures add only `error: "setup-failed"`, and account data stays inside Paykit
 

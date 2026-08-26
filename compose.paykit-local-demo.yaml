@@ -160,7 +160,7 @@ services:
       context: .
       dockerfile: docker/pubky-testnet.Dockerfile
       args:
-        PUBKY_CORE_REV: 75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b
+        PUBKY_CORE_REF: v0.10.0
     ports:
       - "127.0.0.1:${LOCKS_DHT_PORT:-6881}:6881/udp"
       - "127.0.0.1:${LOCKS_DHT_PORT:-6881}:6881/tcp"
@@ -281,12 +281,12 @@ services:
   paykit-server:
     image: pubky-locks-paykit-server:local
     build:
-      context: "https://github.com/pubky/paykit-server.git#5ed3e8e849a16045c26c37a75068625dda333785"
+      context: "https://github.com/pubky/paykit-server.git#master"
       dockerfile: Dockerfile.local
       additional_contexts:
-        paykit-lib: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-lib"
-        paykit-sdk: "https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk"
-        locks: "https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a"
+        paykit-lib: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib"
+        paykit-sdk: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk"
+        locks: "https://github.com/pubky/locks.git#master"
 
     depends_on:
       paykit-postgres:
