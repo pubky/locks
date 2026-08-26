@@ -72,6 +72,7 @@ const requiredSnippets = [
   'createContentLock(body: any): Promise<any>;',
   'deleteGuardedResource(options: DeleteGuardedResourceOptions): Promise<void>;',
   'setLockServicePointer(options: SetLockServicePointerOptions): Promise<void>;',
+  'paykitSetupStatus(): Promise<any>;',
   'export class CreateContentLockRequestBuilder',
   'primaryResource(resource: any): CreateContentLockRequestBuilder;',
   'secondaryResource(resource: any): CreateContentLockRequestBuilder;',
@@ -94,6 +95,13 @@ for (const snippet of requiredSnippets) {
 
 const sdk = await import(pathToFileURL(jsPath));
 await sdk.default(await readFile(wasmPath));
+
+if (typeof sdk.Creator.prototype.paykitSetupStatus !== 'function') {
+  throw new Error('generated Creator missing paykitSetupStatus');
+}
+if (sdk.Creator.prototype.paykitSetupStatus.length !== 0) {
+  throw new Error('paykitSetupStatus must not accept a caller-supplied Creator');
+}
 
 const primaryResource = {
   path: '/priv/locks.app/content/primary.txt',

@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,6 +45,9 @@ use crate::config::{
     PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
     VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
+use crate::paykit_http_client::{
+    PaykitSetupStatusKind, PaykitSetupStatusProvider, PaykitSetupStatusProviderError,
+};
 
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
@@ -66,6 +69,43 @@ struct AlwaysResolvesReader;
 impl ReaderPubkyResolver for AlwaysResolvesReader {
     async fn reader_has_homeserver(&self, _reader: &CreatorPubky) -> bool {
         true
+    }
+}
+
+#[derive(Debug)]
+struct RecordingPaykitSetupStatusProvider {
+    result: Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>,
+    creators: Mutex<Vec<CreatorPubky>>,
+}
+
+impl RecordingPaykitSetupStatusProvider {
+    fn status(status: PaykitSetupStatusKind) -> Self {
+        Self {
+            result: Ok(status),
+            creators: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn failure(error: PaykitSetupStatusProviderError) -> Self {
+        Self {
+            result: Err(error),
+            creators: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn creators(&self) -> Vec<CreatorPubky> {
+        self.creators.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl PaykitSetupStatusProvider for RecordingPaykitSetupStatusProvider {
+    async fn setup_status(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
+        self.creators.lock().unwrap().push(creator.clone());
+        self.result
     }
 }
 
@@ -1430,6 +1470,186 @@ fn frontend_session_authorization_errors_do_not_expose_raw_token_values() {
 
     assert!(!body.to_string().contains("frontend-session-token"));
     assert!(!body.to_string().contains("another-token"));
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_derives_creator_and_projects_all_statuses() {
+    for (status, wire_status) in [
+        (PaykitSetupStatusKind::Ready, "ready"),
+        (PaykitSetupStatusKind::SetupRequired, "setup_required"),
+        (PaykitSetupStatusKind::Unavailable, "unavailable"),
+    ] {
+        let provider = Arc::new(RecordingPaykitSetupStatusProvider::status(status));
+        let state = test_state().with_paykit_setup_status_provider(Some(provider.clone()));
+        seed_frontend_session(&state, "frontend-session-token", creator()).await;
+
+        let response = router(state)
+            .oneshot(auth_request(
+                "GET",
+                "/creator/paykit/setup-status",
+                "Bearer frontend-session-token",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body, json!({ "status": wire_status }));
+        assert_eq!(provider.creators(), vec![creator()]);
+    }
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_uses_creator_from_the_presented_session() {
+    let provider = Arc::new(RecordingPaykitSetupStatusProvider::status(
+        PaykitSetupStatusKind::Ready,
+    ));
+    let state = test_state().with_paykit_setup_status_provider(Some(provider.clone()));
+    seed_frontend_session(&state, "other-session-token", other_creator()).await;
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/creator/paykit/setup-status",
+            "Bearer other-session-token",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(provider.creators(), vec![other_creator()]);
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures_as_unavailable() {
+    let state = test_state();
+    seed_frontend_session(&state, "frontend-session-token", creator()).await;
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/creator/paykit/setup-status",
+            "Bearer frontend-session-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({ "status": "unavailable" })
+    );
+
+    for error in [
+        PaykitSetupStatusProviderError::Timeout,
+        PaykitSetupStatusProviderError::NonSuccess,
+        PaykitSetupStatusProviderError::InvalidResponse,
+        PaykitSetupStatusProviderError::Unavailable,
+    ] {
+        let provider = Arc::new(RecordingPaykitSetupStatusProvider::failure(error));
+        let state = test_state().with_paykit_setup_status_provider(Some(provider));
+        seed_frontend_session(&state, "frontend-session-token", creator()).await;
+
+        let response = router(state)
+            .oneshot(auth_request(
+                "GET",
+                "/creator/paykit/setup-status",
+                "Bearer frontend-session-token",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "status": "unavailable" })
+        );
+    }
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_rejects_query_and_body_after_authentication() {
+    let provider = Arc::new(RecordingPaykitSetupStatusProvider::status(
+        PaykitSetupStatusKind::Ready,
+    ));
+    let state = test_state().with_paykit_setup_status_provider(Some(provider.clone()));
+    seed_frontend_session(&state, "frontend-session-token", creator()).await;
+    let app = router(state);
+
+    for request in [
+        auth_request(
+            "GET",
+            &format!("/creator/paykit/setup-status?creator={}", other_creator()),
+            "Bearer frontend-session-token",
+        ),
+        Request::builder()
+            .method("GET")
+            .uri("/creator/paykit/setup-status")
+            .header(header::AUTHORIZATION, "Bearer frontend-session-token")
+            .body(Body::from("{}"))
+            .unwrap(),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_request"
+        );
+    }
+    assert!(provider.creators().is_empty());
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_preserves_frontend_session_auth_errors() {
+    for authorization in [None, Some("Basic token"), Some("Bearer missing-token")] {
+        let request = match authorization {
+            Some(value) => auth_request("GET", "/creator/paykit/setup-status", value),
+            None => empty_request("GET", "/creator/paykit/setup-status"),
+        };
+        let response = router(test_state()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "frontend_session_unavailable"
+        );
+    }
+
+    let state = test_state();
+    seed_expired_frontend_session(&state, "expired-token", creator()).await;
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/creator/paykit/setup-status",
+            "Bearer expired-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "frontend_session_expired"
+    );
+}
+
+#[tokio::test]
+async fn paykit_setup_status_route_authenticates_before_reading_an_oversized_body() {
+    let response = router(test_state_with_runtime(
+        RuntimeEnvironment::Production,
+        false,
+    ))
+    .oneshot(
+        Request::builder()
+            .method("GET")
+            .uri("/creator/paykit/setup-status")
+            .body(Body::from(vec![0_u8; 2 * 1024 * 1024 + 1]))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "frontend_session_unavailable"
+    );
 }
 
 #[test]
@@ -3039,6 +3259,20 @@ async fn seed_frontend_session(state: &AppState, raw_token: &str, creator: Creat
             creator,
             created_at: now,
             expires_at: now + time::Duration::hours(12),
+        })
+        .await
+        .unwrap();
+}
+
+async fn seed_expired_frontend_session(state: &AppState, raw_token: &str, creator: CreatorPubky) {
+    let now = time::OffsetDateTime::now_utc();
+    state
+        .frontend_sessions()
+        .insert_frontend_session(FrontendSessionRecord {
+            token: FrontendSessionToken::new(raw_token),
+            creator,
+            created_at: now - time::Duration::hours(2),
+            expires_at: now - time::Duration::hours(1),
         })
         .await
         .unwrap();

@@ -67,7 +67,7 @@ use crate::app_state::pubky_clients::{
 };
 pub use crate::app_state::readiness::RuntimeStorageKind;
 use crate::config::LockServerRuntimeConfig;
-use crate::paykit_http_client::PaykitHttpClient;
+use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
 
 #[async_trait]
@@ -169,6 +169,7 @@ pub struct AppState {
     verification_submission_rate_limiter: Arc<InMemoryVerificationSubmissionRateLimiter>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
+    paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -502,6 +503,9 @@ impl AppState {
                 ))
             })
         });
+        let paykit_setup_status_provider = paykit_http_client
+            .as_ref()
+            .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
 
         Self {
             config,
@@ -532,6 +536,7 @@ impl AppState {
             verification_submission_rate_limiter,
             reader_pubky_resolver,
             paykit_http_client,
+            paykit_setup_status_provider,
         }
     }
 
@@ -664,6 +669,19 @@ impl AppState {
 
     pub fn paykit_http_client(&self) -> Option<&Arc<PaykitHttpClient>> {
         self.paykit_http_client.as_ref()
+    }
+
+    pub fn paykit_setup_status_provider(&self) -> Option<&Arc<dyn PaykitSetupStatusProvider>> {
+        self.paykit_setup_status_provider.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_setup_status_provider(
+        mut self,
+        provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
+    ) -> Self {
+        self.paykit_setup_status_provider = provider;
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
