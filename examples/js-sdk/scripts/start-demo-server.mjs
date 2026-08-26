@@ -103,7 +103,7 @@ async function startDemoAuth() {
     const pubky = pubkyForConfig(serviceConfig);
     const capabilities = '/pub/locks.app/:rw,/priv/locks.app/:rw';
     const authRelay = pubkyAuthRelayInboxUrl(serviceConfig.testnet.httpRelay);
-    activeDemoAuthFlow = pubky.startAuthFlow(capabilities, AuthFlowKind.signin(), authRelay);
+    activeDemoAuthFlow = pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), authRelay);
     activeDemoAuthUrl = activeDemoAuthFlow.authorizationUrl;
     activeDemoAuthStartedAt = new Date().toISOString();
     demoAuthPromise = activeDemoAuthFlow

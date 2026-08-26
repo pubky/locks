@@ -79,7 +79,7 @@ export async function signupBestEffort(signer, homeserver) {
   try {
     return await signer.signup(homeserver, null);
   } catch (error) {
-    if (isAlreadyRegisteredError(error)) return await signer.signinBlocking();
+    if (isAlreadyRegisteredError(error)) return await signer.signinCookieBlocking();
     throw error;
   }
 }
