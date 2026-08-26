@@ -37,8 +37,11 @@ CI runs five lanes in parallel:
 | `JS / WASM` | Native bindings, wasm target, generated package, demo, and example smokes |
 | `PostgreSQL` | PostgreSQL-backed service tests and runtime E2E |
 
-The required `Checks` result aggregates all five lanes. `scripts/check` remains the
-sequential local umbrella.
+The `Checks` result aggregates all five lanes. The effective `master` ruleset currently
+requires one approving review but does not enforce status checks, so a failing `Checks`
+result does not by itself block a merge. Maintainers should add `Checks` as a required
+status before treating it as a merge gate. `scripts/check` remains the sequential local
+umbrella.
 
 PostgreSQL-backed tests and `postgres_runtime` require `TEST_DATABASE_URL`; CI uses an
 ephemeral local PostgreSQL service. Do not claim the full suite passed when only a subset
