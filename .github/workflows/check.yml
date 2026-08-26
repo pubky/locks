@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.89.0
@@ -39,7 +41,53 @@ jobs:
         run: ./scripts/test-compose-bootstrap.sh
 
       - name: Whitespace check
-        run: git diff --check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          check_current_commit() {
+            local fallback_base
+            fallback_base="$(
+              git rev-parse --verify "$GITHUB_SHA^" 2>/dev/null ||
+                git hash-object -t tree /dev/null
+            )"
+            git diff --check "$fallback_base..$GITHUB_SHA"
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              git diff --check "$PR_BASE_SHA...$PR_HEAD_SHA"
+              ;;
+            push)
+              zero_sha='0000000000000000000000000000000000000000'
+              if [[ -n "$PUSH_BEFORE_SHA" && "$PUSH_BEFORE_SHA" != "$zero_sha" ]]; then
+                if ! git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+                  if ! git fetch --no-tags --depth=1 origin "$PUSH_BEFORE_SHA"; then
+                    printf 'unable to fetch push base commit: %s\n' "$PUSH_BEFORE_SHA" >&2
+                    exit 1
+                  fi
+                fi
+                if ! git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+                  printf 'unable to fetch push base commit: %s\n' "$PUSH_BEFORE_SHA" >&2
+                  exit 1
+                fi
+                git diff --check "$PUSH_BEFORE_SHA..$GITHUB_SHA"
+              else
+                check_current_commit
+              fi
+              ;;
+            workflow_dispatch)
+              check_current_commit
+              ;;
+            *)
+              printf 'unsupported workflow event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
 
   clippy:
     name: Clippy
