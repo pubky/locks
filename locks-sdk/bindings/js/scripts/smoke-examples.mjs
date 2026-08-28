@@ -121,8 +121,11 @@ const required = {
     'frame.src = connectUrl',
     'event.origin !== state.lockServerOrigin',
     'event.source !== state.lockAuthFrame?.contentWindow',
-    'expectedState: state.pendingConnectState',
-    'expectedCreatorPubky: state.creatorPubky',
+    'expectedState: expectedConnectState',
+    'expectedCreatorPubky,',
+    'const expectedIdentityGeneration = state.creatorIdentityGeneration',
+    'commitIdentityScopedCreatorSession',
+    'state.creatorIdentityGeneration += 1',
     'state.pendingConnectState = null',
     'state.lockServerOrigin = null',
     'state.lockAuthFrame = null',
@@ -159,7 +162,12 @@ const required = {
     'openPaykitSetupIframe',
     'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'acceptPaykitSetupEvent',
-    'state.paykitSetupComplete = true',
+    'decidePaykitSetupReadiness',
+    'queryPaykitSetupStatus',
+    'refreshPaykitSetupReadiness',
+    'state.paykitSetupStatusRequestId',
+    'decision.openSetup',
+    'await refreshPaykitSetupReadiness({ openSetupWhenRequired: false })',
     "el.paykitSetupStatus.className = 'ok'",
     'paykitUrl: state.config.paykit.url',
     'returnTo: window.location.origin',
@@ -168,7 +176,9 @@ const required = {
     'expectedState: state.pendingPaykitSetupState',
     'setupCreator: state.paykitSetupCreator',
     'currentCreator: state.creatorPubky',
-    "if (el.lockType.value === 'paykit-payment' && state.creatorPubky) startPaykitSetup()",
+    "if (el.lockType.value === 'paykit-payment') refreshPaykitSetupReadiness()",
+    'Paykit setup status is unavailable. Retry when Paykit is reachable.',
+    'Authenticate to the Lock Server before checking Paykit setup.',
     'el.retryPaykitSetup.hidden = false',
   ],
   index: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app.js', 'Select primary file', 'id="primary-content-file"', 'Select secondary files', 'id="secondary-content-files"', 'multiple', 'id="selected-resources"', 'id="selected-resource-list"', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
@@ -246,12 +256,14 @@ const required = {
     'session.creator.createContentLock(contentLockRequest)',
     'normalizeResources',
     'new SetLockServicePointerOptions(lockServer)',
+    'queryPaykitSetupStatus',
+    'session.creator.paykitSetupStatus()',
     'session.signout()',
     '.lockLogic(lockLogic)',
   ],
   creatorIdentity: ['enforceCreatorIdentityMatch', 'invalidateIdentityScopedCreatorState', 'session.signout()', 'does not match the demo creator'],
   creatorPolicy: ['buildCreatorLockPolicy', 'paykit-payment', 'recipient_pubky', "asset: 'BTC'"],
-  paykitSetup: ['buildPaykitSetupRequest', 'acceptPaykitSetupEvent', 'paykit-setup-callback'],
+  paykitSetup: ['buildPaykitSetupRequest', 'acceptPaykitSetupEvent', 'decidePaykitSetupReadiness', 'paykit-setup-callback'],
   readerFlow: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
     'loadContentLock',
@@ -503,7 +515,31 @@ await enforceCreatorIdentityMatch({
 });
 assert.equal(matchingSignouts, 0);
 
-const { invalidateIdentityScopedCreatorState } = await import(pathToFileURL(files.creatorIdentity).href);
+const {
+  commitIdentityScopedCreatorSession,
+  invalidateIdentityScopedCreatorState,
+} = await import(pathToFileURL(files.creatorIdentity).href);
+const staleExchangeState = {
+  creatorPubky: secondCreatorPubky,
+  creatorIdentityGeneration: 2,
+  pendingConnectState: null,
+  feLockSessionToken: null,
+  lockAuthenticated: false,
+};
+let staleExchangeRevoked;
+const staleExchange = await commitIdentityScopedCreatorSession({
+  state: staleExchangeState,
+  sessionSecret: 'stale-creator-session',
+  expectedCreatorPubky: firstCreatorPubky,
+  expectedIdentityGeneration: 1,
+  expectedConnectState: 'old-connect-state',
+  revokeSession: async (secret) => { staleExchangeRevoked = secret; },
+});
+assert.deepEqual(staleExchange, { accepted: false, revoked: true });
+assert.equal(staleExchangeRevoked, 'stale-creator-session');
+assert.equal(staleExchangeState.feLockSessionToken, null);
+assert.equal(staleExchangeState.lockAuthenticated, false);
+
 const identityScopedState = {
   feLockSessionToken: 'old-creator-session',
   lockAuthenticated: true,
@@ -615,9 +651,32 @@ assert.throws(
   /authenticated creator/,
 );
 
-const { buildPaykitSetupRequest, acceptPaykitSetupEvent } = await import(
+const { buildPaykitSetupRequest, acceptPaykitSetupEvent, decidePaykitSetupReadiness } = await import(
   pathToFileURL(files.paykitSetup).href
 );
+assert.deepEqual(decidePaykitSetupReadiness({ status: 'ready' }), {
+  setupComplete: true,
+  openSetup: false,
+  retry: false,
+});
+assert.deepEqual(decidePaykitSetupReadiness({ status: 'setup_required' }), {
+  setupComplete: false,
+  openSetup: true,
+  retry: false,
+});
+assert.deepEqual(decidePaykitSetupReadiness({ status: 'unavailable' }), {
+  setupComplete: false,
+  openSetup: false,
+  retry: true,
+});
+for (const invalid of [
+  null,
+  {},
+  { status: 'future' },
+  { status: 'ready', extra: true },
+]) {
+  assert.throws(() => decidePaykitSetupReadiness(invalid), /setup status/);
+}
 const setupRequest = buildPaykitSetupRequest({
   paykitUrl: 'http://localhost:3001',
   returnTo: 'http://localhost:8080',
@@ -757,6 +816,27 @@ if (
   throw new Error('creator identity changes must reset Paykit setup before replacing the identity');
 }
 
+const readinessStartIndex = texts.appIframe.indexOf('async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {})');
+const readinessEndIndex = texts.appIframe.indexOf('\nfunction startPaykitSetup()', readinessStartIndex);
+const readinessBody = texts.appIframe.slice(readinessStartIndex, readinessEndIndex);
+const readinessQueryIndex = readinessBody.indexOf('await queryPaykitSetupStatus({');
+const readinessDecisionIndex = readinessBody.indexOf('decidePaykitSetupReadiness(result)');
+const readinessSetupOpenIndex = readinessBody.indexOf('if (decision.openSetup && openSetupWhenRequired) startPaykitSetup();');
+if (
+  readinessStartIndex < 0
+  || readinessEndIndex < 0
+  || readinessQueryIndex < 0
+  || readinessDecisionIndex < readinessQueryIndex
+  || readinessSetupOpenIndex < readinessDecisionIndex
+) {
+  throw new Error('Paykit setup must open only after the authenticated readiness decision');
+}
+assert.equal(
+  (texts.appIframe.match(/startPaykitSetup\(\);/g) ?? []).length,
+  1,
+  'Paykit setup must have no unconditional open path',
+);
+
 const lockTypeRefreshIndex = texts.appIframe.indexOf('function refreshLockTypeFields()');
 const lockTypeRefreshEnd = texts.appIframe.indexOf('function startPaykitSetup()', lockTypeRefreshIndex);
 const lockTypeRefresh = texts.appIframe.slice(lockTypeRefreshIndex, lockTypeRefreshEnd);
@@ -765,6 +845,7 @@ for (const guard of [
   'if (!paymentSelected)',
   'if (state.paykitSetupComplete)',
   'if (!state.creatorPubky)',
+  'if (!state.feLockSessionToken)',
   'if (state.paykitSetupFrame) return',
 ]) {
   const guardIndex = lockTypeRefresh.indexOf(guard);
@@ -801,13 +882,21 @@ for (const binding of [
 
 const setupAcceptanceIndex = texts.appIframe.indexOf('const result = acceptPaykitSetupEvent({');
 const setupAcceptedGuardIndex = texts.appIframe.indexOf('if (!result) return;', setupAcceptanceIndex);
-const setupCompleteIndex = texts.appIframe.indexOf('state.paykitSetupComplete = true', setupAcceptanceIndex);
+const setupCallbackEndIndex = texts.appIframe.indexOf('// Open the Lock Server /connect page', setupAcceptanceIndex);
+const setupCallbackBody = texts.appIframe.slice(setupAcceptanceIndex, setupCallbackEndIndex);
+const setupConfirmationSequence = [
+  'state.paykitSetupComplete = false;',
+  'closePaykitSetupIframe();',
+  'await refreshPaykitSetupReadiness({ openSetupWhenRequired: false });',
+].join('\n  ');
 if (
   setupAcceptanceIndex < 0
   || setupAcceptedGuardIndex < setupAcceptanceIndex
-  || setupCompleteIndex < setupAcceptedGuardIndex
+  || setupCallbackEndIndex < setupAcceptedGuardIndex
+  || !setupCallbackBody.includes(setupConfirmationSequence)
+  || setupCallbackBody.includes('state.paykitSetupComplete = true')
 ) {
-  throw new Error('Paykit setup must mark completion only after exact callback acceptance');
+  throw new Error('Paykit callback must confirm creator-scoped readiness without optimistic completion');
 }
 
 const setupCloseIndex = texts.appIframe.indexOf('function closePaykitSetupIframe()');
@@ -862,7 +951,7 @@ if (stateGuardIndex < 0 || codeExchangeIndex < 0 || stateGuardIndex > codeExchan
 const callbackExchangeIndex = texts.appIframe.indexOf('await exchangeCreatorConnectCode({');
 const callbackExchangeEndIndex = texts.appIframe.indexOf('});', callbackExchangeIndex);
 const callbackExchangeCall = texts.appIframe.slice(callbackExchangeIndex, callbackExchangeEndIndex);
-for (const binding of ['state: receivedState', 'expectedState: state.pendingConnectState']) {
+for (const binding of ['state: receivedState', 'expectedState: expectedConnectState']) {
   if (!callbackExchangeCall.includes(binding)) {
     throw new Error(`iframe callback exchange must include ${binding}`);
   }

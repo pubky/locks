@@ -14,14 +14,51 @@ import { readReaderCreatorProfile, resolveReaderEnvironment } from './lib/paykit
 import { extractBip84AccountXpub } from './generate-paykit-account-tpub.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
+import {
+  parsePaykitMasterRevision,
+  readBoundedResponseText,
+  validatePaykitSetupStatusSources,
+} from './check-paykit-setup-contract.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
+const paykitMasterRevision = 'd948fe0c88a16016b72d6ea171867788462e34d6';
+assert.equal(
+  parsePaykitMasterRevision(`${paykitMasterRevision}\trefs/heads/master\n`),
+  paykitMasterRevision,
+);
+assert.throws(() => parsePaykitMasterRevision('not-a-revision\n'), /master revision/);
+assert.doesNotThrow(() => validatePaykitSetupStatusSources({
+  setupStatusSource: '.route("/setup/status", post(status))',
+  serverSource: '.merge(http::setup_status::setup_status_router(service))',
+}));
+assert.throws(
+  () => validatePaykitSetupStatusSources({ setupStatusSource: '', serverSource: '' }),
+  /setup-status contract/,
+);
+let oversizedSourceCancelled = false;
+const oversizedSourceResponse = new Response(new ReadableStream({
+  start(controller) {
+    controller.enqueue(new Uint8Array(128 * 1024));
+    controller.enqueue(new Uint8Array(128 * 1024));
+    controller.enqueue(new Uint8Array(1));
+  },
+  cancel() {
+    oversizedSourceCancelled = true;
+  },
+}));
+await assert.rejects(
+  readBoundedResponseText(oversizedSourceResponse),
+  /size limit/,
+);
+assert.equal(oversizedSourceCancelled, true);
 const composeSource = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
 const defaultComposeSource = await readFile(join(repoRoot, 'docker-compose.yml'), 'utf8');
 const creatorAppSource = await readFile(join(repoRoot, 'examples/js-sdk/app-iframe.js'), 'utf8');
 const creatorServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/start-demo-server.mjs'), 'utf8');
 const lockAuthoritySource = await readFile(join(repoRoot, 'locks-server/src/api/creator_authority.rs'), 'utf8');
+const paykitHttpClientSource = await readFile(join(repoRoot, 'locks-server/src/paykit_http_client.rs'), 'utf8');
+const checkWorkflowSource = await readFile(join(repoRoot, '.github/workflows/check.yml'), 'utf8');
 assert.match(composeSource, /^# Local development and demonstration only;/);
 assert.match(composeSource, /^name: pubky-locks-paykit-demo$/m);
 assert.match(creatorAppSource, /hasExactKeys\(event\.data, \['type', 'state', 'code'\]\)/);
@@ -30,6 +67,8 @@ assert.match(creatorAppSource, /\[result\.authorizationUrl, result\.command\]\.f
 assert.doesNotMatch(creatorServerSource, /JSON\.stringify\(entry\)|url\.search/);
 assert.match(creatorServerSource, /if \(!externalWallet\) \{\s+result\.command =/);
 assert.doesNotMatch(lockAuthoritySource, /dev: legacy-connect authorization URL/);
+assert.match(paykitHttpClientSource, /signed_post\("setup\/status", request\)/);
+assert.match(checkWorkflowSource, /npm --prefix examples\/js-sdk run check:paykit-setup-contract/);
 assert.match(defaultComposeSource, /^services:/);
 assert.doesNotMatch(defaultComposeSource, /^  paykit-server:/m);
 assert.match(composeSource, /PAYKIT_READER_RECEIVER_PATH: bitkit\/wallet/);
@@ -265,7 +304,10 @@ try {
 }
 
 const compose = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
+const locksServerDockerfile = await readFile(join(repoRoot, 'Dockerfile'), 'utf8');
 const jsDemoDockerfile = await readFile(join(repoRoot, 'docker/js-demo.Dockerfile'), 'utf8');
+const pubkyTestnetDockerfile = await readFile(join(repoRoot, 'docker/pubky-testnet.Dockerfile'), 'utf8');
+const publicKeyScript = await readFile(join(repoRoot, 'scripts/get_public_key.sh'), 'utf8');
 const locksEntrypoint = await readFile(join(repoRoot, 'docker/locks-server-compose-entrypoint.sh'), 'utf8');
 const resetScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/reset-paykit-demo.mjs'), 'utf8');
 const validateScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/validate-paykit-compose.mjs'), 'utf8');
@@ -298,11 +340,11 @@ for (const required of [
   'cculianu/fulcrum:v1.11.1@sha256:70f06b93ab5863997992d4b4508312fe81ce576017e16ecc7e69c7d38165bdf2',
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
-  'PUBKY_CORE_REV: 75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b',
-  'https://github.com/pubky/paykit-server.git#5ed3e8e849a16045c26c37a75068625dda333785',
-  'https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#6b241878a9bba5cecea919c0298c3f90624be6ff:paykit-sdk',
-  'https://github.com/pubky/locks.git#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a',
+  'PUBKY_CORE_REF: v0.11.0',
+  'https://github.com/pubky/paykit-server.git#master',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk',
+  'https://github.com/pubky/locks.git#master',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
@@ -370,9 +412,22 @@ assert.ok(!readerService.includes('8081'), 'reader container must use the canoni
 assert.ok(readerService.includes('restart: unless-stopped'), 'reader worker must have an explicit restart policy');
 assert.ok(!compose.includes('POSTGRES_PASSWORD: locks'), 'database credentials must not be committed inline');
 assert.ok(!compose.includes('./locks-sdk/bindings/js/pkg:/workspace/locks-sdk/bindings/js/pkg'), 'demo images must provide their own WASM package');
-for (const required of ['FROM rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS locks-sdk-wasm', 'cargo install wasm-pack --version 0.13.1 --locked', 'wasm-pack build --target web --out-dir pkg', 'COPY --from=locks-sdk-wasm']) {
+for (const required of ['FROM rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS locks-sdk-wasm', 'ENV RUSTUP_TOOLCHAIN=1.91.1', 'cargo install wasm-pack --version 0.13.1 --locked', 'wasm-pack build --target web --out-dir pkg', 'COPY --from=locks-sdk-wasm']) {
   assert.ok(jsDemoDockerfile.includes(required), `JS demo image missing ${required}`);
 }
+assert.ok(
+  locksServerDockerfile.includes('ENV RUSTUP_TOOLCHAIN=1.89.0'),
+  'Lock Server image must use the toolchain already installed in its builder image',
+);
+for (const required of [
+  'ARG PUBKY_CORE_REF=v0.11.0',
+  'git clone --branch "${PUBKY_CORE_REF}" --depth 1',
+  'cargo update -p quinn-proto --precise 0.11.15',
+]) {
+  assert.ok(pubkyTestnetDockerfile.includes(required), `Pubky testnet image missing ${required}`);
+}
+assert.ok(!pubkyTestnetDockerfile.includes('PUBKY_CORE_REV'), 'Pubky testnet must not use an opaque revision argument');
+assert.ok(publicKeyScript.includes('pubky-common = "0.11.0"'), 'public-key helper must use Pubky Common 0.11');
 assert.ok(locksEntrypoint.includes('LOCKS_PUBLIC_CONFIG'), 'Lock Server must publish an explicit public artifact');
 for (const required of ['[paykit]', 'server_url = "http://127.0.0.1:3001"', 'minimum_confirmations = 0']) {
   assert.ok(locksEntrypoint.includes(required), `Locks generated config missing ${required}`);
@@ -400,9 +455,18 @@ for (const [script, description] of [
   assert.ok(script.includes("['compose', '-f', COMPOSE_FILE"), `${description} script must pass the local demo Compose file explicitly`);
 }
 assert.equal(packageJson.scripts['validate:paykit-compose'], 'node scripts/validate-paykit-compose.mjs');
+assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.11.0');
+assert.equal(
+  packageJson.scripts['check:paykit-setup-contract'],
+  'node scripts/check-paykit-setup-contract.mjs',
+);
+assert.ok(
+  validateScript.includes("PAYKIT_SERVER_REF = 'master'"),
+  'Compose validation must enforce the Paykit Server master ref',
+);
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],
-  'npm run validate:paykit-compose && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
+  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
 );
 
 console.log('Paykit Compose smoke check passed');

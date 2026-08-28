@@ -112,6 +112,17 @@ export async function configureLockServicePointer({ lockServer, sessionSecret, p
 }
 
 /**
+ * Queries Paykit setup readiness through the current authenticated Locks session.
+ */
+export async function queryPaykitSetupStatus({ lockServer, sessionSecret, pkarrRelays = [] }) {
+  await init();
+
+  const locks = Locks.forServerWithOptions(lockServer, buildLocksOptions({ pkarrRelays }));
+  const session = locks.restoreSession(sessionSecret);
+  return session.creator.paykitSetupStatus();
+}
+
+/**
  * Restores an existing creator session secret and publishes one or more guarded
  * resources plus a content lock for the full resource set.
  *

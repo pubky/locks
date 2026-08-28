@@ -154,8 +154,9 @@ async fn publish_once(
     signed_packet: &pkarr::SignedPacket,
 ) -> Result<(), LockServerKeyRepublisherError> {
     client
-        .publish(signed_packet, None)
+        .publish(signed_packet)
         .await
+        .map(|_| ())
         .map_err(|error| LockServerKeyRepublisherError::Publish(error.to_string()))
 }
 

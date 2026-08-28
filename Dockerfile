@@ -2,6 +2,7 @@
 # Build Stage
 # ========================
 FROM rust:1.89.0-alpine3.20 AS builder
+ENV RUSTUP_TOOLCHAIN=1.89.0
 
 RUN echo "TARGETARCH: $TARGETARCH"
 

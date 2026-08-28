@@ -72,13 +72,12 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
    in `docker compose exec`; those wrappers load private role state on the host and bridge
    only the bounded native-helper request into the demo container.
 
-Its external build contexts use anonymously reachable public repositories pinned to
-immutable commits; no sibling Paykit or Pubky checkout is required. The full Paykit demo adds
-Paykit Server at <http://127.0.0.1:3001>. The reader remains at
-<http://127.0.0.1:8088/reader/> in every local flow. Pubky Testnet is built from
-`pubky/pubky-core` source at
-commit `75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b`, not from a released Pubky image or
-version. Payment remains a manual operator action.
+Its external build contexts use anonymously reachable public repositories selected by
+version tags or documented `master` branches; no sibling Paykit or Pubky checkout is required.
+Pubky Testnet is built from the `pubky/pubky-core` `v0.11.0` tag, Paykit libraries use the
+`v0.1.0-rc47` tag, and Paykit Server plus its compatible Locks context follow `master`.
+The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at
+<http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
 
 ## Documentation
 
