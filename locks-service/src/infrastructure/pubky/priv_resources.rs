@@ -147,6 +147,9 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::models::GuardedResourceRecord;
     use crate::application::ports::GuardedResourceRepository;
+    use crate::application::use_cases::register_guarded_resource::{
+        RegisterGuardedResourceRequest, RegisterGuardedResourceUseCase,
+    };
     use crate::infrastructure::pubky::storage_client::{
         PubkyBytesResource, PubkyHomeserverStorageClient,
     };
@@ -170,6 +173,79 @@ mod tests {
             ]
         );
         assert_eq!(repository.client().last_bytes(), record.bytes);
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_authoritative_content_type_after_upload() {
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec();
+        let path = "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000";
+        let client = FakeStorageClient::default().with_bytes_read(Some(PubkyBytesResource {
+            bytes: bytes.clone(),
+            content_type: Some("application/octet-stream".to_owned()),
+        }));
+        let repository = PubkyPrivResourceRepository::new(client);
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let registered = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: path.to_owned(),
+                content_type: "image/svg+xml".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registered.guarded_resource.content_type,
+            "application/octet-stream"
+        );
+        assert_eq!(registered.guarded_resource.path, path);
+        let verified = repository
+            .get_guarded_resource(
+                &registered.creator,
+                &registered.guarded_resource.path,
+                &registered.guarded_resource.hash,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verified.content_type,
+            registered.guarded_resource.content_type
+        );
+        assert_eq!(verified.size, registered.guarded_resource.size);
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!("put_bytes {} {path} image/svg+xml", creator()),
+                format!("get_bytes {} {path}", creator()),
+                format!("get_bytes {} {path}", creator()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn register_fails_when_uploaded_bytes_cannot_be_read_back() {
+        let repository = PubkyPrivResourceRepository::new(FakeStorageClient::default());
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "image/svg+xml".to_owned(),
+                bytes: br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::InvalidGuardedResource {
+                message: "stored guarded resource did not match uploaded bytes".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
