@@ -28,10 +28,10 @@ clap = { version = "4", features = ["derive"] }
 locks-core = { path = "locks-core" }
 locks-service = { path = "locks-service" }
 mime = "0.3"
-pubky = { version = "0.10.0", features = ["json"] }
-pubky-common = "0.10.0"
+pubky = { version = "0.11.0", features = ["json"] }
+pubky-common = "0.11.0"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-pkarr = "7.0.0"
+pkarr = "8.0.0"
 percent-encoding = "2"
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

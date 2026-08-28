@@ -21,7 +21,7 @@ The protocol keeps three auth relationships separate:
 3. pubky.app/browser -> Lock Server
 ```
 
-For legacy-connect, crates.io `pubky` 0.10.x returns a cookie-auth-flow `authorization_url` that is secret-bearing because it embeds Lock-Server-owned relay/client secret material needed to resume and await approval. The Lock Server must own that flow. `pubky.app` must not receive, render, log, forward, or postMessage the legacy `authorization_url`.
+For legacy-connect, crates.io `pubky` 0.11.x returns a cookie-auth-flow `authorization_url` that is secret-bearing because it embeds Lock-Server-owned relay/client secret material needed to resume and await approval. The Lock Server must own that flow. `pubky.app` must not receive, render, log, forward, or postMessage the legacy `authorization_url`.
 
 The product shell decision is therefore security-sensitive. The choices considered were:
 

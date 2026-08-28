@@ -212,7 +212,7 @@ Do not wrap these commands in `docker compose exec`. The host wrappers load priv
 state locally and bridge only bounded helper input into the relevant container.
 
 The Paykit Server and compatible Locks build contexts follow their public `master`
-branches, Paykit Rust uses the `v0.1.0-rc47` tag, and Pubky Core uses the `v0.10.0`
+branches, Paykit Rust uses the `v0.1.0-rc47` tag, and Pubky Core uses the `v0.11.0`
 tag. The active Locks checkout is used only for the Locks and browser-demo images being
 developed. No sibling repository checkout is required.
 

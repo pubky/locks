@@ -307,6 +307,7 @@ const compose = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'),
 const locksServerDockerfile = await readFile(join(repoRoot, 'Dockerfile'), 'utf8');
 const jsDemoDockerfile = await readFile(join(repoRoot, 'docker/js-demo.Dockerfile'), 'utf8');
 const pubkyTestnetDockerfile = await readFile(join(repoRoot, 'docker/pubky-testnet.Dockerfile'), 'utf8');
+const publicKeyScript = await readFile(join(repoRoot, 'scripts/get_public_key.sh'), 'utf8');
 const locksEntrypoint = await readFile(join(repoRoot, 'docker/locks-server-compose-entrypoint.sh'), 'utf8');
 const resetScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/reset-paykit-demo.mjs'), 'utf8');
 const validateScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/validate-paykit-compose.mjs'), 'utf8');
@@ -339,7 +340,7 @@ for (const required of [
   'cculianu/fulcrum:v1.11.1@sha256:70f06b93ab5863997992d4b4508312fe81ce576017e16ecc7e69c7d38165bdf2',
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
-  'PUBKY_CORE_REF: v0.10.0',
+  'PUBKY_CORE_REF: v0.11.0',
   'https://github.com/pubky/paykit-server.git#master',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk',
@@ -419,13 +420,14 @@ assert.ok(
   'Lock Server image must use the toolchain already installed in its builder image',
 );
 for (const required of [
-  'ARG PUBKY_CORE_REF=v0.10.0',
+  'ARG PUBKY_CORE_REF=v0.11.0',
   'git clone --branch "${PUBKY_CORE_REF}" --depth 1',
   'cargo update -p quinn-proto --precise 0.11.15',
 ]) {
   assert.ok(pubkyTestnetDockerfile.includes(required), `Pubky testnet image missing ${required}`);
 }
 assert.ok(!pubkyTestnetDockerfile.includes('PUBKY_CORE_REV'), 'Pubky testnet must not use an opaque revision argument');
+assert.ok(publicKeyScript.includes('pubky-common = "0.11.0"'), 'public-key helper must use Pubky Common 0.11');
 assert.ok(locksEntrypoint.includes('LOCKS_PUBLIC_CONFIG'), 'Lock Server must publish an explicit public artifact');
 for (const required of ['[paykit]', 'server_url = "http://127.0.0.1:3001"', 'minimum_confirmations = 0']) {
   assert.ok(locksEntrypoint.includes(required), `Locks generated config missing ${required}`);
@@ -453,6 +455,7 @@ for (const [script, description] of [
   assert.ok(script.includes("['compose', '-f', COMPOSE_FILE"), `${description} script must pass the local demo Compose file explicitly`);
 }
 assert.equal(packageJson.scripts['validate:paykit-compose'], 'node scripts/validate-paykit-compose.mjs');
+assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.11.0');
 assert.equal(
   packageJson.scripts['check:paykit-setup-contract'],
   'node scripts/check-paykit-setup-contract.mjs',
