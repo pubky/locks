@@ -48,7 +48,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 
 | Route | Success | Auth / mount | Secret handoff | Representative errors |
 | --- | --- | --- | --- | --- |
-| `PUT /creator/priv-resources/content/<path>` | `200` JSON guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; MIME from `Content-Type`. | No bearer secrets or raw bytes in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
+| `PUT /creator/priv-resources/content/<path>` | `200` JSON storage-authoritative guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; declared `Content-Type` is validated. | No bearer secrets or raw bytes in response. The returned MIME comes from storage readback and may differ from the request header. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
 | `DELETE /creator/priv-resources/content/<path>` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets or raw bytes in response. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `503 creator_authority_unavailable` |
 | `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `404 guarded_resource_not_found`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
 | `POST /creator/lock-service-config` | `200` JSON lock-service pointer | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
@@ -315,7 +315,7 @@ Content-Type: text/plain
 guarded bytes
 ```
 
-The request body is raw resource bytes, not JSON. `Content-Type` is required and becomes the guarded resource MIME type returned during proxy-read.
+The request body is raw resource bytes, not JSON. `Content-Type` is required and validated before upload, but Pubky homeserver storage determines the MIME type recorded for the resource. After writing, the Lock Server reads the exact bytes back and returns a descriptor containing that storage-authoritative `content_type`. It may differ from the request header—for example, an extensionless SVG may be returned as `application/octet-stream`, and WAV may be returned as `audio/x-wav`.
 
 Path rules:
 
@@ -343,7 +343,7 @@ Upload size is limited by `[content_locks].max_resource_bytes` and defaults to 1
 }
 ```
 
-The response is descriptor-only. It does not return raw bytes.
+The response is descriptor-only. It does not return raw bytes. Clients must use the returned descriptor unchanged when creating a content lock; they do not need to predict or normalize the homeserver's MIME type.
 
 #### Error cases
 
@@ -352,6 +352,7 @@ The response is descriptor-only. It does not return raw bytes.
 - Invalid relative path: `400 invalid_request`.
 - Empty body: `400 invalid_request`.
 - Body exceeds configured upload limit: `413 payload_too_large`.
+- Stored bytes cannot be read back with the uploaded hash: `400 invalid_request`.
 - Missing/revoked creator-granted homeserver authority: `503 creator_authority_unavailable`.
 - Old `POST /creator/priv-resources` JSON/base64 route: `404 Not Found`.
 

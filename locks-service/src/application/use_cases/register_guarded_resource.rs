@@ -70,6 +70,23 @@ impl<'a> RegisterGuardedResourceUseCase<'a> {
             })
             .await?;
 
+        let stored = self
+            .guarded_resources
+            .get_guarded_resource(
+                &request.creator,
+                &guarded_resource.path,
+                &guarded_resource.hash,
+            )
+            .await?
+            .ok_or_else(|| ApplicationError::InvalidGuardedResource {
+                message: "stored guarded resource did not match uploaded bytes".to_owned(),
+            })?;
+        let guarded_resource =
+            GuardedResource::new(stored.path, stored.hash, stored.content_type, stored.size)
+                .map_err(|error| ApplicationError::InvalidGuardedResource {
+                    message: error.to_string(),
+                })?;
+
         Ok(RegisteredGuardedResource {
             creator: request.creator,
             guarded_resource,
