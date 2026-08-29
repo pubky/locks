@@ -15,7 +15,7 @@ Creator publishing is authenticated. The removed unauthenticated local/dev creat
 
 ## Paykit Compose local demonstration
 
-The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet v0.11, Locks, Paykit Server, and the creator and reader browser demos. External source builds use anonymous public Git contexts, so no sibling repository checkout is required. Paykit Server and its compatible Locks build context intentionally follow their `master` branches; `npm --prefix examples/js-sdk run check:paykit-setup-contract` resolves the current Paykit Server master SHA and verifies that it still mounts `POST /setup/status`. Paykit library contexts use the versioned `v0.1.0-rc47` tag.
+The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet v0.11, Locks, Paykit Server, and the creator and reader browser demos. External source builds use anonymous public Git contexts, so no sibling repository checkout is required. Paykit Server and its compatible Locks build context intentionally follow their `master` branches; `npm --prefix examples/js-sdk run check:paykit-setup-contract` resolves the current Paykit Server master SHA and verifies that it still mounts `POST /setup/status`. Paykit library contexts use the versioned `v0.1.0-rc48` tag.
 
 The startup dependency flow is:
 

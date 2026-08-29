@@ -7,7 +7,7 @@ import { repoRoot } from './lib/paths.mjs';
 const MAX_MODEL_BYTES = 2 * 1024 * 1024;
 const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
 const PAYKIT_SERVER_REF = 'master';
-const PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
+const DEFAULT_PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
 const REQUIRED_SERVICES = [
   'postgres',
   'paykit-postgres',
@@ -25,14 +25,17 @@ const REQUIRED_SERVICES = [
   'reader-demo',
 ];
 
-export function validateSafeComposeModel(model) {
+export function validateSafeComposeModel(
+  model,
+  expectedPaykitServerContext = expectedPaykitServerContextFromEnvironment(),
+) {
   if (!model || typeof model !== 'object' || Array.isArray(model) || !model.services) {
     throw new Error('Compose returned an invalid model');
   }
   for (const service of REQUIRED_SERVICES) {
     if (!model.services[service]) throw new Error(`Compose model is missing service ${service}`);
   }
-  if (model.services['paykit-server'].build?.context !== PAYKIT_SERVER_CONTEXT) {
+  if (model.services['paykit-server'].build?.context !== expectedPaykitServerContext) {
     throw new Error('paykit-server build context does not provide the setup-status contract');
   }
   for (const [name, service] of Object.entries(model.services)) {
@@ -99,6 +102,15 @@ export function validateSafeComposeModel(model) {
   return model;
 }
 
+function expectedPaykitServerContextFromEnvironment(env = process.env) {
+  const configured = env.PAYKIT_SERVER_CONTEXT?.trim();
+  if (!configured) return DEFAULT_PAYKIT_SERVER_CONTEXT;
+  if (!configured.startsWith('/') || configured.includes('\0') || configured.includes('\n')) {
+    throw new Error('PAYKIT_SERVER_CONTEXT must be an absolute local worktree path');
+  }
+  return configured;
+}
+
 export function validatePaykitCompose({ run = runCompose } = {}) {
   const quiet = run(['compose', '-f', COMPOSE_FILE, 'config', '--quiet'], { capture: false });
   if (quiet.error || quiet.status !== 0 || quiet.signal) {
@@ -130,6 +142,7 @@ function runCompose(args, { capture }) {
     DOCKER_HOST: process.env.DOCKER_HOST,
     DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
     DOCKER_CONFIG: process.env.DOCKER_CONFIG,
+    PAYKIT_SERVER_CONTEXT: process.env.PAYKIT_SERVER_CONTEXT,
   }).filter(([, value]) => typeof value === 'string'));
   return spawnSync('docker', args, {
     cwd: repoRoot,

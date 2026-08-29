@@ -195,7 +195,8 @@ const required = {
     'loadRoleSecret',
     'content-creator',
     'version: 1',
-    'auth_url',
+    'companion_handle',
+    'PAYKIT_SERVER_URL',
     'creator_secret',
     'creatorSecret.buffer',
     'account_xpub',
@@ -209,7 +210,7 @@ const required = {
   composeCompanionHelper: [
     'compose.paykit-local-demo.yaml',
     'PAYKIT_EXTERNAL_READER_PUBKY',
-    'exec -T creator-demo',
+    'exec -T -e PAYKIT_SERVER_URL="$PAYKIT_SERVER_URL" creator-demo',
     '/usr/local/bin/paykit-companion-auth',
   ],
   preparePaykitReader: ['runReaderOperation', "operation: 'prepare'", 'content-viewer', 'writePreparedReaderStatus', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
@@ -235,7 +236,7 @@ const required = {
   startServer: ['createServer', '--allow-unhealthy', 'pubkyAuthRelayInboxUrl', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
   startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8088', 'never proxy'],
   pathsLib: ['localPath', 'roleDir', 'demoConfigPath', 'contentCreatorSessionPath', 'paykitReaderPreparedPath', 'paykitReaderOwnershipPath', 'prepared.v1.json', 'owner.lock'],
-  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
+  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'parseLockServerTomlPaykitServerUrl', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
   pubkyLib: ["from '@synonymdev/pubky'", 'Pubky.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
   creator: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
@@ -1191,7 +1192,7 @@ for (const loadIdentity of [loadRoleKeypair, loadRoleSecret]) {
   );
 }
 
-const authUrl = 'pubkyauth://signin?secret=test-auth-secret';
+const companionHandle = Buffer.alloc(32, 5).toString('base64url');
 const accountXpub = 'tpub-test-account-xpub';
 assert.equal(resolveCompanionHelperPath({
   env: {},
@@ -1209,18 +1210,19 @@ assert.equal(resolveCompanionHelperPath({
   env: { PAYKIT_COMPANION_AUTH_BIN: '/override/helper' },
   nativeHelperAvailable: () => false,
 }), '/override/helper');
-const parsedLines = parsePaykitInputLines(`${authUrl}\n${accountXpub}\n7\n`);
-assert.deepEqual(parsedLines, { authUrl, accountXpub, accountIndex: 7 });
+const parsedLines = parsePaykitInputLines(`${companionHandle}\n${accountXpub}\n7\n`);
+assert.deepEqual(parsedLines, { companionHandle, accountXpub, accountIndex: 7 });
 for (const invalid of [
-  `${authUrl}\n${accountXpub}`,
-  `${authUrl}\n${accountXpub}\n7\nextra`,
-  `${authUrl}\n\n7`,
+  `pubkyauth://signin?secret=test-auth-secret\n${accountXpub}\n7`,
+  `${companionHandle}\n${accountXpub}`,
+  `${companionHandle}\n${accountXpub}\n7\nextra`,
+  `${companionHandle}\n\n7`,
 ]) {
   assert.throws(() => parsePaykitInputLines(invalid), /three ordered lines/);
 }
 
 const prompts = [];
-const answers = [authUrl, accountXpub, '7'];
+const answers = [companionHandle, accountXpub, '7'];
 assert.deepEqual(
   await collectPaykitInputs({
     isTTY: true,
@@ -1232,7 +1234,7 @@ assert.deepEqual(
   parsedLines,
 );
 const promptText = prompts.join('\n');
-for (const sensitive of [authUrl, accountXpub, 'test-auth-secret']) {
+for (const sensitive of [companionHandle, accountXpub]) {
   assert.equal(promptText.includes(sensitive), false);
 }
 
@@ -1244,8 +1246,9 @@ recoveryKeypair.free();
 assert.deepEqual(secretFromRecoveryFile(recoveryFile, recoveryPassphrase), expectedSecret);
 
 const helperInput = buildCompanionHelperInput({ ...parsedLines, creatorSecret: expectedSecret });
+const trustedPaykitServerUrl = 'http://127.0.0.1:3001';
 assert.deepEqual(Object.keys(helperInput), [
-  'version', 'auth_url', 'creator_secret', 'account_xpub', 'account_index',
+  'version', 'companion_handle', 'creator_secret', 'account_xpub', 'account_index',
 ]);
 assert.equal(helperInput.version, 1);
 assert.equal(Buffer.from(helperInput.creator_secret, 'base64url').length, 32);
@@ -1418,11 +1421,11 @@ process.exit(1);
   }), { status: 'failed', error: 'invalid_state' });
 
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: 'invalid\0helper', input: helperInput }),
+    await runCompanionHelper({ helperPath: 'invalid\0helper', input: helperInput, paykitServerUrl: trustedPaykitServerUrl }),
     { status: 'failed' },
   );
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: join(helperDir, 'missing-helper'), input: helperInput }),
+    await runCompanionHelper({ helperPath: join(helperDir, 'missing-helper'), input: helperInput, paykitServerUrl: trustedPaykitServerUrl }),
     { status: 'failed' },
   );
 
@@ -1449,6 +1452,7 @@ process.exit(1);
     await runCompanionHelper({
       helperPath: 'injected-helper',
       input: helperInput,
+      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 10,
       killGraceMs: 10,
       spawnProcess: () => new ErrorDuringTerminationChild(),
@@ -1462,15 +1466,20 @@ process.exit(1);
 let body = '';
 for await (const chunk of process.stdin) body += chunk;
 const value = JSON.parse(body);
-const keys = ['version','auth_url','creator_secret','account_xpub','account_index'];
+const keys = ['version','companion_handle','creator_secret','account_xpub','account_index'];
 if (process.argv.length !== 2 || JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)) process.exit(21);
-if (value.version !== 1 || value.auth_url !== ${JSON.stringify(authUrl)} || value.account_xpub !== ${JSON.stringify(accountXpub)} || value.account_index !== 7) process.exit(22);
+if (value.version !== 1 || value.companion_handle !== ${JSON.stringify(companionHandle)} || value.account_xpub !== ${JSON.stringify(accountXpub)} || value.account_index !== 7) process.exit(22);
 if (Buffer.from(value.creator_secret, 'base64url').length !== 32) process.exit(23);
+if (process.env.PAYKIT_SERVER_URL !== 'http://127.0.0.1:3001') process.exit(24);
 process.stdout.write('{"version":1,"status":"approved"}\\n');
 `);
   chmodSync(approvedHelper, 0o700);
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: approvedHelper, input: helperInput }),
+    await runCompanionHelper({
+      helperPath: approvedHelper,
+      input: helperInput,
+      paykitServerUrl: trustedPaykitServerUrl,
+    }),
     { status: 'approved' },
   );
 
@@ -1479,13 +1488,13 @@ process.stdout.write('{"version":1,"status":"approved"}\\n');
 let body = '';
 for await (const chunk of process.stdin) body += chunk;
 const value = JSON.parse(body);
-process.stderr.write(value.auth_url + value.account_xpub + value.creator_secret);
+process.stderr.write(value.companion_handle + value.account_xpub + value.creator_secret);
 process.exit(1);
 `);
   chmodSync(failedHelper, 0o700);
-  const failed = await runCompanionHelper({ helperPath: failedHelper, input: helperInput });
+  const failed = await runCompanionHelper({ helperPath: failedHelper, input: helperInput, paykitServerUrl: trustedPaykitServerUrl });
   assert.deepEqual(failed, { status: 'failed' });
-  for (const sensitive of [authUrl, accountXpub, helperInput.creator_secret]) {
+  for (const sensitive of [companionHandle, accountXpub, helperInput.creator_secret]) {
     assert.equal(JSON.stringify(failed).includes(sensitive), false);
   }
 
@@ -1499,6 +1508,7 @@ setInterval(() => {}, 1000);
     await runCompanionHelper({
       helperPath: hangingHelper,
       input: helperInput,
+      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 25,
       killGraceMs: 25,
     }),
@@ -1516,6 +1526,7 @@ setInterval(() => {}, 1000);
     await runCompanionHelper({
       helperPath: floodingHelper,
       input: helperInput,
+      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 1000,
       killGraceMs: 25,
     }),
@@ -1525,14 +1536,48 @@ setInterval(() => {}, 1000);
   rmSync(helperDir, { recursive: true, force: true });
 }
 
-const { parseLockServerTomlPublicKey } = await import(pathToFileURL(files.configLib).href);
+const {
+  buildDefaultDemoConfig,
+  parseLockServerTomlPublicKey,
+  parseLockServerTomlPaykitServerUrl,
+} = await import(pathToFileURL(files.configLib).href);
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 assert.equal(
   parseLockServerTomlPublicKey(`
 [credentials]
 lock_server_public_key = "${lockServerPubky}" # Public Pubky derived from lock_server_secret_key.
+paykit_server_url = "http://127.0.0.1:3001"
 `),
   lockServerPubky,
 );
+assert.equal(
+  parseLockServerTomlPaykitServerUrl('paykit_server_url = "http://127.0.0.1:3001"\n'),
+  'http://127.0.0.1:3001',
+);
+assert.equal(
+  parseLockServerTomlPaykitServerUrl('[paykit]\nserver_url = "https://paykit.internal.example:3443"\nminimum_confirmations = 0\n\n[worker]\nenabled = true\n'),
+  'https://paykit.internal.example:3443',
+);
+for (const invalid of [
+  '',
+  'paykit_server_url = "http://user:pass@127.0.0.1:3001"\n',
+  'paykit_server_url = "http://127.0.0.1:3001/path"\n',
+  'paykit_server_url = "http://127.0.0.1:3001?query=1"\n',
+]) {
+  assert.throws(() => parseLockServerTomlPaykitServerUrl(invalid));
+}
+const fullLockConfigDir = mkdtempSync(join(tmpdir(), 'locks-full-config-'));
+try {
+  const fullLockConfigPath = join(fullLockConfigDir, 'config.toml');
+  writeFileSync(
+    fullLockConfigPath,
+    `lock_server_public_key = "${lockServerPubky}"\n\n[paykit]\n# operator-selected confirmation policy\nminimum_confirmations = 0\n\nserver_url = "https://paykit.internal.example:3443"\n\n[worker]\nenabled = true\n`,
+  );
+  const directConfig = await buildDefaultDemoConfig(fullLockConfigPath);
+  assert.equal(directConfig.lockServer.pubky, lockServerPubky);
+  assert.equal(directConfig.paykit.url, 'https://paykit.internal.example:3443');
+} finally {
+  rmSync(fullLockConfigDir, { recursive: true, force: true });
+}
 
 console.log('JS SDK examples smoke check passed');

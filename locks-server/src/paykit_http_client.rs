@@ -22,8 +22,8 @@ const SIGNATURE_HEADER: &str = "X-Paykit-Signature";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaykitClientError {
-    #[error("paykit.server_url must be a valid http(s) URL: {0}")]
-    InvalidServerUrl(String),
+    #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
+    InvalidServerUrl,
     #[error("failed to read lock server signing seed: {0}")]
     SigningSeedRead(std::io::Error),
     #[error("lock_server_secret_key must contain keypair-seed:<base64url-no-pad-32-byte-seed>")]
@@ -314,12 +314,19 @@ fn sign_body(keypair: &Keypair, body: &[u8]) -> String {
 }
 
 fn parse_server_url(value: &str) -> Result<Url, PaykitClientError> {
-    let parsed =
-        Url::parse(value).map_err(|_| PaykitClientError::InvalidServerUrl(value.into()))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(parsed),
-        _ => Err(PaykitClientError::InvalidServerUrl(value.into())),
+    let parsed = Url::parse(value).map_err(|_| PaykitClientError::InvalidServerUrl)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.cannot_be_a_base()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.origin().ascii_serialization() != value
+    {
+        return Err(PaykitClientError::InvalidServerUrl);
     }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -392,26 +399,24 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_preserve_server_url_path_prefix_with_or_without_trailing_slash() {
+    fn server_url_rejects_non_origin_values_without_echoing_them() {
         for server_url in [
+            "ftp://paykit.example",
+            "https://user:password@paykit.example",
             "https://paykit.example/services/paykit",
             "https://paykit.example/services/paykit/",
+            "https://paykit.example/",
+            "https://paykit.example?secret=query",
+            "https://paykit.example#fragment",
         ] {
-            let client = PaykitHttpClient::from_parts(
+            let error = PaykitHttpClient::from_parts(
                 server_url,
                 reqwest::Client::new(),
                 Keypair::from_secret(&[9_u8; 32]),
             )
-            .unwrap();
-
-            assert_eq!(
-                client.endpoint("invoices").as_str(),
-                "https://paykit.example/services/paykit/invoices"
-            );
-            assert_eq!(
-                client.endpoint("transactions/status").as_str(),
-                "https://paykit.example/services/paykit/transactions/status"
-            );
+            .unwrap_err();
+            assert!(matches!(error, PaykitClientError::InvalidServerUrl));
+            assert!(!error.to_string().contains(server_url));
         }
     }
 
@@ -709,25 +714,17 @@ mod setup_status_tests {
     }
 
     #[test]
-    fn setup_status_endpoint_preserves_server_url_prefix() {
-        for server_url in [
+    fn setup_status_endpoint_appends_to_exact_server_origin() {
+        let client = PaykitHttpClient::from_parts(
             "https://paykit.example",
-            "https://paykit.example/services/paykit",
-            "https://paykit.example/services/paykit/",
-        ] {
-            let client = PaykitHttpClient::from_parts(
-                server_url,
-                reqwest::Client::new(),
-                Keypair::from_secret(&[9_u8; 32]),
-            )
-            .unwrap();
-            let expected = if server_url.contains("services/paykit") {
-                "https://paykit.example/services/paykit/setup/status"
-            } else {
-                "https://paykit.example/setup/status"
-            };
-            assert_eq!(client.endpoint("setup/status").as_str(), expected);
-        }
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            client.endpoint("setup/status").as_str(),
+            "https://paykit.example/setup/status"
+        );
     }
 
     #[tokio::test]

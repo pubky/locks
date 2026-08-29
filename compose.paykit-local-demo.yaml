@@ -281,11 +281,11 @@ services:
   paykit-server:
     image: pubky-locks-paykit-server:local
     build:
-      context: "https://github.com/pubky/paykit-server.git#master"
+      context: "${PAYKIT_SERVER_CONTEXT:-https://github.com/pubky/paykit-server.git#master}"
       dockerfile: Dockerfile.local
       additional_contexts:
-        paykit-lib: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib"
-        paykit-sdk: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk"
+        paykit-lib: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib"
+        paykit-sdk: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk"
         locks: "https://github.com/pubky/locks.git#master"
 
     depends_on:

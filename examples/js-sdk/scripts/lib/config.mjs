@@ -45,6 +45,31 @@ export function parseLockServerTomlPublicKey(tomlText) {
   return publicKey.startsWith('pubky') ? publicKey : `pubky${publicKey}`;
 }
 
+export function parseLockServerTomlPaykitServerUrl(tomlText) {
+  const publicMatch = tomlText.match(/^[ \t]*paykit_server_url[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#[^\r\n]*)?$/m);
+  const lines = tomlText.split(/\r?\n/);
+  const paykitStart = lines.findIndex((line) => /^[ \t]*\[paykit\][ \t]*(?:#.*)?$/.test(line));
+  const remainingLines = paykitStart < 0 ? [] : lines.slice(paykitStart + 1);
+  const nextSection = remainingLines.findIndex((line) => /^[ \t]*\[/.test(line));
+  const paykitSection = remainingLines
+    .slice(0, nextSection < 0 ? remainingLines.length : nextSection)
+    .join('\n');
+  const sectionMatch = paykitSection.match(/^[ \t]*server_url[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#[^\r\n]*)?$/m);
+  const match = publicMatch ?? sectionMatch;
+  if (!match) throw new Error('missing paykit_server_url in Lock Server public config');
+  const value = match[1].trim();
+  const url = new URL(value);
+  if (
+    !['http:', 'https:'].includes(url.protocol)
+    || url.username
+    || url.password
+    || value !== url.origin
+  ) {
+    throw new Error('invalid paykit_server_url in Lock Server public config');
+  }
+  return value;
+}
+
 export async function readLockServerPublicKey(configPath = defaultLockServerConfigPath) {
   const expanded = expandHome(configPath);
   if (!existsSync(expanded)) {
@@ -140,7 +165,9 @@ export function withInternalServiceUrls(config, env = process.env) {
 export async function buildDefaultDemoConfig(lockServerConfigPath = defaultLockServerConfigPath) {
   const config = structuredClone(defaultDemoConfig);
   config.lockServer.configPath = lockServerConfigPath;
-  config.lockServer.pubky = await readLockServerPublicKey(lockServerConfigPath);
+  const publicConfig = await readFile(expandHome(lockServerConfigPath), 'utf8');
+  config.lockServer.pubky = parseLockServerTomlPublicKey(publicConfig);
+  config.paykit.url = parseLockServerTomlPaykitServerUrl(publicConfig);
   return validateDemoConfig(config);
 }
 
@@ -158,6 +185,7 @@ trusted_public_key = "${lockServerPubky}"
 allowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
 
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 network = "testnet"
