@@ -15,19 +15,19 @@ import { extractBip84AccountXpub } from './generate-paykit-account-tpub.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
 import {
-  parsePaykitMasterRevision,
+  parsePaykitReleaseRevision,
   readBoundedResponseText,
   validatePaykitSetupStatusSources,
 } from './check-paykit-setup-contract.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-const paykitMasterRevision = 'd948fe0c88a16016b72d6ea171867788462e34d6';
+const paykitReleaseRevision = '31c77c99bf73fe6e377c842b582632a832950022';
 assert.equal(
-  parsePaykitMasterRevision(`${paykitMasterRevision}\trefs/heads/master\n`),
-  paykitMasterRevision,
+  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc2\n`),
+  paykitReleaseRevision,
 );
-assert.throws(() => parsePaykitMasterRevision('not-a-revision\n'), /master revision/);
+assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
   serverSource: '.merge(http::setup_status::setup_status_router(service))',
@@ -345,10 +345,10 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_CORE_REF: v0.11.0',
-  'https://github.com/pubky/paykit-server.git#master',
+  'https://github.com/pubky/paykit-server.git#v0.1.0-rc2',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
-  'https://github.com/pubky/locks.git#master',
+  'https://github.com/pubky/locks.git#v0.1.0-rc1',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
@@ -472,8 +472,12 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_SERVER_REF = 'master'"),
-  'Compose validation must enforce the Paykit Server master ref',
+  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc2'"),
+  'Compose validation must enforce the Paykit Server release ref',
+);
+assert.ok(
+  validateScript.includes("PAYKIT_LOCKS_REF = 'v0.1.0-rc1'"),
+  'Compose validation must enforce the Paykit Locks release ref',
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],

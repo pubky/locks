@@ -6,8 +6,10 @@ import { repoRoot } from './lib/paths.mjs';
 
 const MAX_MODEL_BYTES = 2 * 1024 * 1024;
 const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
-const PAYKIT_SERVER_REF = 'master';
+const PAYKIT_SERVER_REF = 'v0.1.0-rc2';
+const PAYKIT_LOCKS_REF = 'v0.1.0-rc1';
 const DEFAULT_PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
+const DEFAULT_PAYKIT_LOCKS_CONTEXT = `https://github.com/pubky/locks.git#${PAYKIT_LOCKS_REF}`;
 const REQUIRED_SERVICES = [
   'postgres',
   'paykit-postgres',
@@ -37,6 +39,12 @@ export function validateSafeComposeModel(
   }
   if (model.services['paykit-server'].build?.context !== expectedPaykitServerContext) {
     throw new Error('paykit-server build context does not provide the setup-status contract');
+  }
+  if (
+    model.services['paykit-server'].build?.additional_contexts?.locks
+    !== DEFAULT_PAYKIT_LOCKS_CONTEXT
+  ) {
+    throw new Error('paykit-server Locks build context is not release-pinned');
   }
   for (const [name, service] of Object.entries(model.services)) {
     if (typeof service.image === 'string' && !service.build && !service.image.includes('@sha256:')) {

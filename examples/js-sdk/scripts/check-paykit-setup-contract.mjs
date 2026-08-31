@@ -3,14 +3,15 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const PAYKIT_SERVER_REMOTE = 'https://github.com/pubky/paykit-server.git';
-const MASTER_REF = 'refs/heads/master';
+const PAYKIT_SERVER_REF = 'v0.1.0-rc2';
+const RELEASE_REF = `refs/tags/${PAYKIT_SERVER_REF}`;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024;
 const MAX_SOURCE_BYTES = 256 * 1024;
 const TIMEOUT_MS = 30_000;
 
-export function parsePaykitMasterRevision(output) {
-  const match = /^([0-9a-f]{40})\trefs\/heads\/master\n?$/u.exec(output);
-  if (!match) throw new Error('Paykit Server returned an invalid master revision');
+export function parsePaykitReleaseRevision(output) {
+  const match = /^([0-9a-f]{40})\trefs\/tags\/v0\.1\.0-rc2\n?$/u.exec(output);
+  if (!match) throw new Error('Paykit Server returned an invalid release revision');
   return match[1];
 }
 
@@ -19,7 +20,7 @@ export function validatePaykitSetupStatusSources({ setupStatusSource, serverSour
     !setupStatusSource.includes('.route("/setup/status", post(status))')
     || !serverSource.includes('.merge(http::setup_status::setup_status_router(')
   ) {
-    throw new Error('Paykit Server master does not provide the setup-status contract');
+    throw new Error('Paykit Server release does not provide the setup-status contract');
   }
 }
 
@@ -30,12 +31,12 @@ export async function checkPaykitSetupContract({
   const revisionResult = run([
     'ls-remote',
     PAYKIT_SERVER_REMOTE,
-    MASTER_REF,
+    RELEASE_REF,
   ]);
   if (revisionResult.error || revisionResult.status !== 0 || revisionResult.signal) {
-    throw new Error('Could not resolve Paykit Server master');
+    throw new Error('Could not resolve Paykit Server release');
   }
-  const revision = parsePaykitMasterRevision(revisionResult.stdout ?? '');
+  const revision = parsePaykitReleaseRevision(revisionResult.stdout ?? '');
   const sourceBase = `https://raw.githubusercontent.com/pubky/paykit-server/${revision}`;
   const [setupStatusSource, serverSource] = await Promise.all([
     fetchSource(`${sourceBase}/paykit-server/src/http/setup_status.rs`),
