@@ -56,19 +56,22 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server plus its compatible Locks context follow the current public `master` branches until the post-release pin task',
-    'The local worktree override remains available',
+    'Paykit Server uses `v0.1.0-rc2`',
+    "Paykit's compatible Locks context uses `v0.1.0-rc1`",
+    'The local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server and its compatible Locks build context intentionally follow their current public `master` branches until the post-release pin task',
+    'Paykit Server is pinned to `v0.1.0-rc2`',
+    'compatible Locks build context is pinned to `v0.1.0-rc1`',
     'The local worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    '`master` branches until the post-release pin task',
+    'immutable `v0.1.0-rc2` tag',
+    'Locks context uses `v0.1.0-rc1`',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
