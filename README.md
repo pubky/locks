@@ -67,17 +67,9 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
 
 2. Open the content-creator demo at <http://127.0.0.1:8080/examples/js-sdk/>.
 
-3. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...`
-   commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit`
-   in `docker compose exec`; those wrappers load private role state on the host and bridge
-   only the bounded native-helper request into the demo container.
+3. In production, use the production Bitkit QR/deep-link path presented by Paykit. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...` commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit` in `docker compose exec`; those wrappers load private role state on the host and bridge only the bounded native-helper request into the demo container. The helper is supplied only by the Paykit local-demo image/runtime stage, not the normal production package/runtime. Follow the manual bearer-URL log retrieval and retention guidance in the example README.
 
-Its external build contexts use anonymously reachable public repositories selected by
-version tags or documented `master` branches; no sibling Paykit or Pubky checkout is required.
-Pubky Testnet is built from the `pubky/pubky-core` `v0.11.0` tag, Paykit libraries use the
-`v0.1.0-rc47` tag, and Paykit Server plus its compatible Locks context follow `master`.
-The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at
-<http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
+Its external build contexts use anonymously reachable public repositories selected by version tags or documented moving branches; no sibling Paykit or Pubky checkout is required. Pubky Testnet is built from the `pubky/pubky-core` `v0.11.0` tag, Paykit libraries use the `v0.1.0-rc48` tag, and Paykit Server plus its compatible Locks context follow the current public `master` branches until the post-release pin task. The local worktree override remains available through `PAYKIT_SERVER_CONTEXT`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
 
 ## Documentation
 

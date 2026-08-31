@@ -211,10 +211,21 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server and compatible Locks build contexts follow their public `master`
-branches, Paykit Rust uses the `v0.1.0-rc47` tag, and Pubky Core uses the `v0.11.0`
-tag. The active Locks checkout is used only for the Locks and browser-demo images being
-developed. No sibling repository checkout is required.
+The Paykit Server and compatible Locks build contexts follow their current public
+`master` branches until the post-release pin task. Paykit Rust uses the
+`v0.1.0-rc48` tag, and Pubky Core uses the `v0.11.0` tag. The active Locks checkout
+is used only for the Locks and browser-demo images being developed. No sibling
+repository checkout is required.
+
+For coordinated pre-merge Paykit Server work, select an explicit absolute local worktree
+without changing the committed public default:
+
+```bash
+PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
+  docker compose --file compose.paykit-local-demo.yaml up -d --build
+```
+
+Compose validation requires the rendered context to match that environment value exactly.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
@@ -374,19 +385,49 @@ Rules:
 - the parent accepts completion only from that exact iframe window and origin with the pending state
 - the success callback is only `{ type: "paykit-setup-callback", state }`; failures add only `error: "setup-failed"`, and account data stays inside Paykit
 
-The Paykit iframe displays the auth URL and both approved local commands. First create or load the dedicated Bitcoin Core descriptor wallet and print its external BIP84 account `tpub` and account index:
+The Paykit iframe is owned by Paykit and displays only the production Bitkit QR/deep-link path; it contains no local-helper instructions. In production, scan that QR with Bitkit. There is no production handle/helper surface.
+
+For the local Compose fallback, first create or load the dedicated Bitcoin Core descriptor wallet and print its external BIP84 account `tpub` and account index:
 
 ```bash
 npm --prefix examples/js-sdk run generate-paykit-account-tpub
 ```
 
-This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. In the external-wallet flow, scan or paste the Paykit authorization request into the same wallet. For direct npm development with a generated creator recovery file, the companion-auth wrapper remains available:
+This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key.
+
+Next, inspect the latest Paykit Server logs manually:
+
+```bash
+docker compose --file compose.paykit-local-demo.yaml logs --tail=100 paykit-server
+```
+
+Find the event labeled `paykit_setup_authorization_url` and copy its `authorization_url` value. Do not automate log parsing. The URL is a local-only bearer secret: the operator owns Paykit log access and retention. Do not publish, reuse, or retain it beyond this local setup operation.
+
+Then run the host helper wrapper:
 
 ```bash
 npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 ```
 
-Run this command from the repository host, where the encrypted content-creator recovery file is stored. The wrapper loads that local identity and streams one bounded JSON request over stdin to `/usr/local/bin/paykit-companion-auth` in the running `creator-demo` container; private role files are not mounted into the container. `PAYKIT_COMPANION_AUTH_BIN` may override the helper executable path for local testing. Interactive input prompts for the Paykit auth URL, account xpub/tpub, and account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline. Sensitive inputs are sent only through helper stdin and are never forwarded in process arguments, environment variables, or wrapper output.
+Run it from the repository host, where the encrypted content-creator recovery file is stored. The wrapper loads that local identity and streams one bounded JSON request over stdin to `/usr/local/bin/paykit-companion-auth` in the running `creator-demo` container; private role files are not mounted into the container. `PAYKIT_COMPANION_AUTH_BIN` may override the helper executable path for local testing.
+
+Interactive input is prompted in this exact order: Paykit pubkyauth URL, account xpub/tpub, account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline:
+
+```text
+pubkyauth://...
+tpub...
+0
+```
+
+The wrapper sends the helper this closed schema over stdin only. Its fields are `version`, `auth_url`, `creator_secret`, `account_xpub`, and `account_index`:
+
+```json
+{"version":1,"auth_url":"pubkyauth://...","creator_secret":"<base64url-32>","account_xpub":"tpub...","account_index":0}
+```
+
+The example trusts the operator-supplied URL. A modified URL can substitute the requester key (`cpk`), relay, or encryption secret and redirect the grant or encrypted xpub claim; that risk is accepted only for the controlled local demo. The auth URL, Creator secret, and xpub are never placed in process arguments, wrapper output, or `postMessage`.
+
+The helper comes only from the Paykit local-demo image/runtime stage consumed by this Compose demo. It is not part of the normal production Paykit package or runtime.
 
 The browser uses the Locks JS/WASM SDK for publishing:
 

@@ -322,8 +322,8 @@ pub enum ConfigError {
     WildcardReturnOriginInProduction,
     #[error("pkdns.pkarr_relays must contain valid http(s) URLs: {0}")]
     InvalidPkarrRelayUrl(String),
-    #[error("paykit.server_url must be a valid http(s) URL: {0}")]
-    InvalidPaykitServerUrl(String),
+    #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
+    InvalidPaykitServerUrl,
     #[error(
         "paykit requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
     )]

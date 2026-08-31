@@ -9,6 +9,8 @@ import { pathToFileURL } from 'node:url';
 const repoRoot = resolve(new URL('../../../..', import.meta.url).pathname);
 const examplesDir = join(repoRoot, 'examples', 'js-sdk');
 const files = {
+  rootReadme: join(repoRoot, 'README.md'),
+  localOperatorDemo: join(repoRoot, 'docs', 'LOCAL_OPERATOR_DEMO.md'),
   readme: join(examplesDir, 'README.md'),
   packageJson: join(examplesDir, 'package.json'),
   app: join(examplesDir, 'app.js'),
@@ -53,7 +55,20 @@ const texts = Object.fromEntries(
 );
 
 const required = {
+  rootReadme: [
+    'Paykit Server plus its compatible Locks context follow the current public `master` branches until the post-release pin task',
+    'The local worktree override remains available',
+    'production Bitkit QR/deep-link path',
+    'local-demo image/runtime stage',
+  ],
+  localOperatorDemo: [
+    'Paykit Server and its compatible Locks build context intentionally follow their current public `master` branches until the post-release pin task',
+    'The local worktree override remains available',
+    'production Bitkit QR/deep-link path',
+    'local-demo image/runtime stage',
+  ],
   readme: [
+    '`master` branches until the post-release pin task',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
@@ -80,7 +95,22 @@ const required = {
     'opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe',
     'exact iframe window and origin with the pending state',
     'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'docker compose --file compose.paykit-local-demo.yaml logs --tail=100 paykit-server',
+    '`paykit_setup_authorization_url`',
+    '`authorization_url`',
+    'local-only bearer secret',
+    'log access and retention',
+    'Do not publish, reuse, or retain it beyond this local setup operation.',
     'Non-TTY stdin is exactly those three ordered lines',
+    '`auth_url`',
+    '`creator_secret`',
+    '`account_xpub`',
+    '`account_index`',
+    'requester key (`cpk`), relay, or encryption secret',
+    'production Bitkit QR/deep-link path',
+    'no production handle/helper surface',
+    'local-demo image/runtime stage',
+    'not part of the normal production Paykit package or runtime',
     'in-process Paykit reader worker starts with `reader-demo`',
     'sole mutable owner of `./.local/paykit-reader/state.v1`',
     './.local/paykit-reader/state.v1',
@@ -194,6 +224,7 @@ const required = {
     'paykit-companion-auth-compose.sh',
     'loadRoleSecret',
     'content-creator',
+    'latest paykit_setup_authorization_url local-demo log',
     'version: 1',
     'auth_url',
     'creator_secret',
@@ -207,6 +238,9 @@ const required = {
     "child.kill('SIGKILL')",
   ],
   composeCompanionHelper: [
+    'if [ "$#" -ne 0 ]; then',
+    '--project-directory "$repo_root"',
+    '--file "$repo_root/compose.paykit-local-demo.yaml"',
     'compose.paykit-local-demo.yaml',
     'PAYKIT_EXTERNAL_READER_PUBKY',
     'exec -T creator-demo',
@@ -235,7 +269,7 @@ const required = {
   startServer: ['createServer', '--allow-unhealthy', 'pubkyAuthRelayInboxUrl', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
   startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8088', 'never proxy'],
   pathsLib: ['localPath', 'roleDir', 'demoConfigPath', 'contentCreatorSessionPath', 'paykitReaderPreparedPath', 'paykitReaderOwnershipPath', 'prepared.v1.json', 'owner.lock'],
-  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
+  configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'parseLockServerTomlPaykitServerUrl', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
   pubkyLib: ["from '@synonymdev/pubky'", 'Pubky.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
   creator: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
@@ -370,6 +404,54 @@ if (sessionFreeIndex < 0 || signerFreeIndex < sessionFreeIndex || keypairFreeInd
 
 if (texts.authenticatePaykit.includes('Buffer.from(creatorSecret)')) {
   throw new Error('authenticate-paykit must not create an untracked raw-secret Buffer copy');
+}
+for (const forbidden of [
+  'companion_handle',
+  'paykitServerUrl',
+  'PAYKIT_SERVER_URL',
+  'app.paykit.server',
+  '/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw',
+  'watch-only-account-v1',
+]) {
+  if (texts.authenticatePaykit.includes(forbidden)) {
+    throw new Error(`authenticate-paykit must not retain helper server/handle transport: ${forbidden}`);
+  }
+}
+for (const forbidden of [
+  'PAYKIT_SERVER_URL',
+  'exec -T -e',
+  'auth_url',
+  'creator_secret',
+  'account_xpub',
+]) {
+  if (texts.composeCompanionHelper.includes(forbidden)) {
+    throw new Error(`compose companion helper must not project helper authority: ${forbidden}`);
+  }
+}
+for (const forbidden of [
+  'docker compose --file compose.paykit-local-demo.yaml logs',
+  'paykit_setup_authorization_url',
+  'authorization_url',
+  'companion handle',
+  'companion_handle',
+  'PAYKIT_SERVER_URL',
+  '/setup/companion-auth-request',
+]) {
+  if (texts.appIframe.includes(forbidden)) {
+    throw new Error(`Locks parent Paykit modal must remain command-only: ${forbidden}`);
+  }
+}
+for (const label of ['rootReadme', 'localOperatorDemo', 'readme']) {
+  for (const forbidden of [
+    'companion handle',
+    'companion_handle',
+    'PAYKIT_SERVER_URL',
+    '/setup/companion-auth-request',
+  ]) {
+    if (texts[label].includes(forbidden)) {
+      throw new Error(`${label} must not retain active handle/server-exchange guidance: ${forbidden}`);
+    }
+  }
 }
 if (texts.readerApp.includes("readerPublicKey.addEventListener('input'")) {
   throw new Error('reader payment identity must come from confirmed prepare status, not manual input');
@@ -1212,9 +1294,13 @@ assert.equal(resolveCompanionHelperPath({
 const parsedLines = parsePaykitInputLines(`${authUrl}\n${accountXpub}\n7\n`);
 assert.deepEqual(parsedLines, { authUrl, accountXpub, accountIndex: 7 });
 for (const invalid of [
+  `https://paykit.example/setup\n${accountXpub}\n7`,
+  `not a URL\n${accountXpub}\n7`,
+  `\n${accountXpub}\n7`,
   `${authUrl}\n${accountXpub}`,
   `${authUrl}\n${accountXpub}\n7\nextra`,
   `${authUrl}\n\n7`,
+  `pubkyauth://signin?secret=${'x'.repeat(16 * 1024)}\n${accountXpub}\n7`,
 ]) {
   assert.throws(() => parsePaykitInputLines(invalid), /three ordered lines/);
 }
@@ -1232,7 +1318,7 @@ assert.deepEqual(
   parsedLines,
 );
 const promptText = prompts.join('\n');
-for (const sensitive of [authUrl, accountXpub, 'test-auth-secret']) {
+for (const sensitive of [authUrl, accountXpub]) {
   assert.equal(promptText.includes(sensitive), false);
 }
 
@@ -1470,7 +1556,10 @@ process.stdout.write('{"version":1,"status":"approved"}\\n');
 `);
   chmodSync(approvedHelper, 0o700);
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: approvedHelper, input: helperInput }),
+    await runCompanionHelper({
+      helperPath: approvedHelper,
+      input: helperInput,
+    }),
     { status: 'approved' },
   );
 
@@ -1525,14 +1614,48 @@ setInterval(() => {}, 1000);
   rmSync(helperDir, { recursive: true, force: true });
 }
 
-const { parseLockServerTomlPublicKey } = await import(pathToFileURL(files.configLib).href);
+const {
+  buildDefaultDemoConfig,
+  parseLockServerTomlPublicKey,
+  parseLockServerTomlPaykitServerUrl,
+} = await import(pathToFileURL(files.configLib).href);
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 assert.equal(
   parseLockServerTomlPublicKey(`
 [credentials]
 lock_server_public_key = "${lockServerPubky}" # Public Pubky derived from lock_server_secret_key.
+paykit_server_url = "http://127.0.0.1:3001"
 `),
   lockServerPubky,
 );
+assert.equal(
+  parseLockServerTomlPaykitServerUrl('paykit_server_url = "http://127.0.0.1:3001"\n'),
+  'http://127.0.0.1:3001',
+);
+assert.equal(
+  parseLockServerTomlPaykitServerUrl('[paykit]\nserver_url = "https://paykit.internal.example:3443"\nminimum_confirmations = 0\n\n[worker]\nenabled = true\n'),
+  'https://paykit.internal.example:3443',
+);
+for (const invalid of [
+  '',
+  'paykit_server_url = "http://user:pass@127.0.0.1:3001"\n',
+  'paykit_server_url = "http://127.0.0.1:3001/path"\n',
+  'paykit_server_url = "http://127.0.0.1:3001?query=1"\n',
+]) {
+  assert.throws(() => parseLockServerTomlPaykitServerUrl(invalid));
+}
+const fullLockConfigDir = mkdtempSync(join(tmpdir(), 'locks-full-config-'));
+try {
+  const fullLockConfigPath = join(fullLockConfigDir, 'config.toml');
+  writeFileSync(
+    fullLockConfigPath,
+    `lock_server_public_key = "${lockServerPubky}"\n\n[paykit]\n# operator-selected confirmation policy\nminimum_confirmations = 0\n\nserver_url = "https://paykit.internal.example:3443"\n\n[worker]\nenabled = true\n`,
+  );
+  const directConfig = await buildDefaultDemoConfig(fullLockConfigPath);
+  assert.equal(directConfig.lockServer.pubky, lockServerPubky);
+  assert.equal(directConfig.paykit.url, 'https://paykit.internal.example:3443');
+} finally {
+  rmSync(fullLockConfigDir, { recursive: true, force: true });
+}
 
 console.log('JS SDK examples smoke check passed');

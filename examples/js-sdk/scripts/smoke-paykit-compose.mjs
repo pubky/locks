@@ -130,7 +130,7 @@ await assert.rejects(
   /content-creator profile/,
 );
 const config = buildPaykitServerConfig({ lockServerPubky });
-assert.equal(config, `[http]\nlisten_addr = "0.0.0.0:3001"\n\n[locks]\ntrusted_public_key = "${lockServerPubky}"\n\n[setup]\nallowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]\n\n[paykit]\nreceiver_path = "bitkit/server"\nreceiver_path_priority = ["bitkit"]\nnetwork = "testnet"\n\n[bitcoin]\nnetwork = "regtest"\n\n[electrum]\nendpoint = "tcp://fulcrum:50001"\npoll_interval = "1s"\nrequest_timeout = "10s"\nconnect_retries = 1\n\n[outbox]\npoll_interval = "500ms"\nbatch_size = 16\nlease_duration = "30s"\nretry_initial = "1s"\nretry_max = "5m"\n`);
+assert.equal(config, `[http]\nlisten_addr = "0.0.0.0:3001"\n\n[locks]\ntrusted_public_key = "${lockServerPubky}"\n\n[setup]\nallowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]\nlog_authorization_url = true\n\n[paykit]\nclient_id = "app.paykit.server"\nreceiver_path = "bitkit/server"\nreceiver_path_priority = ["bitkit"]\nnetwork = "testnet"\n\n[bitcoin]\nnetwork = "regtest"\n\n[electrum]\nendpoint = "tcp://fulcrum:50001"\npoll_interval = "1s"\nrequest_timeout = "10s"\nconnect_retries = 1\n\n[outbox]\npoll_interval = "500ms"\nbatch_size = 16\nlease_duration = "30s"\nretry_initial = "1s"\nretry_max = "5m"\n`);
 assert.throws(() => buildPaykitServerConfig({ lockServerPubky: 'invalid' }), /Lock Server Pubky/);
 assert.deepEqual(validatePaykitComposeEnvironment({
   PAYKIT_DATABASE_URL: 'postgres://paykit:secret@paykit-postgres:5432/paykit',
@@ -234,10 +234,12 @@ try {
     configOnly: true,
   });
   assert.equal(configured.configGenerated, true);
+  const generatedPaykitConfig = await readFile(join(generatedRoot, 'paykit-config/config.toml'), 'utf8');
   assert.equal(
-    await readFile(join(generatedRoot, 'paykit-config/config.toml'), 'utf8'),
+    generatedPaykitConfig,
     buildPaykitServerConfig({ lockServerPubky }),
   );
+  assert.match(generatedPaykitConfig, /^log_authorization_url = true$/m);
   assert.equal((await stat(join(generatedRoot, 'paykit-config/config.toml'))).mode & 0o777, 0o644);
 
   await writeFile(
@@ -257,10 +259,12 @@ try {
   const lockConfigPath = join(configOnlyRoot, 'lock-server.toml');
   await writeFile(lockConfigPath, `lock_server_public_key = "${lockServerPubky}"\n`, { mode: 0o644 });
   await initializePaykitCompose({ root: configOnlyRoot, lockConfigPath, configOnly: true });
+  const configOnlyPaykitConfig = await readFile(join(configOnlyRoot, 'paykit-config/config.toml'), 'utf8');
   assert.equal(
-    await readFile(join(configOnlyRoot, 'paykit-config/config.toml'), 'utf8'),
+    configOnlyPaykitConfig,
     buildPaykitServerConfig({ lockServerPubky }),
   );
+  assert.match(configOnlyPaykitConfig, /^log_authorization_url = true$/m);
   await assert.rejects(readFile(join(configOnlyRoot, 'compose-secrets.json'), 'utf8'), { code: 'ENOENT' });
 
   const privateProfilePath = join(configOnlyRoot, 'private-profile.json');
@@ -342,8 +346,8 @@ for (const required of [
   'additional_contexts:',
   'PUBKY_CORE_REF: v0.11.0',
   'https://github.com/pubky/paykit-server.git#master',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc47:paykit-sdk',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
   'https://github.com/pubky/locks.git#master',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
@@ -398,6 +402,7 @@ assert.ok(creatorService.includes('rm -f /workspace/.local/creator-public/profil
 assert.ok(!creatorService.includes('create-user -- --role content-creator'), 'external wallet mode must not create a second creator identity');
 assert.ok(!creatorService.includes('.local/content-creator'), 'external wallet mode must not mount creator recovery state');
 assert.ok(!creatorService.includes('--allow-unhealthy'), 'creator preflight must fail closed');
+
 const readerService = compose.slice(compose.indexOf('  reader-demo:'), compose.indexOf('\nvolumes:'));
 assert.ok(!readerService.includes('.local/js-sdk-demo'), 'reader must not mount creator session state');
 assert.ok(!readerService.includes('.local/content-creator'), 'reader must not mount creator recovery state');
@@ -429,7 +434,13 @@ for (const required of [
 assert.ok(!pubkyTestnetDockerfile.includes('PUBKY_CORE_REV'), 'Pubky testnet must not use an opaque revision argument');
 assert.ok(publicKeyScript.includes('pubky-common = "0.11.0"'), 'public-key helper must use Pubky Common 0.11');
 assert.ok(locksEntrypoint.includes('LOCKS_PUBLIC_CONFIG'), 'Lock Server must publish an explicit public artifact');
-for (const required of ['[paykit]', 'server_url = "http://127.0.0.1:3001"', 'minimum_confirmations = 0']) {
+for (const required of [
+  "sed -n '/^\\[paykit\\]$/,/^\\[/p'",
+  'paykit_server_url = "%s"',
+  '[paykit]',
+  'server_url = "http://127.0.0.1:3001"',
+  'minimum_confirmations = 0',
+]) {
   assert.ok(locksEntrypoint.includes(required), `Locks generated config missing ${required}`);
 }
 assert.equal(packageJson.scripts['init-paykit-compose'], 'node scripts/init-paykit-compose.mjs');
