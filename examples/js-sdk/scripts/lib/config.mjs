@@ -183,6 +183,7 @@ trusted_public_key = "${lockServerPubky}"
 
 [setup]
 allowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
+log_authorization_url = true
 
 [paykit]
 client_id = "app.paykit.server"

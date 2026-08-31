@@ -10,10 +10,9 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
 PAYKIT_EXTERNAL_READER_PUBKY=${PAYKIT_EXTERNAL_READER_PUBKY:-}
 export PAYKIT_EXTERNAL_READER_PUBKY
-: "${PAYKIT_SERVER_URL:?PAYKIT_SERVER_URL is required}"
 
 exec docker compose \
     --project-directory "$repo_root" \
     --file "$repo_root/compose.paykit-local-demo.yaml" \
-    exec -T -e PAYKIT_SERVER_URL="$PAYKIT_SERVER_URL" creator-demo \
+    exec -T creator-demo \
     /usr/local/bin/paykit-companion-auth

@@ -9,6 +9,8 @@ import { pathToFileURL } from 'node:url';
 const repoRoot = resolve(new URL('../../../..', import.meta.url).pathname);
 const examplesDir = join(repoRoot, 'examples', 'js-sdk');
 const files = {
+  rootReadme: join(repoRoot, 'README.md'),
+  localOperatorDemo: join(repoRoot, 'docs', 'LOCAL_OPERATOR_DEMO.md'),
   readme: join(examplesDir, 'README.md'),
   packageJson: join(examplesDir, 'package.json'),
   app: join(examplesDir, 'app.js'),
@@ -53,7 +55,20 @@ const texts = Object.fromEntries(
 );
 
 const required = {
+  rootReadme: [
+    'Paykit Server plus its compatible Locks context follow the current public `master` branches until the post-release pin task',
+    'The local worktree override remains available',
+    'production Bitkit QR/deep-link path',
+    'local-demo image/runtime stage',
+  ],
+  localOperatorDemo: [
+    'Paykit Server and its compatible Locks build context intentionally follow their current public `master` branches until the post-release pin task',
+    'The local worktree override remains available',
+    'production Bitkit QR/deep-link path',
+    'local-demo image/runtime stage',
+  ],
   readme: [
+    '`master` branches until the post-release pin task',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
@@ -80,7 +95,22 @@ const required = {
     'opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe',
     'exact iframe window and origin with the pending state',
     'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
+    'docker compose --file compose.paykit-local-demo.yaml logs --tail=100 paykit-server',
+    '`paykit_setup_authorization_url`',
+    '`authorization_url`',
+    'local-only bearer secret',
+    'log access and retention',
+    'Do not publish, reuse, or retain it beyond this local setup operation.',
     'Non-TTY stdin is exactly those three ordered lines',
+    '`auth_url`',
+    '`creator_secret`',
+    '`account_xpub`',
+    '`account_index`',
+    'requester key (`cpk`), relay, or encryption secret',
+    'production Bitkit QR/deep-link path',
+    'no production handle/helper surface',
+    'local-demo image/runtime stage',
+    'not part of the normal production Paykit package or runtime',
     'in-process Paykit reader worker starts with `reader-demo`',
     'sole mutable owner of `./.local/paykit-reader/state.v1`',
     './.local/paykit-reader/state.v1',
@@ -194,9 +224,9 @@ const required = {
     'paykit-companion-auth-compose.sh',
     'loadRoleSecret',
     'content-creator',
+    'latest paykit_setup_authorization_url local-demo log',
     'version: 1',
-    'companion_handle',
-    'PAYKIT_SERVER_URL',
+    'auth_url',
     'creator_secret',
     'creatorSecret.buffer',
     'account_xpub',
@@ -208,9 +238,12 @@ const required = {
     "child.kill('SIGKILL')",
   ],
   composeCompanionHelper: [
+    'if [ "$#" -ne 0 ]; then',
+    '--project-directory "$repo_root"',
+    '--file "$repo_root/compose.paykit-local-demo.yaml"',
     'compose.paykit-local-demo.yaml',
     'PAYKIT_EXTERNAL_READER_PUBKY',
-    'exec -T -e PAYKIT_SERVER_URL="$PAYKIT_SERVER_URL" creator-demo',
+    'exec -T creator-demo',
     '/usr/local/bin/paykit-companion-auth',
   ],
   preparePaykitReader: ['runReaderOperation', "operation: 'prepare'", 'content-viewer', 'writePreparedReaderStatus', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'ownership.release()'],
@@ -371,6 +404,54 @@ if (sessionFreeIndex < 0 || signerFreeIndex < sessionFreeIndex || keypairFreeInd
 
 if (texts.authenticatePaykit.includes('Buffer.from(creatorSecret)')) {
   throw new Error('authenticate-paykit must not create an untracked raw-secret Buffer copy');
+}
+for (const forbidden of [
+  'companion_handle',
+  'paykitServerUrl',
+  'PAYKIT_SERVER_URL',
+  'app.paykit.server',
+  '/pub/paykit/v0/bitkit/server/:rw,/pub/paykit/v0/private/bitkit/server/:rw',
+  'watch-only-account-v1',
+]) {
+  if (texts.authenticatePaykit.includes(forbidden)) {
+    throw new Error(`authenticate-paykit must not retain helper server/handle transport: ${forbidden}`);
+  }
+}
+for (const forbidden of [
+  'PAYKIT_SERVER_URL',
+  'exec -T -e',
+  'auth_url',
+  'creator_secret',
+  'account_xpub',
+]) {
+  if (texts.composeCompanionHelper.includes(forbidden)) {
+    throw new Error(`compose companion helper must not project helper authority: ${forbidden}`);
+  }
+}
+for (const forbidden of [
+  'docker compose --file compose.paykit-local-demo.yaml logs',
+  'paykit_setup_authorization_url',
+  'authorization_url',
+  'companion handle',
+  'companion_handle',
+  'PAYKIT_SERVER_URL',
+  '/setup/companion-auth-request',
+]) {
+  if (texts.appIframe.includes(forbidden)) {
+    throw new Error(`Locks parent Paykit modal must remain command-only: ${forbidden}`);
+  }
+}
+for (const label of ['rootReadme', 'localOperatorDemo', 'readme']) {
+  for (const forbidden of [
+    'companion handle',
+    'companion_handle',
+    'PAYKIT_SERVER_URL',
+    '/setup/companion-auth-request',
+  ]) {
+    if (texts[label].includes(forbidden)) {
+      throw new Error(`${label} must not retain active handle/server-exchange guidance: ${forbidden}`);
+    }
+  }
 }
 if (texts.readerApp.includes("readerPublicKey.addEventListener('input'")) {
   throw new Error('reader payment identity must come from confirmed prepare status, not manual input');
@@ -1192,7 +1273,7 @@ for (const loadIdentity of [loadRoleKeypair, loadRoleSecret]) {
   );
 }
 
-const companionHandle = Buffer.alloc(32, 5).toString('base64url');
+const authUrl = 'pubkyauth://signin?secret=test-auth-secret';
 const accountXpub = 'tpub-test-account-xpub';
 assert.equal(resolveCompanionHelperPath({
   env: {},
@@ -1210,19 +1291,22 @@ assert.equal(resolveCompanionHelperPath({
   env: { PAYKIT_COMPANION_AUTH_BIN: '/override/helper' },
   nativeHelperAvailable: () => false,
 }), '/override/helper');
-const parsedLines = parsePaykitInputLines(`${companionHandle}\n${accountXpub}\n7\n`);
-assert.deepEqual(parsedLines, { companionHandle, accountXpub, accountIndex: 7 });
+const parsedLines = parsePaykitInputLines(`${authUrl}\n${accountXpub}\n7\n`);
+assert.deepEqual(parsedLines, { authUrl, accountXpub, accountIndex: 7 });
 for (const invalid of [
-  `pubkyauth://signin?secret=test-auth-secret\n${accountXpub}\n7`,
-  `${companionHandle}\n${accountXpub}`,
-  `${companionHandle}\n${accountXpub}\n7\nextra`,
-  `${companionHandle}\n\n7`,
+  `https://paykit.example/setup\n${accountXpub}\n7`,
+  `not a URL\n${accountXpub}\n7`,
+  `\n${accountXpub}\n7`,
+  `${authUrl}\n${accountXpub}`,
+  `${authUrl}\n${accountXpub}\n7\nextra`,
+  `${authUrl}\n\n7`,
+  `pubkyauth://signin?secret=${'x'.repeat(16 * 1024)}\n${accountXpub}\n7`,
 ]) {
   assert.throws(() => parsePaykitInputLines(invalid), /three ordered lines/);
 }
 
 const prompts = [];
-const answers = [companionHandle, accountXpub, '7'];
+const answers = [authUrl, accountXpub, '7'];
 assert.deepEqual(
   await collectPaykitInputs({
     isTTY: true,
@@ -1234,7 +1318,7 @@ assert.deepEqual(
   parsedLines,
 );
 const promptText = prompts.join('\n');
-for (const sensitive of [companionHandle, accountXpub]) {
+for (const sensitive of [authUrl, accountXpub]) {
   assert.equal(promptText.includes(sensitive), false);
 }
 
@@ -1246,9 +1330,8 @@ recoveryKeypair.free();
 assert.deepEqual(secretFromRecoveryFile(recoveryFile, recoveryPassphrase), expectedSecret);
 
 const helperInput = buildCompanionHelperInput({ ...parsedLines, creatorSecret: expectedSecret });
-const trustedPaykitServerUrl = 'http://127.0.0.1:3001';
 assert.deepEqual(Object.keys(helperInput), [
-  'version', 'companion_handle', 'creator_secret', 'account_xpub', 'account_index',
+  'version', 'auth_url', 'creator_secret', 'account_xpub', 'account_index',
 ]);
 assert.equal(helperInput.version, 1);
 assert.equal(Buffer.from(helperInput.creator_secret, 'base64url').length, 32);
@@ -1421,11 +1504,11 @@ process.exit(1);
   }), { status: 'failed', error: 'invalid_state' });
 
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: 'invalid\0helper', input: helperInput, paykitServerUrl: trustedPaykitServerUrl }),
+    await runCompanionHelper({ helperPath: 'invalid\0helper', input: helperInput }),
     { status: 'failed' },
   );
   assert.deepEqual(
-    await runCompanionHelper({ helperPath: join(helperDir, 'missing-helper'), input: helperInput, paykitServerUrl: trustedPaykitServerUrl }),
+    await runCompanionHelper({ helperPath: join(helperDir, 'missing-helper'), input: helperInput }),
     { status: 'failed' },
   );
 
@@ -1452,7 +1535,6 @@ process.exit(1);
     await runCompanionHelper({
       helperPath: 'injected-helper',
       input: helperInput,
-      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 10,
       killGraceMs: 10,
       spawnProcess: () => new ErrorDuringTerminationChild(),
@@ -1466,11 +1548,10 @@ process.exit(1);
 let body = '';
 for await (const chunk of process.stdin) body += chunk;
 const value = JSON.parse(body);
-const keys = ['version','companion_handle','creator_secret','account_xpub','account_index'];
+const keys = ['version','auth_url','creator_secret','account_xpub','account_index'];
 if (process.argv.length !== 2 || JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)) process.exit(21);
-if (value.version !== 1 || value.companion_handle !== ${JSON.stringify(companionHandle)} || value.account_xpub !== ${JSON.stringify(accountXpub)} || value.account_index !== 7) process.exit(22);
+if (value.version !== 1 || value.auth_url !== ${JSON.stringify(authUrl)} || value.account_xpub !== ${JSON.stringify(accountXpub)} || value.account_index !== 7) process.exit(22);
 if (Buffer.from(value.creator_secret, 'base64url').length !== 32) process.exit(23);
-if (process.env.PAYKIT_SERVER_URL !== 'http://127.0.0.1:3001') process.exit(24);
 process.stdout.write('{"version":1,"status":"approved"}\\n');
 `);
   chmodSync(approvedHelper, 0o700);
@@ -1478,7 +1559,6 @@ process.stdout.write('{"version":1,"status":"approved"}\\n');
     await runCompanionHelper({
       helperPath: approvedHelper,
       input: helperInput,
-      paykitServerUrl: trustedPaykitServerUrl,
     }),
     { status: 'approved' },
   );
@@ -1488,13 +1568,13 @@ process.stdout.write('{"version":1,"status":"approved"}\\n');
 let body = '';
 for await (const chunk of process.stdin) body += chunk;
 const value = JSON.parse(body);
-process.stderr.write(value.companion_handle + value.account_xpub + value.creator_secret);
+process.stderr.write(value.auth_url + value.account_xpub + value.creator_secret);
 process.exit(1);
 `);
   chmodSync(failedHelper, 0o700);
-  const failed = await runCompanionHelper({ helperPath: failedHelper, input: helperInput, paykitServerUrl: trustedPaykitServerUrl });
+  const failed = await runCompanionHelper({ helperPath: failedHelper, input: helperInput });
   assert.deepEqual(failed, { status: 'failed' });
-  for (const sensitive of [companionHandle, accountXpub, helperInput.creator_secret]) {
+  for (const sensitive of [authUrl, accountXpub, helperInput.creator_secret]) {
     assert.equal(JSON.stringify(failed).includes(sensitive), false);
   }
 
@@ -1508,7 +1588,6 @@ setInterval(() => {}, 1000);
     await runCompanionHelper({
       helperPath: hangingHelper,
       input: helperInput,
-      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 25,
       killGraceMs: 25,
     }),
@@ -1526,7 +1605,6 @@ setInterval(() => {}, 1000);
     await runCompanionHelper({
       helperPath: floodingHelper,
       input: helperInput,
-      paykitServerUrl: trustedPaykitServerUrl,
       timeoutMs: 1000,
       killGraceMs: 25,
     }),

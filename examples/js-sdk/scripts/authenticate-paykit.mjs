@@ -7,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
 import { parseArgs, requiredRole } from './lib/paths.mjs';
-import { readDemoConfig, withInternalServiceUrls } from './lib/config.mjs';
 import { loadRoleSecret } from './lib/pubky.mjs';
 
 const DEFAULT_HELPER_PATH = '/usr/local/bin/paykit-companion-auth';
@@ -29,26 +28,25 @@ function parseAccountIndex(value) {
   return accountIndex;
 }
 
-function normalizeInput(companionHandle, accountXpub, accountIndex) {
-  const normalizedCompanionHandle = String(companionHandle).trim();
+function normalizeInput(authUrl, accountXpub, accountIndex) {
+  const normalizedAuthUrl = String(authUrl).trim();
   const normalizedAccountXpub = String(accountXpub).trim();
-  let decodedHandle;
+  let parsedAuthUrl;
   try {
-    decodedHandle = Buffer.from(normalizedCompanionHandle, 'base64url');
+    parsedAuthUrl = new URL(normalizedAuthUrl);
   } catch {
-    decodedHandle = Buffer.alloc(0);
+    parsedAuthUrl = null;
   }
   if (
-    decodedHandle.length !== 32
-    || decodedHandle.toString('base64url') !== normalizedCompanionHandle
+    !parsedAuthUrl
+    || parsedAuthUrl.protocol !== 'pubkyauth:'
+    || Buffer.byteLength(normalizedAuthUrl, 'utf8') > MAX_INPUT_BYTES
     || !normalizedAccountXpub
   ) {
-    decodedHandle.fill(0);
     throw new Error('Paykit input requires three ordered lines');
   }
-  decodedHandle.fill(0);
   return {
-    companionHandle: normalizedCompanionHandle,
+    authUrl: normalizedAuthUrl,
     accountXpub: normalizedAccountXpub,
     accountIndex: parseAccountIndex(accountIndex),
   };
@@ -95,13 +93,13 @@ export async function collectPaykitInputs({
   if (!isTTY) return parsePaykitInputLines(await readInput());
   if (typeof question !== 'function') throw new Error('interactive input is unavailable');
   return normalizeInput(
-    await question('Paste Paykit companion handle: '),
+    await question('Paste authorization_url from the latest paykit_setup_authorization_url local-demo log: '),
     await question('Paste account xpub/tpub: '),
     await question('Account index: '),
   );
 }
 
-export function buildCompanionHelperInput({ companionHandle, accountXpub, accountIndex, creatorSecret }) {
+export function buildCompanionHelperInput({ authUrl, accountXpub, accountIndex, creatorSecret }) {
   if (!(creatorSecret instanceof Uint8Array) || creatorSecret.length !== 32) {
     throw new Error('creator recovery file must contain a 32-byte secret');
   }
@@ -112,7 +110,7 @@ export function buildCompanionHelperInput({ companionHandle, accountXpub, accoun
   );
   return {
     version: 1,
-    companion_handle: companionHandle,
+    auth_url: authUrl,
     creator_secret: secretView.toString('base64url'),
     account_xpub: accountXpub,
     account_index: accountIndex,
@@ -294,27 +292,16 @@ export async function runBoundedHelper({
 export async function runCompanionHelper({
   helperPath = resolveCompanionHelperPath(),
   input,
-  paykitServerUrl,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   killGraceMs = DEFAULT_KILL_GRACE_MS,
   spawnProcess = spawn,
 }) {
-  const serverUrl = new URL(paykitServerUrl);
-  if (
-    !['http:', 'https:'].includes(serverUrl.protocol)
-    || serverUrl.username
-    || serverUrl.password
-    || serverUrl.origin !== paykitServerUrl
-  ) {
-    throw new Error('invalid Paykit Server URL');
-  }
   return runBoundedHelper({
     helperPath,
     input,
     timeoutMs,
     killGraceMs,
     spawnProcess,
-    spawnEnvironment: { ...process.env, PAYKIT_SERVER_URL: paykitServerUrl },
     classifyClose: ({ code, signal, stdout, stderr }) => (
       code === 0
       && signal === null
@@ -334,7 +321,6 @@ async function main() {
   let creatorSecret;
   let helperInput;
   try {
-    const serviceConfig = withInternalServiceUrls(await readDemoConfig());
     if (stdin.isTTY) readline = createInterface({ input: stdin, output: stdout });
     const values = await collectPaykitInputs({
       isTTY: stdin.isTTY,
@@ -344,7 +330,6 @@ async function main() {
     helperInput = buildCompanionHelperInput({ ...values, creatorSecret });
     const result = await runCompanionHelper({
       input: helperInput,
-      paykitServerUrl: serviceConfig.paykit.url,
     });
     const category = companionResultCategory(result);
     if (category.stream === 'stdout') console.log(category.message);
@@ -354,7 +339,7 @@ async function main() {
     readline?.close();
     creatorSecret?.fill(0);
     if (helperInput) helperInput.creator_secret = '';
-    if (helperInput) helperInput.companion_handle = '';
+    if (helperInput) helperInput.auth_url = '';
   }
 }
 
