@@ -332,6 +332,28 @@ Request body:
 }
 ```
 
+### Check public Paykit data presence
+
+```ts
+const hasPaykitData = await Locks.hasPaykitData("pubky...");
+
+const options = new LocksOptions();
+options.addPkarrRelay("http://127.0.0.1:15411");
+const hasLocalPaykitData = await Locks.hasPaykitDataWithOptions("pubky...", options);
+```
+
+These static methods perform an unauthenticated, uncached homeserver listing for the
+specified user's current `/pub/paykit/v0/` namespace. They return `true` when at least
+one syntactically valid child is present and `false` when the namespace is absent or
+empty. Invalid user keys, malformed listings, resolution failures, and transport errors
+reject the promise instead of returning `false`.
+
+Malformed user keys reject with `InvalidInput`. Operational lookup failures reject with
+the coarse `PaykitDataLookupFailed` error name without exposing upstream details.
+
+This is a data-presence probe only. A `true` result does not prove a valid receiver
+marker, supported capabilities, freshness, or Paykit runtime readiness.
+
 ### Check Paykit setup readiness
 
 ```ts
