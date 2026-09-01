@@ -421,7 +421,7 @@ for (const required of ['FROM rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12e
   assert.ok(jsDemoDockerfile.includes(required), `JS demo image missing ${required}`);
 }
 assert.ok(
-  locksServerDockerfile.includes('ENV RUSTUP_TOOLCHAIN=1.89.0'),
+  locksServerDockerfile.includes('ENV RUSTUP_TOOLCHAIN=1.91.1'),
   'Lock Server image must use the toolchain already installed in its builder image',
 );
 for (const required of [
