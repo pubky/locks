@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "init-config": "node scripts/init-config.mjs",
+    "init-staging-config": "node scripts/init-staging-config.mjs",
     "create-user": "node scripts/create-user.mjs",
     "publish-creator-profile": "node scripts/publish-creator-profile.mjs",
     "authenticate": "node scripts/authenticate.mjs",
@@ -12,16 +13,25 @@
     "prepare-paykit-reader": "node scripts/prepare-paykit-reader.mjs",
     "receive-paykit-request": "node scripts/receive-paykit-request.mjs",
     "test:paykit-reader-worker": "node scripts/test-paykit-reader-worker.mjs",
+    "test:staging-config": "node scripts/test-staging-config.mjs",
+    "test:staging-compose": "node scripts/test-staging-compose.mjs",
+    "test:staging-creator-mode": "node scripts/test-staging-creator-mode.mjs",
+    "test:staging-reader-mode": "node scripts/test-staging-reader-mode.mjs",
+    "test:reader-persistence": "node scripts/test-reader-persistence.mjs",
+    "test:creator-session-state": "node scripts/test-creator-session-state.mjs",
     "start-server": "node scripts/start-demo-server.mjs",
     "start-reader-server": "node scripts/start-reader-demo-server.mjs",
     "init-paykit-compose": "node scripts/init-paykit-compose.mjs",
     "generate-paykit-account-tpub": "node scripts/generate-paykit-account-tpub.mjs",
     "reset-paykit-demo": "node scripts/reset-paykit-demo.mjs",
+    "reset-paykit-staging-demo-local": "node scripts/reset-paykit-staging-demo-local.mjs",
+    "test:reset-paykit-staging-demo-local": "node scripts/test-reset-paykit-staging-demo-local.mjs",
     "validate:paykit-compose": "node scripts/validate-paykit-compose.mjs",
+    "validate:staging-compose": "node scripts/validate-staging-compose.mjs",
     "check:paykit-setup-contract": "node scripts/check-paykit-setup-contract.mjs",
     "smoke:paykit-compose": "npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs",
     "smoke": "npm --prefix ../../locks-sdk/bindings/js run smoke:examples",
-    "check": "node --check scripts/init-config.mjs && node --check scripts/init-paykit-compose.mjs && node --check scripts/homegate-bridge.mjs && node --check scripts/generate-paykit-account-tpub.mjs && node --check scripts/reset-paykit-demo.mjs && node --check scripts/validate-paykit-compose.mjs && node --check scripts/check-paykit-setup-contract.mjs && node --check scripts/electrum-readiness.mjs && node --check scripts/smoke-paykit-compose.mjs && node --check scripts/test-paykit-reader-worker.mjs && node --check scripts/create-user.mjs && node --check scripts/publish-creator-profile.mjs && node --check scripts/authenticate.mjs && node --check scripts/authenticate-paykit.mjs && node --check scripts/register-paykit-reader.mjs && node --check scripts/prepare-paykit-reader.mjs && node --check scripts/receive-paykit-request.mjs && node --check scripts/lib/creator-session-state.mjs && node --check scripts/lib/creator-static-path.mjs && node --check scripts/lib/paykit-reader-helper.mjs && node --check scripts/lib/paykit-reader-status.mjs && node --check scripts/lib/paykit-reader-worker.mjs && node --check scripts/start-demo-server.mjs && node --check scripts/start-reader-demo-server.mjs && node --check app.js && node --check app-iframe.js && node --check creator-identity.js && node --check creator-lock-policy.js && node --check paykit-setup.js && node --check creator-complete-flow.js && node --check reader-app.js && node --check reader-flow.js"
+    "check": "node --check scripts/init-config.mjs && node --check scripts/init-staging-config.mjs && node --check scripts/lib/staging-config.mjs && node --check scripts/lib/demo-runtime.mjs && node --check scripts/test-staging-config.mjs && node --check scripts/validate-staging-compose.mjs && node --check scripts/test-staging-compose.mjs && node --check scripts/test-staging-creator-mode.mjs && node --check scripts/test-staging-reader-mode.mjs && node --check scripts/test-reader-persistence.mjs && node --check scripts/test-creator-session-state.mjs && node --check scripts/reset-paykit-staging-demo-local.mjs && node --check scripts/test-reset-paykit-staging-demo-local.mjs && node --check scripts/init-paykit-compose.mjs && node --check scripts/homegate-bridge.mjs && node --check scripts/generate-paykit-account-tpub.mjs && node --check scripts/reset-paykit-demo.mjs && node --check scripts/validate-paykit-compose.mjs && node --check scripts/check-paykit-setup-contract.mjs && node --check scripts/electrum-readiness.mjs && node --check scripts/smoke-paykit-compose.mjs && node --check scripts/test-paykit-reader-worker.mjs && node --check scripts/create-user.mjs && node --check scripts/publish-creator-profile.mjs && node --check scripts/authenticate.mjs && node --check scripts/authenticate-paykit.mjs && node --check scripts/register-paykit-reader.mjs && node --check scripts/prepare-paykit-reader.mjs && node --check scripts/receive-paykit-request.mjs && node --check scripts/lib/creator-session-state.mjs && node --check scripts/lib/creator-static-path.mjs && node --check scripts/lib/paykit-reader-helper.mjs && node --check scripts/lib/paykit-reader-status.mjs && node --check scripts/lib/paykit-reader-worker.mjs && node --check scripts/start-demo-server.mjs && node --check scripts/start-reader-demo-server.mjs && node --check demo-network.js && node --check reader-persistence.js && node --check reader-staging-paykit.js && node --check app.js && node --check app-iframe.js && node --check creator-identity.js && node --check creator-lock-policy.js && node --check paykit-setup.js && node --check creator-complete-flow.js && node --check reader-app.js && node --check reader-flow.js"
   },
   "dependencies": {
     "@synonymdev/pubky": "^0.11.0"
