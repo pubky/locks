@@ -82,7 +82,7 @@ pub use crate::app_state::readiness::{
     WorkerReadinessState,
 };
 use crate::config::LockServerRuntimeConfig;
-use crate::paykit_http_client::PaykitHttpClient;
+use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
 
 #[async_trait]
@@ -101,7 +101,10 @@ impl ReaderPubkyResolver for PubkyReaderPubkyResolver {
         let Ok(public_key) = pubky_common::crypto::PublicKey::from_str(&reader.to_string()) else {
             return false;
         };
-        self.client.get_homeserver_of(&public_key).await.is_some()
+        self.client
+            .get_homeserver_of(&public_key)
+            .await
+            .is_ok_and(|homeserver| homeserver.is_some())
     }
 }
 
@@ -191,6 +194,7 @@ pub struct AppState {
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
+    paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
 }
 
 /// Purpose-separated runtime ciphers derived from the configured master key.
@@ -657,6 +661,9 @@ impl AppState {
         let payment_drain_client = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaymentDrainClient>);
+        let paykit_setup_status_provider = paykit_http_client
+            .as_ref()
+            .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
 
         Self {
             config,
@@ -695,6 +702,7 @@ impl AppState {
             reader_pubky_resolver,
             paykit_http_client,
             payment_drain_client,
+            paykit_setup_status_provider,
         }
     }
 
@@ -874,6 +882,19 @@ impl AppState {
 
     pub fn paykit_http_client(&self) -> Option<&Arc<PaykitHttpClient>> {
         self.paykit_http_client.as_ref()
+    }
+
+    pub fn paykit_setup_status_provider(&self) -> Option<&Arc<dyn PaykitSetupStatusProvider>> {
+        self.paykit_setup_status_provider.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_setup_status_provider(
+        mut self,
+        provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
+    ) -> Self {
+        self.paykit_setup_status_provider = provider;
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]

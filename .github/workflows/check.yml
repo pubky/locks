@@ -102,6 +102,12 @@ jobs:
           cargo nextest run -p locks-e2e --test production_creator_publishing_http
           cargo nextest run -p locks-e2e --test production_creator_authority_acquisition
 
+      - name: Install JS example dependencies
+        run: npm --prefix examples/js-sdk ci
+
+      - name: Paykit setup-status contract
+        run: npm --prefix examples/js-sdk run check:paykit-setup-contract
+
       - name: JS/WASM SDK tests
         run: npm --prefix locks-sdk/bindings/js run test
 

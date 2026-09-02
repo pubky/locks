@@ -1,0 +1,433 @@
+# Local development and demonstration only; this is not a production deployment definition.
+name: pubky-locks-paykit-demo
+
+services:
+  compose-bootstrap:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "0:0"
+    working_dir: /workspace
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        node examples/js-sdk/scripts/init-paykit-compose.mjs
+        chown -R 1000:1000 \
+          .local/compose-secrets.json \
+          .local/js-sdk-demo \
+          .local/demo-config \
+          .local/creator-public \
+          .local/bitcoin-bootstrap \
+          .local/content-creator \
+          .local/content-viewer \
+          .local/paykit-reader \
+          .local/locks-postgres \
+          .local/paykit-postgres \
+          .local/bitcoin-rpc \
+          .local/pubky-homeserver \
+          .local/locks-server \
+          .local/paykit-server \
+          .local/paykit-config \
+          .local/homegate-bridge
+        chmod 0600 .local/paykit-server/paykit.env
+    volumes:
+      - ./examples/js-sdk:/workspace/examples/js-sdk:ro
+      - ./.local:/workspace/.local
+
+  postgres:
+    image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/locks-postgres.env
+        set +a
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+    volumes:
+      - ./docker/postgres-init/01-create-pubky-homeserver.sql:/docker-entrypoint-initdb.d/01-create-pubky-homeserver.sql:ro
+      - ./.local/locks-postgres:/run/compose-local:ro
+      - locks-postgres-data:/var/lib/postgresql/data
+    depends_on:
+      compose-bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locks -d locks_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  paykit-postgres:
+    image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/paykit-server/postgres.env
+        set +a
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+    volumes:
+      - ./.local/paykit-postgres:/run/compose-local/paykit-server:ro
+      - paykit-postgres-data:/var/lib/postgresql/data
+    depends_on:
+      compose-bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paykit -d paykit"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  bitcoin:
+    image: bitcoin/bitcoin:29.1@sha256:de62c536feb629bed65395f63afd02e3a7a777a3ec82fbed773d50336a739319
+    volumes:
+      - ./.local/bitcoin-rpc:/run/compose-local:ro
+      - bitcoin-data:/home/bitcoin/.bitcoin
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/bitcoin-rpc.env
+        set +a
+        umask 077
+        mkdir -p "$${BITCOIN_DATA}"
+        printf 'rpcuser=%s\nrpcpassword=%s\n' "$${BITCOIN_RPC_USER}" "$${BITCOIN_RPC_PASSWORD}" > "$${BITCOIN_DATA}/bitcoin.conf"
+        exec /entrypoint.sh bitcoind \
+          -conf="$${BITCOIN_DATA}/bitcoin.conf" \
+          -regtest=1 \
+          -server=1 \
+          -txindex=1 \
+          -fallbackfee=0.00001 \
+          -rpcbind=0.0.0.0 \
+          -rpcallowip=0.0.0.0/0 \
+          -rpcport=18443
+    depends_on:
+      compose-bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -conf=\"$${BITCOIN_DATA}/bitcoin.conf\" -regtest getblockchaininfo >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  bitcoin-bootstrap:
+    image: bitcoin/bitcoin:29.1@sha256:de62c536feb629bed65395f63afd02e3a7a777a3ec82fbed773d50336a739319
+    user: "1000:1000"
+    network_mode: service:bitcoin
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/bitcoin-rpc.env
+        set +a
+        exec /usr/local/bin/bitcoin-bootstrap.sh
+    volumes:
+      - ./.local/bitcoin-bootstrap:/home/bitcoin/.bitcoin
+      - ./.local/bitcoin-rpc:/run/compose-local:ro
+      - ./docker/bitcoin-bootstrap.sh:/usr/local/bin/bitcoin-bootstrap.sh:ro
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+
+  fulcrum:
+    image: cculianu/fulcrum:v1.11.1@sha256:70f06b93ab5863997992d4b4508312fe81ce576017e16ecc7e69c7d38165bdf2
+    entrypoint: ["/bin/sh", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/bitcoin-rpc.env
+        set +a
+        exec /entrypoint.sh Fulcrum -b bitcoin:18443 -t 0.0.0.0:50001
+    volumes:
+      - ./.local/bitcoin-rpc:/run/compose-local:ro
+      - fulcrum-data:/data
+    depends_on:
+      bitcoin-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001"
+
+  electrum-readiness:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "1000:1000"
+    command: ["node", "/usr/local/bin/electrum-readiness.mjs"]
+    volumes:
+      - ./examples/js-sdk/scripts/electrum-readiness.mjs:/usr/local/bin/electrum-readiness.mjs:ro
+    depends_on:
+      fulcrum:
+        condition: service_started
+
+  pubky-testnet:
+    build:
+      context: .
+      dockerfile: docker/pubky-testnet.Dockerfile
+      args:
+        PUBKY_CORE_REF: v0.11.0
+    ports:
+      - "127.0.0.1:${LOCKS_DHT_PORT:-6881}:6881/udp"
+      - "127.0.0.1:${LOCKS_DHT_PORT:-6881}:6881/tcp"
+      - "127.0.0.1:${LOCKS_PKARR_RELAY_PORT:-15411}:15411"
+      - "127.0.0.1:${LOCKS_HTTP_RELAY_PORT:-15412}:15412"
+      - "127.0.0.1:${LOCKS_HOMESERVER_HTTP_PORT:-6286}:6286"
+      - "127.0.0.1:${LOCKS_HOMESERVER_PUBKY_PORT:-6287}:6287"
+      - "127.0.0.1:${LOCKS_SERVER_PORT:-3000}:3000"
+      - "127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001"
+      - "127.0.0.1:${LOCKS_CREATOR_DEMO_PORT:-8080}:8080"
+      - "127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088"
+    volumes:
+      - ./.local/pubky-homeserver:/run/compose-local/pubky-homeserver:ro
+    command: ["pubky-testnet", "--homeserver-config", "/run/compose-local/pubky-homeserver/config.toml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  homegate-bridge:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "1000:1000"
+    working_dir: /workspace
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        set -a
+        . /run/compose-local/homegate-bridge/homegate.env
+        set +a
+        exec node examples/js-sdk/scripts/homegate-bridge.mjs
+    environment:
+      HOMEGATE_BRIDGE_CONFIG: /run/compose-local/demo-config/config.json
+      HOMEGATE_BRIDGE_HOMESERVER_ADMIN_URL: http://pubky-testnet:6288
+    ports:
+      - "127.0.0.1:${LOCKS_HOMEGATE_PORT:-6288}:8082"
+    volumes:
+      - ./examples/js-sdk:/workspace/examples/js-sdk:ro
+      - ./.local/demo-config:/run/compose-local/demo-config:ro
+      - ./.local/homegate-bridge:/run/compose-local/homegate-bridge:ro
+    depends_on:
+      pubky-testnet:
+        condition: service_started
+      demo-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8082/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  locks-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubky-testnet:
+        condition: service_started
+    network_mode: service:pubky-testnet
+    environment:
+      RUST_LOG: ${LOCKS_RUST_LOG:-info,pubky::actors::session=warn}
+      LOCKS_PUBLIC_CONFIG: /run/locks-public/config.toml
+    volumes:
+      - lock-home:/var/lib/pubky-lock
+      - lock-public:/run/locks-public
+      - ./.local/locks-server:/run/compose-local/locks-server:ro
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        set -a
+        . /run/compose-local/locks-server/compose.env
+        set +a
+        exec locks-server-compose-entrypoint.sh
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/readyz >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  paykit-config:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "1000:1000"
+    working_dir: /workspace
+    command:
+      - node
+      - examples/js-sdk/scripts/init-paykit-compose.mjs
+      - --config-only
+      - --lock-config
+      - /run/locks-public/config.toml
+    volumes:
+      - ./examples/js-sdk:/workspace/examples/js-sdk:ro
+      - ./.local/paykit-config:/workspace/.local/paykit-config
+      - lock-public:/run/locks-public:ro
+    depends_on:
+      locks-server:
+        condition: service_healthy
+
+  demo-config:
+    image: node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
+    user: "1000:1000"
+    working_dir: /workspace
+    command:
+      - node
+      - examples/js-sdk/scripts/init-config.mjs
+      - --lock-config
+      - /run/locks-public/config.toml
+    volumes:
+      - ./examples/js-sdk:/workspace/examples/js-sdk:ro
+      - ./.local/demo-config:/workspace/.local/demo-config
+      - lock-public:/run/locks-public:ro
+    depends_on:
+      locks-server:
+        condition: service_healthy
+
+  paykit-server:
+    image: pubky-locks-paykit-server:local
+    build:
+      context: "${PAYKIT_SERVER_CONTEXT:-https://github.com/pubky/paykit-server.git#v0.1.0-rc2}"
+      dockerfile: Dockerfile.local
+      additional_contexts:
+        paykit-lib: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib"
+        paykit-sdk: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk"
+        locks: "https://github.com/pubky/locks.git#v0.1.0-rc1"
+
+    depends_on:
+      paykit-postgres:
+        condition: service_healthy
+      pubky-testnet:
+        condition: service_started
+      paykit-config:
+        condition: service_completed_successfully
+      electrum-readiness:
+        condition: service_completed_successfully
+    network_mode: service:pubky-testnet
+    user: "1000:1000"
+    environment:
+      PAYKIT_CONFIG: /etc/paykit-server/config.toml
+      RUST_LOG: ${RUST_LOG:-info}
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        set -a
+        . /run/compose-local/paykit-server/paykit.env
+        set +a
+        exec /usr/local/bin/paykit-server
+    volumes:
+      - ./.local/paykit-config:/etc/paykit-server:ro
+      - ./.local/paykit-server:/run/compose-local/paykit-server:ro
+    healthcheck:
+      test:
+        - CMD
+        - /bin/bash
+        - -ec
+        - >-
+          check() {
+            exec 3<>/dev/tcp/127.0.0.1/3001;
+            printf 'GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' "$$1" >&3;
+            IFS= read -r status <&3;
+            exec 3<&- 3>&-;
+            [[ "$$status" == *" 200 "* ]];
+          };
+          check /health/live && check /health/ready
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  creator-demo:
+    build:
+      context: .
+      dockerfile: docker/js-demo.Dockerfile
+      additional_contexts:
+        paykit-runtime: service:paykit-server
+    working_dir: /workspace
+    user: "1000:1000"
+    depends_on:
+      locks-server:
+        condition: service_healthy
+      paykit-server:
+        condition: service_healthy
+      demo-config:
+        condition: service_completed_successfully
+    network_mode: service:pubky-testnet
+    environment:
+      LOCKS_INTERNAL_LOCK_SERVER_URL: http://127.0.0.1:3000
+      LOCKS_INTERNAL_HTTP_RELAY: http://127.0.0.1:15412
+      LOCKS_INTERNAL_PKARR_RELAY: http://127.0.0.1:15411
+      LOCKS_INTERNAL_DHT_BOOTSTRAP: 127.0.0.1:6881
+      PAYKIT_COMPANION_AUTH_BIN: /usr/local/bin/paykit-companion-auth
+      PUBKY_LOCK_DEBUG: ${PUBKY_LOCK_DEBUG:-0}
+    volumes:
+      - ./.local/demo-config:/workspace/.local/demo-config:ro
+      - ./.local/js-sdk-demo:/workspace/.local/js-sdk-demo
+      - ./.local/creator-public:/workspace/.local/creator-public
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        rm -f /workspace/.local/creator-public/profile.json
+        npm --prefix examples/js-sdk run start-server -- --external-wallet
+
+  reader-demo:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/js-demo.Dockerfile
+      additional_contexts:
+        paykit-runtime: service:paykit-server
+    working_dir: /workspace
+    user: "1000:1000"
+    depends_on:
+      locks-server:
+        condition: service_healthy
+      paykit-server:
+        condition: service_healthy
+      demo-config:
+        condition: service_completed_successfully
+    network_mode: service:pubky-testnet
+    environment:
+      LOCKS_INTERNAL_LOCK_SERVER_URL: http://127.0.0.1:3000
+      LOCKS_INTERNAL_HTTP_RELAY: http://127.0.0.1:15412
+      LOCKS_INTERNAL_PKARR_RELAY: http://127.0.0.1:15411
+      LOCKS_INTERNAL_DHT_BOOTSTRAP: 127.0.0.1:6881
+      PAYKIT_READER_DEMO_BIN: /usr/local/bin/paykit-reader-demo
+      PAYKIT_READER_STATE_PATH: /workspace/.local/paykit-reader/state.v1
+      PAYKIT_READER_CREATOR_PROFILE_PATH: /workspace/.local/creator-public/profile.json
+      PAYKIT_READER_PUBKY_TESTNET_HOST: pubky-testnet
+      PAYKIT_READER_RECEIVER_PATH: bitkit/wallet
+      PAYKIT_READER_SERVER_PATH: bitkit/server
+      PAYKIT_READER_WORKER_ENABLED: "1"
+      PAYKIT_EXTERNAL_READER_PUBKY: ${PAYKIT_EXTERNAL_READER_PUBKY:-}
+      PUBKY_LOCK_DEBUG: ${PUBKY_LOCK_DEBUG:-0}
+    volumes:
+      - ./.local/demo-config:/workspace/.local/demo-config:ro
+      - ./.local/creator-public:/workspace/.local/creator-public:ro
+      - ./.local/content-viewer:/workspace/.local/content-viewer
+      - ./.local/paykit-reader:/workspace/.local/paykit-reader
+    command:
+      - sh
+      - -euc
+      - |
+        if [ -z "$PAYKIT_EXTERNAL_READER_PUBKY" ]; then
+          npm --prefix examples/js-sdk run create-user -- --role content-viewer
+        fi
+        exec node examples/js-sdk/scripts/start-reader-demo-server.mjs
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8088/api/paykit-reader/status').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  lock-home:
+  lock-public:
+  locks-postgres-data:
+    name: pubky-locks-paykit-demo-locks-postgres
+  paykit-postgres-data:
+    name: pubky-locks-paykit-demo-paykit-postgres
+  bitcoin-data:
+    name: pubky-locks-paykit-demo-bitcoin
+  fulcrum-data:
+    name: pubky-locks-paykit-demo-fulcrum

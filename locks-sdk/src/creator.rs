@@ -1,7 +1,7 @@
 pub use locks_core::creator_publishing::{CreateContentLockRequest, SetLockServicePointerRequest};
 use locks_core::ids::LockId;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::session::LocksSession;
@@ -42,6 +42,21 @@ pub struct SdkRequest {
 pub enum SdkRequestBody {
     Json(Value),
     Bytes(Vec<u8>),
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaykitSetupStatusKind {
+    Ready,
+    SetupRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitSetupStatus {
+    pub status: PaykitSetupStatusKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +162,26 @@ impl CreatorLocks {
 
     pub fn set_lock_service_pointer(&self, request: SetLockServicePointerRequest) -> SdkRequest {
         self.set_lock_service_pointer_request(request)
+    }
+
+    pub fn paykit_setup_status_request(&self) -> SdkRequest {
+        SdkRequest {
+            method: "GET",
+            path: "/creator/paykit/setup-status".to_owned(),
+            authorization: self.session.authorization_header_value(),
+            content_type: String::new(),
+            body: SdkRequestBody::Empty,
+        }
+    }
+
+    pub fn paykit_setup_status(&self) -> SdkRequest {
+        self.paykit_setup_status_request()
+    }
+
+    pub fn parse_paykit_setup_status_response(value: Value) -> crate::Result<PaykitSetupStatus> {
+        serde_json::from_value(value).map_err(|_| {
+            crate::LocksSdkError::InvalidResponse("invalid paykit setup status response".to_owned())
+        })
     }
 
     fn post_json(&self, path: &'static str, body: impl Serialize) -> SdkRequest {
@@ -323,6 +358,45 @@ mod tests {
             request.body,
             SdkRequestBody::Json(json!({ "default_lock_server": lock_server }))
         );
+    }
+
+    #[test]
+    fn paykit_setup_status_request_uses_authenticated_get_without_creator_input() {
+        let creator = LocksSession::new("frontend-session-secret").creator();
+
+        let request = creator.paykit_setup_status_request();
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/creator/paykit/setup-status");
+        assert_eq!(request.authorization, "Bearer frontend-session-secret");
+        assert_eq!(request.content_type, "");
+        assert_eq!(request.body, SdkRequestBody::Empty);
+    }
+
+    #[test]
+    fn paykit_setup_status_response_accepts_only_closed_statuses() {
+        for (wire_status, expected) in [
+            ("ready", PaykitSetupStatusKind::Ready),
+            ("setup_required", PaykitSetupStatusKind::SetupRequired),
+            ("unavailable", PaykitSetupStatusKind::Unavailable),
+        ] {
+            assert_eq!(
+                CreatorLocks::parse_paykit_setup_status_response(json!({
+                    "status": wire_status
+                }))
+                .unwrap(),
+                PaykitSetupStatus { status: expected }
+            );
+        }
+
+        for invalid in [
+            json!({ "status": "future" }),
+            json!({ "status": "ready", "extra": true }),
+            json!({}),
+            json!("ready"),
+        ] {
+            assert!(CreatorLocks::parse_paykit_setup_status_response(invalid).is_err());
+        }
     }
 
     fn guarded_resource() -> GuardedResource {

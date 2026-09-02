@@ -60,26 +60,26 @@ pub(crate) trait BrowserEndpointResolver {
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserPkarrResolver {
-    client: pkarr6::Client,
+    client: pkarr8::Client,
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-fn browser_pkarr_cache() -> Arc<dyn pkarr6::Cache> {
-    static CACHE: OnceLock<Arc<dyn pkarr6::Cache>> = OnceLock::new();
+fn browser_pkarr_cache() -> Arc<dyn pkarr8::Cache> {
+    static CACHE: OnceLock<Arc<dyn pkarr8::Cache>> = OnceLock::new();
 
     CACHE
         .get_or_init(|| {
-            Arc::new(pkarr6::InMemoryCache::new(
-                NonZeroUsize::new(pkarr6::DEFAULT_CACHE_SIZE)
+            Arc::new(pkarr8::InMemoryCache::new(
+                NonZeroUsize::new(pkarr8::DEFAULT_CACHE_SIZE)
                     .expect("pkarr default cache size is non-zero"),
             ))
         })
         .clone()
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
-fn build_browser_pkarr_client(options: &LocksOptions) -> locks_sdk::Result<pkarr6::Client> {
-    let mut builder = pkarr6::Client::builder();
+#[cfg(target_arch = "wasm32")]
+fn build_browser_pkarr_client(options: &LocksOptions) -> locks_sdk::Result<pkarr8::Client> {
+    let mut builder = pkarr8::Client::builder();
     builder.cache(browser_pkarr_cache());
     if !options.pkarr_relay_urls().is_empty() {
         builder
@@ -93,17 +93,17 @@ fn build_browser_pkarr_client(options: &LocksOptions) -> locks_sdk::Result<pkarr
 
 #[cfg(any(test, target_arch = "wasm32"))]
 fn creator_homeserver_qname_from_packet(
-    packet: &pkarr6::SignedPacket,
+    packet: &pkarr8::SignedPacket,
 ) -> locks_sdk::Result<String> {
     let qname = packet
         .resource_records("_pubky")
         .find_map(|record| match &record.rdata {
-            pkarr6::dns::rdata::RData::SVCB(svcb) => Some(svcb.target.to_string()),
-            pkarr6::dns::rdata::RData::HTTPS(https) => Some(https.0.target.to_string()),
+            pkarr8::dns::rdata::RData::SVCB(svcb) => Some(svcb.target.to_string()),
+            pkarr8::dns::rdata::RData::HTTPS(https) => Some(https.0.target.to_string()),
             _ => None,
         })
         .ok_or(locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)?;
-    let homeserver = pkarr6::PublicKey::try_from(qname.as_str())
+    let homeserver = pkarr8::PublicKey::try_from(qname.as_str())
         .map_err(|_| locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)?;
     Ok(homeserver.to_z32())
 }
@@ -136,13 +136,13 @@ impl BrowserPkarrResolver {
         &self,
         qname: &str,
     ) -> locks_sdk::Result<locks_sdk::transport::BrowserEndpoint> {
-        let creator = pkarr6::PublicKey::try_from(qname)
+        let creator = pkarr8::PublicKey::try_from(qname)
             .map_err(|_| locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)?;
         let packet = self
             .client
-            .resolve(&creator)
+            .resolve(&creator, pkarr8::ResolvePolicy::CacheFirst)
             .await
-            .ok_or(locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)?;
+            .map_err(|_| locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)?;
         let homeserver_qname = creator_homeserver_qname_from_packet(&packet)?;
         self.resolve_browser_endpoint(&homeserver_qname).await
     }
@@ -150,7 +150,7 @@ impl BrowserPkarrResolver {
 
 #[cfg(target_arch = "wasm32")]
 fn browser_endpoint_from_pkarr_endpoint(
-    endpoint: &pkarr6::extra::endpoints::Endpoint,
+    endpoint: &pkarr8::extra::endpoints::Endpoint,
 ) -> Option<locks_sdk::transport::BrowserEndpoint> {
     let domain = endpoint.domain()?.to_owned();
     let mut params = BTreeMap::new();
@@ -169,12 +169,12 @@ fn browser_endpoint_from_pkarr_endpoint(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn http_port_from_svc_param(param: &pkarr6::dns::rdata::SVCParam<'_>) -> Option<u16> {
+fn http_port_from_svc_param(param: &pkarr8::dns::rdata::SVCParam<'_>) -> Option<u16> {
     match param {
-        pkarr6::dns::rdata::SVCParam::Unknown(_, bytes) => <[u8; 2]>::try_from(bytes.as_ref())
+        pkarr8::dns::rdata::SVCParam::Unknown(_, bytes) => <[u8; 2]>::try_from(bytes.as_ref())
             .ok()
             .map(u16::from_be_bytes),
-        pkarr6::dns::rdata::SVCParam::Port(port) => Some(*port),
+        pkarr8::dns::rdata::SVCParam::Port(port) => Some(*port),
         _ => None,
     }
 }
@@ -240,6 +240,7 @@ impl JsAuthorizedRequestPlan {
 pub struct Session {
     inner: locks_sdk::LocksSession,
     client: locks_sdk::LocksClient,
+    creator_pubky: Option<String>,
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     options: LocksOptions,
 }
@@ -254,6 +255,11 @@ impl Session {
     #[wasm_bindgen(js_name = lockServer)]
     pub fn lock_server(&self) -> String {
         self.client.lock_server().to_string()
+    }
+
+    #[wasm_bindgen(js_name = creatorPubky)]
+    pub fn creator_pubky(&self) -> Option<String> {
+        self.creator_pubky.clone()
     }
 
     #[wasm_bindgen(getter)]
@@ -280,9 +286,19 @@ impl Session {
         client: locks_sdk::LocksClient,
         options: LocksOptions,
     ) -> Self {
+        Self::new_with_creator(inner, client, options, None)
+    }
+
+    pub(crate) fn new_with_creator(
+        inner: locks_sdk::LocksSession,
+        client: locks_sdk::LocksClient,
+        options: LocksOptions,
+        creator_pubky: Option<String>,
+    ) -> Self {
         Self {
             inner,
             client,
+            creator_pubky,
             options,
         }
     }
@@ -414,23 +430,20 @@ mod tests {
 
     #[test]
     fn browser_pkarr_clients_share_singleton_cache() {
-        let first = build_browser_pkarr_client(&LocksOptions::new()).unwrap();
-        let second = build_browser_pkarr_client(&LocksOptions::new()).unwrap();
+        let first = browser_pkarr_cache();
+        let second = browser_pkarr_cache();
 
-        assert!(std::ptr::eq(
-            first.cache().expect("first client cache"),
-            second.cache().expect("second client cache"),
-        ));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
     fn creator_homeserver_qname_is_resolved_from_the_creator_pubky_record() {
-        let creator = pkarr6::Keypair::random();
-        let homeserver = pkarr6::Keypair::random().public_key().to_z32();
-        let packet = pkarr6::SignedPacket::builder()
+        let creator = pkarr8::Keypair::random();
+        let homeserver = pkarr8::Keypair::random().public_key().to_z32();
+        let packet = pkarr8::SignedPacket::builder()
             .https(
                 "_pubky".try_into().expect("_pubky name"),
-                pkarr6::dns::rdata::SVCB::new(
+                pkarr8::dns::rdata::SVCB::new(
                     0,
                     homeserver.as_str().try_into().expect("homeserver qname"),
                 ),
@@ -508,6 +521,20 @@ mod tests {
             restored.creator().export_session_secret_for_tests(),
             "frontend-session-secret"
         );
+    }
+
+    #[test]
+    fn exchanged_session_exposes_authenticated_creator_pubky() {
+        let client = test_client();
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let session = Session::new_with_creator(
+            client.restore_session("frontend-session-secret"),
+            client,
+            LocksOptions::new(),
+            Some(creator.to_owned()),
+        );
+
+        assert_eq!(session.creator_pubky(), Some(creator.to_owned()));
     }
 
     #[test]

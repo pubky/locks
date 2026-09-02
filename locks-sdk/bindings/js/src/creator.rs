@@ -442,6 +442,25 @@ impl Creator {
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
         fetch_authorized_empty(&request).await
     }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = paykitSetupStatus)]
+    pub async fn paykit_setup_status(&self) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let request = self
+            .build_paykit_setup_status_request()
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let value = fetch_authorized_json(&request).await?;
+        let value = serde_wasm_bindgen::from_value(value)
+            .map_err(|_| crate::js_error::invalid_input("invalid paykit setup status response"))?;
+        let validated = validate_paykit_setup_status_response_for_tests(value)
+            .map_err(crate::js_error::invalid_input)?;
+        to_plain_js_value(&validated)
+            .map_err(|_| crate::js_error::invalid_input("invalid paykit setup status response"))
+    }
 }
 
 impl Creator {
@@ -535,6 +554,12 @@ impl Creator {
 
     #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn build_paykit_setup_status_request(&self) -> JsAuthorizedRequestPlan {
+        self.authorized_request_plan(self.session.inner().creator().paykit_setup_status())
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn create_build_content_lock_request(
         &self,
         body: serde_json::Value,
@@ -561,9 +586,19 @@ impl Creator {
             body: match request.body {
                 locks_sdk::SdkRequestBody::Bytes(bytes) => JsRequestBody::Bytes(bytes),
                 locks_sdk::SdkRequestBody::Json(body) => JsRequestBody::Json(body),
+                locks_sdk::SdkRequestBody::Empty => JsRequestBody::Empty,
             },
         }
     }
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_paykit_setup_status_response_for_tests(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let status = locks_sdk::CreatorLocks::parse_paykit_setup_status_response(value)
+        .map_err(|_| "invalid paykit setup status response".to_owned())?;
+    serde_json::to_value(status).map_err(|_| "invalid paykit setup status response".to_owned())
 }
 
 #[cfg(test)]
@@ -872,6 +907,40 @@ mod tests {
             })
         );
         assert!(body.get("creator").is_none());
+    }
+
+    #[test]
+    fn paykit_setup_status_request_uses_current_session_without_creator_argument() {
+        let creator = Creator::new(test_session());
+
+        let request = creator.build_paykit_setup_status_request();
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/creator/paykit/setup-status");
+        assert_eq!(request.authorization, "Bearer frontend-session-secret");
+        assert_eq!(request.content_type, None);
+        assert_eq!(request.body, JsRequestBody::Empty);
+    }
+
+    #[test]
+    fn paykit_setup_status_response_projects_closed_plain_status() {
+        for status in ["ready", "setup_required", "unavailable"] {
+            assert_eq!(
+                validate_paykit_setup_status_response_for_tests(serde_json::json!({
+                    "status": status
+                }))
+                .unwrap(),
+                serde_json::json!({ "status": status })
+            );
+        }
+
+        for invalid in [
+            serde_json::json!({ "status": "future" }),
+            serde_json::json!({ "status": "ready", "extra": true }),
+            serde_json::json!({}),
+        ] {
+            assert!(validate_paykit_setup_status_response_for_tests(invalid).is_err());
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::api::creator_publishing::{
     register_guarded_resource_for_authenticated_creator,
     set_lock_service_pointer_for_authenticated_creator,
 };
+use crate::api::paykit::paykit_setup_status_for_authenticated_creator;
 use crate::api::runtime::{healthz, readyz, well_known_locks_server};
 use crate::api::verification::{
     complete_verification_task, lookup_verification_task, submit_proof_bundle,
@@ -34,6 +35,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/creator/authority-status",
             get(creator_authority_status_route),
+        )
+        .route(
+            "/creator/paykit/setup-status",
+            get(paykit_setup_status_for_authenticated_creator),
         )
         .route(
             "/priv-resources/content/{*tail}",

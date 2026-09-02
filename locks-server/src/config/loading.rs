@@ -151,7 +151,7 @@ fn initialize_default_config(
         deletion: DeletionConfig::default(),
         deletion_worker: DeletionWorkerConfig::default(),
         paykit: Some(PaykitConfig {
-            server_url: "http://127.0.0.1:3001/".to_owned(),
+            server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
         }),
     };
@@ -327,10 +327,10 @@ mod tests {
                 .paykit
                 .expect("generated paykit config")
                 .server_url,
-            "http://127.0.0.1:3001/"
+            "http://127.0.0.1:3001"
         );
         assert!(config_text.contains("[paykit]"));
-        assert!(config_text.contains("server_url = \"http://127.0.0.1:3001/\""));
+        assert!(config_text.contains("server_url = \"http://127.0.0.1:3001\""));
         assert!(config_text.contains("minimum_confirmations = 0"));
     }
 

@@ -7,6 +7,7 @@ compose_config="${LOCKS_COMPOSE_CONFIG:-/var/lib/pubky-lock/config.compose.toml}
 secret_path="$service_home/secret.sess"
 runtime_master_key_path="$service_home/runtime-master-key"
 retired_creator_authority_key_path="$service_home/creator-authority-encryption-key"
+public_config="${LOCKS_PUBLIC_CONFIG:-/run/locks-public/config.toml}"
 
 mkdir -p "$service_home"
 
@@ -108,6 +109,10 @@ url_env = "PUBKY_LOCK_DATABASE_URL"
 max_connections = 10
 run_migrations_on_startup = true
 
+[paykit]
+server_url = "http://127.0.0.1:3001"
+minimum_confirmations = 0
+
 [worker]
 enabled = true
 poll_interval_ms = 250
@@ -124,7 +129,7 @@ frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
 [creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://localhost:8080"]
+allowed_return_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
 
 [secrets]
 runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
@@ -137,7 +142,7 @@ final_credential_issuance_window_seconds = 900
 final_read_window_seconds = 900
 
 [logging]
-level = "info"
+level = "info,pubky::actors::session=warn"
 
 [pubky]
 network = "testnet"
@@ -146,8 +151,8 @@ network = "testnet"
 public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 3000
-icann_domain = "localhost"
-pkarr_relays = ["http://localhost:15411"]
+icann_domain = "127.0.0.1"
+pkarr_relays = ["http://127.0.0.1:15411"]
 key_republisher_interval_seconds = 86400
 
 [rate_limits.verification_submission]
@@ -160,6 +165,23 @@ max_resource_bytes = 10000000
 max_resources = 10
 max_total_resource_bytes = 100000000
 EOF
+
+paykit_server_url="$(
+  sed -n '/^\[paykit\]$/,/^\[/p' "$compose_config" \
+    | grep -E '^server_url = ' \
+    | head -n 1 \
+    | cut -d '"' -f 2
+)"
+if [ -z "$paykit_server_url" ]; then
+  echo "[locks-compose] generated config has no Paykit Server URL" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$public_config")"
+public_config_tmp="$public_config.tmp.$$"
+printf 'lock_server_public_key = "%s"\npaykit_server_url = "%s"\n' \
+  "$lock_server_public_key" "$paykit_server_url" > "$public_config_tmp"
+chmod 0644 "$public_config_tmp"
+mv "$public_config_tmp" "$public_config"
 
 echo "[locks-compose] starting locks-server with $compose_config"
 exec locks-server --config "$compose_config"

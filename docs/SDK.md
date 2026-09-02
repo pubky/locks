@@ -47,7 +47,7 @@ python3 -m http.server 8080 --directory locks-sdk/bindings/js
 Open:
 
 ```text
-http://localhost:8080/demo/
+http://127.0.0.1:8080/demo/
 ```
 
 The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working `legacy-connect` creator acquisition.
@@ -130,7 +130,7 @@ For local Pubky testnet browser development, configure the local PKARR relay exp
 import { Locks, LocksOptions } from "locks-sdk-wasm";
 
 const options = new LocksOptions();
-options.addPkarrRelay("http://localhost:15411");
+options.addPkarrRelay("http://127.0.0.1:15411");
 
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
@@ -138,9 +138,9 @@ const locks = Locks.forServerWithOptions("pubky...", options);
 Local `pubky-core/pubky-testnet` defaults are:
 
 ```text
-PKARR relay     = http://localhost:15411
-HTTP/auth relay = http://localhost:15412
-DHT bootstrap   = localhost:6881
+PKARR relay     = http://127.0.0.1:15411
+HTTP/auth relay = http://127.0.0.1:15412
+DHT bootstrap   = 127.0.0.1:6881
 ```
 
 This remains the stable browser path.
@@ -331,6 +331,29 @@ Request body:
   "default_lock_server": "pubky..."
 }
 ```
+
+### Check Paykit setup readiness
+
+```ts
+const result = await session.creator.paykitSetupStatus();
+
+switch (result.status) {
+  case "ready":
+    // Skip Paykit authorization.
+    break;
+  case "setup_required":
+    // Launch the Paykit setup iframe.
+    break;
+  case "unavailable":
+    // Show retry/degraded state. Do not launch authorization.
+    break;
+}
+```
+
+`paykitSetupStatus()` takes no Creator argument. It uses the current Locks frontend-session bearer
+and calls `GET /creator/paykit/setup-status` with no body. The Lock Server derives the Creator from
+that session. The returned object contains only `status: "ready" | "setup_required" |
+"unavailable"`; malformed responses reject instead of being interpreted as setup readiness.
 
 ## Viewer/access APIs
 

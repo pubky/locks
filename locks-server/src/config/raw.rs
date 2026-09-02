@@ -63,15 +63,23 @@ struct RawPaykitConfig {
 
 impl RawPaykitConfig {
     fn into_paykit_config(self) -> Result<PaykitConfig, ConfigError> {
-        let parsed = Url::parse(&self.server_url)
-            .map_err(|_| ConfigError::InvalidPaykitServerUrl(self.server_url.clone()))?;
-        match parsed.scheme() {
-            "http" | "https" => Ok(PaykitConfig {
-                server_url: parsed.to_string(),
-                minimum_confirmations: self.minimum_confirmations,
-            }),
-            _ => Err(ConfigError::InvalidPaykitServerUrl(self.server_url)),
+        let parsed =
+            Url::parse(&self.server_url).map_err(|_| ConfigError::InvalidPaykitServerUrl)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.cannot_be_a_base()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.origin().ascii_serialization() != self.server_url
+        {
+            return Err(ConfigError::InvalidPaykitServerUrl);
         }
+        Ok(PaykitConfig {
+            server_url: self.server_url,
+            minimum_confirmations: self.minimum_confirmations,
+        })
     }
 }
 
