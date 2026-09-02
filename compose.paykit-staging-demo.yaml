@@ -1,0 +1,87 @@
+# Local browser demos against deployed staging services only; no backend services run here.
+name: pubky-locks-paykit-staging-demo
+
+x-demo-build: &demo-build
+  context: .
+  dockerfile: docker/js-staging-demo.Dockerfile
+
+services:
+  staging-config:
+    image: pubky-locks-paykit-staging-demo:local
+    build: *demo-build
+    user: "0:0"
+    working_dir: /workspace
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        node examples/js-sdk/scripts/init-staging-config.mjs
+        mkdir -p /workspace/.local/paykit-staging-demo/creator-session
+        chown -R 1000:1000 /workspace/.local/paykit-staging-demo
+        chmod 0700 /workspace/.local/paykit-staging-demo/creator-session
+    volumes:
+      - ./.local/paykit-staging-demo:/workspace/.local/paykit-staging-demo
+
+  creator-demo:
+    image: pubky-locks-paykit-staging-demo:local
+    build: *demo-build
+    user: "1000:1000"
+    working_dir: /workspace
+    depends_on:
+      staging-config:
+        condition: service_completed_successfully
+    environment:
+      LOCKS_DEMO_MODE: staging
+      LOCKS_DEMO_CONFIG_PATH: /workspace/.local/paykit-staging-demo/config/config.json
+      LOCKS_DEMO_CREATOR_SESSION_PATH: /workspace/.local/paykit-staging-demo/creator-session/content-creator-session.json
+      PUBKY_LOCK_DEBUG: "0"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./.local/paykit-staging-demo/config:/workspace/.local/paykit-staging-demo/config:ro
+      - ./.local/paykit-staging-demo/creator-session:/workspace/.local/paykit-staging-demo/creator-session
+    command:
+      - npm
+      - --prefix
+      - examples/js-sdk
+      - run
+      - start-server
+      - --
+      - --external-wallet
+      - --staging
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/config.json').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  reader-demo:
+    image: pubky-locks-paykit-staging-demo:local
+    build: *demo-build
+    user: "1000:1000"
+    working_dir: /workspace
+    depends_on:
+      staging-config:
+        condition: service_completed_successfully
+    environment:
+      LOCKS_DEMO_MODE: staging
+      LOCKS_DEMO_CONFIG_PATH: /workspace/.local/paykit-staging-demo/config/config.json
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./.local/paykit-staging-demo/config:/workspace/.local/paykit-staging-demo/config:ro
+    command:
+      - npm
+      - --prefix
+      - examples/js-sdk
+      - run
+      - start-reader-server
+      - --
+      - --staging
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8088/api/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s

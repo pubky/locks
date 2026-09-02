@@ -25,6 +25,8 @@ const files = {
   readerHtml: join(examplesDir, 'reader.html'),
   readerApp: join(examplesDir, 'reader-app.js'),
   readerFlow: join(examplesDir, 'reader-flow.js'),
+  readerPersistence: join(examplesDir, 'reader-persistence.js'),
+  readerStagingPaykit: join(examplesDir, 'reader-staging-paykit.js'),
   initConfig: join(examplesDir, 'scripts', 'init-config.mjs'),
   createUser: join(examplesDir, 'scripts', 'create-user.mjs'),
   authenticate: join(examplesDir, 'scripts', 'authenticate.mjs'),
@@ -37,6 +39,7 @@ const files = {
   paykitReaderStatus: join(examplesDir, 'scripts', 'lib', 'paykit-reader-status.mjs'),
   paykitReaderWorker: join(examplesDir, 'scripts', 'lib', 'paykit-reader-worker.mjs'),
   creatorSessionState: join(examplesDir, 'scripts', 'lib', 'creator-session-state.mjs'),
+  demoNetwork: join(examplesDir, 'demo-network.js'),
   startServer: join(examplesDir, 'scripts', 'start-demo-server.mjs'),
   startReaderServer: join(examplesDir, 'scripts', 'start-reader-demo-server.mjs'),
   pathsLib: join(examplesDir, 'scripts', 'lib', 'paths.mjs'),
@@ -186,7 +189,9 @@ const required = {
     'invalidateIdentityScopedCreatorState',
     'signOutCreator',
     'localStorage.removeItem(pointerConfiguredKey(previousCreatorPubky))',
-    'recipientPubky: state.creatorPubky',
+    'captureCreatorOperation(state)',
+    'creatorOperationMatches(state, operation)',
+    'recipientPubky: operation.creatorPubky',
     'paykitSetupComplete: state.paykitSetupComplete',
     "const paymentSelected = el.lockType.value === 'paykit-payment'",
     'el.devStaticFields.hidden = paymentSelected',
@@ -217,7 +222,7 @@ const required = {
   index: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app.js', 'Select primary file', 'id="primary-content-file"', 'Select secondary files', 'id="secondary-content-files"', 'multiple', 'id="selected-resources"', 'id="selected-resource-list"', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
   iframe: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app-iframe.js', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
   flows: ['Both creator pages use iframe auth', '/examples/js-sdk/', '/examples/js-sdk/iframe.html'],
-  readerHtml: ['id="content-lock-resource"', 'id="lock-resources"', 'id="primary-resource-list"', 'id="secondary-resource-list"', 'id="reset-reader-state"', 'id="read-content"', 'id="reader-public-key" readonly', 'id="refresh-paykit-reader"', 'id="paykit-reader-status"', 'id="paykit-reader-payment"', 'id="paykit-reader-commands"', 'id="poll-payment"', 'paykit-payment', 'Paykit reader identity is prepared automatically', '/reader-app.js'],
+  readerHtml: ['id="content-lock-resource"', 'id="lock-resources"', 'id="primary-resource-list"', 'id="secondary-resource-list"', 'id="reset-reader-state"', 'id="read-content"', 'id="reader-public-key" type="text"', 'id="refresh-paykit-reader"', 'id="paykit-reader-status"', 'id="paykit-reader-payment"', 'id="paykit-reader-commands"', 'id="paykit-reader-guidance"', 'id="poll-payment"', 'paykit-payment', 'prepared automatically by the local demo', '/reader-app.js'],
   initConfig: ['~/.pubky-lock/config.toml', './.local/demo-config/config.json', 'lock_server_public_key', 'http://127.0.0.1:15411', 'http://127.0.0.1:15412', '127.0.0.1:6881'],
   createUser: ['requiredRole', 'Keypair.random()', 'createRecoveryFile', 'profile.json', '--force', 'content-creator', 'content-viewer', 'lock-server', 'clearPreparedReaderStatus', 'clearCreatorDemoSession'],
   authenticate: ['requiredRole', 'readAuthFromPrompt', 'signer.signup', 'approveAuthRequest', '--auth', 'already'],
@@ -269,11 +274,12 @@ const required = {
   paykitReaderWorker: ['runPaykitReaderWorker', 'assertStandaloneReaderOperationAllowed', 'acquirePaykitReaderOwnership', 'supervisePaykitReaderWorker', '/usr/bin/flock', "'--no-fork'", 'shell: false', "operation: 'prepare'", "operation: 'receive'", "state: 'request_received'"],
   registerPaykitReader: ['signupReaderBestEffort', "request.operation !== 'register'", 'registration_failed'],
   creatorSessionState: ['clearCreatorDemoSession', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', 'contentCreatorSessionPath', 'rm'],
-  startServer: ['createServer', '--allow-unhealthy', 'pubkyAuthRelayInboxUrl', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
+  demoNetwork: ['pkarrRelaysForDemoConfig', 'demoAuthRelayForConfig', "config?.mode === 'staging'"],
+  startServer: ['createServer', '--allow-unhealthy', 'demoAuthRelayForConfig', 'resolveCreatorSessionOptions', '/api/demo-auth/start', '/api/demo-auth/status', '/config.json', 'awaitApproval', 'content-creator-session.json', 'readCreatorDemoSessionForCurrentRole', 'writeCreatorDemoSessionForCurrentRole', '/healthz', '/readyz', 'paykit: source.paykit'],
   startReaderServer: ['createServer', '--allow-unhealthy', 'runPaykitReaderWorker', 'supervisePaykitReaderWorker', 'workerOwnsState', 'handleTerminalWorkerFailure', 'writePaykitReaderWorkerStatus', 'readPaykitReaderWorkerStatus', 'AbortController', 'SIGTERM', '/reader/', '/config.json', '/api/health', '/api/preflight', '/api/debug/config', '/api/paykit-reader/status', '/api/client-log', "'cache-control': 'no-store'", '8088', 'never proxy'],
   pathsLib: ['localPath', 'roleDir', 'demoConfigPath', 'contentCreatorSessionPath', 'paykitReaderPreparedPath', 'paykitReaderOwnershipPath', 'prepared.v1.json', 'owner.lock'],
   configLib: ['readDemoConfig', 'writeDemoConfig', 'parseLockServerTomlPublicKey', 'parseLockServerTomlPaykitServerUrl', 'pubkyAuthRelayInboxUrl', 'validateDemoConfig', "url: 'http://127.0.0.1:3001'", "['paykit', 'url']"],
-  pubkyLib: ["from '@synonymdev/pubky'", 'Pubky.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
+  pubkyLib: ["from '@synonymdev/pubky'", 'new PubkyImplementation()', 'PubkyImplementation.testnet', 'Keypair.fromRecoveryFile', 'keypair.secret()', 'loadRoleSecret', 'AuthFlowKind', 'PublicKey.from'],
   creator: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
     'startCreatorConnect',
@@ -304,6 +310,7 @@ const required = {
   readerFlow: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
     'loadContentLock',
+    'hasPaykitData',
     'submitDevStaticProof',
     'submitPaykitPaymentProof',
     'buildPaykitPaymentProofBundle',
@@ -330,6 +337,8 @@ const required = {
     'response.headers.get',
     'response.arrayBuffer()',
   ],
+  readerStagingPaykit: ['validateExternalReaderPubky', 'checkExternalReaderPaykitData', 'distinct Bitkit identities', "state: 'present'", "state: 'absent'", "state: 'unavailable'"],
+  readerPersistence: ['buildPersistedReaderState', 'restorePersistedReaderState', "'resource'", "'loaded'"],
   readerApp: [
     "from './reader-flow.js'",
     'pubky-locks-reader-demo.state',
@@ -364,9 +373,10 @@ const required = {
     'paykitReaderStatusRequests.isCurrent(request, workflowIncarnation)',
     'paykitReaderStatusRequests.invalidate()',
     'state.paykitReaderPrepared',
+    'Use a second Bitkit identity',
     "state.verifierType === 'paykit-payment'",
     '(!state.paykitReaderPrepared || !state.readerPublicKey)',
-    'baselinePaymentRequestId: _baselinePaymentRequestId',
+    'buildPersistedReaderState(state)',
     'toPlainJson',
     'localStorage.setItem',
   ],
@@ -456,8 +466,17 @@ for (const label of ['rootReadme', 'localOperatorDemo', 'readme']) {
     }
   }
 }
-if (texts.readerApp.includes("readerPublicKey.addEventListener('input'")) {
-  throw new Error('reader payment identity must come from confirmed prepare status, not manual input');
+const readerInputListener = texts.readerApp.indexOf("readerPublicKey.addEventListener('input'");
+const stagingOnlyReaderInput = texts.readerApp.indexOf(
+  "if (state.config.mode !== 'staging') return;",
+  readerInputListener,
+);
+if (
+  readerInputListener < 0
+  || stagingOnlyReaderInput < readerInputListener
+  || !texts.readerApp.includes("state.readerPublicKey = status.reader_pubky ?? '';")
+) {
+  throw new Error('manual reader identity input must remain staging-only while local mode uses confirmed prepare status');
 }
 const clearPreparedOnViewerRotation = texts.createUser.indexOf(
   "if (role === 'content-viewer') await clearPreparedReaderStatus();",
@@ -499,6 +518,13 @@ const creatorSessionTestPath = join(creatorSessionTestDir, 'content-creator-sess
 const creatorProfileTestPath = join(creatorSessionTestDir, 'profile.json');
 const firstCreatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const secondCreatorPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
+const creatorSessionRecord = (pubky, exportedSession) => ({
+  role: 'content-creator',
+  pubky,
+  capabilities: ['/pub/locks.app/:rw', '/priv/locks.app/:rw'],
+  exported_session: exportedSession,
+  authenticated_at: '2026-09-02T00:00:00.000Z',
+});
 try {
   writeFileSync(creatorSessionTestPath, '{"exported_session":"sensitive"}');
   await clearCreatorDemoSession(creatorSessionTestPath);
@@ -506,7 +532,7 @@ try {
   await clearCreatorDemoSession(creatorSessionTestPath);
 
   writeFileSync(creatorProfileTestPath, JSON.stringify({ role: 'content-creator', pubky: secondCreatorPubky }));
-  writeFileSync(creatorSessionTestPath, JSON.stringify({ role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'old-secret' }));
+  writeFileSync(creatorSessionTestPath, JSON.stringify(creatorSessionRecord(firstCreatorPubky, 'old-secret')), { mode: 0o600 });
   assert.equal(await readCreatorDemoSessionForCurrentRole({
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -515,14 +541,14 @@ try {
 
   await assert.rejects(
     writeCreatorDemoSessionForCurrentRole(
-      { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'late-old-secret' },
+      creatorSessionRecord(firstCreatorPubky, 'late-old-secret'),
       { sessionPath: creatorSessionTestPath, profilePath: creatorProfileTestPath },
     ),
     /creator identity changed during demo authentication/,
   );
   assert.equal(existsSync(creatorSessionTestPath), false);
 
-  const currentSession = { role: 'content-creator', pubky: secondCreatorPubky, exported_session: 'current-secret' };
+  const currentSession = creatorSessionRecord(secondCreatorPubky, 'current-secret');
   await writeCreatorDemoSessionForCurrentRole(currentSession, {
     sessionPath: creatorSessionTestPath,
     profilePath: creatorProfileTestPath,
@@ -535,7 +561,7 @@ try {
     currentSession,
   );
   assert.equal(statSync(creatorSessionTestPath).mode & 0o777, 0o600);
-  const externalSession = { role: 'content-creator', pubky: firstCreatorPubky, exported_session: 'external-secret' };
+  const externalSession = creatorSessionRecord(firstCreatorPubky, 'external-secret');
   await writeCreatorDemoSessionForCurrentRole(externalSession, {
     sessionPath: creatorSessionTestPath,
     profilePath: null,

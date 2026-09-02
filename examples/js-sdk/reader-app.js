@@ -1,6 +1,7 @@
 import {
   classifyPaymentLifecycle,
   completeDevVerification,
+  hasPaykitData,
   issueAccessCredential,
   loadContentLock,
   lookupVerificationTask,
@@ -13,6 +14,12 @@ import {
   selectCurrentPaykitPaymentRequest,
   workflowHandleMatches,
 } from './reader-flow.js';
+import { pkarrRelaysForDemoConfig } from './demo-network.js';
+import {
+  checkExternalReaderPaykitData,
+  createPaykitDataCheckController,
+} from './reader-staging-paykit.js';
+import { buildPersistedReaderState, restorePersistedReaderState } from './reader-persistence.js';
 
 const STATE_KEY = 'pubky-locks-reader-demo.state';
 
@@ -26,6 +33,7 @@ const state = {
   readerPublicKey: '',
   paykitReaderPrepared: false,
   paykitReaderState: 'starting',
+  paykitDataMessage: '',
   paykitPaymentRequest: null,
   baselinePaymentRequestId: null,
   loadingLock: false,
@@ -44,6 +52,7 @@ const state = {
 
 let workflowIncarnation = 0;
 const paykitReaderStatusRequests = createLatestRequestGate();
+const paykitDataChecks = createPaykitDataCheckController();
 let activeLoadToken = null;
 let activeSubmissionToken = null;
 let activePollToken = null;
@@ -61,6 +70,7 @@ const el = {
   verifierType: document.querySelector('#verifier-type'),
   proofSatisfied: document.querySelector('#proof-satisfied'),
   paykitReaderCommands: document.querySelector('#paykit-reader-commands'),
+  paykitReaderGuidance: document.querySelector('#paykit-reader-guidance'),
   readerPublicKey: document.querySelector('#reader-public-key'),
   refreshPaykitReader: document.querySelector('#refresh-paykit-reader'),
   paykitReaderStatus: document.querySelector('#paykit-reader-status'),
@@ -88,14 +98,20 @@ async function bootstrap() {
   const resource = new URL(window.location.href).searchParams.get('resource')?.trim();
   if (resource) state.resource = resource;
   bindEvents();
-  await refreshPaykitReaderStatus();
+  if (state.config.mode === 'staging') {
+    state.paykitReaderState = 'unchecked';
+  } else {
+    await refreshPaykitReaderStatus();
+  }
   render();
-  setInterval(() => { void refreshPaykitReaderStatus(); }, 1_000);
+  if (state.config.mode !== 'staging') {
+    setInterval(() => { void refreshPaykitReaderStatus(); }, 1_000);
+  }
   await postClientLog('info', 'reader-bootstrap-config-loaded', {
+    mode: state.config.mode ?? 'local-testnet',
     lockServerPubky: state.config.lockServer.pubky,
     lockServerUrl: state.config.lockServer.url,
-    pkarrRelay: state.config.testnet.pkarrRelay,
-    location: window.location.href,
+    customPkarrRelays: pkarrRelaysForDemoConfig(state.config),
     hasState: Boolean(localStorage.getItem(STATE_KEY)),
   });
 }
@@ -114,6 +130,7 @@ function bindEvents() {
       readerPublicKey: '',
       paykitReaderPrepared: false,
       paykitReaderState: 'starting',
+      paykitDataMessage: '',
       paykitPaymentRequest: null,
       baselinePaymentRequestId: null,
       loadingLock: false,
@@ -150,6 +167,16 @@ function bindEvents() {
     render();
   });
 
+  el.readerPublicKey.addEventListener('input', () => {
+    if (state.config.mode !== 'staging') return;
+    paykitDataChecks.invalidate();
+    state.readerPublicKey = el.readerPublicKey.value.trim();
+    state.paykitReaderPrepared = false;
+    state.paykitReaderState = 'unchecked';
+    state.paykitDataMessage = '';
+    render();
+  });
+
   el.refreshPaykitReader.addEventListener('click', refreshPaykitReaderStatus);
   el.load.addEventListener('click', loadLock);
   el.submitProof.addEventListener('click', submitProof);
@@ -165,6 +192,34 @@ function bindEvents() {
 }
 
 async function refreshPaykitReaderStatus() {
+  if (state.config.mode === 'staging') {
+    state.paykitReaderPrepared = false;
+    state.paykitReaderState = 'checking';
+    state.paykitDataMessage = 'Checking public Paykit v0 data...';
+    render();
+    try {
+      if (!state.creator) throw new Error('Load the content lock before checking the reader.');
+      const result = await paykitDataChecks.check({
+        incarnation: workflowIncarnation,
+        resource: state.resource,
+        readerPubky: state.readerPublicKey,
+        creatorPubky: state.creator,
+        lookup: (readerPublicKey) => hasPaykitData({ readerPublicKey }),
+        isCurrent: paykitDataSnapshotMatches,
+      });
+      if (!result) return;
+      state.readerPublicKey = result.readerPubky;
+      state.paykitReaderPrepared = result.canSubmit;
+      state.paykitReaderState = result.state;
+      state.paykitDataMessage = result.message;
+    } catch (error) {
+      state.paykitReaderPrepared = false;
+      state.paykitReaderState = 'invalid';
+      state.paykitDataMessage = error.message ?? String(error);
+    }
+    render();
+    return;
+  }
   const request = paykitReaderStatusRequests.begin(workflowIncarnation);
   try {
     const response = await fetch('/api/paykit-reader/status', { method: 'GET', cache: 'no-store' });
@@ -266,6 +321,7 @@ async function submitProof() {
     resource: state.resource,
     verifierType: state.verifierType,
     readerPublicKey: state.readerPublicKey,
+    paykitCreator: state.loaded?.creator,
     paykitReaderPrepared: state.paykitReaderPrepared,
     proofSatisfied: state.proofSatisfied,
     primaryPath: state.lockResources.find((resource) => resource.kind === 'primary')?.readPath ?? '',
@@ -285,6 +341,23 @@ async function submitProof() {
       resource: snapshot.resource,
       pkarrRelays: snapshot.pkarrRelays,
     };
+    if (state.config.mode === 'staging' && snapshot.verifierType === 'paykit-payment') {
+      const paykitData = await checkExternalReaderPaykitData({
+        readerPubky: snapshot.readerPublicKey,
+        creatorPubky: snapshot.paykitCreator,
+        lookup: (readerPublicKey) => hasPaykitData({ readerPublicKey }),
+      });
+      if (
+        activeSubmissionToken !== submissionToken
+        || !workflowMatches(snapshot)
+        || state.loaded?.creator !== snapshot.paykitCreator
+        || state.readerPublicKey !== snapshot.readerPublicKey
+      ) return;
+      state.paykitReaderPrepared = paykitData.canSubmit;
+      state.paykitReaderState = paykitData.state;
+      state.paykitDataMessage = paykitData.message;
+      if (!paykitData.canSubmit) throw new Error(paykitData.message);
+    }
     const result = snapshot.verifierType === 'paykit-payment'
       ? await submitPaykitPaymentProof({
         ...common,
@@ -534,11 +607,27 @@ function render() {
   el.verifierType.value = state.verifierType;
   el.verifierType.disabled = true;
   el.readerPublicKey.value = state.readerPublicKey ?? '';
+  const stagingMode = state.config.mode === 'staging';
+  el.paykitReaderGuidance.textContent = stagingMode
+    ? 'Use a second Bitkit identity: paste its public Pubky and check public Paykit v0 data before submitting.'
+    : 'The Paykit reader identity is prepared automatically by the local demo.';
+  el.readerPublicKey.readOnly = !stagingMode;
+  el.refreshPaykitReader.textContent = stagingMode ? 'Check Paykit data' : 'Refresh Paykit reader';
   const paymentMode = state.verifierType === 'paykit-payment';
   el.proofSatisfied.closest('label').hidden = paymentMode;
   el.paykitReaderCommands.hidden = !paymentMode;
   el.load.disabled = state.loadingLock || state.submittingProof;
-  if (state.paykitReaderState === 'request_received') {
+  if (stagingMode) {
+    el.paykitReaderStatus.textContent = state.paykitDataMessage
+      || 'Paste the distinct reader Bitkit Pubky, then check public Paykit data.';
+    el.paykitReaderStatus.className = state.paykitReaderState === 'present'
+      ? 'ok'
+      : ['absent', 'unavailable'].includes(state.paykitReaderState)
+        ? 'warning'
+        : state.paykitReaderState === 'invalid'
+          ? 'error'
+          : 'muted';
+  } else if (state.paykitReaderState === 'request_received') {
     el.paykitReaderStatus.textContent = 'Paykit reader received and validated the Payment Request.';
     el.paykitReaderStatus.className = 'ok';
   } else if (state.paykitReaderState === 'waiting') {
@@ -557,7 +646,9 @@ function render() {
     el.paykitReaderStatus.textContent = 'Paykit reader worker is starting.';
     el.paykitReaderStatus.className = 'muted';
   }
-  el.paykitReaderPayment.textContent = state.paykitPaymentRequest
+  el.paykitReaderPayment.textContent = stagingMode
+    ? (state.bundleId ? 'Complete the Payment Request in the external reader Bitkit, then resume payment verification polling.' : '')
+    : state.paykitPaymentRequest
     ? format({
       payment_request_id: state.paykitPaymentRequest.payment_request_id,
       asset: state.paykitPaymentRequest.asset,
@@ -691,7 +782,7 @@ function restoreState() {
   const raw = localStorage.getItem(STATE_KEY);
   if (!raw) return;
   try {
-    Object.assign(state, JSON.parse(raw), {
+    Object.assign(state, restorePersistedReaderState(JSON.parse(raw)), {
       loadingLock: false,
       submittingProof: false,
       paymentPolling: false,
@@ -708,29 +799,24 @@ function restoreState() {
 }
 
 function persistState() {
-  const {
-    config: _config,
-    loadingLock: _loadingLock,
-    submittingProof: _submittingProof,
-    paymentPolling: _paymentPolling,
-    paykitReaderPrepared: _paykitReaderPrepared,
-    readerPublicKey: _readerPublicKey,
-    paykitReaderState: _paykitReaderState,
-    paykitPaymentRequest: _paykitPaymentRequest,
-    baselinePaymentRequestId: _baselinePaymentRequestId,
-    readResult: _readResult,
-    ...persisted
-  } = state;
-  localStorage.setItem(STATE_KEY, JSON.stringify(persisted));
+  localStorage.setItem(STATE_KEY, JSON.stringify(buildPersistedReaderState(state)));
 }
 
 function pkarrRelays() {
-  return [state.config.testnet.pkarrRelay];
+  return pkarrRelaysForDemoConfig(state.config);
+}
+
+function paykitDataSnapshotMatches(snapshot) {
+  return snapshot.incarnation === workflowIncarnation
+    && snapshot.resource === state.resource
+    && snapshot.creatorPubky === state.creator
+    && snapshot.readerPubky === state.readerPublicKey;
 }
 
 function invalidateWorkflow() {
   workflowIncarnation += 1;
   paykitReaderStatusRequests.invalidate();
+  paykitDataChecks.invalidate();
   if (state.paykitPaymentRequest?.payment_request_id) {
     state.baselinePaymentRequestId = state.paykitPaymentRequest.payment_request_id;
   }
@@ -749,6 +835,11 @@ function clearVerificationState({ clearLoaded = false } = {}) {
     state.lockResources = [];
     state.guardedResourcePath = '';
     state.verifierType = 'dev-static';
+    if (state.config?.mode === 'staging') {
+      state.paykitReaderPrepared = false;
+      state.paykitReaderState = 'unchecked';
+      state.paykitDataMessage = '';
+    }
   }
   state.creator = null;
   state.bundleId = null;

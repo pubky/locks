@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { extname, join, normalize } from 'node:path';
 
 import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
+import { readDemoConfigPath } from './lib/demo-runtime.mjs';
 import { examplesRoot, parseArgs, readJson, repoRoot, roleProfilePath } from './lib/paths.mjs';
 import { resolveExistingPathWithin } from './lib/creator-static-path.mjs';
 import { readReaderCreatorProfile } from './lib/paykit-reader-helper.mjs';
@@ -20,17 +21,19 @@ import {
 
 const args = parseArgs(process.argv.slice(2));
 const allowUnhealthy = args['allow-unhealthy'] === true;
-const config = await readDemoConfig();
+const config = await readDemoConfig(readDemoConfigPath());
 const serviceConfig = withInternalServiceUrls(config);
-const readerUrl = new URL(config.demoServer.url);
-readerUrl.port = String(args.port ?? 8088);
+const readerUrl = new URL(config.readerServer?.url ?? config.demoServer.url);
+if (!config.readerServer) readerUrl.port = String(args.port ?? 8088);
 const readerServerUrl = readerUrl.toString().replace(/\/$/, '');
 const preflightStatus = await runPreflight(serviceConfig);
 const externalReaderPubky = process.env.PAYKIT_EXTERNAL_READER_PUBKY?.trim() ?? '';
 if (externalReaderPubky && !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(externalReaderPubky)) {
   throw new Error('PAYKIT_EXTERNAL_READER_PUBKY must be a canonical Pubky');
 }
-const workerEnabled = !externalReaderPubky && process.env.PAYKIT_READER_WORKER_ENABLED === '1';
+const workerEnabled = config.mode !== 'staging'
+  && !externalReaderPubky
+  && process.env.PAYKIT_READER_WORKER_ENABLED === '1';
 const workerController = new AbortController();
 let workerOwnsState = false;
 let workerWaitingForCreator = workerEnabled;
@@ -114,12 +117,14 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
 function publicBrowserConfig(source) {
   validateDemoConfig(source);
-  return {
+  const browserConfig = {
+    mode: source.mode,
     demoServer: { url: readerServerUrl },
     lockServer: source.lockServer,
-    testnet: source.testnet,
     paths: {},
   };
+  if (source.testnet) browserConfig.testnet = source.testnet;
+  return browserConfig;
 }
 
 async function runWorkerAfterCreatorProfile() {
@@ -179,11 +184,14 @@ async function shutdown(signal) {
 }
 
 function debugSnapshot(source, preflight) {
+  const authRelayInbox = source.testnet
+    ? pubkyAuthRelayInboxUrl(source.testnet.httpRelay)
+    : null;
   return {
     checkedAt: new Date().toISOString(),
     config: publicBrowserConfig(source),
     derived: {
-      authRelayInbox: pubkyAuthRelayInboxUrl(source.testnet.httpRelay),
+      authRelayInbox,
       readerUrl: `${readerServerUrl}/reader/`,
     },
     preflight,
@@ -202,8 +210,13 @@ async function runPreflight(source) {
   checks.push({ name: 'WASM package', ok: existsSync(wasmPackage), message: existsSync(wasmPackage) ? 'present' : 'missing' });
   await checkHttp(`${source.lockServer.url}/healthz`, 'lock-server /healthz', checks, (status) => status === 200);
   await checkHttp(`${source.lockServer.url}/readyz`, 'lock-server /readyz', checks, (status) => status === 200);
-  await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status === 200 || status === 404);
-  await checkHttp(source.testnet.httpRelay, 'http/auth relay', checks, (status) => status === 200 || status === 404);
+  if (source.mode === 'staging') {
+    await checkHttp(`${source.paykit.url}/health/live`, 'paykit /health/live', checks, (status) => status === 200);
+    await checkHttp(`${source.paykit.url}/health/ready`, 'paykit /health/ready', checks, (status) => status === 200);
+  } else {
+    await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status === 200 || status === 404);
+    await checkHttp(source.testnet.httpRelay, 'http/auth relay', checks, (status) => status === 200 || status === 404);
+  }
   return { ok: checks.every((check) => check.ok), checks, checkedAt: new Date().toISOString() };
 }
 

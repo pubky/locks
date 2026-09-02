@@ -13,6 +13,11 @@ export function buildLocksOptions({ pkarrRelays = [] } = {}) {
   return options;
 }
 
+export async function hasPaykitData({ readerPublicKey }) {
+  await init();
+  return Locks.hasPaykitData(readerPublicKey);
+}
+
 export async function loadContentLock({ resource, pkarrRelays = [] } = {}) {
   await init();
   const options = buildLocksOptions({ pkarrRelays });
