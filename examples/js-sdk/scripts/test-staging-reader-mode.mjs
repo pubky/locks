@@ -101,6 +101,8 @@ assert.match(readerAppSource, /paykitDataChecks\.invalidate\(\)/);
 assert.match(readerAppSource, /paykitDataSnapshotMatches/);
 assert.match(readerAppSource, /creatorPubky: snapshot\.paykitCreator/);
 assert.match(readerAppSource, /state\.loaded\?\.creator !== snapshot\.paykitCreator/);
+assert.match(readerAppSource, /stagingMode \|\| paymentMode \|\| !state\.bundleId/);
+assert.match(readerAppSource, /Dev-static completion is not available on deployed staging/);
 assert.match(readerAppSource, /state\.config\.mode === 'staging'/);
 assert.doesNotMatch(readerAppSource, /state\.config\.testnet\.pkarrRelay/);
 assert.match(readerAppSource, /buildPersistedReaderState\(state\)/);

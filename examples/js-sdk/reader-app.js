@@ -695,10 +695,13 @@ function render() {
   });
   el.pollPayment.disabled = !paymentMode || !state.bundleId || state.paymentPolling;
 
-  el.completeVerification.disabled = paymentMode || !state.bundleId;
+  el.completeVerification.disabled = stagingMode || paymentMode || !state.bundleId;
   if (state.completion) {
     el.completionStatus.textContent = `Dev verification completed. Status: ${state.completion.status}`;
     el.completionStatus.className = state.completion.status === 'failed' ? 'error' : 'ok';
+  } else if (stagingMode && !paymentMode) {
+    el.completionStatus.textContent = 'Dev-static completion is not available on deployed staging. Publish and load a paykit-payment lock for this flow.';
+    el.completionStatus.className = 'warning';
   } else if (paymentMode) {
     el.completionStatus.textContent = 'Payment verification is completed by the Lock Server; no dev completion call is used.';
     el.completionStatus.className = 'muted';
