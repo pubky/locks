@@ -251,9 +251,10 @@ fn render_connect_shell_html(
 /// Shell JS for postmessage delivery. Long-polls `POST /complete` (the server blocks until Ring
 /// approval). Before approval the endpoint is effectively idempotent (the pending flow still
 /// exists), so transient failures — a dropped connection or a gateway timeout from a proxy that
-/// capped the idle long-poll — are retried with capped exponential backoff. A definitive error
-/// (expired/rejected flow) is surfaced as a closed `{ type, state, error }` message so the embedder is never
-/// left hanging. On success it posts `{ type, state, code }` and stops.
+/// capped the idle long-poll — are retried with capped exponential backoff. Application-level
+/// creator-authority failures and other definitive errors are surfaced as a closed
+/// `{ type, state, error }` message so the embedder is never left hanging. On success it posts
+/// `{ type, state, code }` and stops.
 fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state: &str) -> String {
     let flow_id_js = js_string_literal(flow_id);
     let target_origin_js = js_string_literal(target_origin);
@@ -277,9 +278,20 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state:
       reportHeight();
       if (window.ResizeObserver) {{ new ResizeObserver(reportHeight).observe(document.documentElement); }}
       // Statuses that mean "not done yet, try again" (proxy/gateway timeouts, rate limiting).
+      // A non-JSON 503 remains retryable as a likely proxy response, while the stable Locks
+      // creator-authority error is terminal because its one-shot approval may be consumed.
       const RETRYABLE = new Set([408, 425, 429, 502, 503, 504]);
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       const post = (payload) => window.parent.postMessage(payload, TARGET_ORIGIN);
+      const isTerminalApplicationError = async (res) => {{
+        if (res.status !== 503) return false;
+        try {{
+          const error = await res.clone().json();
+          return error?.error?.code === "creator_authority_unavailable";
+        }} catch (_e) {{
+          return false;
+        }}
+      }};
       let delay = 500;
       const backoff = async () => {{ await sleep(delay); delay = Math.min(delay * 2, 5000); }};
       while (true) {{
@@ -298,6 +310,10 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state:
           }} catch (_e) {{
             post({{ type: CALLBACK_TYPE, state: CALLBACK_STATE, error: "invalid-response" }});
           }}
+          return;
+        }}
+        if (await isTerminalApplicationError(res)) {{
+          post({{ type: CALLBACK_TYPE, state: CALLBACK_STATE, error: "connect-failed" }});
           return;
         }}
         if (RETRYABLE.has(res.status)) {{

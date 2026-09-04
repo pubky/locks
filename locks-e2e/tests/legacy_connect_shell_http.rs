@@ -161,6 +161,9 @@ async fn connect_shell_postmessage_mode_returns_json_and_frames_allowed_parent()
     assert!(shell_html.contains("CALLBACK_STATE = \"opaque-state\""));
     assert!(shell_html.contains("error: \"invalid-response\""));
     assert!(shell_html.contains("error: \"connect-failed\""));
+    assert!(shell_html.contains("error?.error?.code === \"creator_authority_unavailable\""));
+    assert!(shell_html.contains("if (await isTerminalApplicationError(res))"));
+    assert!(shell_html.contains("const RETRYABLE = new Set([408, 425, 429, 502, 503, 504]);"));
     assert!(!shell_html.contains("connect-failed-\" + res.status"));
     assert!(!shell_html.contains("I approved this connection"));
     assert!(!shell_html.contains("<form"));
