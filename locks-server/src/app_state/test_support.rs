@@ -13,8 +13,8 @@ use crate::app_state::pubky_clients::{
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
 use crate::config::{
     ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, PubkyConfig, PubkyNetwork, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-    SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    LoggingConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
@@ -206,12 +206,27 @@ async fn postgres_state_has_rate_limiter_configured_from_runtime_config() {
 
 #[test]
 fn pubky_http_client_constructor_follows_configured_network() {
+    let mainnet = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        resolution: PubkyResolution::Default,
+    };
     assert_eq!(
-        pubky_http_client_constructor(PubkyNetwork::Mainnet),
+        pubky_http_client_constructor(&mainnet),
         PubkyHttpClientConstructor::Mainnet
     );
+
+    let mainnet_relay_only = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        resolution: PubkyResolution::RelayOnly,
+    };
     assert_eq!(
-        pubky_http_client_constructor(PubkyNetwork::Testnet),
+        pubky_http_client_constructor(&mainnet_relay_only),
+        PubkyHttpClientConstructor::MainnetRelayOnly
+    );
+
+    let testnet = PubkyConfig::default();
+    assert_eq!(
+        pubky_http_client_constructor(&testnet),
         PubkyHttpClientConstructor::Testnet("127.0.0.1")
     );
 }

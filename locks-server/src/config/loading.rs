@@ -197,6 +197,7 @@ level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or En
 
 [pubky]
 network = "testnet" # One of: testnet, mainnet. Selects Pubky SDK network defaults; testnet expects local pubky-testnet services.
+resolution = "default" # One of: default, relay-only. relay-only disables direct Mainline DHT resolution while retaining PKARR relays on mainnet.
 
 [pkdns]
 public_ip = "{}" # Public IP advertised in PKARR/PKDNS records. Local default is loopback; production must use the externally reachable address.
