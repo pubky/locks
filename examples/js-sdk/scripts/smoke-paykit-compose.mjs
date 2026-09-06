@@ -388,7 +388,7 @@ assert.equal(
   1,
   'only compose-bootstrap may mount the complete generated local state tree',
 );
-for (const siblingContext of ['../pubky-core', '../../Paykit/', '../paykit-rs', '../../Pubky/locks']) {
+for (const siblingContext of ['../pubky-homeserver', '../../Paykit/', '../paykit-rs', '../../Pubky/locks']) {
   assert.ok(!compose.includes(siblingContext), `Compose must not require sibling context ${siblingContext}`);
 }
 for (const privateVolume of ['name: locks_lock-home', 'name: pubky-locks-demo-public']) {
