@@ -1,4 +1,4 @@
-FROM rust:1.89.0-bookworm AS builder
+FROM rust:1.91.1-bookworm AS builder
 
 ARG PUBKY_CORE_REF=v0.11.0
 WORKDIR /usr/src/pubky-core

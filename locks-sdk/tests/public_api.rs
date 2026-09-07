@@ -110,6 +110,7 @@ fn crate_root_exports_foundation_sdk_types() {
         &locks_core::lock_policy::ContentLock,
         Option<&CreatorLockServicePointer>,
     ) -> locks_sdk::Result<LockServerPubky> = lock_server_for_content_lock;
+    let _paykit_data_probe = locks_sdk::has_paykit_data;
 
     assert_eq!(LocksSession::new("another").export_secret(), "another");
 }

@@ -20,7 +20,7 @@ criteria and receive scoped access through a Lock Server.
 
 ## Build and verify
 
-The repository uses Rust 1.89.0. CI also requires PostgreSQL 16, Node.js 22,
+The repository uses Rust 1.91.1. CI also requires PostgreSQL 16, Node.js 22,
 `cargo-nextest`, the `wasm32-unknown-unknown` target, and `wasm-pack` 0.13.1.
 
 ```bash
