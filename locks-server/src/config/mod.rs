@@ -13,8 +13,8 @@ pub use schema::{
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
     PAYKIT_CONNECT_TIMEOUT_SECONDS, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig,
-    PubkyConfig, PubkyNetwork, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 pub use secrets::{FilesystemLockServerIdentityProvider, LockServerIdentityProvider};
 pub(crate) use secrets::{LockServerSigningKeyError, load_lock_server_signing_keypair};

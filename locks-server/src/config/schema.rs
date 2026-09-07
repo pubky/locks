@@ -53,6 +53,7 @@ impl Default for ContentLocksConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubkyConfig {
     pub network: PubkyNetwork,
+    pub resolution: PubkyResolution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -62,10 +63,19 @@ pub enum PubkyNetwork {
     Testnet,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PubkyResolution {
+    #[default]
+    Default,
+    RelayOnly,
+}
+
 impl Default for PubkyConfig {
     fn default() -> Self {
         Self {
             network: PubkyNetwork::Testnet,
+            resolution: PubkyResolution::Default,
         }
     }
 }

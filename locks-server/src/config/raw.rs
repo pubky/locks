@@ -13,7 +13,7 @@ use super::schema::{
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
     VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
@@ -77,12 +77,15 @@ impl RawPaykitConfig {
 struct RawPubkyConfig {
     #[serde(default = "default_pubky_network")]
     network: PubkyNetwork,
+    #[serde(default)]
+    resolution: PubkyResolution,
 }
 
 impl Default for RawPubkyConfig {
     fn default() -> Self {
         Self {
             network: default_pubky_network(),
+            resolution: PubkyResolution::default(),
         }
     }
 }
@@ -91,12 +94,37 @@ impl RawPubkyConfig {
     fn into_pubky_config(self) -> PubkyConfig {
         PubkyConfig {
             network: self.network,
+            resolution: self.resolution,
         }
     }
 }
 
 fn default_pubky_network() -> PubkyNetwork {
     PubkyNetwork::Testnet
+}
+
+#[cfg(test)]
+mod pubky_tests {
+    use super::*;
+
+    #[test]
+    fn parses_relay_only_resolution() {
+        let raw: RawPubkyConfig = toml::from_str(
+            r#"
+network = "mainnet"
+resolution = "relay-only"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw.into_pubky_config(),
+            PubkyConfig {
+                network: PubkyNetwork::Mainnet,
+                resolution: PubkyResolution::RelayOnly,
+            }
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
