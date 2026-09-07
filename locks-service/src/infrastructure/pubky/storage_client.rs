@@ -230,6 +230,10 @@ impl PubkyLegacyCookieSessionImporter {
 }
 
 #[async_trait]
+#[allow(
+    deprecated,
+    reason = "legacy cookie session restore remains current creator authority contract"
+)]
 impl PubkySessionImporter for PubkyLegacyCookieSessionImporter {
     type Session = PubkyImportedSession;
 

@@ -34,6 +34,10 @@ impl PubkyLegacyCookieSessionRevalidator {
 }
 
 #[async_trait]
+#[allow(
+    deprecated,
+    reason = "legacy cookie session restore remains current creator authority contract"
+)]
 impl LegacyCookieSessionRevalidator for PubkyLegacyCookieSessionRevalidator {
     async fn revalidate_legacy_cookie_secret(
         &self,

@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{future::Future, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use locks_core::ids::CreatorPubky;
@@ -6,7 +6,7 @@ use locks_core::ids::CreatorPubky;
     deprecated,
     reason = "legacy cookie auth remains the current creator authority contract"
 )]
-use pubky::{AuthFlowKind, Capabilities, PubkyCookieAuthFlow};
+use pubky::{AuthFlowKind, Capabilities, CookieCredential, PubkyCookieAuthFlow, PubkySession};
 use url::Url;
 
 use crate::application::errors::ApplicationError;
@@ -14,6 +14,9 @@ use crate::application::models::{
     CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, LegacyCreatorConnectFlowApproval,
 };
 use crate::application::ports::LegacyCreatorConnectFlowClient;
+
+const MAX_HOMESERVER_RESOLUTION_ATTEMPTS: usize = 3;
+const INITIAL_HOMESERVER_RESOLUTION_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Pubky SDK-backed legacy creator connect-flow client.
 #[derive(Debug, Clone)]
@@ -50,6 +53,10 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
         &self,
         requested_scopes: &[String],
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        tracing::info!(
+            auth_stage = "flow_start",
+            "starting legacy creator auth flow"
+        );
         let capabilities = requested_scopes_to_capabilities(requested_scopes)?;
         let flow = match &self.auth_relay {
             Some(auth_relay) => PubkyCookieAuthFlow::builder(&capabilities, AuthFlowKind::signin())
@@ -59,7 +66,14 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
                 .pubky
                 .start_cookie_auth_flow(&capabilities, AuthFlowKind::signin()),
         }
-        .map_err(|_| legacy_connect_flow_error("failed to start legacy creator connect flow"))?;
+        .map_err(|error| {
+            log_pubky_stage_failure("flow_start", &error);
+            legacy_connect_flow_error("failed to start legacy creator connect flow")
+        })?;
+        tracing::info!(
+            auth_stage = "flow_start",
+            "legacy creator auth flow started"
+        );
         Ok(CreatorConnectAuthorizationUrl::new(
             flow.authorization_url().to_string(),
         ))
@@ -69,27 +83,198 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
         &self,
         authorization_url: &CreatorConnectAuthorizationUrl,
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
+        tracing::info!(
+            auth_stage = "flow_resume",
+            "resuming legacy creator auth flow"
+        );
         let flow = self
             .pubky
             .resume_cookie_auth_flow(authorization_url.expose_url())
-            .map_err(|_| {
+            .map_err(|error| {
+                log_pubky_stage_failure("flow_resume", &error);
                 legacy_connect_flow_error("failed to resume legacy creator connect flow")
             })?;
-        let session = flow.await_approval().await.map_err(|_| {
+        let target_homeserver = flow.target_homeserver();
+        tracing::info!(
+            auth_stage = "relay_approval",
+            "waiting for legacy creator auth relay approval"
+        );
+        // The SDK owns relay long-poll retries. `await_token` consumes this resumed flow;
+        // any broader retry must construct another flow from the stored authorization URL.
+        let token = flow.await_token().await.map_err(|error| {
+            log_pubky_stage_failure("relay_approval", &error);
             legacy_connect_flow_error("legacy creator connect flow approval failed or expired")
         })?;
+        tracing::info!(
+            auth_stage = "relay_approval",
+            "legacy creator auth token received and verified"
+        );
+
+        let creator_public_key = token.public_key().clone();
+        let homeserver = retry_homeserver_resolution(
+            || async {
+                let homeserver = match target_homeserver.clone() {
+                    Some(homeserver) => homeserver,
+                    None => self
+                        .pubky
+                        .get_homeserver_of(&creator_public_key)
+                        .await?
+                        .unwrap_or_else(|| creator_public_key.clone()),
+                };
+                self.pubky
+                    .client()
+                    .pkarr()
+                    .resolve(&homeserver, pubky::pkarr::ResolvePolicy::CacheFirst)
+                    .await
+                    .map_err(pubky::Error::from)?;
+                Ok(homeserver)
+            },
+            INITIAL_HOMESERVER_RESOLUTION_RETRY_DELAY,
+        )
+        .await
+        .map_err(|_| legacy_connect_flow_error("legacy creator homeserver resolution failed"))?;
+        tracing::info!(
+            auth_stage = "homeserver_resolution",
+            "legacy creator homeserver resolved"
+        );
+
+        tracing::info!(
+            auth_stage = "session_exchange",
+            "starting legacy creator POST /session exchange"
+        );
+        let credential =
+            CookieCredential::from_auth_token(&token, self.pubky.client(), Some(homeserver))
+                .await
+                .map_err(|error| {
+                    log_pubky_stage_failure("session_exchange", &error);
+                    legacy_connect_flow_error("legacy creator homeserver session exchange failed")
+                })?;
+        tracing::info!(
+            auth_stage = "session_exchange",
+            "legacy creator homeserver session established"
+        );
+        let session = PubkySession::from_cookie_credential(self.pubky.client().clone(), credential);
         let creator = creator_from_pubky_public_key_z32(&session.info().public_key().z32())?;
         let session_secret = session
             .as_cookie()
             .and_then(|cookie| cookie.export_secret())
             .map(CreatorAuthoritySecret::new)
             .ok_or_else(|| {
+                tracing::warn!(
+                    auth_stage = "credential_export",
+                    error_kind = "missing_cookie_secret",
+                    "legacy creator auth stage failed"
+                );
                 legacy_connect_flow_error("legacy creator connect flow returned no cookie secret")
             })?;
+        tracing::info!(
+            auth_stage = "credential_export",
+            "legacy creator credential exported"
+        );
         Ok(LegacyCreatorConnectFlowApproval {
             creator,
             session_secret,
         })
+    }
+}
+
+async fn retry_homeserver_resolution<T, F, Fut>(
+    mut operation: F,
+    mut retry_delay: Duration,
+) -> pubky::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = pubky::Result<T>>,
+{
+    for attempt in 1..=MAX_HOMESERVER_RESOLUTION_ATTEMPTS {
+        tracing::info!(
+            auth_stage = "homeserver_resolution",
+            attempt,
+            max_attempts = MAX_HOMESERVER_RESOLUTION_ATTEMPTS,
+            "starting legacy creator homeserver resolution"
+        );
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if is_retryable_homeserver_resolution_error(&error)
+                    && attempt < MAX_HOMESERVER_RESOLUTION_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    auth_stage = "homeserver_resolution",
+                    attempt,
+                    max_attempts = MAX_HOMESERVER_RESOLUTION_ATTEMPTS,
+                    error_kind = pubky_error_kind(&error),
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "legacy creator homeserver resolution failed; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2);
+            }
+            Err(error) => {
+                log_pubky_stage_failure("homeserver_resolution", &error);
+                return Err(error);
+            }
+        }
+    }
+
+    unreachable!("bounded homeserver resolution loop always returns")
+}
+
+fn is_retryable_homeserver_resolution_error(error: &pubky::Error) -> bool {
+    // Resolution failures happen before `/session` dispatch. Never broaden this to request
+    // errors: the Homeserver may have consumed the one-shot token before the response was lost.
+    matches!(
+        error,
+        pubky::Error::Pkarr(pubky::errors::PkarrError::Resolve(_))
+    )
+}
+
+fn log_pubky_stage_failure(auth_stage: &'static str, error: &pubky::Error) {
+    tracing::warn!(
+        auth_stage,
+        error_kind = pubky_error_kind(error),
+        http_status = pubky_error_http_status(error),
+        "legacy creator auth stage failed"
+    );
+}
+
+fn pubky_error_kind(error: &pubky::Error) -> &'static str {
+    match error {
+        pubky::Error::Request(pubky::errors::RequestError::Transport(_)) => "request_transport",
+        pubky::Error::Request(pubky::errors::RequestError::Server { .. }) => "request_server",
+        pubky::Error::Request(pubky::errors::RequestError::Validation { .. }) => {
+            "request_validation"
+        }
+        pubky::Error::Request(pubky::errors::RequestError::DecodeJson { .. }) => {
+            "request_decode_json"
+        }
+        pubky::Error::Pkarr(pubky::errors::PkarrError::Dns(_)) => "pkarr_dns",
+        pubky::Error::Pkarr(pubky::errors::PkarrError::SignPacket(_)) => "pkarr_sign_packet",
+        pubky::Error::Pkarr(pubky::errors::PkarrError::Publish(_)) => "pkarr_publish",
+        pubky::Error::Pkarr(pubky::errors::PkarrError::Resolve(_)) => "pkarr_resolution",
+        pubky::Error::Pkarr(pubky::errors::PkarrError::InvalidRecord(_)) => "pkarr_invalid_record",
+        pubky::Error::Parse(_) => "url_parse",
+        pubky::Error::Authentication(pubky::errors::AuthError::CookieSessionRecord(_)) => {
+            "auth_cookie_record"
+        }
+        pubky::Error::Authentication(pubky::errors::AuthError::VerificationFailed(_)) => {
+            "auth_token_verification"
+        }
+        pubky::Error::Authentication(pubky::errors::AuthError::DecryptError(_)) => {
+            "auth_decryption"
+        }
+        pubky::Error::Authentication(pubky::errors::AuthError::Validation(_)) => "auth_validation",
+        pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired) => "auth_expired",
+        pubky::Error::Build(_) => "client_build",
+    }
+}
+
+fn pubky_error_http_status(error: &pubky::Error) -> Option<u16> {
+    match error {
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. }) => {
+            Some(status.as_u16())
+        }
+        _ => None,
     }
 }
 
@@ -148,6 +333,11 @@ fn legacy_connect_flow_error(message: &'static str) -> ApplicationError {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
@@ -156,6 +346,7 @@ mod tests {
     use super::{
         PubkyLegacyCreatorConnectFlowClient, creator_from_pubky_public_key_z32,
         creator_z32_from_creator_pubky, legacy_locks_connect_capabilities,
+        retry_homeserver_resolution,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -263,6 +454,61 @@ mod tests {
                 message: "invalid legacy creator capability scope".to_owned(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn homeserver_resolution_retries_transient_pkarr_failures() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        retry_homeserver_resolution(
+            move || {
+                let attempt = observed_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        return Err(pubky::Error::Pkarr(pubky::errors::PkarrError::Resolve(
+                            pubky::pkarr::errors::ResolveError::NoResponses,
+                        )));
+                    }
+                    Ok(())
+                }
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn homeserver_resolution_does_not_retry_session_server_failures() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        let error = retry_homeserver_resolution(
+            move || {
+                observed_attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<(), _>(pubky::Error::Request(pubky::errors::RequestError::Server {
+                        status: pubky::StatusCode::SERVICE_UNAVAILABLE,
+                        message: "session exchange failed".to_owned(),
+                    }))
+                }
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status: pubky::StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     struct FakeLegacyConnectFlowClient;
