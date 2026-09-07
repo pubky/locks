@@ -344,7 +344,7 @@ for (const required of [
   'cculianu/fulcrum:v1.11.1@sha256:70f06b93ab5863997992d4b4508312fe81ce576017e16ecc7e69c7d38165bdf2',
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
-  'PUBKY_CORE_REF: v0.11.0',
+  'PUBKY_HOMESERVER_REF: v0.11.0',
   'https://github.com/pubky/paykit-server.git#v0.1.0-rc2',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
@@ -388,7 +388,13 @@ assert.equal(
   1,
   'only compose-bootstrap may mount the complete generated local state tree',
 );
-for (const siblingContext of ['../pubky-core', '../../Paykit/', '../paykit-rs', '../../Pubky/locks']) {
+for (const siblingContext of [
+  '../pubky-core',
+  '../pubky-homeserver',
+  '../../Paykit/',
+  '../paykit-rs',
+  '../../Pubky/locks',
+]) {
   assert.ok(!compose.includes(siblingContext), `Compose must not require sibling context ${siblingContext}`);
 }
 for (const privateVolume of ['name: locks_lock-home', 'name: pubky-locks-demo-public']) {
@@ -425,13 +431,22 @@ assert.ok(
   'Lock Server image must use the toolchain already installed in its builder image',
 );
 for (const required of [
-  'ARG PUBKY_CORE_REF=v0.11.0',
-  'git clone --branch "${PUBKY_CORE_REF}" --depth 1',
+  'ARG PUBKY_HOMESERVER_REF=v0.11.0',
+  'git clone --branch "${PUBKY_HOMESERVER_REF}" --depth 1',
+  'https://github.com/pubky/pubky-homeserver.git',
   'cargo update -p quinn-proto --precise 0.11.15',
 ]) {
   assert.ok(pubkyTestnetDockerfile.includes(required), `Pubky testnet image missing ${required}`);
 }
-assert.ok(!pubkyTestnetDockerfile.includes('PUBKY_CORE_REV'), 'Pubky testnet must not use an opaque revision argument');
+assert.ok(
+  !pubkyTestnetDockerfile.includes('PUBKY_CORE_REF'),
+  'Pubky testnet must not use the obsolete Pubky Core ref argument',
+);
+assert.ok(
+  !pubkyTestnetDockerfile.includes('PUBKY_CORE_REV'),
+  'Pubky testnet must not use the obsolete Pubky Core revision argument',
+);
+assert.ok(!pubkyTestnetDockerfile.includes('PUBKY_HOMESERVER_REV'), 'Pubky testnet must not use an opaque revision argument');
 assert.ok(publicKeyScript.includes('pubky-common = "0.11.0"'), 'public-key helper must use Pubky Common 0.11');
 assert.ok(locksEntrypoint.includes('LOCKS_PUBLIC_CONFIG'), 'Lock Server must publish an explicit public artifact');
 for (const required of [

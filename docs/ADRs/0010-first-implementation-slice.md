@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Pubky-Core questions remain open around private-path writes, private namespace stability, and event visibility. Starting with creator publishing would force the first implementation to assume answers in areas that are still unresolved.
+Pubky Homeserver questions remain open around private-path writes, private namespace stability, and event visibility. Starting with creator publishing would force the first implementation to assume answers in areas that are still unresolved.
 
 The first implementation still needs to prove the core Locks workflow: proof submission, asynchronous verification, entitlement persistence, access credential issuance, entitlement-backed access validation, and proxy-read behavior.
 
@@ -39,7 +39,7 @@ The workspace contains an application-level regression test for this flow: `retr
 
 ## Consequences
 
-- The first implementation proves application/domain organization without depending on unresolved Pubky-Core behavior.
+- The first implementation proves application/domain organization without depending on unresolved Pubky Homeserver behavior.
 - Creator publishing remains deferred until guarded write, namespace, and event semantics are confirmed or explicitly mocked.
 - The `dev-static` verifier is only registered for dev/test runtime wiring and is not available to production-mode workers.
 - The in-memory adapters can later support a fake-adapter Lock Server skeleton before Pubky-backed adapters exist.

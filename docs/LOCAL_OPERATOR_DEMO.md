@@ -70,13 +70,13 @@ The complete startup and reset commands, browser URLs, local state boundaries, a
 
 ## Dev legacy-connect testnet automation
 
-For local Pubky-Core testnet work without pubky.app, use:
+For local Pubky testnet work without pubky.app, use:
 
 ```bash
 scripts/dev-legacy-connect-testnet.sh auth
 ```
 
-This assumes both the Pubky-Core testnet and Lock Server are already running. It creates/reuses a local dev Pubky user under `.local/pubky-lock-dev/`, starts the hosted Lock-Server `/connect` shell, approves the rendered `pubkyauth://` URL with the Pubky SDK, completes the shell flow, and exchanges the redirected one-time code for a Locks-local frontend session token.
+This assumes both the Pubky testnet and Lock Server are already running. It creates/reuses a local dev Pubky user under `.local/pubky-lock-dev/`, starts the hosted Lock-Server `/connect` shell, approves the rendered `pubkyauth://` URL with the Pubky SDK, completes the shell flow, and exchanges the redirected one-time code for a Locks-local frontend session token.
 
 To continue into creator publishing with the acquired frontend session, run:
 

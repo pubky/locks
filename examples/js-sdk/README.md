@@ -109,7 +109,7 @@ The compose stack starts:
 - creator demo on `http://127.0.0.1:8080/examples/js-sdk/`
 - reader demo on `http://127.0.0.1:8088/reader/`
 
-The Pubky testnet image is built from the public `pubky/pubky-core` repository at
+The Pubky testnet image is built from the public `pubky/pubky-homeserver` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
 
 Compose keeps the Lock Server identity, config, and generated creator-authority
@@ -130,7 +130,7 @@ The browser-facing demo config uses `127.0.0.1`; container-internal health check
 
 ## Local Pubky testnet defaults
 
-`pubky-core/pubky-testnet` local static development uses:
+`pubky-homeserver/pubky-testnet` local static development uses:
 
 ```text
 PKARR relay     = http://127.0.0.1:15411
@@ -212,7 +212,7 @@ Do not wrap these commands in `docker compose exec`. The host wrappers load priv
 state locally and bridge only bounded helper input into the relevant container.
 
 The Paykit Server build context uses the immutable `v0.1.0-rc2` tag, its compatible
-Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Core uses
+Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Homeserver uses
 `v0.11.0`. The active Locks checkout is used only for the Locks and browser-demo
 images being developed. No sibling repository checkout is required.
 
