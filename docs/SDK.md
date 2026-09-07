@@ -135,7 +135,7 @@ options.addPkarrRelay("http://127.0.0.1:15411");
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
 
-Local `pubky-core/pubky-testnet` defaults are:
+Local `pubky-homeserver/pubky-testnet` defaults are:
 
 ```text
 PKARR relay     = http://127.0.0.1:15411

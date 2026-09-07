@@ -8,7 +8,7 @@ Accepted
 
 Access credentials must remain separate from durable entitlement records. The Bundle ID is the durable viewer-held recovery handle and entitlement anchor. The access credential is a Lock-Server-issued convenience credential for proxy access.
 
-The first implementation needs a concrete lifecycle so application services, in-memory stores, and later HTTP routes can be modeled without waiting on Pubky-Core questions.
+The first implementation needs a concrete lifecycle so application services, in-memory stores, and later HTTP routes can be modeled without waiting on Pubky integration questions.
 
 ## Decision
 

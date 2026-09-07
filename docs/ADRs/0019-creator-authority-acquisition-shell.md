@@ -65,7 +65,7 @@ Rejected for legacy-connect.
 
 Native pubky.app rendering would require pubky.app to receive enough data to display the QR/deeplink. With the current legacy auth flow, that display URL is secret-bearing. Showing it in pubky.app would expose Lock-Server-owned relay/client secret material to pubky.app, violating the auth boundary.
 
-pubky.app-native rendering remains a good target for a future grant-based or Pubky-Core-provided non-secret metadata flow where the display artifact is safe for pubky.app to render.
+pubky.app-native rendering remains a good target for a future grant-based or Pubky SDK-provided non-secret metadata flow where the display artifact is safe for pubky.app to render.
 
 ### Lock-Server-hosted iframe first
 
@@ -125,5 +125,5 @@ Negative:
 - Implement the Lock-Server-hosted `/connect` page/shell as a separate plan slice.
 - Add explicit allowed `return_to` origin config before enabling the shell outside local/dev tests.
 - Decide whether the first shell should default to popup or full-page redirect in pubky.app UX.
-- Revisit pubky.app-native rendering when Pubky-Core grant-based auth or a non-secret QR/deeplink metadata API is available.
+- Revisit pubky.app-native rendering when Pubky grant-based auth or a non-secret QR/deeplink metadata API is available.
 - ~~If iframe embedding is requested later, add an iframe-specific ADR/checklist before implementation.~~ Done (issue #15): iframe `?delivery=postmessage` shipped as an additive mode on the same shell; constraints documented under "Lock-Server-hosted iframe first" above. A follow-up may still add per-app `frame-ancestors` registration for multi-tenant framing (currently scoped to the single `return_to` origin per flow).

@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The first retrieval/access slices proved viewer-side verification, entitlement-backed credential issuance, and proxy-read using in-memory content-lock and guarded-resource repositories. Until Pubky-Core confirms private-path write support, private namespace rules, and event visibility semantics, production Pubky-backed creator publishing must stay behind ports.
+The first retrieval/access slices proved viewer-side verification, entitlement-backed credential issuance, and proxy-read using in-memory content-lock and guarded-resource repositories. Until Pubky Homeserver private-path write support, private namespace rules, and event visibility semantics are confirmed, production Pubky-backed creator publishing must stay behind ports.
 
 The product still needs a creator-side local publishing flow so a creator can add guarded content and publish a content lock through public HTTP API during development and E2E testing. This flow should exercise Locks-native domain objects rather than reusing `pubky-app-specs`, whose schemas are specific to Pubky.app posts/files/follows and `/pub/pubky.app/...` paths.
 
