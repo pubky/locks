@@ -93,7 +93,7 @@ allowed_return_origins = ["https://pubky.app"]
 network = "mainnet"
 ```
 
-The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Runtime publication is configured under `[pkdns]`; see [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
+The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Endpoint data and republishing cadence are configured under `[pkdns]`; shared relay URLs are configured under `[pubky]`. See [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
 
 The SDK verifies the public service identity endpoint:
 
