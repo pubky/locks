@@ -136,13 +136,13 @@ await Promise.race([
 ]);
 
 const primaryResource = {
-  path: '/priv/locks.app/content/primary.txt',
+  path: '/priv/app.locks/content/primary.txt',
   hash: '0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G',
   content_type: 'text/plain',
   size: 13,
 };
 const secondaryResource = {
-  path: '/priv/locks.app/content/secondary.txt',
+  path: '/priv/app.locks/content/secondary.txt',
   hash: '0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G',
   content_type: 'text/plain',
   size: 7,

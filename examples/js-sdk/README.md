@@ -379,7 +379,7 @@ Rules:
 - file upload only
 - guarded path prefix is fixed:
   ```text
-  /priv/locks.app/content/
+  /priv/app.locks/content/
   ```
 - only the filename segment is editable
 - `/` in filename is rejected
@@ -449,7 +449,7 @@ The Node demo server does not write Locks resources directly to the homeserver.
 After success, the page displays the **Viewer content lock resource**:
 
 ```text
-<creator_pubky>/pub/locks.app/<lock_id>.json
+<creator_pubky>/pub/app.locks/<lock_id>.json
 ```
 
 ## Reader browser flow

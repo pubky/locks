@@ -80,7 +80,7 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
         .set_lock_service_config("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
         .await
         .unwrap();
-    assert_eq!(pointer_json["path"], "/pub/locks.app/config.json");
+    assert_eq!(pointer_json["path"], "/pub/app.locks/config.json");
     assert_secret_free(&pointer_json);
 
     let guarded_json = client
@@ -90,7 +90,7 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
     let guarded_resource = guarded_json["guarded_resource"].clone();
     assert_eq!(
         guarded_resource["path"],
-        "/priv/locks.app/content/example.txt"
+        "/priv/app.locks/content/example.txt"
     );
     assert_secret_free(&guarded_json);
 
@@ -119,11 +119,11 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
     let operations = storage.operations();
     assert!(
         operations.iter().any(|operation| {
-            operation == "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/locks.app/config.json"
+            operation == "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/app.locks/config.json"
         })
     );
     assert!(operations.iter().any(|operation| {
-        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt text/plain"
+        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt text/plain"
     }));
     assert!(operations.iter().any(|operation| {
         operation == &format!("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {content_lock_path}")
@@ -258,8 +258,8 @@ impl CreatorAuthorityManager for FakeCreatorAuthorityManager {
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             authorized: true,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             session_expires_at: None,
         })

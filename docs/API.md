@@ -246,7 +246,7 @@ Authorized response:
   "creator": "pubkycreator123",
   "authorized": true,
   "auth_kind": "legacy_cookie",
-  "granted_scopes": ["/pub/locks.app/:rw", "/priv/locks.app/:rw"],
+  "granted_scopes": ["/pub/app.locks/:rw", "/priv/app.locks/:rw"],
   "session_expires_at": null
 }
 ```
@@ -303,7 +303,7 @@ Creator publishing routes always use Pubky homeserver-backed repositories. Calle
 
 Response-shape fixture: `locks-server/tests/fixtures/creator_publishing/register_guarded_resource_response_shape.json`
 
-Registers or replaces the current guarded resource bytes for the authenticated creator and decoded relative content path. The server reconstructs the canonical private guarded resource path as `/priv/locks.app/content/<path>`. With Pubky-backed repositories, it writes bytes to the creator homeserver under that path.
+Registers or replaces the current guarded resource bytes for the authenticated creator and decoded relative content path. The server reconstructs the canonical private guarded resource path as `/priv/app.locks/content/<path>`. With Pubky-backed repositories, it writes bytes to the creator homeserver under that path.
 
 #### Request
 
@@ -320,7 +320,7 @@ The request body is raw resource bytes, not JSON. `Content-Type` is required and
 Path rules:
 
 - MUST be non-empty after percent-decoding.
-- MUST be relative to `/priv/locks.app/content/`; callers supply only the relative path, not the full private path.
+- MUST be relative to `/priv/app.locks/content/`; callers supply only the relative path, not the full private path.
 - MAY contain nested slash-separated segments.
 - MUST NOT start with `/`.
 - MUST NOT contain `..` traversal segments, including encoded traversal.
@@ -335,7 +335,7 @@ Upload size is limited by `[content_locks].max_resource_bytes` and defaults to 1
 {
   "creator": "pubkycreator123",
   "guarded_resource": {
-    "path": "/priv/locks.app/content/example.txt",
+    "path": "/priv/app.locks/content/example.txt",
     "hash": "<guarded_resource_hash>",
     "content_type": "text/plain",
     "size": 13
@@ -378,7 +378,7 @@ Creates or replaces a content lock from a resource set. A content lock may conta
 - `primary_resource`: optional full [`GuardedResource`](#success-response) descriptor.
 - `secondary_resources`: optional map keyed by full canonical private path. Values contain `hash`, `content_type`, and `size` only.
 
-At least one resource is required. If a primary resource is present, its path must not also appear in `secondary_resources`. `secondary_resources` keys are full canonical private paths such as `/priv/locks.app/content/attachments/a.txt`.
+At least one resource is required. If a primary resource is present, its path must not also appear in `secondary_resources`. `secondary_resources` keys are full canonical private paths such as `/priv/app.locks/content/attachments/a.txt`.
 
 With Pubky-backed repositories, this writes the public content lock JSON to the creator homeserver under its derived `content_lock_path`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
@@ -401,13 +401,13 @@ Every referenced guarded resource must currently exist for the same creator/path
 ```json
 {
   "primary_resource": {
-    "path": "/priv/locks.app/content/post.json",
+    "path": "/priv/app.locks/content/post.json",
     "hash": "<primary_hash>",
     "content_type": "application/json",
     "size": 123
   },
   "secondary_resources": {
-    "/priv/locks.app/content/attachments/a.txt": {
+    "/priv/app.locks/content/attachments/a.txt": {
       "hash": "<attachment_hash>",
       "content_type": "text/plain",
       "size": 13
@@ -438,18 +438,18 @@ Every referenced guarded resource must currently exist for the same creator/path
 ```json
 {
   "lock_id": "<lock_id>",
-  "content_lock_path": "/pub/locks.app/<lock_id>.json",
+  "content_lock_path": "/pub/app.locks/<lock_id>.json",
   "content_lock": {
     "version": 1,
     "creator": "pubkycreator123",
     "primary_resource": {
-      "path": "/priv/locks.app/content/post.json",
+      "path": "/priv/app.locks/content/post.json",
       "hash": "<primary_hash>",
       "content_type": "application/json",
       "size": 123
     },
     "secondary_resources": {
-      "/priv/locks.app/content/attachments/a.txt": {
+      "/priv/app.locks/content/attachments/a.txt": {
         "hash": "<attachment_hash>",
         "content_type": "text/plain",
         "size": 13
@@ -496,9 +496,9 @@ Fixtures:
 - Request: `locks-server/tests/fixtures/creator_publishing/set_lock_service_config_request.json`
 - Response shape: `locks-server/tests/fixtures/creator_publishing/set_lock_service_config_response_shape.json`
 
-Stores or replaces the creator's default Lock Service Pointer for the canonical Pubky path `/pub/locks.app/config.json`.
+Stores or replaces the creator's default Lock Service Pointer for the canonical Pubky path `/pub/app.locks/config.json`.
 
-With Pubky-backed repositories, this writes the pointer JSON to the creator homeserver at `/pub/locks.app/config.json`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
+With Pubky-backed repositories, this writes the pointer JSON to the creator homeserver at `/pub/app.locks/config.json`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
 Content lock creation does not require a Lock Service Pointer. A content lock may carry `lock_server.override`; future viewer discovery can use the pointer when no override exists.
 
@@ -515,7 +515,7 @@ Content lock creation does not require a Lock Service Pointer. A content lock ma
 ```json
 {
   "creator": "pubkycreator123",
-  "path": "/pub/locks.app/config.json",
+  "path": "/pub/app.locks/config.json",
   "lock_service_pointer": {
     "version": 1,
     "default_lock_server": "pubkyserver123",
@@ -548,7 +548,7 @@ Request envelope:
   "submitted_proof_bundle": {
     "version": 1,
     "bundle_id": "<bundle_id>",
-    "pubky_lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
+    "pubky_lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
     "reader_public_key": "pubky<reader>",
     "proofs": [
       {
@@ -570,7 +570,7 @@ Submission processing applies rate limiting, validates proof shape, loads the cu
 ```json
 {
   "bundle_id": "<bundle_id>",
-  "lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
+  "lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
   "reader": "pubky<reader>"
 }
 ```
@@ -615,7 +615,7 @@ Response includes the raw credential exactly once. Polling routes never return c
 
 ### `GET /priv-resources/content/<path>`
 
-Proxy-reads one guarded resource from the content lock authorized by a bearer credential. The `<path>` segment is the same relative path used for upload; the server reconstructs `/priv/locks.app/content/<path>` and verifies that path is in the credential's content lock resource set before reading bytes.
+Proxy-reads one guarded resource from the content lock authorized by a bearer credential. The `<path>` segment is the same relative path used for upload; the server reconstructs `/priv/app.locks/content/<path>` and verifies that path is in the credential's content lock resource set before reading bytes.
 
 Credentials are accepted only through:
 

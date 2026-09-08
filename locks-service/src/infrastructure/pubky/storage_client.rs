@@ -592,7 +592,7 @@ mod tests {
         let client = AuthorizingPubkyHomeserverStorageClient::new(inner, manager);
 
         let result = client
-            .get_json_value_as_creator(&creator(), "/pub/locks.app/config.json")
+            .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
             .await
             .unwrap();
 
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(client.manager().seen_creators(), vec![creator()]);
         assert_eq!(
             client.inner().operations(),
-            vec![format!("get_json {} /pub/locks.app/config.json", creator())]
+            vec![format!("get_json {} /pub/app.locks/config.json", creator())]
         );
     }
 
@@ -611,7 +611,7 @@ mod tests {
         let client = AuthorizingPubkyHomeserverStorageClient::new(inner, manager);
 
         let result = client
-            .get_json_value_as_creator(&creator(), "/pub/locks.app/config.json")
+            .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
             .await;
 
         assert_eq!(result, Err(ApplicationError::CreatorAuthorityUnavailable));
@@ -622,14 +622,14 @@ mod tests {
     fn pubky_storage_error_redacts_private_locks_paths() {
         let error = pubky_storage_error(
             "get",
-            "/priv/locks.app/content/secret.txt",
+            "/priv/app.locks/content/secret.txt",
             "network timeout",
         );
 
         let debug = format!("{error:?}");
         assert!(debug.contains("Pubky homeserver get failed for private Locks path"));
         assert!(!debug.contains("secret.txt"));
-        assert!(!debug.contains("/priv/locks.app/content/secret.txt"));
+        assert!(!debug.contains("/priv/app.locks/content/secret.txt"));
         assert!(!debug.contains("network timeout"));
     }
 
@@ -642,17 +642,17 @@ mod tests {
         client
             .put_json_value_as_creator(
                 &creator(),
-                "/pub/locks.app/config.json",
+                "/pub/app.locks/config.json",
                 json!({"version": 1}),
             )
             .await
             .unwrap();
         let bytes = client
-            .get_bytes_as_creator(&creator(), "/priv/locks.app/content/example.txt")
+            .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
             .await
             .unwrap();
         client
-            .delete_as_creator(&creator(), "/priv/locks.app/proofs/example.json")
+            .delete_as_creator(&creator(), "/priv/app.locks/proofs/example.json")
             .await
             .unwrap();
 
@@ -670,9 +670,9 @@ mod tests {
         assert_eq!(
             provider.storage_operations(),
             vec![
-                "put_json /pub/locks.app/config.json".to_owned(),
-                "get_bytes /priv/locks.app/content/example.txt".to_owned(),
-                "delete /priv/locks.app/proofs/example.json".to_owned(),
+                "put_json /pub/app.locks/config.json".to_owned(),
+                "get_bytes /priv/app.locks/content/example.txt".to_owned(),
+                "delete /priv/app.locks/proofs/example.json".to_owned(),
             ]
         );
     }
@@ -685,7 +685,7 @@ mod tests {
         let result = client
             .put_bytes_as_creator(
                 &creator(),
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 b"secret".to_vec(),
                 "text/plain",
             )
@@ -757,7 +757,7 @@ mod tests {
 
         let storage = provider.storage_for_creator(&creator()).await.unwrap();
         storage
-            .put_json_value("/pub/locks.app/config.json", json!({"version": 1}))
+            .put_json_value("/pub/app.locks/config.json", json!({"version": 1}))
             .await
             .unwrap();
 
@@ -781,8 +781,8 @@ mod tests {
                     auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
                     authorized: true,
                     granted_scopes: vec![
-                        "/pub/locks.app/:rw".to_owned(),
-                        "/priv/locks.app/:rw".to_owned(),
+                        "/pub/app.locks/:rw".to_owned(),
+                        "/priv/app.locks/:rw".to_owned(),
                     ],
                     session_expires_at: None,
                 }),
@@ -1134,8 +1134,8 @@ mod tests {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new(secret),
             session_expires_at: Some(datetime!(2026-05-29 12:15:00 UTC)),

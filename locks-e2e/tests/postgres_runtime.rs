@@ -233,8 +233,8 @@ fn creator_authority_record(secret: &str) -> CreatorAuthorityRecord {
         creator: creator(),
         auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
         granted_scopes: vec![
-            "/pub/locks.app/:rw".to_owned(),
-            "/priv/locks.app/:rw".to_owned(),
+            "/pub/app.locks/:rw".to_owned(),
+            "/priv/app.locks/:rw".to_owned(),
         ],
         secret: CreatorAuthoritySecret::new(secret.to_owned()),
         session_expires_at: None,
@@ -347,7 +347,7 @@ fn content_lock() -> ContentLock {
         version: CONTENT_LOCK_VERSION,
         creator: creator(),
         primary_resource: Some(GuardedResource {
-            path: "/priv/locks.app/content/postgres-runtime.txt".to_owned(),
+            path: "/priv/app.locks/content/postgres-runtime.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes([9; 32]),
             content_type: "text/plain".to_owned(),
             size: 22,

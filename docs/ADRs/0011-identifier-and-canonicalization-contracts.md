@@ -72,7 +72,7 @@ Rules:
 
 Rules:
 
-- Must be exactly `/pub/locks.app/<lock_id>.json`.
+- Must be exactly `/pub/app.locks/<lock_id>.json`.
 - Not a full Pubky URL.
 - Not a homeserver URL.
 - Not any other `/pub/...` path.
@@ -85,7 +85,7 @@ Rules:
 
 Rules:
 
-- Must be exactly `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`, matching the preferred `PubkyResource` identifier form from the `pubky` crate.
+- Must be exactly `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`, matching the preferred `PubkyResource` identifier form from the `pubky` crate.
 - Must not use the alternate `pubky://...` form in Locks protocol payloads.
 - Must not be an HTTP(S) homeserver transport URL.
 - Embedded creator must parse as `CreatorPubky`.
@@ -107,6 +107,6 @@ Protocol timestamps use `time::OffsetDateTime` and serialize as RFC3339 JSON str
 - `base32` crate behavior is part of the implementation contract and should be covered by tests for lowercase, ambiguous Crockford characters, and hyphen rejection.
 - `BundleId` and `TaskId` are visibly distinct wherever both appear internally; public HTTP API payloads use the `{ creator, bundle_id }` verification handle and do not expose `TaskId`.
 - Content lock paths have one canonical creator-relative shape and do not accept arbitrary Pubky URLs.
-- Pubky lock resources have one canonical protocol-facing shape: `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`.
+- Pubky lock resources have one canonical protocol-facing shape: `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`.
 - `locks-core` relies on `pubky::PublicKey` for Pubky identity parsing instead of reimplementing syntax checks.
 - Canonical JSON and timestamp behavior are explicit protocol contracts, not incidental implementation choices.

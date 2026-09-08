@@ -236,7 +236,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         assert_eq!(
             requested_scopes,
-            ["/pub/locks.app/:rw", "/priv/locks.app/:rw"]
+            ["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
         Ok(CreatorConnectAuthorizationUrl::new(
             "pubkyauth://fake-secret-flow-url",

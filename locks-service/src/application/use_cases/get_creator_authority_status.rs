@@ -149,8 +149,8 @@ mod tests {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new("creator-authority-secret"),
             session_expires_at: Some(session_expires_at),
@@ -176,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             status.granted_scopes,
-            vec!["/pub/locks.app/:rw", "/priv/locks.app/:rw"]
+            vec!["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
         assert_eq!(status.session_expires_at, Some(session_expires_at));
 

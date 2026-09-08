@@ -281,9 +281,9 @@ fn pubky_error_http_status(error: &pubky::Error) -> Option<u16> {
 /// Default Lock Server Pubky capabilities requested by the legacy creator connect flow.
 pub fn legacy_locks_connect_capabilities() -> Capabilities {
     Capabilities::builder()
-        .read_write("/priv/locks.app/")
+        .read_write("/priv/app.locks/")
         .expect("static private Locks capability is canonical")
-        .read_write("/pub/locks.app/")
+        .read_write("/pub/app.locks/")
         .expect("static public Locks capability is canonical")
         .finish()
 }
@@ -385,7 +385,7 @@ mod tests {
         let capabilities = legacy_locks_connect_capabilities();
         assert_eq!(
             capabilities.to_string(),
-            "/priv/locks.app/:rw,/pub/locks.app/:rw"
+            "/priv/app.locks/:rw,/pub/app.locks/:rw"
         );
     }
 

@@ -96,7 +96,7 @@ mod tests {
         let result = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator.clone(),
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes: bytes.clone(),
             })
@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(result.creator, creator);
         assert_eq!(
             result.guarded_resource.path,
-            "/priv/locks.app/content/hello.txt"
+            "/priv/app.locks/content/hello.txt"
         );
         assert_eq!(result.guarded_resource.hash, expected_hash);
         assert_eq!(result.guarded_resource.content_type, "text/plain");
@@ -139,7 +139,7 @@ mod tests {
         let first = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator.clone(),
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes: b"first bytes".to_vec(),
             })
@@ -148,7 +148,7 @@ mod tests {
         let second = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator.clone(),
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 content_type: "image/png".to_owned(),
                 bytes: b"second bytes".to_vec(),
             })
@@ -184,7 +184,7 @@ mod tests {
         let result = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 content_type: "not a mime".to_owned(),
                 bytes: b"hello".to_vec(),
             })
@@ -204,7 +204,7 @@ mod tests {
         let result = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/empty.txt".to_owned(),
+                path: "/priv/app.locks/content/empty.txt".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes: Vec::new(),
             })

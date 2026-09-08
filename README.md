@@ -166,7 +166,7 @@ For the implemented authorization boundary, see
 Lock Server as a Pubky application can optionally provide functionality for content creator to:
 
 - Create guarded content on the creator's homeserver
-- Create public lock policies under `/pub/locks.app/*`
+- Create public lock policies under `/pub/app.locks/*`
 - Store verified proof bundles under a guarded Locks path
 
 Alternatively, content creators can create guarded content and public lock policies using other available methods.
@@ -192,19 +192,19 @@ Minimum for verification plus proxy access:
 A future narrower target could look like:
 
 ```text
-[/priv/locks.app/content/:r, /priv/locks.app/proofs/:rw]
+[/priv/app.locks/content/:r, /priv/app.locks/proofs/:rw]
 ```
 
 If the Lock Server also creates guarded content and public lock policies for the creator, it additionally needs write access to the guarded content namespace and:
 
 ```text
-[/pub/locks.app/:rw]
+[/pub/app.locks/:rw]
 ```
 
 Until narrower guarded capabilities are implemented, the interim grant may need to be broader, for example:
 
 ```text
-[/priv/:rw, /pub/locks.app/:rw]
+[/priv/:rw, /pub/app.locks/:rw]
 ```
 
 This trade-off should be explicit: a broad `/priv/:rw` grant means the creator is trusting the Lock Server with all guarded payloads, not only Locks-specific payloads. The desired end state is a Locks-specific private namespace.
@@ -243,7 +243,7 @@ For credible exit, the default Lock Server pointer should be centralized rather 
 Recommended default location:
 
 ```text
-/pub/locks.app/config.json
+/pub/app.locks/config.json
 ```
 
 Current v0 Lock Service Pointer shape:
@@ -286,13 +286,13 @@ This needs more careful consideration and should not be the default in this draf
 1. Content creator authorizes the Lock Server or creator app with the required capabilities.
 2. Content creator uploads guarded content to their homeserver, preferably under a Locks-specific private namespace once supported.
 3. Content creator computes a hash of the guarded content.
-4. Content creator defines lock conditions and uploads the public lock policy to `/pub/locks.app/<lock_id>.json`.
+4. Content creator defines lock conditions and uploads the public lock policy to `/pub/app.locks/<lock_id>.json`.
 5. Content creator creates a preview post anywhere, such as a pubky.app post, pointing to the public lock policy.
 
 Example preview text:
 
 ```text
-Check out my locked content at pubky<creator_z32>/pub/locks.app/<lock_id>.json
+Check out my locked content at pubky<creator_z32>/pub/app.locks/<lock_id>.json
 ```
 
 Guarded content write should not trigger a public `/events` entry. Public lock policy write should trigger `/events`.
@@ -311,14 +311,14 @@ sequenceDiagram
   H-->>C: 200 JWT
 
   Note over C,H: Step 2: Store guarded payload
-  C->>H: PUT /priv/locks.app/content/<content_id> [header: JWT]
+  C->>H: PUT /priv/app.locks/content/<content_id> [header: JWT]
   H-->>C: 200 OK
 
   Note over C,C: Step 3: Hash guarded payload
   C->>C: blake3(content)
 
   Note over C,H: Step 4: Create lock policy
-  C->>H: PUT /pub/locks.app/<lock_id>.json [header: JWT]
+  C->>H: PUT /pub/app.locks/<lock_id>.json [header: JWT]
   H-->>C: 200 OK
   H-->>H: Emit /events
 
@@ -333,8 +333,8 @@ sequenceDiagram
 #### Flow 3.2
 
 1. Viewer discovers lock either through a preview post or via `/events` endpoint. Event discovery may be missing human context.
-2. Viewer reads public unlock conditions from `pubky<creator_z32>/pub/locks.app/<lock_id>.json`.
-3. Viewer resolves the Lock Server using `/pub/locks.app/config.json`, unless the lock policy contains a service override.
+2. Viewer reads public unlock conditions from `pubky<creator_z32>/pub/app.locks/<lock_id>.json`.
+3. Viewer resolves the Lock Server using `/pub/app.locks/config.json`, unless the lock policy contains a service override.
 4. Viewer solves the lock-specific challenge or gathers required proof material.
 5. Viewer submits a proof bundle to the Lock Server. The current HTTP server applies a configurable process-local fixed-window admission limit before creating verification work.
 6. Lock Server verifies the submitted proof bundle.
@@ -358,11 +358,11 @@ sequenceDiagram
   H-->>V: preview + lock link
 
   Note over V,H: Step 2: Get unlock conditions
-  V->>H: GET /pub/locks.app/<lock_id>.json
+  V->>H: GET /pub/app.locks/<lock_id>.json
   H-->>V: LockPolicy JSON
 
   Note over V,H: Step 3: Resolve Lock Server
-  V->>H: GET /pub/locks.app/config.json
+  V->>H: GET /pub/app.locks/config.json
   H-->>V: default Lock Server pointer
 
   Note over V,V: Step 4: Lock-specific process
@@ -385,7 +385,7 @@ sequenceDiagram
   end
 
   alt Verification succeeds
-    L->>H: PUT /priv/locks.app/proofs/<bundle_id>.json [header: JWT]
+    L->>H: PUT /priv/app.locks/proofs/<bundle_id>.json [header: JWT]
     H-->>L: 200 OK
     L-->>V: { "creator": "...", "bundle_id": "...", "status": "completed" }
   else Verification fails
@@ -394,7 +394,7 @@ sequenceDiagram
 
   Note over V,L: Step 10: Access content
   V->>L: GET opaque bearer credential returned by `POST /access-credentials`
-  L->>H: GET /priv/locks.app/content/<content_id> [header: JWT]
+  L->>H: GET /priv/app.locks/content/<content_id> [header: JWT]
   H-->>L: 200 OK
   L-->>V: 200 OK
 ```
@@ -403,7 +403,7 @@ sequenceDiagram
 
 1. Creator revokes the old Lock Server session/grant.
 2. Creator grants the new Lock Server access to guarded content and stored verified proof bundles.
-3. Creator updates `/pub/locks.app/config.json` with the new Lock Server pointer.
+3. Creator updates `/pub/app.locks/config.json` with the new Lock Server pointer.
 4. If a lock policy used a per-lock service override, that lock policy also needs to be updated.
 5. Viewer presents their stored `bundle_id` to the new Lock Server.
 6. New Lock Server reads the verified proof bundle from the creator's guarded Locks proof path.
@@ -420,7 +420,7 @@ Because verified proof bundles are stored on the creator's homeserver, migration
 Public path:
 
 ```text
-pubky<creator_z32>/pub/locks.app/<lock_id>.json
+pubky<creator_z32>/pub/app.locks/<lock_id>.json
 ```
 
 Example:
@@ -430,13 +430,13 @@ Example:
   "version": 1,
   "creator": "pubky<creator_z32>",
   "primary_resource": {
-    "path": "/priv/locks.app/content/post.json",
+    "path": "/priv/app.locks/content/post.json",
     "hash": "<blake3 guarded resource hash>",
     "content_type": "application/json",
     "size": 1234
   },
   "secondary_resources": {
-    "/priv/locks.app/content/attachments/image.png": {
+    "/priv/app.locks/content/attachments/image.png": {
       "hash": "<blake3 attachment hash>",
       "content_type": "image/png",
       "size": 4567
@@ -490,7 +490,7 @@ Example:
 {
   "version": 1,
   "bundle_id": "<cryptographically random bearer secret>",
-  "pubky_lock_resource": "pubky<creator_z32>/pub/locks.app/<lock_id>.json",
+  "pubky_lock_resource": "pubky<creator_z32>/pub/app.locks/<lock_id>.json",
   "reader_public_key": "pubky<reader_z32>",
   "proofs": [
     {
@@ -515,7 +515,7 @@ A verified proof bundle is stored only after successful verification. It functio
 Guarded path example:
 
 ```text
-pubky<creator_z32>/priv/locks.app/proofs/<bundle_id>.json
+pubky<creator_z32>/priv/app.locks/proofs/<bundle_id>.json
 ```
 
 Example:
@@ -526,10 +526,10 @@ Example:
   "bundle_id": "<cryptographically random bearer secret>",
   "status": "verified",
   "creator": "pubky<creator_z32>",
-  "pubky_lock_resource": "pubky<creator_z32>/pub/locks.app/<lock_id>.json",
+  "pubky_lock_resource": "pubky<creator_z32>/pub/app.locks/<lock_id>.json",
   "lock_hash": "<blake3 of canonical content lock>",
   "resource_set": {
-    "primary_path": "/priv/locks.app/content/post.json",
+    "primary_path": "/priv/app.locks/content/post.json",
     "resource_hashes": [
       "<blake3 guarded resource hash>",
       "<blake3 attachment hash>"

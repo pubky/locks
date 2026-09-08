@@ -350,7 +350,7 @@ mod tests {
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
-    const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/1111111111111111111111111111111111111111111111111111.json";
+    const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/1111111111111111111111111111111111111111111111111111.json";
     const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 
     #[test]

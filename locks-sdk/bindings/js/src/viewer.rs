@@ -523,7 +523,7 @@ mod tests {
         json!({
             "version": 1,
             "bundle_id": BUNDLE_ID,
-            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
             "proofs": [{
                 "criterion_id": "criterion-1",
                 "verifier_type": "dev-static",

@@ -19,13 +19,13 @@ Production Locks uses one creator-granted Locks app session per creator per Lock
 The required creator-granted scopes are:
 
 ```text
-/pub/locks.app/:rw
-/priv/locks.app/:rw
+/pub/app.locks/:rw
+/priv/app.locks/:rw
 ```
 
-`/pub/locks.app/:rw` covers public Locks resources such as the Lock Service Pointer and content lock files. `/priv/locks.app/:rw` covers guarded Locks resources such as guarded content, verified proof bundles / entitlement records, and proxy reads after viewer authorization succeeds. Locks stores guarded content bytes under `/priv/locks.app/content/` and verified proof bundles under `/priv/locks.app/proofs/<bundle_id>.json`. The `/priv/locks.app/:rw` scope is sufficient for read/write/delete on all Locks private children; any Pubky SDK transport quirks stay inside infrastructure adapters rather than domain/use-case logic.
+`/pub/app.locks/:rw` covers public Locks resources such as the Lock Service Pointer and content lock files. `/priv/app.locks/:rw` covers guarded Locks resources such as guarded content, verified proof bundles / entitlement records, and proxy reads after viewer authorization succeeds. Locks stores guarded content bytes under `/priv/app.locks/content/` and verified proof bundles under `/priv/app.locks/proofs/<bundle_id>.json`. The `/priv/app.locks/:rw` scope is sufficient for read/write/delete on all Locks private children; any Pubky SDK transport quirks stay inside infrastructure adapters rather than domain/use-case logic.
 
-Current Pubky Homeserver code supports the capability syntax and `/pub/locks.app/:rw` through existing `/pub/` homeserver write authorization. The confirmed homeserver path for Locks private data is `/priv/locks.app/`, so creator-granted Locks authority must include `/priv/locks.app/:rw` for private resources. Locks depends on Pubky homeserver private storage rather than implementing a parallel guarded storage/auth path. Current Pubky Homeserver emits events for public file writes/deletes and supports path-prefix event filtering. Private writes under `/priv/locks.app/...` emit no public events, and private paths are non-public; Locks discovery must use public `/pub/locks.app/...` resources rather than private write events.
+Current Pubky Homeserver code supports the capability syntax and `/pub/app.locks/:rw` through existing `/pub/` homeserver write authorization. The confirmed homeserver path for Locks private data is `/priv/app.locks/`, so creator-granted Locks authority must include `/priv/app.locks/:rw` for private resources. Locks depends on Pubky homeserver private storage rather than implementing a parallel guarded storage/auth path. Current Pubky Homeserver emits events for public file writes/deletes and supports path-prefix event filtering. Private writes under `/priv/app.locks/...` emit no public events, and private paths are non-public; Locks discovery must use public `/pub/app.locks/...` resources rather than private write events.
 
 The first implemented creator authorization path is the existing Pubky QR/deeplink auth flow using the legacy/cookie session variant. After that legacy path is working, Locks should migrate creator authorization to the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the durable production auth primitive. A Locks-specific UX/API wrapper is acceptable, but the Pubky protocol does not need a new auth primitive for the first implementation. Manual operator provisioning and direct client submission of raw session material are not production acquisition paths.
 
@@ -78,7 +78,7 @@ Positive:
 Negative:
 
 - The Lock Server stores high-value creator-granted session material.
-- `/priv/locks.app/:rw` gives Locks broad read/write authority within the Locks private namespace.
+- `/priv/app.locks/:rw` gives Locks broad read/write authority within the Locks private namespace.
 - Proxy-read integrity verification adds read/hash cost to the first production implementation.
 - Creator status UX requires real Pubky/Ring token validation before it can be safely exposed.
 
