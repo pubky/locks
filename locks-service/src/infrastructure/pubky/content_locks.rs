@@ -81,7 +81,7 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::ports::ContentLockRepository;
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyHomeserverStorageClient,
+        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     #[tokio::test]
@@ -248,6 +248,14 @@ mod tests {
             _creator: &CreatorPubky,
             _path: &str,
         ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            unimplemented!("not needed by content lock repository tests")
+        }
+
+        async fn get_metadata_as_creator(
+            &self,
+            _creator: &CreatorPubky,
+            _path: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
             unimplemented!("not needed by content lock repository tests")
         }
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, GuardedResourceHash};
-use locks_core::lock_policy::PRIVATE_RESOURCE_CONTENT_PATH_PREFIX;
+use locks_core::lock_policy::{GuardedResource, PRIVATE_RESOURCE_CONTENT_PATH_PREFIX};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
@@ -37,16 +37,52 @@ where
     async fn upsert_guarded_resource(
         &self,
         guarded_resource: GuardedResourceRecord,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<GuardedResource, ApplicationError> {
         ensure_private_resource_path(&guarded_resource.path)?;
+        let creator = guarded_resource.creator;
+        let path = guarded_resource.path;
+        let hash = guarded_resource.hash;
+        let size = guarded_resource.size;
         self.client
             .put_bytes_as_creator(
-                &guarded_resource.creator,
-                &guarded_resource.path,
+                &creator,
+                &path,
                 guarded_resource.bytes,
                 &guarded_resource.content_type,
             )
-            .await
+            .await?;
+        let metadata = self
+            .client
+            .get_metadata_as_creator(&creator, &path)
+            .await?
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "Pubky homeserver resource metadata unavailable after put".to_owned(),
+            })?;
+        let stored_size = metadata
+            .content_length
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "Pubky homeserver resource length unavailable after put".to_owned(),
+            })?;
+        if stored_size != size {
+            return Err(ApplicationError::Storage {
+                message: "Pubky homeserver resource size changed after put".to_owned(),
+            });
+        }
+        if metadata.content_hash.as_ref() != Some(hash.as_bytes()) {
+            return Err(ApplicationError::Storage {
+                message: "Pubky homeserver resource hash changed after put".to_owned(),
+            });
+        }
+        let content_type = metadata
+            .content_type
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "Pubky homeserver resource content type unavailable after put".to_owned(),
+            })?;
+        GuardedResource::new(path, hash, content_type, size).map_err(|_| {
+            ApplicationError::Storage {
+                message: "Pubky homeserver returned invalid resource metadata after put".to_owned(),
+            }
+        })
     }
 
     async fn get_guarded_resource(
@@ -147,13 +183,18 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::models::GuardedResourceRecord;
     use crate::application::ports::GuardedResourceRepository;
+    use crate::application::use_cases::register_guarded_resource::{
+        RegisterGuardedResourceRequest, RegisterGuardedResourceUseCase,
+    };
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyHomeserverStorageClient,
+        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     #[tokio::test]
     async fn upsert_guarded_resource_writes_bytes_to_exact_private_path() {
-        let client = FakeStorageClient::default();
+        let client = FakeStorageClient::default().with_metadata_read(Some(
+            PubkyResourceMetadata::from_bytes(b"guarded bytes", Some("text/plain".to_owned())),
+        ));
         let repository = PubkyPrivResourceRepository::new(client);
         let record = resource_record(b"guarded bytes".to_vec(), "text/plain");
 
@@ -165,11 +206,222 @@ mod tests {
         assert_eq!(
             repository.client().operations(),
             vec![
-                "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt text/plain"
-                    .to_owned()
+                "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt text/plain".to_owned(),
+                "get_metadata pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt".to_owned(),
             ]
         );
         assert_eq!(repository.client().last_bytes(), record.bytes);
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_authoritative_content_type_without_downloading_bytes() {
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec();
+        let path = "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000";
+        let client = FakeStorageClient::default().with_metadata_read(Some(
+            PubkyResourceMetadata::from_bytes(&bytes, Some("application/octet-stream".to_owned())),
+        ));
+        let repository = PubkyPrivResourceRepository::new(client);
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let registered = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: path.to_owned(),
+                content_type: "image/svg+xml".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registered.guarded_resource.content_type,
+            "application/octet-stream"
+        );
+        assert_eq!(registered.guarded_resource.path, path);
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!("put_bytes {} {path} image/svg+xml", creator()),
+                format!("get_metadata {} {path}", creator()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_replacement_returns_storage_error_without_deleting_newer_resource() {
+        let newer_resource = PubkyBytesResource {
+            bytes: b"different data".to_vec(),
+            content_type: Some("application/octet-stream".to_owned()),
+        };
+        let repository = PubkyPrivResourceRepository::new(
+            FakeStorageClient::default().with_replacement_after_put(newer_resource.clone()),
+        );
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "text/plain".to_owned(),
+                bytes: b"uploaded bytes".to_vec(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver resource hash changed after put".to_owned(),
+            }
+        );
+        assert_eq!(repository.client().current_resource(), Some(newer_resource));
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!(
+                    "put_bytes {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000 text/plain",
+                    creator()
+                ),
+                format!(
+                    "get_metadata {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000",
+                    creator()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_error_when_head_size_differs_from_uploaded_bytes() {
+        let bytes = b"uploaded bytes".to_vec();
+        let mut metadata = PubkyResourceMetadata::from_bytes(&bytes, Some("text/plain".to_owned()));
+        metadata.content_length = Some(999);
+        let repository = PubkyPrivResourceRepository::new(
+            FakeStorageClient::default().with_metadata_read(Some(metadata)),
+        );
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "text/plain".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver resource size changed after put".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_error_when_head_content_type_is_invalid() {
+        let bytes = b"uploaded bytes".to_vec();
+        let metadata =
+            PubkyResourceMetadata::from_bytes(&bytes, Some("not a valid content type".to_owned()));
+        let repository = PubkyPrivResourceRepository::new(
+            FakeStorageClient::default().with_metadata_read(Some(metadata)),
+        );
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "text/plain".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver returned invalid resource metadata after put".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_error_when_head_content_length_is_missing() {
+        let bytes = b"uploaded bytes".to_vec();
+        let mut metadata = PubkyResourceMetadata::from_bytes(&bytes, Some("text/plain".to_owned()));
+        metadata.content_length = None;
+        let repository = PubkyPrivResourceRepository::new(
+            FakeStorageClient::default().with_metadata_read(Some(metadata)),
+        );
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "text/plain".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver resource length unavailable after put".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_error_when_head_content_type_is_missing() {
+        let bytes = b"uploaded bytes".to_vec();
+        let metadata = PubkyResourceMetadata::from_bytes(&bytes, None);
+        let repository = PubkyPrivResourceRepository::new(
+            FakeStorageClient::default().with_metadata_read(Some(metadata)),
+        );
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "text/plain".to_owned(),
+                bytes,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver resource content type unavailable after put".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn register_returns_storage_error_when_uploaded_metadata_is_unavailable() {
+        let repository = PubkyPrivResourceRepository::new(FakeStorageClient::default());
+        let use_case = RegisterGuardedResourceUseCase::new(&repository);
+
+        let error = use_case
+            .execute(RegisterGuardedResourceRequest {
+                creator: creator(),
+                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                content_type: "image/svg+xml".to_owned(),
+                bytes: br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::Storage {
+                message: "Pubky homeserver resource metadata unavailable after put".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -332,6 +584,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeStorageClient {
         bytes_read: Mutex<Option<PubkyBytesResource>>,
+        metadata_read: Mutex<Option<PubkyResourceMetadata>>,
+        replacement_after_put: Mutex<Option<PubkyBytesResource>>,
         last_bytes: Mutex<Option<Vec<u8>>>,
         operations: Mutex<Vec<String>>,
     }
@@ -340,6 +594,20 @@ mod tests {
         fn with_bytes_read(self, value: Option<PubkyBytesResource>) -> Self {
             *self.bytes_read.lock().unwrap() = value;
             self
+        }
+
+        fn with_metadata_read(self, value: Option<PubkyResourceMetadata>) -> Self {
+            *self.metadata_read.lock().unwrap() = value;
+            self
+        }
+
+        fn with_replacement_after_put(self, value: PubkyBytesResource) -> Self {
+            *self.replacement_after_put.lock().unwrap() = Some(value);
+            self
+        }
+
+        fn current_resource(&self) -> Option<PubkyBytesResource> {
+            self.bytes_read.lock().unwrap().clone()
         }
 
         fn operations(&self) -> Vec<String> {
@@ -386,6 +654,13 @@ mod tests {
                 .unwrap()
                 .push(format!("put_bytes {creator} {path} {content_type}"));
             *self.last_bytes.lock().unwrap() = Some(bytes);
+            if let Some(replacement) = self.replacement_after_put.lock().unwrap().clone() {
+                *self.metadata_read.lock().unwrap() = Some(PubkyResourceMetadata::from_bytes(
+                    &replacement.bytes,
+                    replacement.content_type.clone(),
+                ));
+                *self.bytes_read.lock().unwrap() = Some(replacement);
+            }
             Ok(())
         }
 
@@ -399,6 +674,18 @@ mod tests {
                 .unwrap()
                 .push(format!("get_bytes {creator} {path}"));
             Ok(self.bytes_read.lock().unwrap().clone())
+        }
+
+        async fn get_metadata_as_creator(
+            &self,
+            creator: &CreatorPubky,
+            path: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("get_metadata {creator} {path}"));
+            Ok(self.metadata_read.lock().unwrap().clone())
         }
 
         async fn delete_as_creator(

@@ -655,8 +655,8 @@ impl GuardedResourceRepository for UnusedPortImplementations {
     async fn upsert_guarded_resource(
         &self,
         _guarded_resource: GuardedResourceRecord,
-    ) -> Result<(), ApplicationError> {
-        unreachable!()
+    ) -> Result<GuardedResource, ApplicationError> {
+        unimplemented!("not used in credential flow tests")
     }
 
     async fn get_guarded_resource(

@@ -159,6 +159,7 @@ impl TestServerApp {
                 bytes,
             })
             .await
+            .map(|_| ())
     }
 
     pub async fn insert_frontend_session_for_test(

@@ -59,7 +59,8 @@ impl<'a> RegisterGuardedResourceUseCase<'a> {
             message: error.to_string(),
         })?;
 
-        self.guarded_resources
+        let guarded_resource = self
+            .guarded_resources
             .upsert_guarded_resource(GuardedResourceRecord {
                 creator: request.creator.clone(),
                 path: guarded_resource.path.clone(),

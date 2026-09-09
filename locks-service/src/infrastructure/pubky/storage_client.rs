@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use locks_core::ids::CreatorPubky;
 use locks_core::lock_policy::{
     PRIVATE_PROOF_BUNDLE_PATH_PREFIX, PRIVATE_RESOURCE_CONTENT_PATH_PREFIX,
@@ -16,6 +17,28 @@ pub struct PubkyBytesResource {
     pub bytes: Vec<u8>,
     /// Optional content type from homeserver response metadata.
     pub content_type: Option<String>,
+}
+
+/// Metadata fetched without downloading a creator-owned Pubky resource body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubkyResourceMetadata {
+    /// Stored byte length from response metadata.
+    pub content_length: Option<u64>,
+    /// Stored content type from response metadata.
+    pub content_type: Option<String>,
+    /// Stored BLAKE3 content hash decoded from Pubky ETag metadata.
+    pub content_hash: Option<[u8; 32]>,
+}
+
+impl PubkyResourceMetadata {
+    /// Builds metadata for in-process storage adapters which already hold resource bytes.
+    pub fn from_bytes(bytes: &[u8], content_type: Option<String>) -> Self {
+        Self {
+            content_length: u64::try_from(bytes.len()).ok(),
+            content_type,
+            content_hash: Some(*blake3::hash(bytes).as_bytes()),
+        }
+    }
 }
 
 /// Object-safe seam for creator-scoped Pubky homeserver storage operations.
@@ -51,6 +74,13 @@ pub trait PubkyHomeserverStorageClient: Send + Sync {
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError>;
+
+    /// Reads resource metadata without downloading its body.
+    async fn get_metadata_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError>;
 
     /// Deletes a creator-owned path.
     async fn delete_as_creator(
@@ -104,6 +134,14 @@ where
         (**self).get_bytes_as_creator(creator, path).await
     }
 
+    async fn get_metadata_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        (**self).get_metadata_as_creator(creator, path).await
+    }
+
     async fn delete_as_creator(
         &self,
         creator: &CreatorPubky,
@@ -135,6 +173,11 @@ pub trait CreatorScopedPubkyStorage: Send + Sync {
     ) -> Result<(), ApplicationError>;
 
     async fn get_bytes(&self, path: &str) -> Result<Option<PubkyBytesResource>, ApplicationError>;
+
+    async fn get_metadata(
+        &self,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError>;
 
     async fn delete(&self, path: &str) -> Result<(), ApplicationError>;
 }
@@ -360,6 +403,23 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
         }))
     }
 
+    async fn get_metadata(
+        &self,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        self.storage
+            .stats(path)
+            .await
+            .map(|stats| {
+                stats.map(|stats| PubkyResourceMetadata {
+                    content_length: stats.content_length,
+                    content_type: stats.content_type,
+                    content_hash: stats.etag.as_deref().and_then(decode_pubky_etag),
+                })
+            })
+            .map_err(|error| pubky_storage_error("head", path, error))
+    }
+
     async fn delete(&self, path: &str) -> Result<(), ApplicationError> {
         self.storage
             .delete(path)
@@ -438,6 +498,18 @@ where
             .storage_for_creator(creator)
             .await?
             .get_bytes(path)
+            .await
+    }
+
+    async fn get_metadata_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        self.provider
+            .storage_for_creator(creator)
+            .await?
+            .get_metadata(path)
             .await
     }
 
@@ -527,6 +599,15 @@ where
         self.inner.get_bytes_as_creator(creator, path).await
     }
 
+    async fn get_metadata_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        self.manager.require_creator_authority(creator).await?;
+        self.inner.get_metadata_as_creator(creator, path).await
+    }
+
     async fn delete_as_creator(
         &self,
         creator: &CreatorPubky,
@@ -535,6 +616,14 @@ where
         self.manager.require_creator_authority(creator).await?;
         self.inner.delete_as_creator(creator, path).await
     }
+}
+
+fn decode_pubky_etag(etag: &str) -> Option<[u8; 32]> {
+    base64::engine::general_purpose::STANDARD
+        .decode(etag)
+        .ok()?
+        .try_into()
+        .ok()
 }
 
 /// Maps Pubky storage failures to a secret-safe application storage error.
@@ -570,8 +659,8 @@ mod tests {
         AuthorizingPubkyHomeserverStorageClient, CreatorScopedPubkyStorage,
         CreatorScopedPubkyStorageProvider, ImportedPubkySession,
         LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
-        PubkyBytesResource, PubkyHomeserverStorageClient, PubkySessionImporter,
-        pubky_storage_error,
+        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
+        PubkySessionImporter, pubky_storage_error,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -893,6 +982,18 @@ mod tests {
             Ok(None)
         }
 
+        async fn get_metadata_as_creator(
+            &self,
+            creator: &CreatorPubky,
+            path: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("get_metadata {creator} {path}"));
+            Ok(None)
+        }
+
         async fn delete_as_creator(
             &self,
             creator: &CreatorPubky,
@@ -1012,6 +1113,21 @@ mod tests {
             Ok(Some(PubkyBytesResource {
                 bytes: b"guarded".to_vec(),
                 content_type: Some("text/plain".to_owned()),
+            }))
+        }
+
+        async fn get_metadata(
+            &self,
+            path: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("get_metadata {path}"));
+            Ok(Some(PubkyResourceMetadata {
+                content_length: Some(7),
+                content_type: Some("text/plain".to_owned()),
+                content_hash: Some(*blake3::hash(b"guarded").as_bytes()),
             }))
         }
 
