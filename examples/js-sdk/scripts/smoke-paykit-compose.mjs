@@ -506,7 +506,7 @@ assert.ok(
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],
-  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
+  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:pubky && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
 );
 
 console.log('Paykit Compose smoke check passed');
