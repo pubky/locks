@@ -315,7 +315,7 @@ Content-Type: text/plain
 guarded bytes
 ```
 
-The request body is raw resource bytes, not JSON. `Content-Type` is required and validated before upload, but Pubky homeserver storage determines the MIME type recorded for the resource. After writing, the Lock Server reads the exact bytes back and returns a descriptor containing that storage-authoritative `content_type`. It may differ from the request header—for example, an extensionless SVG may be returned as `application/octet-stream`, and WAV may be returned as `audio/x-wav`.
+The request body is raw resource bytes, not JSON. `Content-Type` is required and validated before upload, but Pubky homeserver storage determines the MIME type recorded for the resource. After writing, the Lock Server performs a metadata-only `HEAD`, verifies its ETag/content hash and length against the upload, and returns a descriptor containing the storage-authoritative `content_type`. It may differ from the request header—for example, an extensionless SVG may be returned as `application/octet-stream`, and WAV may be returned as `audio/x-wav`. The resource body is not downloaded again.
 
 Path rules:
 
@@ -352,7 +352,7 @@ The response is descriptor-only. It does not return raw bytes. Clients must use 
 - Invalid relative path: `400 invalid_request`.
 - Empty body: `400 invalid_request`.
 - Body exceeds configured upload limit: `413 payload_too_large`.
-- Stored bytes cannot be read back with the uploaded hash: `400 invalid_request`.
+- Missing, malformed, or mismatched metadata after a successful upload: `500 internal_error`. This includes concurrent replacement between `PUT` and `HEAD`; clients may retry.
 - Missing/revoked creator-granted homeserver authority: `503 creator_authority_unavailable`.
 - Old `POST /creator/priv-resources` JSON/base64 route: `404 Not Found`.
 

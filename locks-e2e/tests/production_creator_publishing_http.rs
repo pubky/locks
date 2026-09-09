@@ -15,7 +15,7 @@ use locks_service::application::ports::{CreatorAuthorityManager, CreatorAuthorit
 use locks_service::infrastructure::pubky::{
     AuthorizingPubkyHomeserverStorageClient, PubkyBytesResource, PubkyContentLockRepository,
     PubkyEntitlementRepository, PubkyHomeserverStorageClient, PubkyLockServicePointerRepository,
-    PubkyPrivResourceRepository,
+    PubkyPrivResourceRepository, PubkyResourceMetadata,
 };
 use serde_json::json;
 use support::creator_publishing_client::LocalCreatorPublishingClient;
@@ -426,6 +426,23 @@ impl PubkyHomeserverStorageClient for FakePubkyHomeserverStorage {
             .bytes
             .get(&(creator.to_string(), path.to_owned()))
             .cloned())
+    }
+
+    async fn get_metadata_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .operations
+            .push(format!("get_metadata {creator} {path}"));
+        Ok(inner
+            .bytes
+            .get(&(creator.to_string(), path.to_owned()))
+            .map(|resource| {
+                PubkyResourceMetadata::from_bytes(&resource.bytes, resource.content_type.clone())
+            }))
     }
 
     async fn delete_as_creator(

@@ -59,7 +59,8 @@ impl<'a> RegisterGuardedResourceUseCase<'a> {
             message: error.to_string(),
         })?;
 
-        self.guarded_resources
+        let guarded_resource = self
+            .guarded_resources
             .upsert_guarded_resource(GuardedResourceRecord {
                 creator: request.creator.clone(),
                 path: guarded_resource.path.clone(),
@@ -69,23 +70,6 @@ impl<'a> RegisterGuardedResourceUseCase<'a> {
                 bytes: request.bytes,
             })
             .await?;
-
-        let stored = self
-            .guarded_resources
-            .get_guarded_resource(
-                &request.creator,
-                &guarded_resource.path,
-                &guarded_resource.hash,
-            )
-            .await?
-            .ok_or_else(|| ApplicationError::InvalidGuardedResource {
-                message: "stored guarded resource did not match uploaded bytes".to_owned(),
-            })?;
-        let guarded_resource =
-            GuardedResource::new(stored.path, stored.hash, stored.content_type, stored.size)
-                .map_err(|error| ApplicationError::InvalidGuardedResource {
-                    message: error.to_string(),
-                })?;
 
         Ok(RegisteredGuardedResource {
             creator: request.creator,

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, GuardedResourceHash};
+use locks_core::lock_policy::GuardedResource;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
@@ -7,11 +8,11 @@ use crate::application::models::GuardedResourceRecord;
 /// Repository for guarded resource bytes used by the first retrieval/access slice.
 #[async_trait]
 pub trait GuardedResourceRepository: Send + Sync {
-    /// Creates or replaces a guarded resource record.
+    /// Creates or replaces a guarded resource record and returns stored descriptor metadata.
     async fn upsert_guarded_resource(
         &self,
         guarded_resource: GuardedResourceRecord,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<GuardedResource, ApplicationError>;
 
     /// Loads a guarded resource by creator, path, and expected hash.
     ///
