@@ -11,9 +11,10 @@ import {
 
 export { AuthFlowKind, Keypair, Pubky, PublicKey };
 
-export function pubkyForConfig(config) {
+export function pubkyForConfig(config, PubkyImplementation = Pubky) {
+  if (config.mode === 'staging') return new PubkyImplementation();
   const host = new URL(config.testnet.httpRelay).hostname;
-  return Pubky.testnet(host);
+  return PubkyImplementation.testnet(host);
 }
 
 export function randomPassphrase() {

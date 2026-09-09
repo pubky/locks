@@ -22,7 +22,7 @@
   </head>
   <body>
     <h1>Pubky Locks JS SDK reader demo</h1>
-    <p>This local testnet demo exercises the unauthenticated reader flow against a configured Lock Server.</p>
+    <p>This demo exercises the unauthenticated reader flow against a configured Lock Server.</p>
     <p class="warning"><strong>Local-dev warning:</strong> bundle IDs and access credentials are bearer-like secrets. This page displays them for debugging only.</p>
 
     <div class="row">
@@ -59,12 +59,12 @@
         </select>
       </label>
       <section id="paykit-reader-commands" hidden>
-        <p>The Paykit reader identity is prepared automatically by the local demo.</p>
+        <p id="paykit-reader-guidance">The Paykit reader identity is prepared automatically by the local demo.</p>
         <button id="refresh-paykit-reader" type="button">Refresh Paykit reader</button>
         <p id="paykit-reader-status" class="muted">Waiting for the Paykit reader.</p>
         <label>
           Reader Pubky
-          <input id="reader-public-key" readonly />
+          <input id="reader-public-key" type="text" autocomplete="off" spellcheck="false" />
         </label>
         <p>Validated Payment Request and manual operator commands:</p>
         <pre id="paykit-reader-payment"></pre>

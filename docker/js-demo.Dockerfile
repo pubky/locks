@@ -2,6 +2,7 @@
 FROM paykit-runtime AS paykit-runtime
 
 FROM rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS locks-sdk-wasm
+ENV RUSTUP_TOOLCHAIN=1.91.1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*

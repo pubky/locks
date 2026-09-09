@@ -52,7 +52,8 @@ test "$(wc -c < "$key_file" | tr -d ' ')" -eq 43
 grep -Eq '^[A-Za-z0-9_-]{43}$' "$key_file"
 test "$(file_mode "$key_file")" = 600
 cmp -s "$key_file" "$capture"
-test "$(cat "$public_config")" = 'lock_server_public_key = "test-public-key"'
+test "$(cat "$public_config")" = 'lock_server_public_key = "test-public-key"
+paykit_server_url = "http://127.0.0.1:3001"'
 test "$(file_mode "$public_config")" = 644
 first_key="$(cat "$key_file")"
 

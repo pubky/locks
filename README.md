@@ -20,7 +20,7 @@ criteria and receive scoped access through a Lock Server.
 
 ## Build and verify
 
-The repository uses Rust 1.89.0. CI also requires PostgreSQL 16, Node.js 22,
+The repository uses Rust 1.91.1. CI also requires PostgreSQL 16, Node.js 22,
 `cargo-nextest`, the `wasm32-unknown-unknown` target, and `wasm-pack` 0.13.1.
 
 ```bash
@@ -67,18 +67,17 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
 
 2. Open the content-creator demo at <http://127.0.0.1:8080/examples/js-sdk/>.
 
-3. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...`
-   commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit`
-   in `docker compose exec`; those wrappers load private role state on the host and bridge
-   only the bounded native-helper request into the demo container.
+3. In production, use the production Bitkit QR/deep-link path presented by Paykit. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...` commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit` in `docker compose exec`; those wrappers load private role state on the host and bridge only the bounded native-helper request into the demo container. The helper is supplied only by the Paykit local-demo image/runtime stage, not the normal production package/runtime. Follow the manual bearer-URL log retrieval and retention guidance in the example README.
 
-Its external build contexts use anonymously reachable public repositories pinned to
-immutable commits; no sibling Paykit or Pubky checkout is required. The full Paykit demo adds
-Paykit Server at <http://127.0.0.1:3001>. The reader remains at
-<http://127.0.0.1:8088/reader/> in every local flow. Pubky Testnet is built from
-`pubky/pubky-core` source at
-commit `75eb1324f86e8caa16c41f18a2cd6b8e1909ee7b`, not from a released Pubky image or
-version. Payment remains a manual operator action.
+Its external build contexts use anonymously reachable public repositories selected by immutable version tags; no sibling Paykit or Pubky checkout is required. Pubky Testnet is built from the `pubky/pubky-homeserver` `v0.11.0` tag, Paykit libraries use the `v0.1.0-rc48` tag, Paykit Server uses `v0.1.0-rc2`, and Paykit's compatible Locks context uses `v0.1.0-rc1`. The local Paykit Server worktree override remains available through `PAYKIT_SERVER_CONTEXT`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
+
+For the helper-free loopback browser demo against deployed staging Locks and Paykit services:
+
+```bash
+docker compose --file compose.paykit-staging-demo.yaml up -d --build
+```
+
+This staging-specific model uses fixed deployed origins, public Pubky SDK defaults, and two distinct external Bitkit identities. It does not run or reset remote services. See [Paykit staging browser demo](docs/PAYKIT_STAGING_DEMO.md).
 
 ## Documentation
 
@@ -88,6 +87,7 @@ version. Payment remains a manual operator action.
 - [Domain model](docs/DOMAIN_MODEL.md)
 - [Terminology](docs/THESAURUS.md)
 - [Local operator demo](docs/LOCAL_OPERATOR_DEMO.md)
+- [Paykit staging browser demo](docs/PAYKIT_STAGING_DEMO.md)
 - [Security policy](SECURITY.md)
 - [Support](SUPPORT.md)
 

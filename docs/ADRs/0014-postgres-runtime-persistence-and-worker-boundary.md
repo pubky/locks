@@ -50,7 +50,7 @@ Positive:
 - Multiple workers can be introduced without redesigning persistence.
 - Task claiming, leases, retries, and operational inspection have a natural home.
 - The unguarded completion route can be removed from production routing without blocking local/test workflows.
-- Pubky-owned content and entitlement semantics remain isolated until Pubky-Core questions are resolved.
+- Pubky-owned content and entitlement semantics remain isolated until Pubky integration questions are resolved.
 
 Negative:
 

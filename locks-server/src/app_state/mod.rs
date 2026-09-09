@@ -62,6 +62,7 @@ use crate::app_state::private_runtime::{
     InMemoryCreatorAuthorityStore, InMemoryCreatorConnectFlowStore,
     InMemoryFrontendSessionCodeStore, InMemoryFrontendSessionStore, PrivateRuntimeAdapters,
 };
+pub(crate) use crate::app_state::pubky_clients::configure_pkarr_builder;
 use crate::app_state::pubky_clients::{
     build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
 };
@@ -86,7 +87,10 @@ impl ReaderPubkyResolver for PubkyReaderPubkyResolver {
         let Ok(public_key) = pubky_common::crypto::PublicKey::from_str(&reader.to_string()) else {
             return false;
         };
-        self.client.get_homeserver_of(&public_key).await.is_some()
+        self.client
+            .get_homeserver_of(&public_key)
+            .await
+            .is_ok_and(|homeserver| homeserver.is_some())
     }
 }
 
@@ -370,7 +374,7 @@ impl AppState {
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
-        let pubky_http_client = build_pubky_http_client(config.pubky.network);
+        let pubky_http_client = build_pubky_http_client(&config.pubky);
         let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
             Arc::new(LegacyCookieCreatorAuthorityManager::new(
                 creator_authority_store.clone(),
@@ -380,7 +384,7 @@ impl AppState {
             CreatorRepositoryAdapters::pubky_homeserver(creator_authority_store, pubky_http_client);
         let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
             if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(config.pubky.network);
+                let pubky = build_pubky_client(&config.pubky);
                 match pubky_auth_relay_for_network(config.pubky.network) {
                     Some(auth_relay) => Arc::new(
                         PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
@@ -428,7 +432,7 @@ impl AppState {
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
-        let pubky_http_client = build_pubky_http_client(config.pubky.network);
+        let pubky_http_client = build_pubky_http_client(&config.pubky);
         let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
             Arc::new(LegacyCookieCreatorAuthorityManager::new(
                 creator_authority_store,
@@ -436,7 +440,7 @@ impl AppState {
             ));
         let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
             if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(config.pubky.network);
+                let pubky = build_pubky_client(&config.pubky);
                 match pubky_auth_relay_for_network(config.pubky.network) {
                     Some(auth_relay) => Arc::new(
                         PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
@@ -487,7 +491,7 @@ impl AppState {
                 config.rate_limits.verification_submission.clone(),
             ));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
-            client: build_pubky_client(config.pubky.network),
+            client: build_pubky_client(&config.pubky),
         });
         let paykit_http_client = config.paykit.as_ref().map(|paykit| {
             Arc::new(

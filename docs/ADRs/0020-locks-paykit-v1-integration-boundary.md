@@ -96,7 +96,7 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 - Paykit HTTP connect timeout is 5 seconds and whole-request timeout is 20 seconds.
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
-- Configured Paykit base-URL path prefixes are preserved when appending endpoint paths, with or without a trailing slash.
+- Configured Paykit `server_url` is a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash; endpoint paths are appended only after validation.
 
 ## Consequences
 

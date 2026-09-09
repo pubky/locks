@@ -60,7 +60,6 @@ public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "localhost"
-pkarr_relays = []
 key_republisher_interval_seconds = 3600
 
 [rate_limits.verification_submission]
@@ -84,6 +83,45 @@ max_total_resource_bytes = 100000000
     assert_eq!(config.runtime.environment, RuntimeEnvironment::Development);
     assert_eq!(config.pubky.network, PubkyNetwork::Testnet);
     assert!(config.creator_authority_acquisition.enabled);
+}
+
+#[test]
+fn parses_pubky_pkarr_relay_array_through_runtime_config_loader() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config_text = minimal_config(&secret_path, &public_key, "staging").replace(
+        "network = \"testnet\"",
+        r#"network = "mainnet"
+resolution = "relay-only"
+pkarr_relays = ["https://relay.example"]"#,
+    );
+    std::fs::write(&config_path, config_text).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(
+        config.pubky.pkarr_relays,
+        Some(vec!["https://relay.example/".to_owned()])
+    );
+}
+
+#[test]
+fn rejects_removed_pkdns_pkarr_relays() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("locks.toml");
+    let config_text = minimal_config(&secret_path, &public_key, "staging").replace(
+        "icann_domain = \"localhost\"",
+        "icann_domain = \"localhost\"\npkarr_relays = [\"https://relay.example\"]",
+    );
+    std::fs::write(&config_path, config_text).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(error.to_string().contains("unknown field `pkarr_relays`"));
 }
 
 #[test]
@@ -118,7 +156,7 @@ fn parses_optional_paykit_runtime_config() {
     let config = load_existing_config_from_path(&config_path).unwrap();
 
     let paykit = config.paykit.expect("paykit config is present");
-    assert_eq!(paykit.server_url, "http://127.0.0.1:3001/");
+    assert_eq!(paykit.server_url, "http://127.0.0.1:3001");
     assert_eq!(paykit.minimum_confirmations, 0);
 }
 
@@ -145,18 +183,29 @@ fn rejects_invalid_paykit_server_url() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "development").replace(
-        "[content_locks]",
-        "[paykit]\nserver_url = \"ftp://127.0.0.1:3001\"\nminimum_confirmations = 0\n\n[content_locks]",
-    );
-    std::fs::write(&config_path, config).unwrap();
-
-    let error = load_existing_config_from_path(&config_path).unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "paykit.server_url must be a valid http(s) URL: ftp://127.0.0.1:3001"
-    );
+    for server_url in [
+        "ftp://127.0.0.1:3001",
+        "http://user:password@127.0.0.1:3001",
+        "http://127.0.0.1:3001/",
+        "http://127.0.0.1:3001/path",
+        "http://127.0.0.1:3001?secret=query",
+        "http://127.0.0.1:3001#fragment",
+    ] {
+        let config = minimal_config(&secret_path, &public_key, "development").replace(
+            "[content_locks]",
+            &format!(
+                "[paykit]\nserver_url = \"{server_url}\"\nminimum_confirmations = 0\n\n[content_locks]"
+            ),
+        );
+        std::fs::write(&config_path, config).unwrap();
+        let error = load_existing_config_from_path(&config_path).unwrap_err();
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "paykit.server_url must be an exact HTTP(S) origin without credentials"
+        );
+        assert!(!message.contains(server_url));
+    }
 }
 
 #[test]
@@ -373,7 +422,6 @@ public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "localhost"
-pkarr_relays = []
 key_republisher_interval_seconds = 3600
 
 [rate_limits.verification_submission]

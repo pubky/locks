@@ -4,9 +4,13 @@ import { createServer } from 'node:http';
 import { extname, join } from 'node:path';
 
 import { AuthFlowKind, pubkyForConfig } from './lib/pubky.mjs';
-import { contentCreatorSessionPath, examplesRoot, parseArgs, repoRoot } from './lib/paths.mjs';
-import { readDemoConfig, validateDemoConfig, pubkyAuthRelayInboxUrl, withInternalServiceUrls } from './lib/config.mjs';
+import { examplesRoot, parseArgs, repoRoot } from './lib/paths.mjs';
+import { readDemoConfig, validateDemoConfig, withInternalServiceUrls } from './lib/config.mjs';
+import { demoAuthRelayForConfig } from '../demo-network.js';
+import { readDemoConfigPath, resolveCreatorSessionOptions } from './lib/demo-runtime.mjs';
 import {
+  assertRestorableCreatorDemoSession,
+  clearCreatorDemoSession,
   readCreatorDemoSessionForCurrentRole,
   writeCreatorDemoSessionForCurrentRole,
 } from './lib/creator-session-state.mjs';
@@ -16,8 +20,16 @@ import { publishCreatorProfile } from './publish-creator-profile.mjs';
 const args = parseArgs();
 const allowUnhealthy = Boolean(args['allow-unhealthy']);
 const externalWallet = Boolean(args['external-wallet']);
-const config = await readDemoConfig();
+const config = await readDemoConfig(readDemoConfigPath());
 const serviceConfig = withInternalServiceUrls(config);
+const pubky = pubkyForConfig(serviceConfig);
+const creatorSessionOptions = resolveCreatorSessionOptions({
+  mode: config.mode,
+  externalWallet,
+});
+const creatorSessionDisplayPath = config.mode === 'staging'
+  ? './.local/paykit-staging-demo/creator-session/content-creator-session.json'
+  : './.local/js-sdk-demo/content-creator-session.json';
 const port = Number(new URL(config.demoServer.url).port || 8080);
 const debugEnabled = args.debug !== false;
 let activeDemoAuthFlow = null;
@@ -96,14 +108,15 @@ server.listen(port, () => {
 
 async function startDemoAuth() {
   if (await hasPersistedDemoSession()) {
-    console.log(`[demo] reusing persisted content-creator session at ./.local/js-sdk-demo/content-creator-session.json`);
+    console.log(`[demo] reusing persisted content-creator session at ${creatorSessionDisplayPath}`);
     return { authenticated: true, role: 'content-creator' };
   }
   if (!activeDemoAuthFlow) {
-    const pubky = pubkyForConfig(serviceConfig);
     const capabilities = '/pub/locks.app/:rw,/priv/locks.app/:rw';
-    const authRelay = pubkyAuthRelayInboxUrl(serviceConfig.testnet.httpRelay);
-    activeDemoAuthFlow = pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), authRelay);
+    const authRelay = demoAuthRelayForConfig(serviceConfig);
+    activeDemoAuthFlow = authRelay
+      ? pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), authRelay)
+      : pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin());
     activeDemoAuthUrl = activeDemoAuthFlow.authorizationUrl;
     activeDemoAuthStartedAt = new Date().toISOString();
     demoAuthPromise = activeDemoAuthFlow
@@ -117,7 +130,9 @@ async function startDemoAuth() {
           authenticated_at: new Date().toISOString(),
         };
         await writeCreatorDemoSessionForCurrentRole(creatorSession, sessionStateOptions());
-        if (externalWallet) await publishCreatorProfile({ profile: creatorSession });
+        if (externalWallet && config.mode !== 'staging') {
+          await publishCreatorProfile({ profile: creatorSession });
+        }
         return session;
       })
       .catch((error) => {
@@ -146,15 +161,16 @@ async function demoAuthStatus() {
   const session = await readCurrentCreatorSession();
   if (session) {
     if (debugEnabled) {
-      console.log(`[demo] demo-auth persisted session pubky=${session.pubky} path=./.local/js-sdk-demo/content-creator-session.json`);
+      console.log(`[demo] demo-auth persisted session pubky=${session.pubky} path=${creatorSessionDisplayPath}`);
     }
-    return {
+    const result = {
       authenticated: true,
       role: 'content-creator',
       pubky: session.pubky,
-      homeserver: config.testnet.homeserver,
-      sessionPath: './.local/js-sdk-demo/content-creator-session.json',
+      sessionPath: creatorSessionDisplayPath,
     };
+    if (config.mode !== 'staging') result.homeserver = config.testnet.homeserver;
+    return result;
   }
   return {
     authenticated: false,
@@ -170,41 +186,56 @@ async function hasPersistedDemoSession() {
 }
 
 function sessionStateOptions() {
-  return externalWallet ? { profilePath: null } : {};
+  return creatorSessionOptions;
 }
 
 async function readCurrentCreatorSession() {
   const session = await readCreatorDemoSessionForCurrentRole(sessionStateOptions());
-  if (session && externalWallet) await publishCreatorProfile({ profile: session });
+  if (session) {
+    try {
+      await assertRestorableCreatorDemoSession(session, {
+        restore: (exported) => pubky.restoreSession(exported),
+      });
+    } catch {
+      await clearCreatorDemoSession(creatorSessionOptions.sessionPath);
+      return null;
+    }
+  }
+  if (session && externalWallet && config.mode !== 'staging') {
+    await publishCreatorProfile({ profile: session });
+  }
   return session;
 }
 
 function publicBrowserConfig(source) {
   validateDemoConfig(source);
-  return {
+  const browserConfig = {
+    mode: source.mode,
     demoServer: source.demoServer,
     lockServer: source.lockServer,
     paykit: source.paykit,
-    testnet: source.testnet,
     paths: {
       lockServerCallback: `${source.demoServer.url}/auth/lock-server/callback`,
     },
   };
+  if (source.testnet) browserConfig.testnet = source.testnet;
+  return browserConfig;
 }
 
 function logStartupDiagnostics(source, preflight) {
   if (!debugEnabled) return;
-  const authRelay = pubkyAuthRelayInboxUrl(source.testnet.httpRelay);
   console.log('[demo] startup diagnostics');
-  console.log('[demo] config path: ./.local/demo-config/config.json');
+  console.log(`[demo] mode=${source.mode ?? 'local-testnet'}`);
   console.log(`[demo] demoServer.url=${source.demoServer.url}`);
   console.log(`[demo] lockServer.url=${source.lockServer.url}`);
   console.log(`[demo] lockServer.pubky=${source.lockServer.pubky}`);
   console.log(`[demo] lockServer.callback=${source.demoServer.url}/auth/lock-server/callback`);
-  console.log(`[demo] testnet.pkarrRelay=${source.testnet.pkarrRelay}`);
-  console.log(`[demo] testnet.httpRelay=${source.testnet.httpRelay}`);
-  console.log(`[demo] testnet.authRelayInbox=${authRelay}`);
-  console.log(`[demo] testnet.homeserver=${source.testnet.homeserver}`);
+  if (source.testnet) {
+    console.log(`[demo] testnet.pkarrRelay=${source.testnet.pkarrRelay}`);
+    console.log(`[demo] testnet.httpRelay=${source.testnet.httpRelay}`);
+    console.log(`[demo] testnet.authRelayInbox=${demoAuthRelayForConfig(source)}`);
+    console.log(`[demo] testnet.homeserver=${source.testnet.homeserver}`);
+  }
   for (const check of preflight.checks) {
     console.log(`[demo] preflight ${check.ok ? 'ok' : 'FAIL'} ${check.name}: ${check.message}`);
   }
@@ -216,12 +247,12 @@ function debugSnapshot(source, preflight) {
     config: publicBrowserConfig(source),
     derived: {
       lockServerCallback: `${source.demoServer.url}/auth/lock-server/callback`,
-      authRelayInbox: pubkyAuthRelayInboxUrl(source.testnet.httpRelay),
+      authRelayInbox: demoAuthRelayForConfig(source) ?? null,
       expectedConnectUrlHost: source.lockServer.pubky,
-      contentCreatorSessionPath: './.local/js-sdk-demo/content-creator-session.json',
+      contentCreatorSessionPath: creatorSessionDisplayPath,
     },
     state: {
-      hasPersistedDemoSession: existsSync(contentCreatorSessionPath),
+      hasPersistedDemoSession: existsSync(creatorSessionOptions.sessionPath),
       activeDemoAuth: Boolean(activeDemoAuthFlow),
       activeDemoAuthStartedAt,
     },
@@ -252,19 +283,14 @@ async function runPreflight(source) {
 
   await checkHttp(`${source.lockServer.url}/healthz`, 'lock-server /healthz', checks, (status) => status >= 200 && status < 300);
   await checkHttp(`${source.lockServer.url}/readyz`, 'lock-server /readyz', checks, (status) => status >= 200 && status < 300);
-  await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status < 500); // status < 500
-  await checkHttp(source.testnet.httpRelay, 'http/auth relay', checks, (status) => status < 500); // status < 500
-
-  if (/^[^:]+:\d+$/.test(source.testnet.dhtBootstrap)) {
-    push('dht bootstrap', true, 'valid host:port syntax');
+  if (source.mode === 'staging') {
+    await checkHttp(`${source.paykit.url}/health/live`, 'paykit /health/live', checks, (status) => status === 200);
+    await checkHttp(`${source.paykit.url}/health/ready`, 'paykit /health/ready', checks, (status) => status === 200);
   } else {
-    push('dht bootstrap', false, 'expected host:port');
-  }
-
-  if (source.testnet.homeserver.startsWith('pubky')) {
-    push('homeserver', true, 'pubky-shaped');
-  } else {
-    push('homeserver', false, 'expected pubky... public key');
+    await checkHttp(source.testnet.pkarrRelay, 'pkarr relay', checks, (status) => status < 500);
+    await checkHttp(source.testnet.httpRelay, 'http/auth relay', checks, (status) => status < 500);
+    push('dht bootstrap', /^[^:]+:\d+$/.test(source.testnet.dhtBootstrap), 'valid host:port syntax');
+    push('homeserver', source.testnet.homeserver.startsWith('pubky'), 'pubky-shaped');
   }
 
   return { ok: checks.every((check) => check.ok), checks, checkedAt: new Date().toISOString() };

@@ -2,12 +2,23 @@ import {
   configureLockServicePointer,
   exchangeCreatorConnectCode,
   publishLockedContent,
+  queryPaykitSetupStatus,
   signOutCreator,
   startCreatorConnect,
 } from './creator-complete-flow.js';
-import { invalidateIdentityScopedCreatorState } from './creator-identity.js';
+import {
+  captureCreatorOperation,
+  commitIdentityScopedCreatorSession,
+  creatorOperationMatches,
+  invalidateIdentityScopedCreatorState,
+} from './creator-identity.js';
 import { buildCreatorLockPolicy } from './creator-lock-policy.js';
-import { acceptPaykitSetupEvent, buildPaykitSetupRequest } from './paykit-setup.js';
+import {
+  acceptPaykitSetupEvent,
+  buildPaykitSetupRequest,
+  decidePaykitSetupReadiness,
+} from './paykit-setup.js';
+import { pkarrRelaysForDemoConfig } from './demo-network.js';
 import init, { Locks } from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
 
 // Shared creator-page iframe flow — direct postMessage delivery (ADR 0019).
@@ -39,10 +50,12 @@ const state = {
   pendingConnectState: null, // opaque state persisted for the in-flight connect (in-memory)
   lockServerOrigin: null,    // origin of the connect iframe; the only accepted postMessage sender
   lockAuthFrame: null,       // the connect iframe element; only its window may post the callback
+  creatorIdentityGeneration: 0,
   pendingPaykitSetupState: null,
   paykitSetupOrigin: null,
   paykitSetupFrame: null,
   paykitSetupCreator: null,
+  paykitSetupStatusRequestId: 0,
   demoAuthStatusRequestId: 0,
 };
 
@@ -72,6 +85,8 @@ const el = {
   creatorResult: document.querySelector('#creator-result'),
   viewerResource: document.querySelector('#viewer-resource'),
 };
+let pointerOperationToken = null;
+let publicationOperationToken = null;
 
 await init();
 await bootstrap();
@@ -110,21 +125,39 @@ window.addEventListener('message', async (event) => {
   ) return;
   try {
     const { code, state: receivedState } = event.data;
+    const expectedCreatorPubky = state.creatorPubky;
+    const expectedIdentityGeneration = state.creatorIdentityGeneration;
+    const expectedConnectState = state.pendingConnectState;
     const { sessionSecret } = await exchangeCreatorConnectCode({
       lockServer: state.config.lockServer.pubky,
       code,
       state: receivedState,
-      expectedState: state.pendingConnectState,
-      expectedCreatorPubky: state.creatorPubky,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      expectedState: expectedConnectState,
+      expectedCreatorPubky,
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
-    state.feLockSessionToken = sessionSecret; // in-memory only
-    state.lockAuthenticated = true;
+    const commit = await commitIdentityScopedCreatorSession({
+      state,
+      sessionSecret,
+      expectedCreatorPubky,
+      expectedIdentityGeneration,
+      expectedConnectState,
+      revokeSession: (staleSessionSecret) => signOutCreator({
+        lockServer: state.config.lockServer.pubky,
+        sessionSecret: staleSessionSecret,
+        pkarrRelays: pkarrRelaysForDemoConfig(state.config),
+      }),
+    });
+    if (!commit.accepted) {
+      if (!commit.revoked) await postClientLog('warn', 'stale-lock-session-revocation-failed');
+      return;
+    }
     refreshLockAuthStatus();
     showLockAuthComplete();
     state.pendingConnectState = null;
     state.lockServerOrigin = null;
     state.lockAuthFrame = null;
+    await refreshLockTypeFields();
     await postClientLog('info', 'lock-auth-iframe-complete');
   } catch (error) {
     closeLockAuthIframe(); // otherwise the full-screen overlay hides the error message
@@ -140,7 +173,7 @@ function hasExactKeys(value, expected) {
   return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]);
 }
 
-window.addEventListener('message', (event) => {
+window.addEventListener('message', async (event) => {
   const result = acceptPaykitSetupEvent({
     event,
     expectedOrigin: state.paykitSetupOrigin,
@@ -159,11 +192,9 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  state.paykitSetupComplete = true;
+  state.paykitSetupComplete = false;
   closePaykitSetupIframe();
-  el.retryPaykitSetup.hidden = true;
-  el.paykitSetupStatus.textContent = 'Paykit setup complete for this creator.';
-  el.paykitSetupStatus.className = 'ok';
+  await refreshPaykitSetupReadiness({ openSetupWhenRequired: false });
 });
 
 // Open the Lock Server /connect page inside an iframe overlay. The demo draws the modal CARD
@@ -251,7 +282,9 @@ function openPaykitSetupIframe(setupUrl) {
   title.style.cssText = 'margin:0;padding-right:40px;';
 
   const description = document.createElement('p');
-  description.textContent = 'Complete the Paykit instructions for the current creator. From the repository root, use this explicit Compose command:';
+  description.textContent = state.config.mode === 'staging'
+    ? 'Complete setup for the current Creator with the Creator Bitkit identity. Use a different Bitkit identity for the reader.'
+    : 'Complete the Paykit instructions for the current creator. From the repository root, use this explicit Compose command:';
   description.style.cssText = 'margin:0;';
 
   const companionCommand = document.createElement('code');
@@ -265,7 +298,9 @@ function openPaykitSetupIframe(setupUrl) {
   frame.referrerPolicy = 'no-referrer';
   frame.style.cssText = 'width:100%;height:min(520px,70vh);border:0;display:block;';
 
-  card.append(closeBtn, title, description, companionCommand, frame);
+  card.append(closeBtn, title, description);
+  if (state.config.mode !== 'staging') card.append(companionCommand);
+  card.append(frame);
   overlay.append(card);
   document.body.append(overlay);
   state.paykitSetupFrame = frame;
@@ -308,16 +343,16 @@ function showLockAuthComplete() {
 async function bootstrap() {
   state.config = await fetchJson('/config.json');
   await postClientLog('info', 'bootstrap-config-loaded', {
+    mode: state.config.mode ?? 'local-testnet',
     lockServerPubky: state.config.lockServer.pubky,
     lockServerUrl: state.config.lockServer.url,
-    pkarrRelay: state.config.testnet.pkarrRelay,
-    httpRelay: state.config.testnet.httpRelay,
+    customPkarrRelays: pkarrRelaysForDemoConfig(state.config),
     callback: `${window.location.origin}/auth/lock-server/callback`,
     hasLockSession: Boolean(state.feLockSessionToken),
   });
   await refreshDemoAuthStatus();
   refreshLockAuthStatus();
-  refreshLockTypeFields();
+  await refreshLockTypeFields();
   refreshPublishingState();
   setInterval(refreshDemoAuthStatus, 2000);
 }
@@ -346,13 +381,13 @@ el.startLockAuth.addEventListener('click', async () => {
       lockServerPubky: state.config.lockServer.pubky,
       returnTo,
       state: connectState,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     const { connectUrl } = await startCreatorConnect({
       lockServer: state.config.lockServer.pubky,
       returnTo,
       state: connectState,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     // Opt into direct postMessage delivery and remember the origin we will accept messages from.
     const deliveryUrl = new URL(connectUrl);
@@ -367,19 +402,25 @@ el.startLockAuth.addEventListener('click', async () => {
 });
 
 el.configurePointer.addEventListener('click', async () => {
+  const operation = captureCreatorOperation(state);
+  const token = Symbol('configure-pointer');
+  pointerOperationToken = token;
   try {
-    const sessionSecret = state.feLockSessionToken;
     await configureLockServicePointer({
       lockServer: state.config.lockServer.pubky,
-      sessionSecret,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      sessionSecret: operation.sessionSecret,
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
-    localStorage.setItem(pointerConfiguredKey(state.creatorPubky), 'true');
+    if (pointerOperationToken !== token || !creatorOperationMatches(state, operation)) return;
+    localStorage.setItem(pointerConfiguredKey(operation.creatorPubky), 'true');
     el.publishingStatus.textContent = 'Lock Service Pointer configured. Upload a file to create locked content.';
     el.publishingStatus.className = 'ok';
     refreshPublishingState();
   } catch (error) {
+    if (pointerOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     showError(el.publishingStatus, error);
+  } finally {
+    if (pointerOperationToken === token) pointerOperationToken = null;
   }
 });
 
@@ -393,13 +434,16 @@ el.primaryContentFile.addEventListener('change', () => {
 
 el.secondaryContentFiles.addEventListener('change', renderSelectedResources);
 el.resourceFilename.addEventListener('input', renderSelectedResources);
-el.lockType.addEventListener('change', refreshLockTypeFields);
+el.lockType.addEventListener('change', () => refreshLockTypeFields());
 el.retryPaykitSetup.addEventListener('click', () => {
-  if (el.lockType.value === 'paykit-payment' && state.creatorPubky) startPaykitSetup();
+  if (el.lockType.value === 'paykit-payment') refreshPaykitSetupReadiness();
 });
 
 el.lockedContentForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  const operation = captureCreatorOperation(state);
+  const token = Symbol('publish-content-lock');
+  publicationOperationToken = token;
   try {
     const primaryFile = el.primaryContentFile.files?.[0];
     if (!primaryFile) throw new Error('select a primary file first');
@@ -408,27 +452,32 @@ el.lockedContentForm.addEventListener('submit', async (event) => {
 
     const secondaryFiles = Array.from(el.secondaryContentFiles.files ?? []);
     const resources = await buildResourcesFromFiles(primaryFile, secondaryFiles, filename);
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     const { criteria, lockLogic } = buildCreatorLockPolicy({
       lockType: el.lockType.value,
       criterionId: el.criterionId.value,
       devStaticSatisfied: el.criterionSatisfied.value === 'true',
       amountSats: el.paykitAmountSats.value,
-      recipientPubky: state.creatorPubky,
+      recipientPubky: operation.creatorPubky,
       paykitSetupComplete: state.paykitSetupComplete,
     });
     const result = await publishLockedContent({
       lockServer: state.config.lockServer.pubky,
-      sessionSecret: state.feLockSessionToken,
+      sessionSecret: operation.sessionSecret,
       resources,
       criteria,
       lockLogic,
       accessTtlSeconds: Number(el.accessTtl.value),
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     el.creatorResult.textContent = JSON.stringify(result, null, 2);
     el.viewerResource.textContent = result.contentLockResource;
   } catch (error) {
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     showError(el.publishingStatus, error);
+  } finally {
+    if (publicationOperationToken === token) publicationOperationToken = null;
   }
 });
 
@@ -440,6 +489,7 @@ async function refreshDemoAuthStatus() {
     const creatorPubky = status.authenticated ? status.pubky : null;
     const creatorChanged = state.creatorPubky !== creatorPubky;
     if (creatorChanged) {
+      state.creatorIdentityGeneration += 1;
       const previousCreatorPubky = state.creatorPubky;
       const hadLockSession = Boolean(state.feLockSessionToken);
       closeLockAuthIframe();
@@ -450,7 +500,7 @@ async function refreshDemoAuthStatus() {
         revokeSession: (sessionSecret) => signOutCreator({
           lockServer: state.config.lockServer.pubky,
           sessionSecret,
-          pkarrRelays: [state.config.testnet.pkarrRelay],
+          pkarrRelays: pkarrRelaysForDemoConfig(state.config),
         }),
       });
       if (requestId !== state.demoAuthStatusRequestId) return;
@@ -458,12 +508,15 @@ async function refreshDemoAuthStatus() {
         await postClientLog('warn', 'lock-session-revocation-failed-after-creator-change');
       }
       state.paykitSetupComplete = false;
+      state.paykitSetupStatusRequestId += 1;
       closePaykitSetupIframe();
     }
     state.creatorPubky = creatorPubky;
     state.demoAuthenticated = status.authenticated;
     if (status.authenticated) {
-      el.demoAuthStatus.textContent = `Authenticated as ${status.pubky} on ${status.homeserver}`;
+      el.demoAuthStatus.textContent = status.homeserver
+        ? `Authenticated as ${status.pubky} on ${status.homeserver}`
+        : `Authenticated as ${status.pubky}`;
       el.demoAuthStatus.className = 'ok';
       el.startDemoAuth.disabled = true;
       el.demoAuthCommand.textContent = '';
@@ -472,35 +525,107 @@ async function refreshDemoAuthStatus() {
       el.demoAuthStatus.className = 'muted';
     }
     refreshLockAuthStatus();
-    if (creatorChanged) refreshLockTypeFields();
+    if (creatorChanged) await refreshLockTypeFields();
   } catch (error) {
     if (requestId !== state.demoAuthStatusRequestId) return;
     showError(el.demoAuthStatus, error);
   }
 }
 
-function refreshLockTypeFields() {
+async function refreshLockTypeFields() {
   const paymentSelected = el.lockType.value === 'paykit-payment';
   el.devStaticFields.hidden = paymentSelected;
   el.paykitPaymentFields.hidden = !paymentSelected;
   el.paykitAmountSats.required = paymentSelected;
 
   if (!paymentSelected) {
+    state.paykitSetupStatusRequestId += 1;
     closePaykitSetupIframe();
+    el.retryPaykitSetup.hidden = true;
     return;
   }
   if (state.paykitSetupComplete) {
+    el.retryPaykitSetup.hidden = true;
     el.paykitSetupStatus.textContent = 'Paykit setup complete for this creator.';
     el.paykitSetupStatus.className = 'ok';
     return;
   }
   if (!state.creatorPubky) {
+    el.retryPaykitSetup.hidden = true;
     el.paykitSetupStatus.textContent = 'Authenticate the content creator before starting Paykit setup.';
     el.paykitSetupStatus.className = 'muted';
     return;
   }
+  if (!state.feLockSessionToken) {
+    el.retryPaykitSetup.hidden = true;
+    el.paykitSetupStatus.textContent = 'Authenticate to the Lock Server before checking Paykit setup.';
+    el.paykitSetupStatus.className = 'muted';
+    return;
+  }
   if (state.paykitSetupFrame) return;
-  startPaykitSetup();
+  await refreshPaykitSetupReadiness();
+}
+
+async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}) {
+  if (
+    el.lockType.value !== 'paykit-payment'
+    || !state.creatorPubky
+    || !state.feLockSessionToken
+    || state.paykitSetupFrame
+  ) return;
+
+  const requestId = ++state.paykitSetupStatusRequestId;
+  const creatorPubky = state.creatorPubky;
+  const sessionSecret = state.feLockSessionToken;
+  el.retryPaykitSetup.hidden = true;
+  el.paykitSetupStatus.textContent = 'Checking Paykit setup status.';
+  el.paykitSetupStatus.className = 'muted';
+
+  try {
+    const result = await queryPaykitSetupStatus({
+      lockServer: state.config.lockServer.pubky,
+      sessionSecret,
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
+    });
+    if (
+      requestId !== state.paykitSetupStatusRequestId
+      || creatorPubky !== state.creatorPubky
+      || sessionSecret !== state.feLockSessionToken
+      || el.lockType.value !== 'paykit-payment'
+    ) return;
+
+    const decision = decidePaykitSetupReadiness(result);
+    state.paykitSetupComplete = decision.setupComplete;
+    if (decision.setupComplete) {
+      el.retryPaykitSetup.hidden = true;
+      el.paykitSetupStatus.textContent = 'Paykit setup complete for this creator.';
+      el.paykitSetupStatus.className = 'ok';
+      return;
+    }
+    if (decision.retry) {
+      el.retryPaykitSetup.hidden = false;
+      el.paykitSetupStatus.textContent = 'Paykit setup status is unavailable. Retry when Paykit is reachable.';
+      el.paykitSetupStatus.className = 'error';
+      return;
+    }
+    if (decision.openSetup && openSetupWhenRequired) startPaykitSetup();
+    if (decision.openSetup && !openSetupWhenRequired) {
+      el.retryPaykitSetup.hidden = false;
+      el.paykitSetupStatus.textContent = 'Paykit setup is not ready for this creator. Retry to check again.';
+      el.paykitSetupStatus.className = 'error';
+    }
+  } catch {
+    if (
+      requestId !== state.paykitSetupStatusRequestId
+      || creatorPubky !== state.creatorPubky
+      || sessionSecret !== state.feLockSessionToken
+      || el.lockType.value !== 'paykit-payment'
+    ) return;
+    state.paykitSetupComplete = false;
+    el.retryPaykitSetup.hidden = false;
+    el.paykitSetupStatus.textContent = 'Paykit setup status is unavailable. Retry when Paykit is reachable.';
+    el.paykitSetupStatus.className = 'error';
+  }
 }
 
 function startPaykitSetup() {

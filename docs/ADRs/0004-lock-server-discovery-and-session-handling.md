@@ -56,4 +56,4 @@ Negative:
 
 - Define secure storage requirements for native session secrets.
 - Define renewal behavior before a 6-month session expires.
-- Confirm private path write support and namespace with Pubky-Core.
+- Confirm private path write support and namespace in Pubky Homeserver.

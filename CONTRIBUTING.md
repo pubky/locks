@@ -5,7 +5,7 @@ maintainers may change APIs and persistence contracts without backwards compatib
 
 ## Development prerequisites
 
-- Rust 1.89.0 with `rustfmt`, `clippy`, and the `wasm32-unknown-unknown` target
+- Rust 1.91.1 with `rustfmt`, `clippy`, and the `wasm32-unknown-unknown` target
 - PostgreSQL 16 for persistence and E2E tests
 - Node.js 22 and npm
 - `cargo-nextest`

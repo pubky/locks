@@ -93,7 +93,7 @@ allowed_return_origins = ["https://pubky.app"]
 network = "mainnet"
 ```
 
-The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Runtime publication is configured under `[pkdns]`; see [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
+The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Endpoint data and republishing cadence are configured under `[pkdns]`; shared relay URLs are configured under `[pubky]`. See [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
 
 The SDK verifies the public service identity endpoint:
 
@@ -135,7 +135,7 @@ options.addPkarrRelay("http://127.0.0.1:15411");
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
 
-Local `pubky-core/pubky-testnet` defaults are:
+Local `pubky-homeserver/pubky-testnet` defaults are:
 
 ```text
 PKARR relay     = http://127.0.0.1:15411
@@ -331,6 +331,28 @@ Request body:
   "default_lock_server": "pubky..."
 }
 ```
+
+### Check public Paykit data presence
+
+```ts
+const hasPaykitData = await Locks.hasPaykitData("pubky...");
+
+const options = new LocksOptions();
+options.addPkarrRelay("http://127.0.0.1:15411");
+const hasLocalPaykitData = await Locks.hasPaykitDataWithOptions("pubky...", options);
+```
+
+These static methods perform an unauthenticated, uncached homeserver listing for the
+specified user's current `/pub/paykit/v0/` namespace. They return `true` when at least
+one syntactically valid child is present and `false` when the namespace is absent or
+empty. Invalid user keys, malformed listings, resolution failures, and transport errors
+reject the promise instead of returning `false`.
+
+Malformed user keys reject with `InvalidInput`. Operational lookup failures reject with
+the coarse `PaykitDataLookupFailed` error name without exposing upstream details.
+
+This is a data-presence probe only. A `true` result does not prove a valid receiver
+marker, supported capabilities, freshness, or Paykit runtime readiness.
 
 ### Check Paykit setup readiness
 

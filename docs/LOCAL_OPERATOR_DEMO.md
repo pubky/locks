@@ -15,7 +15,9 @@ Creator publishing is authenticated. The removed unauthenticated local/dev creat
 
 ## Paykit Compose local demonstration
 
-The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet, Locks, Paykit Server, and the creator and reader browser demos. External source builds use anonymous public Git contexts pinned to immutable commits; no sibling repository checkout is required.
+The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet v0.11, Locks, Paykit Server, and the creator and reader browser demos. External source builds use anonymous public Git contexts, so no sibling repository checkout is required. Paykit Server is pinned to `v0.1.0-rc2`, its compatible Locks build context is pinned to `v0.1.0-rc1`, and Paykit library contexts use `v0.1.0-rc48`. The local worktree override remains available through the exact absolute `PAYKIT_SERVER_CONTEXT` flow documented in the example README.
+
+The Paykit iframe remains Paykit-owned and presents the production Bitkit QR/deep-link path without local helper instructions. The host wrapper is only a controlled local fallback: its helper comes from the Paykit local-demo image/runtime stage and is not part of the normal production package/runtime. Operators must manually obtain the local-only bearer URL from the labeled Paykit Server log event and follow the secret-handling guidance in [`examples/js-sdk/README.md`](../examples/js-sdk/README.md).
 
 The startup dependency flow is:
 
@@ -68,13 +70,13 @@ The complete startup and reset commands, browser URLs, local state boundaries, a
 
 ## Dev legacy-connect testnet automation
 
-For local Pubky-Core testnet work without pubky.app, use:
+For local Pubky testnet work without pubky.app, use:
 
 ```bash
 scripts/dev-legacy-connect-testnet.sh auth
 ```
 
-This assumes both the Pubky-Core testnet and Lock Server are already running. It creates/reuses a local dev Pubky user under `.local/pubky-lock-dev/`, starts the hosted Lock-Server `/connect` shell, approves the rendered `pubkyauth://` URL with the Pubky SDK, completes the shell flow, and exchanges the redirected one-time code for a Locks-local frontend session token.
+This assumes both the Pubky testnet and Lock Server are already running. It creates/reuses a local dev Pubky user under `.local/pubky-lock-dev/`, starts the hosted Lock-Server `/connect` shell, approves the rendered `pubkyauth://` URL with the Pubky SDK, completes the shell flow, and exchanges the redirected one-time code for a Locks-local frontend session token.
 
 To continue into creator publishing with the acquired frontend session, run:
 

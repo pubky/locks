@@ -31,7 +31,18 @@ function parseAccountIndex(value) {
 function normalizeInput(authUrl, accountXpub, accountIndex) {
   const normalizedAuthUrl = String(authUrl).trim();
   const normalizedAccountXpub = String(accountXpub).trim();
-  if (!normalizedAuthUrl || !normalizedAccountXpub) {
+  let parsedAuthUrl;
+  try {
+    parsedAuthUrl = new URL(normalizedAuthUrl);
+  } catch {
+    parsedAuthUrl = null;
+  }
+  if (
+    !parsedAuthUrl
+    || parsedAuthUrl.protocol !== 'pubkyauth:'
+    || Buffer.byteLength(normalizedAuthUrl, 'utf8') > MAX_INPUT_BYTES
+    || !normalizedAccountXpub
+  ) {
     throw new Error('Paykit input requires three ordered lines');
   }
   return {
@@ -82,7 +93,7 @@ export async function collectPaykitInputs({
   if (!isTTY) return parsePaykitInputLines(await readInput());
   if (typeof question !== 'function') throw new Error('interactive input is unavailable');
   return normalizeInput(
-    await question('Paste Paykit auth URL: '),
+    await question('Paste authorization_url from the latest paykit_setup_authorization_url local-demo log: '),
     await question('Paste account xpub/tpub: '),
     await question('Account index: '),
   );
@@ -317,7 +328,9 @@ async function main() {
     });
     creatorSecret = await loadRoleSecret(role);
     helperInput = buildCompanionHelperInput({ ...values, creatorSecret });
-    const result = await runCompanionHelper({ input: helperInput });
+    const result = await runCompanionHelper({
+      input: helperInput,
+    });
     const category = companionResultCategory(result);
     if (category.stream === 'stdout') console.log(category.message);
     else console.error(category.message);
@@ -326,6 +339,7 @@ async function main() {
     readline?.close();
     creatorSecret?.fill(0);
     if (helperInput) helperInput.creator_secret = '';
+    if (helperInput) helperInput.auth_url = '';
   }
 }
 
