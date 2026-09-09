@@ -47,3 +47,17 @@ export async function invalidateIdentityScopedCreatorState({ state, revokeSessio
     return { revoked: false };
   }
 }
+
+export function captureCreatorOperation(state) {
+  return Object.freeze({
+    generation: state.creatorIdentityGeneration,
+    creatorPubky: state.creatorPubky,
+    sessionSecret: state.feLockSessionToken,
+  });
+}
+
+export function creatorOperationMatches(state, operation) {
+  return operation.generation === state.creatorIdentityGeneration
+    && operation.creatorPubky === state.creatorPubky
+    && operation.sessionSecret === state.feLockSessionToken;
+}

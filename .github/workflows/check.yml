@@ -105,6 +105,9 @@ jobs:
       - name: Install JS example dependencies
         run: npm --prefix examples/js-sdk ci
 
+      - name: Staging config tests
+        run: npm --prefix examples/js-sdk run test:staging-config
+
       - name: Paykit setup-status contract
         run: npm --prefix examples/js-sdk run check:paykit-setup-contract
 

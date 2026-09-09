@@ -44,12 +44,25 @@ level = "info"
 ```toml
 [pubky]
 network = "testnet"
+# Optional override; omit to preserve Pubky/Pkarr defaults.
+pkarr_relays = ["http://127.0.0.1:15411"]
 ```
 
 Supported values:
 
 - `testnet`: generated/default local development network.
 - `mainnet`: public Pubky network for production/staging deployments.
+
+`pubky.pkarr_relays` is an optional non-empty array of HTTP(S) relay URL strings shared by Pubky authentication/storage clients and Lock Server PKARR publication. Relay URLs must not contain credentials, query strings, or fragments. On `mainnet`, omitting it keeps Pkarr's current default relays:
+
+```text
+https://pkarr.pubky.app
+https://pkarr.pubky.org
+```
+
+On `testnet`, omitting it preserves the Pubky SDK's local testnet relay (`http://127.0.0.1:15411`).
+
+`resolution = "relay-only"` still disables Mainline DHT while retaining either configured relays or these defaults. The same relay list is used to publish and republish the Lock Server's own PKARR record.
 
 ## Runtime environment and route gates
 
@@ -111,11 +124,10 @@ public_ip = "203.0.113.10"
 public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "locks.example"
-pkarr_relays = []
 key_republisher_interval_seconds = 3600
 ```
 
-`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pkarr_relays = ["http://127.0.0.1:15411"]`.
+`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pubky.pkarr_relays = ["http://127.0.0.1:15411"]`.
 
 PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds.
 
@@ -193,6 +205,8 @@ This mounts authenticated Pubky-backed creator publishing routes, hosted legacy-
 ```toml
 [pubky]
 network = "mainnet"
+resolution = "relay-only"
+pkarr_relays = ["https://pkarr.pubky.app", "https://pkarr.pubky.org"]
 
 [runtime]
 environment = "staging" # or "production"

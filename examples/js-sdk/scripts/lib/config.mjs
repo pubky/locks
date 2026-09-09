@@ -4,6 +4,13 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 import { demoConfigPath, writeJson, readJson } from './paths.mjs';
+import {
+  STAGING_CREATOR_ORIGIN,
+  STAGING_LOCKS_ORIGIN,
+  STAGING_PAYKIT_ORIGIN,
+  STAGING_READER_ORIGIN,
+} from './staging-config.mjs';
+import { demoAuthRelayForConfig } from '../../demo-network.js';
 
 export const defaultLockServerConfigPath = '~/.pubky-lock/config.toml';
 
@@ -79,15 +86,11 @@ export async function readLockServerPublicKey(configPath = defaultLockServerConf
 }
 
 export function pubkyAuthRelayInboxUrl(httpRelayUrl) {
-  const url = new URL(httpRelayUrl);
-  const normalizedPath = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  if (!normalizedPath.endsWith('/inbox/')) {
-    url.pathname = `${normalizedPath}inbox/`.replace(/\/+/g, '/');
-  }
-  return url.toString();
+  return demoAuthRelayForConfig({ testnet: { httpRelay: httpRelayUrl } });
 }
 
 export function validateDemoConfig(config) {
+  if (config?.mode === 'staging') return validateStagingDemoConfig(config);
   for (const path of [
     ['demoServer', 'url'],
     ['lockServer', 'url'],
@@ -140,6 +143,20 @@ export async function writeDemoConfig(config, path = demoConfigPath) {
 
 export async function readDemoConfig(path = demoConfigPath) {
   return validateDemoConfig(await readJson(path));
+}
+
+function validateStagingDemoConfig(config) {
+  if (
+    config.demoServer?.url !== STAGING_CREATOR_ORIGIN
+    || config.readerServer?.url !== STAGING_READER_ORIGIN
+    || config.lockServer?.url !== STAGING_LOCKS_ORIGIN
+    || !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/u.test(config.lockServer?.pubky ?? '')
+    || config.paykit?.url !== STAGING_PAYKIT_ORIGIN
+    || config.testnet !== undefined
+  ) {
+    throw new Error('invalid staging demo config');
+  }
+  return config;
 }
 
 export function withInternalServiceUrls(config, env = process.env) {

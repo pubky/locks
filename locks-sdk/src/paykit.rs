@@ -23,11 +23,10 @@ fn paykit_directory(user: &PublicKey) -> String {
 fn classify_listing(listing: pubky::Result<Vec<PubkyResource>>) -> pubky::Result<bool> {
     match listing {
         Ok(entries) => Ok(!entries.is_empty()),
-        Err(pubky::Error::Request(RequestError::Server { status, .. }))
-            if status == StatusCode::NOT_FOUND =>
-        {
-            Ok(false)
-        }
+        Err(pubky::Error::Request(RequestError::Server {
+            status: StatusCode::NOT_FOUND | StatusCode::GONE,
+            ..
+        })) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -76,6 +75,17 @@ mod tests {
             !classify_listing(Err(pubky::Error::Request(RequestError::Server {
                 status: StatusCode::NOT_FOUND,
                 message: "not found".to_owned(),
+            })))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn gone_namespace_means_no_paykit_data() {
+        assert!(
+            !classify_listing(Err(pubky::Error::Request(RequestError::Server {
+                status: StatusCode::GONE,
+                message: "gone".to_owned(),
             })))
             .unwrap()
         );

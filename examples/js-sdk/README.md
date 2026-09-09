@@ -256,6 +256,16 @@ npm --prefix examples/js-sdk run reset-paykit-demo
 
 Do not use `docker compose --file compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
 
+### Helper-free staging services demo
+
+To run only the Creator and reader browser apps against fixed deployed staging services:
+
+```bash
+docker compose --file compose.paykit-staging-demo.yaml up -d --build
+```
+
+This path uses two distinct external Bitkit staging identities, the standard public Pubky network, and no native Paykit helpers or local backend services. Creator and reader remain on ports 8080 and 8088. See [`docs/PAYKIT_STAGING_DEMO.md`](../../docs/PAYKIT_STAGING_DEMO.md) for the exact role split, pasted-reader-Pubky gate, local-client reset, known external setup blocker, and full acceptance milestones.
+
 ### Direct npm server
 
 ```bash

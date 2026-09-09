@@ -198,13 +198,13 @@ level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or En
 [pubky]
 network = "testnet" # One of: testnet, mainnet. Selects Pubky SDK network defaults; testnet expects local pubky-testnet services.
 resolution = "default" # One of: default, relay-only. relay-only disables direct Mainline DHT resolution while retaining PKARR relays on mainnet.
+# pkarr_relays = ["http://127.0.0.1:15411"] # Optional shared PKARR relay URL array for Pubky auth/storage resolution and Lock Server record publication. Omit to use network defaults.
 
 [pkdns]
 public_ip = "{}" # Public IP advertised in PKARR/PKDNS records. Local default is loopback; production must use the externally reachable address.
 public_pubky_tls_port = {} # Public PubkyTLS port advertised for the Lock Server. Set to the externally reachable TLS port, or omit only if unsupported by config policy.
 public_icann_http_port = {} # Public HTTP port advertised for ICANN/HTTP access. Use the proxy/listener port clients reach, commonly 80 or 443.
 icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default is localhost; production should be the public hostname.
-pkarr_relays = [] # Optional PKARR relay URLs to publish through. Empty uses SDK/default behavior; set explicit relays for controlled staging/prod publication.
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
 [rate_limits.verification_submission]

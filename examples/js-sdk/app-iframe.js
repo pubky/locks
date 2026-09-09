@@ -7,7 +7,9 @@ import {
   startCreatorConnect,
 } from './creator-complete-flow.js';
 import {
+  captureCreatorOperation,
   commitIdentityScopedCreatorSession,
+  creatorOperationMatches,
   invalidateIdentityScopedCreatorState,
 } from './creator-identity.js';
 import { buildCreatorLockPolicy } from './creator-lock-policy.js';
@@ -16,6 +18,7 @@ import {
   buildPaykitSetupRequest,
   decidePaykitSetupReadiness,
 } from './paykit-setup.js';
+import { pkarrRelaysForDemoConfig } from './demo-network.js';
 import init, { Locks } from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
 
 // Shared creator-page iframe flow — direct postMessage delivery (ADR 0019).
@@ -82,6 +85,8 @@ const el = {
   creatorResult: document.querySelector('#creator-result'),
   viewerResource: document.querySelector('#viewer-resource'),
 };
+let pointerOperationToken = null;
+let publicationOperationToken = null;
 
 await init();
 await bootstrap();
@@ -129,7 +134,7 @@ window.addEventListener('message', async (event) => {
       state: receivedState,
       expectedState: expectedConnectState,
       expectedCreatorPubky,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     const commit = await commitIdentityScopedCreatorSession({
       state,
@@ -140,7 +145,7 @@ window.addEventListener('message', async (event) => {
       revokeSession: (staleSessionSecret) => signOutCreator({
         lockServer: state.config.lockServer.pubky,
         sessionSecret: staleSessionSecret,
-        pkarrRelays: [state.config.testnet.pkarrRelay],
+        pkarrRelays: pkarrRelaysForDemoConfig(state.config),
       }),
     });
     if (!commit.accepted) {
@@ -277,7 +282,9 @@ function openPaykitSetupIframe(setupUrl) {
   title.style.cssText = 'margin:0;padding-right:40px;';
 
   const description = document.createElement('p');
-  description.textContent = 'Complete the Paykit instructions for the current creator. From the repository root, use this explicit Compose command:';
+  description.textContent = state.config.mode === 'staging'
+    ? 'Complete setup for the current Creator with the Creator Bitkit identity. Use a different Bitkit identity for the reader.'
+    : 'Complete the Paykit instructions for the current creator. From the repository root, use this explicit Compose command:';
   description.style.cssText = 'margin:0;';
 
   const companionCommand = document.createElement('code');
@@ -291,7 +298,9 @@ function openPaykitSetupIframe(setupUrl) {
   frame.referrerPolicy = 'no-referrer';
   frame.style.cssText = 'width:100%;height:min(520px,70vh);border:0;display:block;';
 
-  card.append(closeBtn, title, description, companionCommand, frame);
+  card.append(closeBtn, title, description);
+  if (state.config.mode !== 'staging') card.append(companionCommand);
+  card.append(frame);
   overlay.append(card);
   document.body.append(overlay);
   state.paykitSetupFrame = frame;
@@ -334,10 +343,10 @@ function showLockAuthComplete() {
 async function bootstrap() {
   state.config = await fetchJson('/config.json');
   await postClientLog('info', 'bootstrap-config-loaded', {
+    mode: state.config.mode ?? 'local-testnet',
     lockServerPubky: state.config.lockServer.pubky,
     lockServerUrl: state.config.lockServer.url,
-    pkarrRelay: state.config.testnet.pkarrRelay,
-    httpRelay: state.config.testnet.httpRelay,
+    customPkarrRelays: pkarrRelaysForDemoConfig(state.config),
     callback: `${window.location.origin}/auth/lock-server/callback`,
     hasLockSession: Boolean(state.feLockSessionToken),
   });
@@ -372,13 +381,13 @@ el.startLockAuth.addEventListener('click', async () => {
       lockServerPubky: state.config.lockServer.pubky,
       returnTo,
       state: connectState,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     const { connectUrl } = await startCreatorConnect({
       lockServer: state.config.lockServer.pubky,
       returnTo,
       state: connectState,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     // Opt into direct postMessage delivery and remember the origin we will accept messages from.
     const deliveryUrl = new URL(connectUrl);
@@ -393,19 +402,25 @@ el.startLockAuth.addEventListener('click', async () => {
 });
 
 el.configurePointer.addEventListener('click', async () => {
+  const operation = captureCreatorOperation(state);
+  const token = Symbol('configure-pointer');
+  pointerOperationToken = token;
   try {
-    const sessionSecret = state.feLockSessionToken;
     await configureLockServicePointer({
       lockServer: state.config.lockServer.pubky,
-      sessionSecret,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      sessionSecret: operation.sessionSecret,
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
-    localStorage.setItem(pointerConfiguredKey(state.creatorPubky), 'true');
+    if (pointerOperationToken !== token || !creatorOperationMatches(state, operation)) return;
+    localStorage.setItem(pointerConfiguredKey(operation.creatorPubky), 'true');
     el.publishingStatus.textContent = 'Lock Service Pointer configured. Upload a file to create locked content.';
     el.publishingStatus.className = 'ok';
     refreshPublishingState();
   } catch (error) {
+    if (pointerOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     showError(el.publishingStatus, error);
+  } finally {
+    if (pointerOperationToken === token) pointerOperationToken = null;
   }
 });
 
@@ -426,6 +441,9 @@ el.retryPaykitSetup.addEventListener('click', () => {
 
 el.lockedContentForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  const operation = captureCreatorOperation(state);
+  const token = Symbol('publish-content-lock');
+  publicationOperationToken = token;
   try {
     const primaryFile = el.primaryContentFile.files?.[0];
     if (!primaryFile) throw new Error('select a primary file first');
@@ -434,27 +452,32 @@ el.lockedContentForm.addEventListener('submit', async (event) => {
 
     const secondaryFiles = Array.from(el.secondaryContentFiles.files ?? []);
     const resources = await buildResourcesFromFiles(primaryFile, secondaryFiles, filename);
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     const { criteria, lockLogic } = buildCreatorLockPolicy({
       lockType: el.lockType.value,
       criterionId: el.criterionId.value,
       devStaticSatisfied: el.criterionSatisfied.value === 'true',
       amountSats: el.paykitAmountSats.value,
-      recipientPubky: state.creatorPubky,
+      recipientPubky: operation.creatorPubky,
       paykitSetupComplete: state.paykitSetupComplete,
     });
     const result = await publishLockedContent({
       lockServer: state.config.lockServer.pubky,
-      sessionSecret: state.feLockSessionToken,
+      sessionSecret: operation.sessionSecret,
       resources,
       criteria,
       lockLogic,
       accessTtlSeconds: Number(el.accessTtl.value),
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     el.creatorResult.textContent = JSON.stringify(result, null, 2);
     el.viewerResource.textContent = result.contentLockResource;
   } catch (error) {
+    if (publicationOperationToken !== token || !creatorOperationMatches(state, operation)) return;
     showError(el.publishingStatus, error);
+  } finally {
+    if (publicationOperationToken === token) publicationOperationToken = null;
   }
 });
 
@@ -477,7 +500,7 @@ async function refreshDemoAuthStatus() {
         revokeSession: (sessionSecret) => signOutCreator({
           lockServer: state.config.lockServer.pubky,
           sessionSecret,
-          pkarrRelays: [state.config.testnet.pkarrRelay],
+          pkarrRelays: pkarrRelaysForDemoConfig(state.config),
         }),
       });
       if (requestId !== state.demoAuthStatusRequestId) return;
@@ -491,7 +514,9 @@ async function refreshDemoAuthStatus() {
     state.creatorPubky = creatorPubky;
     state.demoAuthenticated = status.authenticated;
     if (status.authenticated) {
-      el.demoAuthStatus.textContent = `Authenticated as ${status.pubky} on ${status.homeserver}`;
+      el.demoAuthStatus.textContent = status.homeserver
+        ? `Authenticated as ${status.pubky} on ${status.homeserver}`
+        : `Authenticated as ${status.pubky}`;
       el.demoAuthStatus.className = 'ok';
       el.startDemoAuth.disabled = true;
       el.demoAuthCommand.textContent = '';
@@ -560,7 +585,7 @@ async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}
     const result = await queryPaykitSetupStatus({
       lockServer: state.config.lockServer.pubky,
       sessionSecret,
-      pkarrRelays: [state.config.testnet.pkarrRelay],
+      pkarrRelays: pkarrRelaysForDemoConfig(state.config),
     });
     if (
       requestId !== state.paykitSetupStatusRequestId

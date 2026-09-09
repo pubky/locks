@@ -8,7 +8,8 @@ use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
 
 use crate::app_state::pubky_clients::{
-    PubkyHttpClientConstructor, pubky_auth_relay_for_network, pubky_http_client_constructor,
+    PubkyHttpClientConstructor, configure_pkarr_builder, pubky_auth_relay_for_network,
+    pubky_http_client_constructor,
 };
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
 use crate::config::{
@@ -209,6 +210,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
     let mainnet = PubkyConfig {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::Default,
+        pkarr_relays: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet),
@@ -218,6 +220,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
     let mainnet_relay_only = PubkyConfig {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
+        pkarr_relays: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet_relay_only),
@@ -229,6 +232,59 @@ fn pubky_http_client_constructor_follows_configured_network() {
         pubky_http_client_constructor(&testnet),
         PubkyHttpClientConstructor::Testnet("127.0.0.1")
     );
+}
+
+#[test]
+fn relay_only_pkarr_builder_keeps_default_relays_when_not_configured() {
+    let config = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        resolution: PubkyResolution::RelayOnly,
+        pkarr_relays: None,
+    };
+    let mut builder = pkarr::Client::builder();
+
+    configure_pkarr_builder(&mut builder, &config, true).unwrap();
+
+    let configured = format!("{builder:?}");
+    assert!(configured.contains("dht: None"));
+    assert!(configured.contains("https://pkarr.pubky.app/"));
+    assert!(configured.contains("https://pkarr.pubky.org/"));
+}
+
+#[test]
+fn configured_pubky_pkarr_relays_replace_defaults_without_disabling_dht() {
+    let config = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        resolution: PubkyResolution::Default,
+        pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+    };
+    let mut builder = pkarr::Client::builder();
+
+    configure_pkarr_builder(&mut builder, &config, false).unwrap();
+
+    let configured = format!("{builder:?}");
+    assert!(configured.contains("dht: Some"));
+    assert!(configured.contains("https://relay.example/"));
+    assert!(!configured.contains("https://pkarr.pubky.app/"));
+    assert!(!configured.contains("https://pkarr.pubky.org/"));
+}
+
+#[test]
+fn configured_relay_only_pkarr_builder_replaces_defaults_and_disables_dht() {
+    let config = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        resolution: PubkyResolution::RelayOnly,
+        pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+    };
+    let mut builder = pkarr::Client::builder();
+
+    configure_pkarr_builder(&mut builder, &config, true).unwrap();
+
+    let configured = format!("{builder:?}");
+    assert!(configured.contains("dht: None"));
+    assert!(configured.contains("https://relay.example/"));
+    assert!(!configured.contains("https://pkarr.pubky.app/"));
+    assert!(!configured.contains("https://pkarr.pubky.org/"));
 }
 
 #[test]
