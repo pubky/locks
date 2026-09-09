@@ -62,6 +62,7 @@ use crate::app_state::private_runtime::{
     InMemoryCreatorAuthorityStore, InMemoryCreatorConnectFlowStore,
     InMemoryFrontendSessionCodeStore, InMemoryFrontendSessionStore, PrivateRuntimeAdapters,
 };
+pub(crate) use crate::app_state::pubky_clients::configure_pkarr_builder;
 use crate::app_state::pubky_clients::{
     build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
 };

@@ -43,11 +43,8 @@ impl LockServerKeyRepublisher {
         let keypair = load_lock_server_keypair(&config.credentials)?;
         let signed_packet = create_signed_packet(&config.pkdns, &keypair)?;
         let mut builder = pkarr::Client::builder();
-        if !config.pkdns.pkarr_relays.is_empty() {
-            builder
-                .relays(&config.pkdns.pkarr_relays)
-                .map_err(|error| LockServerKeyRepublisherError::ClientBuild(error.to_string()))?;
-        }
+        configure_key_republisher_pkarr_builder(&mut builder, &config.pubky)
+            .map_err(|error| LockServerKeyRepublisherError::ClientBuild(error.to_string()))?;
         let client = builder
             .build()
             .map_err(|error| LockServerKeyRepublisherError::ClientBuild(error.to_string()))?;
@@ -76,6 +73,13 @@ impl Drop for LockServerKeyRepublisher {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn configure_key_republisher_pkarr_builder<'a>(
+    builder: &'a mut pkarr::ClientBuilder,
+    config: &crate::config::PubkyConfig,
+) -> Result<&'a mut pkarr::ClientBuilder, pkarr::errors::InvalidRelayUrl> {
+    crate::app_state::configure_pkarr_builder(builder, config, false)
 }
 
 fn requires_lock_server_pkarr(config: &LockServerRuntimeConfig) -> bool {
@@ -180,6 +184,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lock_server_republisher_uses_pubky_pkarr_relays() {
+        let pubky = crate::config::PubkyConfig {
+            network: crate::config::PubkyNetwork::Mainnet,
+            resolution: crate::config::PubkyResolution::RelayOnly,
+            pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+        };
+        let mut builder = pkarr::Client::builder();
+
+        configure_key_republisher_pkarr_builder(&mut builder, &pubky).unwrap();
+
+        let configured = format!("{builder:?}");
+        assert!(configured.contains("https://relay.example/"));
+        assert!(!configured.contains("https://pkarr.pubky.app/"));
+        assert!(!configured.contains("https://pkarr.pubky.org/"));
+    }
+
+    #[test]
+    fn lock_server_republisher_uses_pubky_testnet_relay_when_override_is_absent() {
+        let pubky = crate::config::PubkyConfig {
+            network: crate::config::PubkyNetwork::Testnet,
+            resolution: crate::config::PubkyResolution::Default,
+            pkarr_relays: None,
+        };
+        let mut builder = pkarr::Client::builder();
+
+        configure_key_republisher_pkarr_builder(&mut builder, &pubky).unwrap();
+
+        let configured = format!("{builder:?}");
+        assert!(configured.contains("http://127.0.0.1:15411/"));
+        assert!(!configured.contains("https://pkarr.pubky.app/"));
+        assert!(!configured.contains("https://pkarr.pubky.org/"));
+    }
+
+    #[test]
     fn create_signed_packet_uses_operator_pkdns_endpoints() {
         let keypair = Keypair::from_secret(&[9_u8; 32]);
         let config = PkdnsConfig {
@@ -187,7 +225,6 @@ mod tests {
             public_pubky_tls_port: Some(6287),
             public_icann_http_port: Some(8080),
             icann_domain: Some("localhost".to_owned()),
-            pkarr_relays: Vec::new(),
             key_republisher_interval_seconds: 3600,
         };
 
@@ -225,7 +262,6 @@ mod tests {
             public_pubky_tls_port: Some(6287),
             public_icann_http_port: Some(3000),
             icann_domain: Some("127.0.0.1".to_owned()),
-            pkarr_relays: Vec::new(),
             key_republisher_interval_seconds: 3600,
         };
 

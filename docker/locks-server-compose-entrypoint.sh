@@ -90,13 +90,13 @@ level = "info,pubky::actors::session=warn"
 
 [pubky]
 network = "testnet"
+pkarr_relays = ["http://127.0.0.1:15411"]
 
 [pkdns]
 public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 3000
 icann_domain = "127.0.0.1"
-pkarr_relays = ["http://127.0.0.1:15411"]
 key_republisher_interval_seconds = 86400
 
 [rate_limits.verification_submission]
