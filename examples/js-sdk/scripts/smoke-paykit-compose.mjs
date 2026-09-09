@@ -313,12 +313,22 @@ const jsDemoDockerfile = await readFile(join(repoRoot, 'docker/js-demo.Dockerfil
 const pubkyTestnetDockerfile = await readFile(join(repoRoot, 'docker/pubky-testnet.Dockerfile'), 'utf8');
 const publicKeyScript = await readFile(join(repoRoot, 'scripts/get_public_key.sh'), 'utf8');
 const locksEntrypoint = await readFile(join(repoRoot, 'docker/locks-server-compose-entrypoint.sh'), 'utf8');
+const bitcoinBootstrap = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap.sh'), 'utf8');
 const resetScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/reset-paykit-demo.mjs'), 'utf8');
 const validateScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/validate-paykit-compose.mjs'), 'utf8');
 const accountScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/generate-paykit-account-tpub.mjs'), 'utf8');
 const packageJson = JSON.parse(await readFile(join(repoRoot, 'examples/js-sdk/package.json'), 'utf8'));
 const bootstrapMode = (await stat(join(repoRoot, 'docker/bitcoin-bootstrap.sh'))).mode;
 assert.notEqual(bootstrapMode & 0o111, 0, 'Bitcoin bootstrap script must be executable');
+for (const required of [
+  'blocks_to_mine=0',
+  'blocks_to_mine="$((101 - height))"',
+  `'"initialblockdownload": true'`,
+  'blocks_to_mine=1',
+  'generatetoaddress "$blocks_to_mine"',
+]) {
+  assert.ok(bitcoinBootstrap.includes(required), `Bitcoin bootstrap missing persisted-chain freshness rule: ${required}`);
+}
 assert.match(locksEntrypoint, /level = "info,pubky::actors::session=warn"/);
 assert.match(compose, /RUST_LOG: \$\{LOCKS_RUST_LOG:-info,pubky::actors::session=warn\}/);
 for (const required of ['--no-install-recommends ca-certificates util-linux', 'rm -rf /var/lib/apt/lists/*']) {
