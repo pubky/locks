@@ -6,6 +6,8 @@ import { repoRoot } from './lib/paths.mjs';
 
 const MAX_MODEL_BYTES = 2 * 1024 * 1024;
 const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
+const PAYKIT_SERVER_REF = '26bda476b9fa1d29feb87cbb24a90042d00f42c4';
+const DEFAULT_PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
 const REQUIRED_SERVICES = [
   'postgres',
   'paykit-postgres',
@@ -108,9 +110,7 @@ export function validateSafeComposeModel(
 
 function expectedPaykitServerContextFromEnvironment(env = process.env) {
   const configured = env.PAYKIT_SERVER_CONTEXT?.trim();
-  if (!configured) {
-    throw new Error('PAYKIT_SERVER_CONTEXT must select an absolute local paykit-server worktree');
-  }
+  if (!configured) return DEFAULT_PAYKIT_SERVER_CONTEXT;
   if (!configured.startsWith('/') || configured.includes('\0') || configured.includes('\n')) {
     throw new Error('PAYKIT_SERVER_CONTEXT must be an absolute local worktree path');
   }

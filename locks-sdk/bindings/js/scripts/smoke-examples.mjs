@@ -59,22 +59,22 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'export PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server',
-    'Paykit Server is built against the current Locks worktree',
-    'Keep `PAYKIT_SERVER_CONTEXT` exported',
+    'Paykit Server uses merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'and is built against the current Locks worktree',
+    'local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'compatible local Paykit Server worktree',
+    'merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
     'built against the current Locks worktree',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'export PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server',
-    'compatible local worktree',
-    'variable exported for every later Compose command',
+    'merged commit',
+    '`26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'For coordinated Paykit development',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',

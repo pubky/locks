@@ -361,7 +361,7 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
-  '${PAYKIT_SERVER_CONTEXT:?set PAYKIT_SERVER_CONTEXT to an absolute local paykit-server worktree}',
+  'https://github.com/pubky/paykit-server.git#26bda476b9fa1d29feb87cbb24a90042d00f42c4',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
   'locks: .',
@@ -507,8 +507,8 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes('PAYKIT_SERVER_CONTEXT must select an absolute local paykit-server worktree'),
-  'Compose validation must require the compatible local Paykit Server worktree',
+  validateScript.includes("PAYKIT_SERVER_REF = '26bda476b9fa1d29feb87cbb24a90042d00f42c4'"),
+  'Compose validation must enforce the merged Paykit Server revision',
 );
 assert.ok(
   validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),
