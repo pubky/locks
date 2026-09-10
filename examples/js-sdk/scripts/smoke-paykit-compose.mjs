@@ -479,6 +479,10 @@ assert.equal(packageJson.scripts['reset-paykit-demo'], 'node scripts/reset-payki
 for (const required of ['bitcoinBootstrapDir', 'rm(bitcoinBootstrapDir']) {
   assert.ok(resetScript.includes(required), `reset script missing ${required}`);
 }
+assert.ok(
+  resetScript.includes('PAYKIT_SERVER_CONTEXT: process.env.PAYKIT_SERVER_CONTEXT'),
+  'reset script must forward the required Paykit Server context to Compose',
+);
 for (const volume of [
   'pubky-locks-paykit-demo-locks-postgres',
   'pubky-locks-paykit-demo-paykit-postgres',

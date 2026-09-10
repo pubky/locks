@@ -108,6 +108,11 @@ jobs:
       - name: Staging config tests
         run: npm --prefix examples/js-sdk run test:staging-config
 
+      - name: JS example behavior tests
+        run: |
+          npm --prefix examples/js-sdk run test:reader-load-state
+          npm --prefix examples/js-sdk run test:pubky
+
       - name: Paykit setup-status contract
         run: npm --prefix examples/js-sdk run check:paykit-setup-contract
 

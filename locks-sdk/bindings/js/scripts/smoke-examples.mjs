@@ -59,22 +59,22 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server uses `v0.1.0-rc2`',
-    "Paykit's compatible Locks context uses `v0.1.0-rc1`",
-    'The local Paykit Server worktree override remains available',
+    'export PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server',
+    'Paykit Server is built against the current Locks worktree',
+    'Keep `PAYKIT_SERVER_CONTEXT` exported',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server is pinned to `v0.1.0-rc2`',
-    'compatible Locks build context is pinned to `v0.1.0-rc1`',
-    'The local worktree override remains available',
+    'compatible local Paykit Server worktree',
+    'built against the current Locks worktree',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'immutable `v0.1.0-rc2` tag',
-    'Locks context uses `v0.1.0-rc1`',
+    'export PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server',
+    'compatible local worktree',
+    'variable exported for every later Compose command',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',

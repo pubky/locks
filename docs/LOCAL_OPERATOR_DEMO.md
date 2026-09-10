@@ -17,6 +17,8 @@ Creator publishing is authenticated. The removed unauthenticated local/dev creat
 
 The repository's browser-facing Paykit demonstration is a separate operator path from the manual single-server walkthrough below. Its local-only definition is `compose.paykit-local-demo.yaml`. It composes PostgreSQL, Bitcoin regtest, Fulcrum, Pubky testnet v0.11, Locks, Paykit Server, and the creator and reader browser demos. A compatible local Paykit Server worktree must be selected with an absolute `PAYKIT_SERVER_CONTEXT` path. It is built against the current Locks worktree so both services use the same protocol paths; Paykit library contexts use `v0.1.0-rc48`. See the exact command in the example README.
 
+The `app.locks` path change does not migrate old demo resources or grants. Republish old locks and reauthorize creator identities for the new public and private namespaces. If disposable demo database state still references `locks.app`, finish or discard that state before restarting on this version; do not delete persistent volumes as a routine upgrade step.
+
 The Paykit iframe remains Paykit-owned and presents the production Bitkit QR/deep-link path without local helper instructions. The host wrapper is only a controlled local fallback: its helper comes from the Paykit local-demo image/runtime stage and is not part of the normal production package/runtime. Operators must manually obtain the local-only bearer URL from the labeled Paykit Server log event and follow the secret-handling guidance in [`examples/js-sdk/README.md`](../examples/js-sdk/README.md).
 
 The startup dependency flow is:

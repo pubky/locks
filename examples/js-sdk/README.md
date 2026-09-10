@@ -191,8 +191,8 @@ Replacing the content-creator identity clears any persisted demo-auth session fo
 1. From the repository root, build and start the complete stack in the background:
 
 ```bash
-PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
-  docker compose --file compose.paykit-local-demo.yaml up -d --build
+export PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server
+docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
 
 2. Open the content-creator demo:
@@ -215,7 +215,8 @@ state locally and bridge only bounded helper input into the relevant container.
 The Paykit Server build requires a compatible local worktree selected by an explicit
 absolute `PAYKIT_SERVER_CONTEXT` path. Its Docker build uses the active Locks checkout,
 Paykit Rust `v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. Compose validation requires
-the rendered Paykit Server context to match that environment value exactly.
+the rendered Paykit Server context to match that environment value exactly. Keep the
+variable exported for every later Compose command in this walkthrough.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
