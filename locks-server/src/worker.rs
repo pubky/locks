@@ -584,7 +584,7 @@ mod tests {
             version: CONTENT_LOCK_VERSION,
             creator: creator(),
             primary_resource: Some(GuardedResource {
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 hash: GuardedResourceHash::from_bytes([7; 32]),
                 content_type: "text/plain".to_owned(),
                 size: 13,

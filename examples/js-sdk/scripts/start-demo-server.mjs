@@ -112,7 +112,7 @@ async function startDemoAuth() {
     return { authenticated: true, role: 'content-creator' };
   }
   if (!activeDemoAuthFlow) {
-    const capabilities = '/pub/locks.app/:rw,/priv/locks.app/:rw';
+    const capabilities = '/pub/app.locks/:rw,/priv/app.locks/:rw';
     const authRelay = demoAuthRelayForConfig(serviceConfig);
     activeDemoAuthFlow = authRelay
       ? pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), authRelay)

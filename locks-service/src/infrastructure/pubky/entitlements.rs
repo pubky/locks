@@ -305,7 +305,7 @@ mod tests {
             version: VERIFIED_PROOF_BUNDLE_VERSION,
             bundle_id: bundle_id(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             verification_result: VerificationResult {

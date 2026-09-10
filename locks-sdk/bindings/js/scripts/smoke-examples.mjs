@@ -59,22 +59,22 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server uses `v0.1.0-rc2`',
-    "Paykit's compatible Locks context uses `v0.1.0-rc1`",
-    'The local Paykit Server worktree override remains available',
+    'Paykit Server uses merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'and is built against the current Locks worktree',
+    'local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server is pinned to `v0.1.0-rc2`',
-    'compatible Locks build context is pinned to `v0.1.0-rc1`',
-    'The local worktree override remains available',
+    'merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'built against the current Locks worktree',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'immutable `v0.1.0-rc2` tag',
-    'Locks context uses `v0.1.0-rc1`',
+    'merged commit',
+    '`26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'For coordinated Paykit development',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',
@@ -87,7 +87,7 @@ const required = {
     './.local/content-creator/recovery_file',
     'http://127.0.0.1:15411',
     'http://127.0.0.1:8088/reader/',
-    '/priv/locks.app/content/',
+    '/priv/app.locks/content/',
     'Viewer content lock resource',
     'Reset reader state',
     'Both creator pages open the Lock Server `/connect` shell in an iframe modal.',
@@ -521,7 +521,7 @@ const secondCreatorPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr
 const creatorSessionRecord = (pubky, exportedSession) => ({
   role: 'content-creator',
   pubky,
-  capabilities: ['/pub/locks.app/:rw', '/priv/locks.app/:rw'],
+  capabilities: ['/pub/app.locks/:rw', '/priv/app.locks/:rw'],
   exported_session: exportedSession,
   authenticated_at: '2026-09-02T00:00:00.000Z',
 });
@@ -1086,7 +1086,7 @@ const {
   selectCurrentPaykitPaymentRequest,
   workflowHandleMatches,
 } = await import(pathToFileURL(files.readerFlow).href);
-const paymentResource = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json';
+const paymentResource = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json';
 const paymentBundleId = '000G40R40M30E209185GR38E1W';
 const readerPublicKey = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 assert.deepEqual(buildPaykitPaymentProofBundle({

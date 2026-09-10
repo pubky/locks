@@ -166,7 +166,7 @@ mod tests {
         );
         assert_eq!(
             authority.granted_scopes,
-            vec!["/pub/locks.app/:rw", "/priv/locks.app/:rw"]
+            vec!["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
 
         let code = code_store.record().expect("frontend session code stored");
@@ -226,8 +226,8 @@ mod tests {
             state: "opaque-state".to_owned(),
             authorization_url: CreatorConnectAuthorizationUrl::new("pubkyauth://secret-flow-url"),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: now,
             expires_at: now + Duration::minutes(5),

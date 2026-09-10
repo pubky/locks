@@ -238,7 +238,7 @@ mod tests {
         };
         let mut secondary_resources = BTreeMap::new();
         secondary_resources.insert(
-            "/priv/locks.app/content/attachments/example.txt".to_owned(),
+            "/priv/app.locks/content/attachments/example.txt".to_owned(),
             secondary_resource.clone(),
         );
 
@@ -361,7 +361,7 @@ mod tests {
 
     fn guarded_resource() -> GuardedResource {
         GuardedResource::new(
-            "/priv/locks.app/content/example.txt",
+            "/priv/app.locks/content/example.txt",
             GuardedResourceHash::from_bytes([7; 32]),
             "text/plain",
             13,

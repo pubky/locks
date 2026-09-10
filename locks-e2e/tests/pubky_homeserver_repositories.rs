@@ -51,7 +51,7 @@ async fn pubky_homeserver_repository_flow_writes_to_fake_homeserver_storage() {
         .set_lock_service_config("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
         .await
         .unwrap();
-    assert_eq!(pointer_json["path"], "/pub/locks.app/config.json");
+    assert_eq!(pointer_json["path"], "/pub/app.locks/config.json");
 
     let guarded_json = client
         .register_guarded_resource("pubky-e2e.txt", "text/plain", GUARDED_BYTES)
@@ -108,19 +108,19 @@ async fn pubky_homeserver_repository_flow_writes_to_fake_homeserver_storage() {
     let operations = storage.operations();
     assert!(
         operations.iter().any(|operation| {
-            operation == "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/locks.app/config.json"
+            operation == "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/app.locks/config.json"
         })
     );
     assert!(operations.iter().any(|operation| {
-        operation.starts_with("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/locks.app/")
+        operation.starts_with("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/app.locks/")
             && operation.ends_with(".json")
-            && operation != "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/locks.app/config.json"
+            && operation != "put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /pub/app.locks/config.json"
     }));
     assert!(operations.iter().any(|operation| {
-        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/pubky-e2e.txt text/plain"
+        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/pubky-e2e.txt text/plain"
     }));
     assert!(operations.iter().any(|operation| {
-        *operation == format!("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/proofs/{BUNDLE_ID}.json")
+        *operation == format!("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/proofs/{BUNDLE_ID}.json")
     }));
 }
 

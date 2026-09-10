@@ -34,6 +34,10 @@ impl PubkyLegacyCookieSessionRevalidator {
 }
 
 #[async_trait]
+#[allow(
+    deprecated,
+    reason = "legacy cookie session restore remains current creator authority contract"
+)]
 impl LegacyCookieSessionRevalidator for PubkyLegacyCookieSessionRevalidator {
     async fn revalidate_legacy_cookie_secret(
         &self,
@@ -175,8 +179,8 @@ mod tests {
                 auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
                 authorized: true,
                 granted_scopes: vec![
-                    "/pub/locks.app/:rw".to_owned(),
-                    "/priv/locks.app/:rw".to_owned(),
+                    "/pub/app.locks/:rw".to_owned(),
+                    "/priv/app.locks/:rw".to_owned(),
                 ],
                 session_expires_at: Some(datetime!(2026-05-29 12:15:00 UTC)),
             }
@@ -284,8 +288,8 @@ mod tests {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new(secret),
             session_expires_at: Some(datetime!(2026-05-29 12:15:00 UTC)),

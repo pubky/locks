@@ -28,7 +28,7 @@ Each criterion verification result includes:
 
 v0 criterion results do not include arbitrary lock-type-specific metadata. The verified proof bundle instead references the exact content lock file using `pubky_lock_resource`.
 
-`VerifiedProofBundle` uses `pubky_lock_resource`, not `content_lock`, because the field value is the protocol-facing addressed Pubky resource: `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`. To honor an entitlement, the Lock Server derives creator, content lock path, and Lock ID from this resource, reads the content lock file, and verifies that it hashes to the embedded Lock ID.
+`VerifiedProofBundle` uses `pubky_lock_resource`, not `content_lock`, because the field value is the protocol-facing addressed Pubky resource: `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`. To honor an entitlement, the Lock Server derives creator, content lock path, and Lock ID from this resource, reads the content lock file, and verifies that it hashes to the embedded Lock ID.
 
 ## Consequences
 

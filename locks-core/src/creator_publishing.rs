@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn create_content_lock_request_serializes_creator_free_json_shape() {
         let primary_resource = guarded_resource(
-            "/priv/locks.app/content/post.json",
+            "/priv/app.locks/content/post.json",
             7,
             "application/json",
             5,
@@ -51,7 +51,7 @@ mod tests {
         };
         let mut secondary_resources = BTreeMap::new();
         secondary_resources.insert(
-            "/priv/locks.app/content/attachments/image.png".to_owned(),
+            "/priv/app.locks/content/attachments/image.png".to_owned(),
             secondary_resource.clone(),
         );
         let request = CreateContentLockRequest {
@@ -73,7 +73,7 @@ mod tests {
             json!({
                 "primary_resource": primary_resource,
                 "secondary_resources": {
-                    "/priv/locks.app/content/attachments/image.png": secondary_resource,
+                    "/priv/app.locks/content/attachments/image.png": secondary_resource,
                 },
                 "criteria": [],
                 "lock_logic": { "type": "all", "criteria": [] },

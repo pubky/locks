@@ -11,7 +11,10 @@ import {
 import { repoRoot, writeSecret } from './lib/paths.mjs';
 import { initializePaykitCompose } from './init-paykit-compose.mjs';
 import { readReaderCreatorProfile, resolveReaderEnvironment } from './lib/paykit-reader-helper.mjs';
-import { extractBip84AccountXpub } from './generate-paykit-account-tpub.mjs';
+import {
+  buildComposeChildEnvironment,
+  extractBip84AccountXpub,
+} from './generate-paykit-account-tpub.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
 import {
@@ -54,6 +57,7 @@ await assert.rejects(
 assert.equal(oversizedSourceCancelled, true);
 const composeSource = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
 const defaultComposeSource = await readFile(join(repoRoot, 'docker-compose.yml'), 'utf8');
+const bitcoinBootstrapSource = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap.sh'), 'utf8');
 const creatorAppSource = await readFile(join(repoRoot, 'examples/js-sdk/app-iframe.js'), 'utf8');
 const creatorServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/start-demo-server.mjs'), 'utf8');
 const lockAuthoritySource = await readFile(join(repoRoot, 'locks-server/src/api/creator_authority.rs'), 'utf8');
@@ -96,6 +100,16 @@ const readerBaseEnvironment = {
   PAYKIT_READER_SERVER_PATH: 'bitkit/server',
 };
 const testAccountXpub = `tpub${'A'.repeat(107)}`;
+assert.deepEqual(buildComposeChildEnvironment({
+  PATH: '/bin',
+  DOCKER_HOST: 'unix:///docker.sock',
+  PAYKIT_SERVER_CONTEXT: '/work/paykit-server',
+  PRIVATE_TOKEN: 'must-not-cross',
+}), {
+  PATH: '/bin',
+  DOCKER_HOST: 'unix:///docker.sock',
+  PAYKIT_SERVER_CONTEXT: '/work/paykit-server',
+});
 assert.deepEqual(
   extractBip84AccountXpub({
     walletName: 'paykit-creator',
@@ -319,6 +333,8 @@ const accountScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/gen
 const packageJson = JSON.parse(await readFile(join(repoRoot, 'examples/js-sdk/package.json'), 'utf8'));
 const bootstrapMode = (await stat(join(repoRoot, 'docker/bitcoin-bootstrap.sh'))).mode;
 assert.notEqual(bootstrapMode & 0o111, 0, 'Bitcoin bootstrap script must be executable');
+assert.match(bitcoinBootstrapSource, /"initialblockdownload": true/);
+assert.match(bitcoinBootstrapSource, /generatetoaddress 1/);
 assert.match(locksEntrypoint, /level = "info,pubky::actors::session=warn"/);
 assert.match(compose, /RUST_LOG: \$\{LOCKS_RUST_LOG:-info,pubky::actors::session=warn\}/);
 for (const required of ['--no-install-recommends ca-certificates util-linux', 'rm -rf /var/lib/apt/lists/*']) {
@@ -345,10 +361,10 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
-  'https://github.com/pubky/paykit-server.git#v0.1.0-rc2',
+  'https://github.com/pubky/paykit-server.git#26bda476b9fa1d29feb87cbb24a90042d00f42c4',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
-  'https://github.com/pubky/locks.git#v0.1.0-rc1',
+  'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
@@ -463,6 +479,10 @@ assert.equal(packageJson.scripts['reset-paykit-demo'], 'node scripts/reset-payki
 for (const required of ['bitcoinBootstrapDir', 'rm(bitcoinBootstrapDir']) {
   assert.ok(resetScript.includes(required), `reset script missing ${required}`);
 }
+assert.ok(
+  resetScript.includes('PAYKIT_SERVER_CONTEXT: process.env.PAYKIT_SERVER_CONTEXT'),
+  'reset script must forward the required Paykit Server context to Compose',
+);
 for (const volume of [
   'pubky-locks-paykit-demo-locks-postgres',
   'pubky-locks-paykit-demo-paykit-postgres',
@@ -487,16 +507,16 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc2'"),
-  'Compose validation must enforce the Paykit Server release ref',
+  validateScript.includes("PAYKIT_SERVER_REF = '26bda476b9fa1d29feb87cbb24a90042d00f42c4'"),
+  'Compose validation must enforce the merged Paykit Server revision',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_LOCKS_REF = 'v0.1.0-rc1'"),
-  'Compose validation must enforce the Paykit Locks release ref',
+  validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),
+  'Compose validation must enforce the current Locks worktree context',
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],
-  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
+  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:pubky && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
 );
 
 console.log('Paykit Compose smoke check passed');

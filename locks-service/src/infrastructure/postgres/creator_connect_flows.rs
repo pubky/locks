@@ -219,8 +219,8 @@ mod tests {
             state: "state-123".to_owned(),
             authorization_url: CreatorConnectAuthorizationUrl::new("pubkyauth://secret-flow-token"),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: datetime!(2026-05-29 12:00:00 UTC),
             expires_at: datetime!(2026-05-29 12:05:00 UTC),

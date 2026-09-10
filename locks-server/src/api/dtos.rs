@@ -435,8 +435,8 @@ mod tests {
             authorized: true,
             auth_kind: Some(CreatorAuthorityAuthKind::LegacyCookie),
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             session_expires_at: None,
         });
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(json["auth_kind"], "legacy_cookie");
         assert_eq!(
             json["granted_scopes"],
-            json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+            json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
         );
         assert_eq!(json["session_expires_at"], Value::Null);
         assert_no_keys(
@@ -472,7 +472,7 @@ mod tests {
             version: SUBMITTED_PROOF_BUNDLE_VERSION,
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             reader_public_key: None,

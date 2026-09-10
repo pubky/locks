@@ -1062,7 +1062,7 @@ async fn authenticated_creator_content_lock_over_max_resources_returns_invalid_r
     seed_frontend_session(&state, "frontend-session-secret", creator()).await;
     let mut request = creator_content_lock_request(registered_guarded_resource_json());
     request["secondary_resources"] = json!({
-        "/priv/locks.app/content/secondary.txt": {
+        "/priv/app.locks/content/secondary.txt": {
             "hash": registered_guarded_resource_json()["hash"].clone(),
             "content_type": "text/plain",
             "size": 1
@@ -1908,7 +1908,7 @@ async fn creator_publishing_contract_fixtures_create_content_lock() {
     let lock_id = body["lock_id"].as_str().unwrap();
     assert_eq!(
         body["content_lock_path"],
-        format!("/pub/locks.app/{lock_id}.json")
+        format!("/pub/app.locks/{lock_id}.json")
     );
     assert_eq!(
         body["content_lock"]["version"],
@@ -2041,7 +2041,7 @@ async fn creator_guarded_resources_registers_resource_when_enabled() {
     );
     assert_eq!(
         body["guarded_resource"]["path"],
-        "/priv/locks.app/content/example.txt"
+        "/priv/app.locks/content/example.txt"
     );
     assert_eq!(body["guarded_resource"]["content_type"], "text/plain");
     assert_eq!(body["guarded_resource"]["size"], 13);
@@ -2051,7 +2051,7 @@ async fn creator_guarded_resources_registers_resource_when_enabled() {
 
     let stored = state
         .guarded_resources()
-        .get_current_guarded_resource(&creator(), "/priv/locks.app/content/example.txt")
+        .get_current_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
         .await
         .unwrap()
         .unwrap();
@@ -2184,7 +2184,7 @@ async fn creator_content_locks_create_lock_for_registered_guarded_resource() {
     let body = response_json(response).await;
     let lock_id = body["lock_id"].as_str().unwrap();
     let path = body["content_lock_path"].as_str().unwrap();
-    assert!(path.starts_with("/pub/locks.app/"));
+    assert!(path.starts_with("/pub/app.locks/"));
     assert!(path.ends_with(".json"));
     assert!(path.contains(lock_id));
     assert_eq!(
@@ -2405,7 +2405,7 @@ async fn creator_authority_status_route_returns_authorized_status_without_secret
     assert_eq!(body["auth_kind"], "legacy_cookie");
     assert_eq!(
         body["granted_scopes"],
-        json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+        json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
     );
     assert_eq!(body["session_expires_at"], Value::Null);
     assert!(!body.to_string().contains("creator-authority-secret"));
@@ -2776,7 +2776,7 @@ async fn creator_lock_service_config_sets_pointer_when_enabled() {
         body["creator"],
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
-    assert_eq!(body["path"], "/pub/locks.app/config.json");
+    assert_eq!(body["path"], "/pub/app.locks/config.json");
     assert_eq!(body["lock_service_pointer"]["version"], 1);
     assert_eq!(
         body["lock_service_pointer"]["default_lock_server"],
@@ -3213,7 +3213,7 @@ fn content_lock_for_creator(creator: CreatorPubky, satisfied: bool) -> ContentLo
         version: CONTENT_LOCK_VERSION,
         creator,
         primary_resource: Some(GuardedResource {
-            path: "/priv/locks.app/content/hello.txt".to_owned(),
+            path: "/priv/app.locks/content/hello.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes([7; 32]),
             content_type: "text/plain".to_owned(),
             size: 13,
@@ -3285,8 +3285,8 @@ async fn seed_creator_authority(state: &AppState) {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new("creator-authority-secret"),
             session_expires_at: None,
@@ -3313,8 +3313,8 @@ async fn seed_pending_creator_connect_flow(
                 "pubkyauth://fake-secret-flow-url",
             ),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: now,
             expires_at: now + time::Duration::minutes(5),
@@ -3372,7 +3372,7 @@ fn handle_request() -> Value {
 fn legacy_json_guarded_resource_payload() -> Value {
     json!({
         "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
-        "path": "/priv/locks.app/content/example.txt",
+        "path": "/priv/app.locks/content/example.txt",
         "content_type": "text/plain",
         "content_base64": "Z3VhcmRlZCBieXRlcw==",
     })
@@ -3380,7 +3380,7 @@ fn legacy_json_guarded_resource_payload() -> Value {
 
 fn registered_guarded_resource_json() -> Value {
     serde_json::to_value(GuardedResource {
-        path: "/priv/locks.app/content/example.txt".to_owned(),
+        path: "/priv/app.locks/content/example.txt".to_owned(),
         hash: GuardedResourceHash::from_bytes([7; 32]),
         content_type: "text/plain".to_owned(),
         size: 13,

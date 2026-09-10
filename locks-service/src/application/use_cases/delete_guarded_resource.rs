@@ -53,7 +53,7 @@ mod tests {
         repository
             .upsert_guarded_resource(GuardedResourceRecord {
                 creator: creator.clone(),
-                path: "/priv/locks.app/content/delete-me.txt".to_owned(),
+                path: "/priv/app.locks/content/delete-me.txt".to_owned(),
                 hash: GuardedResourceHash::from_bytes([7; 32]),
                 content_type: "text/plain".to_owned(),
                 size: 5,
@@ -65,14 +65,14 @@ mod tests {
         DeleteGuardedResourceUseCase::new(&repository)
             .execute(DeleteGuardedResourceRequest {
                 creator: creator.clone(),
-                path: "/priv/locks.app/content/delete-me.txt".to_owned(),
+                path: "/priv/app.locks/content/delete-me.txt".to_owned(),
             })
             .await
             .unwrap();
 
         assert_eq!(
             repository
-                .get_current_guarded_resource(&creator, "/priv/locks.app/content/delete-me.txt")
+                .get_current_guarded_resource(&creator, "/priv/app.locks/content/delete-me.txt")
                 .await
                 .unwrap(),
             None
@@ -86,7 +86,7 @@ mod tests {
         let error = DeleteGuardedResourceUseCase::new(&repository)
             .execute(DeleteGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/missing.txt".to_owned(),
+                path: "/priv/app.locks/content/missing.txt".to_owned(),
             })
             .await
             .unwrap_err();

@@ -176,14 +176,14 @@ mod tests {
 
         assert!(
             !repo
-                .delete_guarded_resource(&creator, "/priv/locks.app/content/delete.txt")
+                .delete_guarded_resource(&creator, "/priv/app.locks/content/delete.txt")
                 .await
                 .unwrap()
         );
 
         repo.upsert_guarded_resource(GuardedResourceRecord {
             creator: creator.clone(),
-            path: "/priv/locks.app/content/delete.txt".to_owned(),
+            path: "/priv/app.locks/content/delete.txt".to_owned(),
             hash,
             content_type: "text/plain".to_owned(),
             size: 6,
@@ -193,19 +193,19 @@ mod tests {
         .unwrap();
 
         assert!(
-            repo.delete_guarded_resource(&creator, "/priv/locks.app/content/delete.txt")
+            repo.delete_guarded_resource(&creator, "/priv/app.locks/content/delete.txt")
                 .await
                 .unwrap()
         );
         assert_eq!(
-            repo.get_current_guarded_resource(&creator, "/priv/locks.app/content/delete.txt")
+            repo.get_current_guarded_resource(&creator, "/priv/app.locks/content/delete.txt")
                 .await
                 .unwrap(),
             None
         );
         assert!(
             !repo
-                .delete_guarded_resource(&creator, "/priv/locks.app/content/delete.txt")
+                .delete_guarded_resource(&creator, "/priv/app.locks/content/delete.txt")
                 .await
                 .unwrap()
         );

@@ -160,12 +160,12 @@ mod tests {
         let response = use_case
             .execute(ProxyReadGuardedResourceRequest {
                 credential: fixture.credential.clone(),
-                path: "/priv/locks.app/content/resource.txt".to_owned(),
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
             })
             .await
             .unwrap();
 
-        assert_eq!(response.path, "/priv/locks.app/content/resource.txt");
+        assert_eq!(response.path, "/priv/app.locks/content/resource.txt");
         assert_eq!(response.content_type, "text/plain");
         assert_eq!(response.bytes, b"guarded bytes".to_vec());
     }
@@ -184,7 +184,7 @@ mod tests {
         let result = use_case
             .execute(ProxyReadGuardedResourceRequest {
                 credential: AccessCredential::new("wrong"),
-                path: "/priv/locks.app/content/resource.txt".to_owned(),
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
             })
             .await;
 
@@ -205,7 +205,7 @@ mod tests {
         let result = use_case
             .execute(ProxyReadGuardedResourceRequest {
                 credential: fixture.credential.clone(),
-                path: "/priv/locks.app/content/resource.txt".to_owned(),
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
             })
             .await;
 
@@ -226,12 +226,12 @@ mod tests {
         let response = use_case
             .execute(ProxyReadGuardedResourceRequest {
                 credential: fixture.credential.clone(),
-                path: "/priv/locks.app/content/secondary.txt".to_owned(),
+                path: "/priv/app.locks/content/secondary.txt".to_owned(),
             })
             .await
             .unwrap();
 
-        assert_eq!(response.path, "/priv/locks.app/content/secondary.txt");
+        assert_eq!(response.path, "/priv/app.locks/content/secondary.txt");
         assert_eq!(response.content_type, "text/plain");
         assert_eq!(response.bytes, b"secondary bytes".to_vec());
     }
@@ -250,7 +250,7 @@ mod tests {
         let result = use_case
             .execute(ProxyReadGuardedResourceRequest {
                 credential: fixture.credential.clone(),
-                path: "/priv/locks.app/content/outside.txt".to_owned(),
+                path: "/priv/app.locks/content/outside.txt".to_owned(),
             })
             .await;
 
@@ -326,7 +326,7 @@ mod tests {
                 guarded_resources
                     .upsert_guarded_resource(GuardedResourceRecord {
                         creator: creator(),
-                        path: "/priv/locks.app/content/resource.txt".to_owned(),
+                        path: "/priv/app.locks/content/resource.txt".to_owned(),
                         hash: GuardedResourceHash::from_bytes([7; 32]),
                         content_type: "text/plain".to_owned(),
                         size: 13,
@@ -337,7 +337,7 @@ mod tests {
                 guarded_resources
                     .upsert_guarded_resource(GuardedResourceRecord {
                         creator: creator(),
-                        path: "/priv/locks.app/content/secondary.txt".to_owned(),
+                        path: "/priv/app.locks/content/secondary.txt".to_owned(),
                         hash: GuardedResourceHash::from_bytes([8; 32]),
                         content_type: "text/plain".to_owned(),
                         size: 15,
@@ -363,13 +363,13 @@ mod tests {
             version: CONTENT_LOCK_VERSION,
             creator: creator(),
             primary_resource: Some(GuardedResource {
-                path: "/priv/locks.app/content/resource.txt".to_owned(),
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
                 hash: GuardedResourceHash::from_bytes([7; 32]),
                 content_type: "text/plain".to_owned(),
                 size: 13,
             }),
             secondary_resources: BTreeMap::from([(
-                "/priv/locks.app/content/secondary.txt".to_owned(),
+                "/priv/app.locks/content/secondary.txt".to_owned(),
                 SecondaryGuardedResource {
                     hash: GuardedResourceHash::from_bytes([8; 32]),
                     content_type: "text/plain".to_owned(),

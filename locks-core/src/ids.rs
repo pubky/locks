@@ -10,7 +10,7 @@ const LOCK_ID_LEN: usize = 52;
 const LOCK_HASH_BYTES: usize = 32;
 const BUNDLE_ID_LEN: usize = 26;
 const BUNDLE_ID_BYTES: usize = 16;
-const CONTENT_LOCK_PREFIX: &str = "/pub/locks.app/";
+const CONTENT_LOCK_PREFIX: &str = "/pub/app.locks/";
 const CONTENT_LOCK_SUFFIX: &str = ".json";
 
 /// Errors returned when parsing Locks identifier and path value objects.
@@ -31,11 +31,11 @@ pub enum IdParseError {
     /// A Pubky identity wrapper could not be parsed as a Pubky public key.
     #[error("Pubky identity must be a valid pubky::PublicKey")]
     InvalidPubkyIdentity,
-    /// A content lock path did not match `/pub/locks.app/<lock_id>.json`.
-    #[error("content lock path must match /pub/locks.app/<lock_id>.json")]
+    /// A content lock path did not match `/pub/app.locks/<lock_id>.json`.
+    #[error("content lock path must match /pub/app.locks/<lock_id>.json")]
     InvalidContentLockPath,
-    /// A Pubky lock resource did not match `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`.
-    #[error("Pubky lock resource must match pubky<creator_pubky>/pub/locks.app/<lock_id>.json")]
+    /// A Pubky lock resource did not match `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`.
+    #[error("Pubky lock resource must match pubky<creator_pubky>/pub/app.locks/<lock_id>.json")]
     InvalidPubkyLockResource,
 }
 
@@ -328,7 +328,7 @@ impl FromStr for LockServerPubky {
 
 /// Canonical creator-homeserver-relative path to a content lock file.
 ///
-/// The only accepted shape is `/pub/locks.app/<lock_id>.json`. Display and
+/// The only accepted shape is `/pub/app.locks/<lock_id>.json`. Display and
 /// serialization normalize the embedded [`LockId`] to canonical uppercase form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContentLockPath {
@@ -398,7 +398,7 @@ impl FromStr for ContentLockPath {
 /// Fully addressed Pubky resource for a public content lock.
 ///
 /// The only accepted serialized shape is
-/// `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`, matching the preferred
+/// `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`, matching the preferred
 /// Pubky addressed-resource form from the `pubky` crate. Display and
 /// serialization normalize the embedded [`ContentLockPath`] while preserving the
 /// creator Pubky identity value.
@@ -653,10 +653,10 @@ mod tests {
 
     #[test]
     fn content_lock_path_accepts_exact_canonical_shape_and_normalizes_embedded_lock_id() {
-        let lowercase_path = format!("/pub/locks.app/{}.json", LOCK_ID.to_lowercase());
+        let lowercase_path = format!("/pub/app.locks/{}.json", LOCK_ID.to_lowercase());
         let path = ContentLockPath::from_str(&lowercase_path).expect("valid content lock path");
 
-        assert_eq!(path.to_string(), format!("/pub/locks.app/{LOCK_ID}.json"));
+        assert_eq!(path.to_string(), format!("/pub/app.locks/{LOCK_ID}.json"));
         assert_eq!(path.lock_id().to_string(), LOCK_ID);
     }
 
@@ -664,7 +664,7 @@ mod tests {
     fn pubky_lock_resource_accepts_preferred_pubky_resource_shape() {
         let creator = test_pubky_identity();
         let resource = PubkyLockResource::from_str(&format!(
-            "{}/pub/locks.app/{}.json",
+            "{}/pub/app.locks/{}.json",
             creator,
             LOCK_ID.to_lowercase()
         ))
@@ -674,11 +674,11 @@ mod tests {
         assert_eq!(resource.lock_id().to_string(), LOCK_ID);
         assert_eq!(
             resource.content_lock_path().to_string(),
-            format!("/pub/locks.app/{LOCK_ID}.json")
+            format!("/pub/app.locks/{LOCK_ID}.json")
         );
         assert_eq!(
             resource.to_string(),
-            format!("{creator}/pub/locks.app/{LOCK_ID}.json")
+            format!("{creator}/pub/app.locks/{LOCK_ID}.json")
         );
     }
 
@@ -686,7 +686,7 @@ mod tests {
     fn pubky_lock_resource_rejects_pubky_url_and_non_lock_paths() {
         assert!(
             PubkyLockResource::from_str(&format!(
-                "pubky://creator123/pub/locks.app/{LOCK_ID}.json"
+                "pubky://creator123/pub/app.locks/{LOCK_ID}.json"
             ))
             .is_err()
         );
@@ -697,7 +697,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            PubkyLockResource::from_str(&format!("creator123/pub/locks.app/{LOCK_ID}.json"))
+            PubkyLockResource::from_str(&format!("creator123/pub/app.locks/{LOCK_ID}.json"))
                 .is_err()
         );
     }
@@ -705,14 +705,14 @@ mod tests {
     #[test]
     fn content_lock_path_rejects_urls_and_noncanonical_paths() {
         assert!(
-            ContentLockPath::from_str(&format!("pubky://creator/pub/locks.app/{LOCK_ID}.json"))
+            ContentLockPath::from_str(&format!("pubky://creator/pub/app.locks/{LOCK_ID}.json"))
                 .is_err()
         );
         assert!(
-            ContentLockPath::from_str(&format!("https://example.com/pub/locks.app/{LOCK_ID}.json"))
+            ContentLockPath::from_str(&format!("https://example.com/pub/app.locks/{LOCK_ID}.json"))
                 .is_err()
         );
         assert!(ContentLockPath::from_str(&format!("/pub/other.app/{LOCK_ID}.json")).is_err());
-        assert!(ContentLockPath::from_str(&format!("/pub/locks.app/{LOCK_ID}")).is_err());
+        assert!(ContentLockPath::from_str(&format!("/pub/app.locks/{LOCK_ID}")).is_err());
     }
 }

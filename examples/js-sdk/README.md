@@ -211,20 +211,11 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build context uses the immutable `v0.1.0-rc2` tag, its compatible
-Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Homeserver uses
-`v0.11.0`. The active Locks checkout is used only for the Locks and browser-demo
-images being developed. No sibling repository checkout is required.
-
-For coordinated pre-merge Paykit Server work, select an explicit absolute local worktree
-without changing the committed public default:
-
-```bash
-PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
-  docker compose --file compose.paykit-local-demo.yaml up -d --build
-```
-
-Compose validation requires the rendered context to match that environment value exactly.
+The Paykit Server build uses merged commit
+`26bda476b9fa1d29feb87cbb24a90042d00f42c4`, the active Locks checkout, Paykit Rust
+`v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. For coordinated Paykit development,
+export an absolute `PAYKIT_SERVER_CONTEXT` worktree path before running Compose;
+validation requires the rendered context to match that override exactly.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
@@ -379,7 +370,7 @@ Rules:
 - file upload only
 - guarded path prefix is fixed:
   ```text
-  /priv/locks.app/content/
+  /priv/app.locks/content/
   ```
 - only the filename segment is editable
 - `/` in filename is rejected
@@ -449,7 +440,7 @@ The Node demo server does not write Locks resources directly to the homeserver.
 After success, the page displays the **Viewer content lock resource**:
 
 ```text
-<creator_pubky>/pub/locks.app/<lock_id>.json
+<creator_pubky>/pub/app.locks/<lock_id>.json
 ```
 
 ## Reader browser flow
