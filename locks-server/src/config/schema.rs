@@ -54,6 +54,7 @@ impl Default for ContentLocksConfig {
 pub struct PubkyConfig {
     pub network: PubkyNetwork,
     pub resolution: PubkyResolution,
+    pub pkarr_relays: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -76,6 +77,7 @@ impl Default for PubkyConfig {
         Self {
             network: PubkyNetwork::Testnet,
             resolution: PubkyResolution::Default,
+            pkarr_relays: None,
         }
     }
 }
@@ -86,7 +88,6 @@ pub struct PkdnsConfig {
     pub public_pubky_tls_port: Option<u16>,
     pub public_icann_http_port: Option<u16>,
     pub icann_domain: Option<String>,
-    pub pkarr_relays: Vec<String>,
     pub key_republisher_interval_seconds: u64,
 }
 
@@ -97,7 +98,6 @@ impl Default for PkdnsConfig {
             public_pubky_tls_port: Some(6287),
             public_icann_http_port: Some(80),
             icann_domain: Some("localhost".to_owned()),
-            pkarr_relays: Vec::new(),
             key_republisher_interval_seconds: 3600,
         }
     }
@@ -330,8 +330,12 @@ pub enum ConfigError {
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
-    #[error("pkdns.pkarr_relays must contain valid http(s) URLs: {0}")]
-    InvalidPkarrRelayUrl(String),
+    #[error("pubky.pkarr_relays must contain at least one relay when configured")]
+    EmptyPubkyPkarrRelays,
+    #[error(
+        "pubky.pkarr_relays must contain valid http(s) URLs without credentials, query, or fragment"
+    )]
+    InvalidPubkyPkarrRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
     #[error(
