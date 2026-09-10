@@ -80,7 +80,15 @@ export async function signupBestEffort(signer, homeserver) {
   try {
     return await signer.signup(homeserver, null);
   } catch (error) {
-    if (isAlreadyRegisteredError(error)) return await signer.signinCookieBlocking();
+    if (isAlreadyRegisteredError(error)) {
+      const pkdns = signer.pkdns;
+      try {
+        await pkdns.publishHomeserverIfStale(homeserver);
+      } finally {
+        pkdns.free();
+      }
+      return await signer.signinCookieBlocking();
+    }
     throw error;
   }
 }

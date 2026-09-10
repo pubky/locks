@@ -62,14 +62,15 @@ and Fulcrum:
 1. Build and start the complete stack from the repository root:
 
 ```bash
-docker compose --file compose.paykit-local-demo.yaml up -d --build
+PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
+  docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
 
 2. Open the content-creator demo at <http://127.0.0.1:8080/examples/js-sdk/>.
 
 3. In production, use the production Bitkit QR/deep-link path presented by Paykit. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...` commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit` in `docker compose exec`; those wrappers load private role state on the host and bridge only the bounded native-helper request into the demo container. The helper is supplied only by the Paykit local-demo image/runtime stage, not the normal production package/runtime. Follow the manual bearer-URL log retrieval and retention guidance in the example README.
 
-Its external build contexts use anonymously reachable public repositories selected by immutable version tags; no sibling Paykit or Pubky checkout is required. Pubky Testnet is built from the `pubky/pubky-homeserver` `v0.11.0` tag, Paykit libraries use the `v0.1.0-rc48` tag, and Paykit Server uses `v0.1.0-rc2`. Paykit Server is built against the current Locks worktree so both services use the same protocol paths. The local Paykit Server worktree override remains available through `PAYKIT_SERVER_CONTEXT`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
+The demo requires a compatible local Paykit Server worktree selected by the absolute `PAYKIT_SERVER_CONTEXT` path. Paykit Server is built against the current Locks worktree so both services use the same protocol paths. Other external build contexts remain anonymously reachable and version-tagged: Pubky Testnet uses `pubky/pubky-homeserver` `v0.11.0`, and Paykit libraries use `v0.1.0-rc48`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
 
 For the helper-free loopback browser demo against deployed staging Locks and Paykit services:
 
