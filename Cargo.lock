@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "base32",
  "blake3",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "locks-e2e"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "async-trait",
  "axum",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "locks-sdk"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "locks-core",
  "paykit-lib",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "locks-sdk-wasm"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "futures-lite",
  "js-sys",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "locks-server"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "locks-service"
-version = "0.1.0-rc2"
+version = "0.1.0-rc4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
