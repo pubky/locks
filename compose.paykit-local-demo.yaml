@@ -286,7 +286,7 @@ services:
       additional_contexts:
         paykit-lib: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib"
         paykit-sdk: "https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk"
-        locks: "https://github.com/pubky/locks.git#v0.1.0-rc1"
+        locks: .
 
     depends_on:
       paykit-postgres:

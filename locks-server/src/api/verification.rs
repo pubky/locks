@@ -147,6 +147,19 @@ async fn maybe_prepare_paykit_submission(
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
+    match &error {
+        PaykitClientError::NonSuccess { operation, status } => {
+            tracing::warn!(operation, %status, "Paykit request returned non-success status");
+        }
+        PaykitClientError::Http(source) => {
+            tracing::warn!(
+                timeout = source.is_timeout(),
+                connect = source.is_connect(),
+                "Paykit request transport failed"
+            );
+        }
+        _ => tracing::warn!("Paykit invoice creation failed"),
+    }
     if matches!(
         error,
         PaykitClientError::NonSuccess {

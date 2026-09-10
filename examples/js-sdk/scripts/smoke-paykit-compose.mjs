@@ -348,7 +348,7 @@ for (const required of [
   'https://github.com/pubky/paykit-server.git#v0.1.0-rc2',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
-  'https://github.com/pubky/locks.git#v0.1.0-rc1',
+  'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
@@ -491,8 +491,8 @@ assert.ok(
   'Compose validation must enforce the Paykit Server release ref',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_LOCKS_REF = 'v0.1.0-rc1'"),
-  'Compose validation must enforce the Paykit Locks release ref',
+  validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),
+  'Compose validation must enforce the current Locks worktree context',
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],
