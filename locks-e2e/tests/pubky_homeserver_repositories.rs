@@ -130,6 +130,7 @@ fn submitted_proof_bundle_for(content_lock_path: ContentLockPath) -> SubmittedPr
         bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
         pubky_lock_resource: PubkyLockResource::new(creator(), content_lock_path),
         reader_public_key: None,
+        client_reference: None,
         proofs: vec![Proof {
             criterion_id: "criterion-1".to_owned(),
             verifier_type: locks_core::lock_policy::VerifierType::DevStatic,

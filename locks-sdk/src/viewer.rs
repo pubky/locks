@@ -1,5 +1,5 @@
-use locks_core::ids::{BundleId, CreatorPubky};
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
+use locks_core::verification::{ClientReference, SubmittedProofBundle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,11 +44,26 @@ pub enum VerificationTaskStatus {
     Expired,
 }
 
+/// Public verification task lifecycle view.
+///
+/// The four binding fields (`pubky_lock_resource`, `criterion_ids`,
+/// `reader_public_key`, `client_reference`) are optional so an upgraded SDK
+/// also parses lifecycle responses from a Lock Server that predates them.
+/// Unknown fields are still rejected, so older SDK releases cannot parse
+/// responses from a newer server that adds fields.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationTaskLifecycleResponse {
     pub creator: CreatorPubky,
     pub bundle_id: BundleId,
+    #[serde(default)]
+    pub pubky_lock_resource: Option<PubkyLockResource>,
+    #[serde(default)]
+    pub criterion_ids: Vec<String>,
+    #[serde(default)]
+    pub reader_public_key: Option<CreatorPubky>,
+    #[serde(default)]
+    pub client_reference: Option<ClientReference>,
     pub status: VerificationTaskStatus,
     #[serde(with = "time::serde::rfc3339")]
     pub submitted_at: time::OffsetDateTime,
@@ -262,6 +277,10 @@ mod tests {
         let response = ViewerLocks::parse_lifecycle_response(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "criterion_ids": ["criterion-1", "criterion-2"],
+            "reader_public_key": null,
+            "client_reference": "order-instance-1",
             "status": "completed",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": "2026-06-01T12:00:01Z",
@@ -272,8 +291,49 @@ mod tests {
 
         assert_eq!(response.creator.to_string(), CREATOR);
         assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
+        assert_eq!(
+            response
+                .pubky_lock_resource
+                .as_ref()
+                .map(ToString::to_string),
+            Some(format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"))
+        );
+        assert_eq!(
+            response.criterion_ids,
+            vec!["criterion-1".to_owned(), "criterion-2".to_owned()]
+        );
+        assert_eq!(response.reader_public_key, None);
+        assert_eq!(
+            response
+                .client_reference
+                .as_ref()
+                .map(|reference| reference.as_str()),
+            Some("order-instance-1")
+        );
         assert_eq!(response.status, VerificationTaskStatus::Completed);
         assert!(response.failure_message.is_none());
+    }
+
+    #[test]
+    fn lifecycle_response_from_old_server_without_binding_fields_still_parses() {
+        let response = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null
+        }))
+        .unwrap();
+
+        assert_eq!(response.creator.to_string(), CREATOR);
+        assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
+        assert_eq!(response.pubky_lock_resource, None);
+        assert_eq!(response.criterion_ids, Vec::<String>::new());
+        assert_eq!(response.reader_public_key, None);
+        assert_eq!(response.client_reference, None);
+        assert_eq!(response.status, VerificationTaskStatus::Completed);
     }
 
     #[test]
@@ -281,6 +341,10 @@ mod tests {
         let result = ViewerLocks::parse_lifecycle_response(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "criterion_ids": ["criterion-1"],
+            "reader_public_key": null,
+            "client_reference": null,
             "status": "pending",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
@@ -288,6 +352,26 @@ mod tests {
             "failure_message": null,
             "task_id": "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
             "credential": "raw-secret"
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lifecycle_response_rejects_raw_proof_material() {
+        let result = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "criterion_ids": ["criterion-1"],
+            "reader_public_key": null,
+            "client_reference": null,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "proofs": [{ "criterion_id": "criterion-1", "payload": { "secret": true } }]
         }));
 
         assert!(result.is_err());
@@ -332,6 +416,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,

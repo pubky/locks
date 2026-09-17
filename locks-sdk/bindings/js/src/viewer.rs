@@ -691,6 +691,10 @@ mod tests {
         let result = validate_lifecycle_response_for_tests(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "criterion_ids": ["criterion-1"],
+            "reader_public_key": null,
+            "client_reference": null,
             "status": "pending",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
@@ -718,6 +722,10 @@ mod tests {
         let lifecycle = validate_lifecycle_response_for_tests(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"),
+            "criterion_ids": ["criterion-1"],
+            "reader_public_key": null,
+            "client_reference": "order-instance-1",
             "status": "completed",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": "2026-06-01T12:00:01Z",
@@ -726,6 +734,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(lifecycle["status"], "completed");
+        assert_eq!(lifecycle["client_reference"], "order-instance-1");
 
         let credential = validate_access_credential_response_for_tests(json!({
             "credential": "raw-access-credential",
@@ -733,6 +742,23 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(credential["credential"], "raw-access-credential");
+    }
+
+    #[test]
+    fn lifecycle_response_validation_accepts_old_server_shape_without_binding_fields() {
+        let lifecycle = validate_lifecycle_response_for_tests(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null
+        }))
+        .unwrap();
+
+        assert_eq!(lifecycle["status"], "completed");
+        assert!(lifecycle.get("client_reference").is_none());
     }
 
     #[test]

@@ -123,7 +123,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    };
 
     use super::*;
 
@@ -271,12 +273,88 @@ mod tests {
         assert_eq!(tasks.update_count(), 0);
     }
 
+    #[tokio::test]
+    async fn submit_proof_bundle_returns_existing_lifecycle_for_identical_client_reference_replay()
+    {
+        let existing = verification_task_with_bundle(submitted_proof_bundle_with_client_reference(
+            Some("order-instance-1"),
+        ))
+        .transition_to(
+            VerificationTaskStatus::InProgress,
+            datetime!(2026-05-29 12:01:00 UTC),
+            None,
+        )
+        .unwrap();
+        let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+        let tasks = CapturingTaskRepository::with_existing(existing);
+        let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+        let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+
+        let result = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: submitted_proof_bundle_with_client_reference(Some(
+                    "order-instance-1",
+                )),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, VerificationTaskStatus::InProgress);
+        assert_eq!(
+            result.client_reference,
+            Some(ClientReference::from_str("order-instance-1").unwrap())
+        );
+        assert_eq!(task_ids.generate_count(), 0);
+        assert_eq!(tasks.insert_count(), 0);
+        assert_eq!(tasks.update_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn submit_proof_bundle_conflicts_when_replay_changes_client_reference() {
+        for (stored, replayed) in [
+            (None, Some("order-instance-1")),
+            (Some("order-instance-1"), None),
+            (Some("order-instance-1"), Some("order-instance-2")),
+        ] {
+            let existing =
+                verification_task_with_bundle(submitted_proof_bundle_with_client_reference(stored));
+            let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+            let tasks = CapturingTaskRepository::with_existing(existing);
+            let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+            let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+
+            let result = use_case
+                .execute(SubmitProofBundleRequest {
+                    submitted_proof_bundle: submitted_proof_bundle_with_client_reference(replayed),
+                })
+                .await;
+
+            assert_eq!(
+                result,
+                Err(ApplicationError::VerificationTaskConflict),
+                "stored {stored:?} replayed as {replayed:?} must conflict"
+            );
+            assert_eq!(task_ids.generate_count(), 0);
+            assert_eq!(tasks.insert_count(), 0);
+            assert_eq!(tasks.update_count(), 0);
+        }
+    }
+
     fn creator() -> CreatorPubky {
         CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap()
     }
 
     fn submitted_proof_bundle() -> SubmittedProofBundle {
         submitted_proof_bundle_with_payload(json!({}))
+    }
+
+    fn submitted_proof_bundle_with_client_reference(
+        client_reference: Option<&str>,
+    ) -> SubmittedProofBundle {
+        let mut bundle = submitted_proof_bundle();
+        bundle.client_reference =
+            client_reference.map(|value| ClientReference::from_str(value).unwrap());
+        bundle
     }
 
     fn submitted_proof_bundle_with_payload(payload: serde_json::Value) -> SubmittedProofBundle {
@@ -288,6 +366,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,

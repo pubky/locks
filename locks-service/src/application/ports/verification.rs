@@ -20,7 +20,13 @@ pub trait VerificationTaskRepository: Send + Sync {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError>;
 
-    /// Updates an existing verification task.
+    /// Updates an existing verification task's lifecycle fields.
+    ///
+    /// Only `status`, `started_at`, `completed_at`, and `failure_message` are
+    /// written. The task identity (`creator`, `bundle_id`, `submitted_at`) and
+    /// the stored submitted proof bundle — including its `client_reference` —
+    /// are immutable after insert; implementations ignore the incoming record's
+    /// identity and bundle fields.
     ///
     /// Returns `MissingRecord` when the task does not exist.
     async fn update_verification_task(

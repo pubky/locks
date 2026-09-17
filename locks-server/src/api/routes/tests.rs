@@ -16,7 +16,9 @@ use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
     LockServerConfig, VerifierType,
 };
-use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+use locks_core::verification::{
+    ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
@@ -302,6 +304,16 @@ async fn viewer_access_contract_fixtures_submit_proof_bundle() {
     let body = response_json(response).await;
     assert_eq!(body["creator"], response_shape["creator"]);
     assert_eq!(body["bundle_id"], response_shape["bundle_id"]);
+    assert_eq!(
+        body["pubky_lock_resource"],
+        response_shape["pubky_lock_resource"]
+    );
+    assert_eq!(body["criterion_ids"], response_shape["criterion_ids"]);
+    assert_eq!(
+        body["reader_public_key"],
+        response_shape["reader_public_key"]
+    );
+    assert_eq!(body["client_reference"], response_shape["client_reference"]);
     assert_eq!(body["status"], response_shape["status"]);
     assert_eq!(body["started_at"], response_shape["started_at"]);
     assert_eq!(body["completed_at"], response_shape["completed_at"]);
@@ -311,10 +323,11 @@ async fn viewer_access_contract_fixtures_submit_proof_bundle() {
         &body,
         &[
             "task_id",
-            "pubky_lock_resource",
             "submitted_proof_bundle",
             "proofs",
+            "payload",
             "credential",
+            "invoice",
         ],
     );
 }
@@ -379,15 +392,23 @@ async fn post_proof_bundles_returns_public_lifecycle_handle_without_task_id() {
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
     assert_eq!(body["bundle_id"], BUNDLE_ID);
+    assert_eq!(
+        body["pubky_lock_resource"],
+        submitted_proof_bundle().pubky_lock_resource.to_string()
+    );
+    assert_eq!(body["criterion_ids"], json!(["criterion-1"]));
+    assert_eq!(body["reader_public_key"], Value::Null);
+    assert_eq!(body["client_reference"], Value::Null);
     assert_eq!(body["status"], "pending");
     assert!(body.get("submitted_at").and_then(Value::as_str).is_some());
     assert_no_keys(
         &body,
         &[
             "task_id",
-            "pubky_lock_resource",
             "submitted_proof_bundle",
             "proofs",
+            "payload",
+            "invoice",
         ],
     );
 }
@@ -650,12 +671,106 @@ async fn lookup_verification_task_returns_pending_lifecycle_view_without_secrets
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
     assert_eq!(body["bundle_id"], BUNDLE_ID);
+    assert_eq!(
+        body["pubky_lock_resource"],
+        submitted_proof_bundle().pubky_lock_resource.to_string()
+    );
+    assert_eq!(body["criterion_ids"], json!(["criterion-1"]));
+    assert_eq!(body["reader_public_key"], Value::Null);
+    assert_eq!(body["client_reference"], Value::Null);
     assert_eq!(body["status"], "pending");
     assert_eq!(body["submitted_at"], submitted_at);
     assert_eq!(body["started_at"], Value::Null);
     assert_eq!(body["completed_at"], Value::Null);
     assert_eq!(body["failure_message"], Value::Null);
-    assert_no_keys(&body, &["task_id", "credential", "credential_issuance"]);
+    assert_no_keys(
+        &body,
+        &[
+            "task_id",
+            "credential",
+            "credential_issuance",
+            "submitted_proof_bundle",
+            "proofs",
+            "payload",
+            "invoice",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn lookup_verification_task_echoes_client_reference_and_binding_fields() {
+    let app = router(test_state());
+    let mut bundle = submitted_proof_bundle();
+    bundle.client_reference = Some(ClientReference::from_str("order-instance-1").unwrap());
+    let expected_resource = bundle.pubky_lock_resource.to_string();
+    let submit_response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit_response.status(), StatusCode::OK);
+    let submit_body = response_json(submit_response).await;
+    assert_eq!(submit_body["client_reference"], "order-instance-1");
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            handle_request(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["client_reference"], "order-instance-1");
+    assert_eq!(body["pubky_lock_resource"], expected_resource);
+    assert_eq!(body["criterion_ids"], json!(["criterion-1"]));
+    assert_eq!(body["reader_public_key"], Value::Null);
+    assert_no_keys(
+        &body,
+        &[
+            "task_id",
+            "credential",
+            "submitted_proof_bundle",
+            "proofs",
+            "payload",
+            "invoice",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn resubmission_with_changed_client_reference_conflicts() {
+    let app = router(test_state());
+    let mut bundle = submitted_proof_bundle();
+    bundle.client_reference = Some(ClientReference::from_str("order-instance-1").unwrap());
+
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(second, StatusCode::CONFLICT, "task_state_conflict").await;
 }
 
 #[tokio::test]
@@ -3009,6 +3124,7 @@ fn submitted_proof_bundle_for_creator_and_bundle_id(
             content_lock.content_lock_path().unwrap(),
         ),
         reader_public_key: None,
+        client_reference: None,
         proofs: vec![Proof {
             criterion_id: "criterion-1".to_owned(),
             verifier_type: VerifierType::DevStatic,
@@ -3026,6 +3142,7 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
             content_lock.content_lock_path().unwrap(),
         ),
         reader_public_key: None,
+        client_reference: None,
         proofs: vec![Proof {
             criterion_id: "criterion-1".to_owned(),
             verifier_type: VerifierType::DevStatic,

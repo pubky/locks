@@ -550,6 +550,7 @@ Request envelope:
     "bundle_id": "<bundle_id>",
     "pubky_lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
     "reader_public_key": "pubky<reader>",
+    "client_reference": "<opaque relying-service reference>",
     "proofs": [
       {
         "criterion_id": "criterion-1",
@@ -561,7 +562,9 @@ Request envelope:
 }
 ```
 
-Success response returns lifecycle metadata only. It does not return internal `task_id`, raw proof material, entitlement evidence, or access credentials.
+Success response returns lifecycle metadata and the submitted binding fields (`pubky_lock_resource`, `criterion_ids`, `reader_public_key`, `client_reference`). It does not return internal `task_id`, raw proof material, entitlement evidence, or access credentials.
+
+`client_reference` is optional. It is an opaque relying-service string of 1–64 bytes of UTF-8 without control characters; Locks stores it with the task exactly as submitted (no trimming, case folding, or interpretation) and echoes it on lifecycle lookups. A relying service can mint it server-side per payment or order instance and require exact equality at completion. An absent `client_reference` on the lookup response is not a match for any expected value. It participates in the replay identity: re-submitting the same `{ creator, bundle_id }` with a different `client_reference` (present vs absent, or a different value) is `409 task_state_conflict`.
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
@@ -586,6 +589,26 @@ Rate limiting, when enabled, returns `429 rate_limited` with the stable error en
 Looks up lifecycle metadata by public handle `{ creator, bundle_id }` using a JSON body. Bundle ID is bearer-secret-like, so it is not placed in URL paths or query strings.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
+
+Response shape (the same public lifecycle view returned by `POST /proof-bundles` and `POST /verification-task-completions`):
+
+```json
+{
+  "creator": "pubky<creator>",
+  "bundle_id": "<bundle_id>",
+  "pubky_lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
+  "criterion_ids": ["criterion-1"],
+  "reader_public_key": "pubky<reader>",
+  "client_reference": "<opaque relying-service reference>",
+  "status": "pending",
+  "submitted_at": "2026-05-29T12:00:00Z",
+  "started_at": null,
+  "completed_at": null,
+  "failure_message": null
+}
+```
+
+`pubky_lock_resource`, `criterion_ids` (the submitted proofs' `criterion_id`s in submission order), `reader_public_key`, and `client_reference` are echoed from the stored submitted proof bundle; `reader_public_key` and `client_reference` are `null` when the bundle did not carry them. The response never contains `task_id`, raw proof payloads, invoice data, entitlement evidence, or bearer credentials.
 
 ### `POST /verification-task-completions`
 

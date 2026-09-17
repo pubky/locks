@@ -1,6 +1,7 @@
 use time::OffsetDateTime;
 
-use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+use locks_core::verification::ClientReference;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
@@ -38,6 +39,14 @@ pub struct VerificationTaskLifecycleView {
     pub creator: CreatorPubky,
     /// Viewer-generated durable bundle identifier for this verification attempt.
     pub bundle_id: BundleId,
+    /// Pubky resource for the content lock the submitted bundle references.
+    pub pubky_lock_resource: PubkyLockResource,
+    /// Submitted proofs' `criterion_id`s in submission order.
+    pub criterion_ids: Vec<String>,
+    /// Reader Pubky identity submitted with the bundle, when present.
+    pub reader_public_key: Option<CreatorPubky>,
+    /// Opaque relying-service reference submitted with the bundle, when present.
+    pub client_reference: Option<ClientReference>,
     /// Current lifecycle status.
     pub status: VerificationTaskStatus,
     /// Timestamp when the task was accepted.
@@ -54,7 +63,16 @@ impl From<VerificationTaskRecord> for VerificationTaskLifecycleView {
     fn from(task: VerificationTaskRecord) -> Self {
         Self {
             creator: task.creator,
-            bundle_id: task.submitted_proof_bundle.bundle_id,
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            pubky_lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            criterion_ids: task
+                .submitted_proof_bundle
+                .proofs
+                .iter()
+                .map(|proof| proof.criterion_id.clone())
+                .collect(),
+            reader_public_key: task.submitted_proof_bundle.reader_public_key.clone(),
+            client_reference: task.submitted_proof_bundle.client_reference.clone(),
             status: task.status,
             submitted_at: task.submitted_at,
             started_at: task.started_at,
@@ -155,7 +173,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    };
 
     use super::*;
     use crate::application::models::VerificationTaskRecord;
@@ -234,6 +254,22 @@ mod tests {
             view.bundle_id,
             BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap()
         );
+        assert_eq!(
+            view.pubky_lock_resource,
+            PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            view.criterion_ids,
+            vec!["criterion-1".to_owned(), "criterion-2".to_owned()]
+        );
+        assert_eq!(view.reader_public_key, None);
+        assert_eq!(
+            view.client_reference,
+            Some(ClientReference::from_str("order-instance-1").unwrap())
+        );
         assert_eq!(view.status, VerificationTaskStatus::InProgress);
         assert_eq!(view.submitted_at, datetime!(2026-05-29 12:00:00 UTC));
         assert_eq!(view.started_at, Some(datetime!(2026-05-29 12:01:00 UTC)));
@@ -276,6 +312,21 @@ mod tests {
         assert_eq!(
             view.bundle_id,
             BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap()
+        );
+        assert_eq!(
+            view.pubky_lock_resource.to_string(),
+            format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            )
+        );
+        assert_eq!(
+            view.criterion_ids,
+            vec!["criterion-1".to_owned(), "criterion-2".to_owned()]
+        );
+        assert_eq!(view.reader_public_key, None);
+        assert_eq!(
+            view.client_reference,
+            Some(ClientReference::from_str("order-instance-1").unwrap())
         );
         assert_eq!(view.status, VerificationTaskStatus::InProgress);
         assert_eq!(view.submitted_at, datetime!(2026-05-29 12:00:00 UTC));
@@ -323,11 +374,19 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
-                proofs: vec![Proof {
-                    criterion_id: "criterion-1".to_owned(),
-                    verifier_type: VerifierType::DevStatic,
-                    payload: json!({ "satisfied": true }),
-                }],
+                client_reference: Some(ClientReference::from_str("order-instance-1").unwrap()),
+                proofs: vec![
+                    Proof {
+                        criterion_id: "criterion-1".to_owned(),
+                        verifier_type: VerifierType::DevStatic,
+                        payload: json!({ "satisfied": true }),
+                    },
+                    Proof {
+                        criterion_id: "criterion-2".to_owned(),
+                        verifier_type: VerifierType::DevStatic,
+                        payload: json!({ "satisfied": true }),
+                    },
+                ],
             },
             status: VerificationTaskStatus::Pending,
             submitted_at: datetime!(2026-05-29 12:00:00 UTC),

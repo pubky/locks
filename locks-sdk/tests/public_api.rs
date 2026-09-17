@@ -56,6 +56,10 @@ fn crate_root_exports_foundation_sdk_types() {
         ViewerLocks::parse_lifecycle_response(serde_json::json!({
             "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
             "bundle_id": "000G40R40M30E209185GR38E1W",
+            "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "criterion_ids": ["criterion-1"],
+            "reader_public_key": null,
+            "client_reference": null,
             "status": "pending",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
@@ -64,6 +68,7 @@ fn crate_root_exports_foundation_sdk_types() {
         }))
         .unwrap();
     assert_eq!(lifecycle.status, VerificationTaskStatus::Pending);
+    assert_eq!(lifecycle.criterion_ids, vec!["criterion-1".to_owned()]);
 
     let issued: AccessCredentialResponse =
         ViewerLocks::parse_access_credential_response(serde_json::json!({

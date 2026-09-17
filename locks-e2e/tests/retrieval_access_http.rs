@@ -11,7 +11,9 @@ use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
     LockServerConfig, VerifierType,
 };
-use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+use locks_core::verification::{
+    ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+};
 use locks_server::testing::TestServerApp;
 use locks_service::application::models::VerificationTaskStatus;
 use serde_json::{Value, json};
@@ -46,9 +48,16 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
         .unwrap();
     assert_eq!(submit_response.status(), StatusCode::OK);
     let submit_json = response_json(submit_response).await;
+    let expected_lock_resource = submitted_proof_bundle_for(&content_lock)
+        .pubky_lock_resource
+        .to_string();
     assert_eq!(submit_json["creator"], creator().to_string());
     assert_eq!(submit_json["bundle_id"], BUNDLE_ID);
     assert_eq!(submit_json["status"], "pending");
+    assert_eq!(submit_json["pubky_lock_resource"], expected_lock_resource);
+    assert_eq!(submit_json["criterion_ids"], json!(["criterion-1"]));
+    assert_eq!(submit_json["reader_public_key"], Value::Null);
+    assert_eq!(submit_json["client_reference"], "e2e-order-instance-1");
     assert!(submit_json.get("task_id").is_none());
 
     let task = test_app
@@ -86,10 +95,15 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
         .await
         .unwrap();
     assert_eq!(completed_response.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(completed_response).await["status"],
-        "completed"
-    );
+    let lookup_json = response_json(completed_response).await;
+    assert_eq!(lookup_json["status"], "completed");
+    assert_eq!(lookup_json["client_reference"], "e2e-order-instance-1");
+    assert_eq!(lookup_json["pubky_lock_resource"], expected_lock_resource);
+    assert_eq!(lookup_json["criterion_ids"], json!(["criterion-1"]));
+    assert_eq!(lookup_json["reader_public_key"], Value::Null);
+    assert!(lookup_json.get("task_id").is_none());
+    assert!(lookup_json.get("proofs").is_none());
+    assert!(lookup_json.get("payload").is_none());
 
     let credential_response = router
         .clone()
@@ -131,6 +145,7 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
             content_lock.content_lock_path().unwrap(),
         ),
         reader_public_key: None,
+        client_reference: Some(ClientReference::from_str("e2e-order-instance-1").unwrap()),
         proofs: vec![Proof {
             criterion_id: "criterion-1".to_owned(),
             verifier_type: VerifierType::DevStatic,

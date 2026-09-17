@@ -2,10 +2,12 @@ pub use locks_core::creator_publishing::{
     CreateContentLockRequest as AuthenticatedCreateContentLockHttpRequest,
     SetLockServicePointerRequest as AuthenticatedSetLockServicePointerHttpRequest,
 };
-use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, LockId, LockServerPubky};
+use locks_core::ids::{
+    BundleId, ContentLockPath, CreatorPubky, LockId, LockServerPubky, PubkyLockResource,
+};
 use locks_core::lock_policy::{ContentLock, GuardedResource};
 use locks_core::lock_service_pointer::LockServicePointer;
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::verification::{ClientReference, SubmittedProofBundle};
 use locks_service::application::models::{
     AccessCredential, FrontendSessionCode, VerificationTaskStatus,
 };
@@ -75,6 +77,10 @@ pub struct SubmitProofBundleHttpRequest {
 pub struct VerificationTaskLifecycleHttpResponse {
     pub creator: CreatorPubky,
     pub bundle_id: BundleId,
+    pub pubky_lock_resource: PubkyLockResource,
+    pub criterion_ids: Vec<String>,
+    pub reader_public_key: Option<CreatorPubky>,
+    pub client_reference: Option<ClientReference>,
     #[serde(serialize_with = "serialize_task_status")]
     pub status: VerificationTaskStatus,
     #[serde(with = "time::serde::rfc3339")]
@@ -91,6 +97,10 @@ impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpRespon
         Self {
             creator: view.creator,
             bundle_id: view.bundle_id,
+            pubky_lock_resource: view.pubky_lock_resource,
+            criterion_ids: view.criterion_ids,
+            reader_public_key: view.reader_public_key,
+            client_reference: view.client_reference,
             status: view.status,
             submitted_at: view.submitted_at,
             started_at: view.started_at,
@@ -221,7 +231,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    };
     use locks_service::application::models::{
         AccessCredential, CreatorAuthorityAuthKind, VerificationTaskStatus,
     };
@@ -263,6 +275,13 @@ mod tests {
             )
             .unwrap(),
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            ))
+            .unwrap(),
+            criterion_ids: vec!["criterion-1".to_owned()],
+            reader_public_key: None,
+            client_reference: None,
             status: VerificationTaskStatus::Pending,
             submitted_at: datetime!(2026-05-29 12:00:00 UTC),
             started_at: None,
@@ -277,16 +296,20 @@ mod tests {
             "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
         );
         assert_eq!(json["bundle_id"], BUNDLE_ID);
+        assert_eq!(
+            json["pubky_lock_resource"],
+            format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            )
+        );
+        assert_eq!(json["criterion_ids"], serde_json::json!(["criterion-1"]));
+        assert_eq!(json["reader_public_key"], Value::Null);
+        assert_eq!(json["client_reference"], Value::Null);
         assert_eq!(json["status"], "pending");
         assert_eq!(json["submitted_at"], "2026-05-29T12:00:00Z");
         assert_no_keys(
             &json,
-            &[
-                "task_id",
-                "pubky_lock_resource",
-                "submitted_proof_bundle",
-                "proofs",
-            ],
+            &["task_id", "submitted_proof_bundle", "proofs", "payload"],
         );
     }
 
@@ -298,6 +321,18 @@ mod tests {
             )
             .unwrap(),
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            ))
+            .unwrap(),
+            criterion_ids: vec!["criterion-1".to_owned(), "criterion-2".to_owned()],
+            reader_public_key: Some(
+                CreatorPubky::from_str(
+                    "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+                )
+                .unwrap(),
+            ),
+            client_reference: Some(ClientReference::from_str("order-instance-1").unwrap()),
             status: VerificationTaskStatus::Completed,
             submitted_at: datetime!(2026-05-29 12:00:00 UTC),
             started_at: Some(datetime!(2026-05-29 12:01:00 UTC)),
@@ -312,11 +347,38 @@ mod tests {
             "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
         );
         assert_eq!(json["bundle_id"], BUNDLE_ID);
+        assert_eq!(
+            json["pubky_lock_resource"],
+            format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+            )
+        );
+        assert_eq!(
+            json["criterion_ids"],
+            serde_json::json!(["criterion-1", "criterion-2"])
+        );
+        assert_eq!(
+            json["reader_public_key"],
+            "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+        );
+        assert_eq!(json["client_reference"], "order-instance-1");
         assert_eq!(json["status"], "completed");
         assert_eq!(json["submitted_at"], "2026-05-29T12:00:00Z");
         assert_eq!(json["started_at"], "2026-05-29T12:01:00Z");
         assert_eq!(json["completed_at"], "2026-05-29T12:02:00Z");
-        assert_no_keys(&json, &["task_id", "credential", "credential_issuance"]);
+        assert_no_keys(
+            &json,
+            &[
+                "task_id",
+                "credential",
+                "credential_issuance",
+                "proofs",
+                "payload",
+                "submitted_proof_bundle",
+                "invoice",
+                "payment",
+            ],
+        );
     }
 
     #[test]
@@ -476,6 +538,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,

@@ -317,6 +317,7 @@ Likely fields:
 - `version`
 - `bundle_id: BundleId`
 - `pubky_lock_resource: PubkyLockResource`
+- `client_reference: Option<ClientReference>`
 - `proofs: Vec<Proof>`
 
 Invariants:
@@ -325,6 +326,7 @@ Invariants:
 - Bundle ID is a canonical 128-bit cryptographically random value encoded with Crockford base32.
 - Bundle ID must be safe to use as a filename after validation.
 - Submitted proof bundle is not an entitlement.
+- `client_reference` is an opaque relying-service string of 1–64 bytes of UTF-8 without control characters. Locks never interprets it (no trimming, case folding, or normalization), persists it immutably with the task, and echoes it on the public lifecycle lookup. It is part of the submitted bundle compared for replay idempotency, so a changed reference under the same `{ creator, bundle_id }` is a conflict.
 
 ### VerificationTask Aggregate
 
@@ -353,7 +355,7 @@ Invariants:
 - Failed verification does not create an entitlement record.
 - Completed successful verification must attempt entitlement persistence before access credential issuance.
 - Task records store operational lifecycle state only; they do not store `VerificationResult` because successful verification evidence lives in `VerifiedProofBundle`.
-- Public lifecycle responses replace internal `task_id` with `creator` and `bundle_id`, keep status/timestamp/failure fields, and must not expose submitted proof material, raw credentials, entitlement evidence, or worker claim metadata.
+- Public lifecycle responses replace internal `task_id` with `creator` and `bundle_id`, keep status/timestamp/failure fields, echo the submitted binding fields (`pubky_lock_resource`, `criterion_ids`, `reader_public_key`, `client_reference`), and must not expose submitted proof material, raw credentials, entitlement evidence, or worker claim metadata.
 - `{ creator, bundle_id }` is a permanent one-attempt lifecycle identity. After current canonical preflight, re-submitting the exact same submitted proof bundle returns the existing lifecycle state without creating new work or another Paykit invoice; different proof material for the same identity is a conflict.
 - Paykit status lookup uses a signed `{ creator, bundle_id }` request. Any status-call transport, HTTP, authentication/authorization, protocol, or decoding failure returns the task to pending for durable retry; v1 has no terminal Paykit payment-failure status.
 - Retrying after `failed` or `expired` requires a new Bundle ID.

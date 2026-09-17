@@ -107,29 +107,24 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
-        let row = VerificationTaskWriteRow::try_from(&task)?;
+        // Lifecycle-only update: the task identity and the stored submitted
+        // proof bundle (including `client_reference`) are immutable after
+        // insert, so the incoming record's identity and bundle fields are
+        // never written.
         let result = sqlx::query(
             "UPDATE verification_tasks
-            SET creator = $2,
-                bundle_id = $3,
-                status = $4,
-                submitted_proof_bundle = $5,
-                submitted_at = $6,
-                started_at = $7,
-                completed_at = $8,
-                failure_message = $9,
+            SET status = $2,
+                started_at = $3,
+                completed_at = $4,
+                failure_message = $5,
                 updated_at = now()
             WHERE task_id = $1::uuid",
         )
-        .bind(row.task_id)
-        .bind(row.creator)
-        .bind(row.bundle_id)
-        .bind(row.status)
-        .bind(row.submitted_proof_bundle)
-        .bind(row.submitted_at)
-        .bind(row.started_at)
-        .bind(row.completed_at)
-        .bind(row.failure_message)
+        .bind(task.task_id.to_string())
+        .bind(status_to_database(task.status))
+        .bind(task.started_at)
+        .bind(task.completed_at)
+        .bind(task.failure_message)
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -320,7 +315,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    };
 
     use super::PostgresVerificationTaskRepository;
     use crate::application::errors::ApplicationError;
@@ -500,6 +497,90 @@ mod tests {
         database.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn update_is_lifecycle_only_and_cannot_rewrite_stored_client_reference() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let task_id = TaskId::from_str(TASK_ID).unwrap();
+        let mut pending = task(VerificationTaskStatus::Pending);
+        pending.submitted_proof_bundle.client_reference =
+            Some(ClientReference::from_str("order-instance-1").unwrap());
+
+        // Adversarial update: a valid lifecycle transition whose record carries
+        // a DIFFERENT client_reference (and different proofs) than the stored
+        // bundle.
+        let mut tampered_in_progress = pending
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        tampered_in_progress.submitted_proof_bundle.client_reference =
+            Some(ClientReference::from_str("order-instance-2").unwrap());
+        tampered_in_progress.submitted_proof_bundle.proofs = vec![Proof {
+            criterion_id: "criterion-tampered".to_owned(),
+            verifier_type: VerifierType::DevStatic,
+            payload: json!({ "satisfied": false }),
+        }];
+        let mut tampered_failed = pending
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .transition_to(
+                VerificationTaskStatus::Failed,
+                datetime!(2026-05-29 12:02:00 UTC),
+                Some("verifier rejected proof".to_owned()),
+            )
+            .unwrap();
+        tampered_failed.submitted_proof_bundle.client_reference = None;
+
+        repo.insert_verification_task(pending).await.unwrap();
+        repo.update_verification_task(tampered_in_progress)
+            .await
+            .unwrap();
+        repo.update_verification_task(tampered_failed)
+            .await
+            .unwrap();
+
+        let stored_json: serde_json::Value = sqlx::query_scalar(
+            "SELECT submitted_proof_bundle FROM verification_tasks WHERE task_id = $1::uuid",
+        )
+        .bind(TASK_ID)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_json["client_reference"], "order-instance-1");
+        assert_eq!(stored_json["proofs"][0]["criterion_id"], "criterion-1");
+
+        for read in [
+            repo.get_verification_task(&task_id).await.unwrap(),
+            repo.get_verification_task_by_handle(
+                &CreatorPubky::from_str(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                )
+                .unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap(),
+        ] {
+            let stored = read.unwrap();
+            assert_eq!(stored.status, VerificationTaskStatus::Failed);
+            assert_eq!(
+                stored.submitted_proof_bundle.client_reference,
+                Some(ClientReference::from_str("order-instance-1").unwrap())
+            );
+        }
+
+        database.cleanup().await;
+    }
+
     fn task(status: VerificationTaskStatus) -> VerificationTaskRecord {
         task_with(
             TASK_ID,
@@ -526,6 +607,7 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

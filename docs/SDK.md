@@ -458,6 +458,16 @@ let issued: AccessCredentialResponse =
 
 Those parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. The JS/WASM viewer methods reuse the same Rust parsers internally before returning lifecycle or access-credential JSON to browser callers.
 
+`VerificationTaskLifecycleResponse` mirrors the server lifecycle view: `creator`, `bundle_id`, `pubky_lock_resource`, `criterion_ids` (the submitted proofs' `criterion_id`s in submission order), `reader_public_key`, `client_reference`, `status`, `submitted_at`, `started_at`, `completed_at`, and `failure_message`. The four binding fields (`pubky_lock_resource`, `criterion_ids`, `reader_public_key`, `client_reference`) are deserialized as optional (`Option` / `#[serde(default)]`), so this SDK release parses lifecycle responses from both a Lock Server that predates those fields and one that returns them. A relying service that binds tasks to its own `client_reference` must treat an absent or `None` echo as a mismatch, never as a match: only an exactly equal echoed value proves the task was submitted for that instance.
+
+Rollout order matters because the parsers deny unknown fields. The only safe order is:
+
+1. Release the SDK with the binding fields read as optional.
+2. Consumers (Rust and JS/WASM, which share the same Rust parser) upgrade to that SDK release.
+3. Deploy the Lock Server that returns the four new fields.
+
+The reverse direction has no compatibility shim: SDK releases from before this change deny unknown fields, so they reject the new server's lifecycle responses on submit, lookup, and dev completion. This follows the repository's existing `deny_unknown_fields` parser posture and CONTRIBUTING's statement that maintainers may change APIs without backwards compatibility. Consumers pinned to a pre-change strict SDK release must upgrade before the server deploys; do not deploy the server first.
+
 ## Current verification commands
 
 ```bash

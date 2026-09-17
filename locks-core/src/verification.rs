@@ -1,8 +1,87 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
 use crate::lock_policy::VerifierType;
+
+/// Maximum accepted length of a [`ClientReference`] in bytes.
+pub const CLIENT_REFERENCE_MAX_BYTES: usize = 64;
+
+/// Errors returned when parsing a relying-service client reference.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClientReferenceParseError {
+    /// The reference was empty.
+    #[error("client reference must not be empty")]
+    Empty,
+    /// The reference exceeded the byte-length bound.
+    #[error("client reference must be at most 64 bytes")]
+    TooLong,
+    /// The reference contained a control character.
+    #[error("client reference must not contain control characters")]
+    ControlCharacter,
+}
+
+/// Opaque relying-service reference persisted with a submitted proof bundle.
+///
+/// A relying service mints this value server-side (for example per payment or
+/// order instance) before the viewer submits the bundle, and requires exact
+/// equality at completion. Locks never interprets the value: no trimming, no
+/// case folding, no normalization of any kind. The value is bounded to
+/// 1..=64 bytes of UTF-8 without control characters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientReference(String);
+
+impl ClientReference {
+    /// Returns the reference exactly as supplied.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ClientReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ClientReference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for ClientReference {
+    type Err = ClientReferenceParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(ClientReferenceParseError::Empty);
+        }
+        if value.len() > CLIENT_REFERENCE_MAX_BYTES {
+            return Err(ClientReferenceParseError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ClientReferenceParseError::ControlCharacter);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
 
 /// Supported v0 submitted proof bundle payload version.
 pub const SUBMITTED_PROOF_BUNDLE_VERSION: u16 = 1;
@@ -27,6 +106,12 @@ pub struct SubmittedProofBundle {
     /// Reader Pubky identity used by payment-backed invoice flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reader_public_key: Option<CreatorPubky>,
+    /// Opaque relying-service reference binding this bundle to one instance.
+    ///
+    /// Persisted immutably with the verification task and echoed on the
+    /// handle-based lifecycle lookup. Locks never interprets the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_reference: Option<ClientReference>,
     /// Viewer-submitted proofs keyed to content lock criteria.
     pub proofs: Vec<Proof>,
 }
@@ -102,6 +187,7 @@ mod tests {
     use crate::ids::{BundleId, LockServerPubky, PubkyLockResource};
     use crate::lock_policy::VerifierType;
     use crate::verification::{
+        CLIENT_REFERENCE_MAX_BYTES, ClientReference, ClientReferenceParseError,
         CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
         SubmittedProofBundle, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
         VerifiedProofBundle,
@@ -128,6 +214,7 @@ mod tests {
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: pubky_lock_resource_fixture(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,
@@ -189,6 +276,120 @@ mod tests {
         let result = serde_json::from_value::<SubmittedProofBundle>(value);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_reference_round_trips_through_submitted_proof_bundle_json() {
+        let mut submitted = submitted_proof_bundle_fixture();
+        submitted.client_reference =
+            Some(ClientReference::from_str("order-instance-018fc6ec").unwrap());
+
+        let serialized = serde_json::to_value(&submitted).unwrap();
+        assert_eq!(serialized["client_reference"], "order-instance-018fc6ec");
+
+        let parsed: SubmittedProofBundle = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed, submitted);
+    }
+
+    #[test]
+    fn submitted_proof_bundle_accepts_absent_client_reference() {
+        let fixture = submitted_proof_bundle_fixture();
+        let value = serde_json::to_value(&fixture).unwrap();
+        assert!(value.get("client_reference").is_none());
+
+        let parsed: SubmittedProofBundle = serde_json::from_value(value).unwrap();
+
+        assert_eq!(parsed.client_reference, None);
+        assert_eq!(parsed, fixture);
+    }
+
+    #[test]
+    fn client_reference_accepts_single_byte_and_exactly_64_bytes() {
+        assert_eq!(ClientReference::from_str("a").unwrap().as_str(), "a");
+        let maxed = "b".repeat(CLIENT_REFERENCE_MAX_BYTES);
+        assert_eq!(ClientReference::from_str(&maxed).unwrap().as_str(), maxed);
+    }
+
+    #[test]
+    fn client_reference_accepts_64_bytes_of_multibyte_utf8() {
+        // 32 two-byte characters are exactly 64 bytes.
+        let value = "é".repeat(32);
+        assert_eq!(value.len(), CLIENT_REFERENCE_MAX_BYTES);
+
+        let reference = ClientReference::from_str(&value).unwrap();
+
+        assert_eq!(reference.as_str(), value);
+    }
+
+    #[test]
+    fn client_reference_rejects_empty_value() {
+        assert_eq!(
+            ClientReference::from_str(""),
+            Err(ClientReferenceParseError::Empty)
+        );
+    }
+
+    #[test]
+    fn client_reference_rejects_65_bytes() {
+        let too_long = "c".repeat(CLIENT_REFERENCE_MAX_BYTES + 1);
+
+        assert_eq!(
+            ClientReference::from_str(&too_long),
+            Err(ClientReferenceParseError::TooLong)
+        );
+        // 33 two-byte characters exceed the byte bound at 66 bytes.
+        let multibyte_too_long = "é".repeat(33);
+        assert_eq!(
+            ClientReference::from_str(&multibyte_too_long),
+            Err(ClientReferenceParseError::TooLong)
+        );
+    }
+
+    #[test]
+    fn client_reference_rejects_control_characters() {
+        for value in ["order\n1", "order\t1", "order\u{7}1", "\u{0}order"] {
+            assert_eq!(
+                ClientReference::from_str(value),
+                Err(ClientReferenceParseError::ControlCharacter)
+            );
+        }
+    }
+
+    #[test]
+    fn client_reference_deserialization_validates_like_construction() {
+        assert_eq!(
+            serde_json::from_value::<ClientReference>(json!("order-instance-018fc6ec"))
+                .unwrap()
+                .as_str(),
+            "order-instance-018fc6ec"
+        );
+        assert!(serde_json::from_value::<ClientReference>(json!("")).is_err());
+        assert!(serde_json::from_value::<ClientReference>(json!("order\n1")).is_err());
+        assert!(serde_json::from_value::<ClientReference>(json!("c".repeat(65).as_str())).is_err());
+    }
+
+    #[test]
+    fn submitted_proof_bundle_rejects_invalid_client_reference() {
+        let mut value = serde_json::to_value(submitted_proof_bundle_fixture()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("client_reference".to_owned(), json!("order\n1"));
+
+        let result = serde_json::from_value::<SubmittedProofBundle>(value);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_reference_does_not_trim_or_fold_case() {
+        let reference = ClientReference::from_str("  Order-ABC  ").unwrap();
+
+        assert_eq!(reference.as_str(), "  Order-ABC  ");
+        assert_ne!(
+            ClientReference::from_str("Order-ABC").unwrap(),
+            ClientReference::from_str("order-abc").unwrap()
+        );
     }
 
     #[test]

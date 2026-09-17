@@ -49,12 +49,18 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
         let mut records = self.records.write().await;
-        if !records.contains_key(&task.task_id) {
+        let Some(stored) = records.get_mut(&task.task_id) else {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
-        }
-        records.insert(task.task_id, task);
+        };
+        // Lifecycle-only update: the stored identity and submitted proof
+        // bundle (including `client_reference`) are immutable after insert, so
+        // the incoming record's identity and bundle fields are ignored.
+        stored.status = task.status;
+        stored.started_at = task.started_at;
+        stored.completed_at = task.completed_at;
+        stored.failure_message = task.failure_message;
         Ok(())
     }
 
@@ -96,7 +102,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        ClientReference, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    };
 
     use super::*;
     use crate::application::models::VerificationTaskStatus;
@@ -244,6 +252,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_is_lifecycle_only_and_cannot_rewrite_stored_client_reference() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let task_id = TaskId::from_str(TASK_ID).unwrap();
+        let creator =
+            CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap();
+        let bundle_id = BundleId::from_str(BUNDLE_ID).unwrap();
+        let mut pending = task(VerificationTaskStatus::Pending);
+        pending.submitted_proof_bundle.client_reference =
+            Some(ClientReference::from_str("order-instance-1").unwrap());
+
+        // Adversarial update: a valid lifecycle transition whose record carries
+        // a DIFFERENT client_reference (and different proofs) than the stored
+        // bundle.
+        let mut tampered_in_progress = pending
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        tampered_in_progress.submitted_proof_bundle.client_reference =
+            Some(ClientReference::from_str("order-instance-2").unwrap());
+        tampered_in_progress.submitted_proof_bundle.proofs = vec![Proof {
+            criterion_id: "criterion-tampered".to_owned(),
+            verifier_type: VerifierType::DevStatic,
+            payload: json!({ "satisfied": false }),
+        }];
+        let mut tampered_failed = pending
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .transition_to(
+                VerificationTaskStatus::Failed,
+                datetime!(2026-05-29 12:02:00 UTC),
+                Some("verifier rejected proof".to_owned()),
+            )
+            .unwrap();
+        tampered_failed.submitted_proof_bundle.client_reference = None;
+
+        repo.insert_verification_task(pending).await.unwrap();
+        repo.update_verification_task(tampered_in_progress)
+            .await
+            .unwrap();
+        repo.update_verification_task(tampered_failed)
+            .await
+            .unwrap();
+
+        for read in [
+            repo.get_verification_task(&task_id).await.unwrap(),
+            repo.get_verification_task_by_handle(&creator, &bundle_id)
+                .await
+                .unwrap(),
+        ] {
+            let stored = read.unwrap();
+            assert_eq!(stored.status, VerificationTaskStatus::Failed);
+            assert_eq!(stored.started_at, Some(datetime!(2026-05-29 12:01:00 UTC)));
+            assert_eq!(
+                stored.submitted_proof_bundle.client_reference,
+                Some(ClientReference::from_str("order-instance-1").unwrap())
+            );
+            assert_eq!(
+                stored.submitted_proof_bundle.proofs[0].criterion_id,
+                "criterion-1"
+            );
+        }
+    }
+
     fn task(status: VerificationTaskStatus) -> VerificationTaskRecord {
         task_with(
             TASK_ID,
@@ -270,6 +352,7 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

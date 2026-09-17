@@ -1023,6 +1023,7 @@ mod tests {
                 bundle_id: bundle_id(),
                 pubky_lock_resource: pubky_lock_resource_for(content_lock),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

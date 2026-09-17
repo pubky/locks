@@ -1,6 +1,12 @@
 {
   "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
   "bundle_id": "000G40R40M30E209185GR38E1W",
+  "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+  "criterion_ids": [
+    "criterion-1"
+  ],
+  "reader_public_key": null,
+  "client_reference": "order-instance-1",
   "status": "pending",
   "submitted_at": "<submitted_at>",
   "started_at": null,
