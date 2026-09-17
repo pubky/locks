@@ -44,6 +44,14 @@ pub enum VerificationTaskStatus {
     Expired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaykitConnectionState {
+    Connected,
+    Handshake,
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationTaskLifecycleResponse {
@@ -57,6 +65,14 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<time::OffsetDateTime>,
     pub failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitProofBundleResponse {
+    #[serde(flatten)]
+    pub lifecycle: VerificationTaskLifecycleResponse,
+    pub connection_state: PaykitConnectionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -129,6 +145,10 @@ impl ViewerLocks {
     }
 
     pub fn parse_lifecycle_response(value: Value) -> Result<VerificationTaskLifecycleResponse> {
+        serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
+    }
+
+    pub fn parse_submit_proof_bundle_response(value: Value) -> Result<SubmitProofBundleResponse> {
         serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
     }
 
@@ -258,22 +278,65 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_response_parses_public_view_without_task_id_or_credentials() {
-        let response = ViewerLocks::parse_lifecycle_response(json!({
+    fn submit_proof_bundle_response_parses_connected_state() {
+        let response = ViewerLocks::parse_submit_proof_bundle_response(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
             "status": "completed",
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": "2026-06-01T12:00:01Z",
             "completed_at": "2026-06-01T12:00:02Z",
-            "failure_message": null
+            "failure_message": null,
+            "connection_state": "connected"
         }))
         .unwrap();
 
-        assert_eq!(response.creator.to_string(), CREATOR);
-        assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
-        assert_eq!(response.status, VerificationTaskStatus::Completed);
-        assert!(response.failure_message.is_none());
+        assert_eq!(response.lifecycle.creator.to_string(), CREATOR);
+        assert_eq!(response.lifecycle.bundle_id.to_string(), BUNDLE_ID);
+        assert_eq!(response.lifecycle.status, VerificationTaskStatus::Completed);
+        assert_eq!(response.connection_state, PaykitConnectionState::Connected);
+        assert!(response.lifecycle.failure_message.is_none());
+    }
+
+    #[test]
+    fn submit_proof_bundle_response_parses_all_connection_states() {
+        for (wire, expected) in [
+            ("none", PaykitConnectionState::None),
+            ("handshake", PaykitConnectionState::Handshake),
+            ("connected", PaykitConnectionState::Connected),
+        ] {
+            let response = ViewerLocks::parse_submit_proof_bundle_response(json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null,
+                "connection_state": wire
+            }))
+            .unwrap();
+            assert_eq!(response.connection_state, expected);
+        }
+    }
+
+    #[test]
+    fn submit_proof_bundle_response_requires_known_connection_state() {
+        for connection_state in [None, Some("blocked")] {
+            let mut response = json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null
+            });
+            if let Some(connection_state) = connection_state {
+                response["connection_state"] = json!(connection_state);
+            }
+            assert!(ViewerLocks::parse_submit_proof_bundle_response(response).is_err());
+        }
     }
 
     #[test]

@@ -371,7 +371,7 @@ sequenceDiagram
   Note over V,L: Step 5: Proof bundle submission
   V->>L: POST /proof-bundles { submitted_proof_bundle }
   alt Under configured submission limit
-    L-->>V: { "creator": "...", "bundle_id": "...", "status": "pending" }
+    L-->>V: { "creator": "...", "bundle_id": "...", "status": "pending", "connection_state": "none|handshake|connected" }
   else Limit exceeded
     L-->>V: 429 Retry-After: <seconds> { "error": { "code": "rate_limited", "message": "rate limit exceeded" } }
   end
@@ -504,7 +504,7 @@ Example:
 
 The `bundle_id` must be cryptographically random and treated as a bearer secret. The viewer is responsible for storing it for future reference.
 
-`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. An exact persisted replay returns the existing lifecycle, while changed submitted proof material conflicts; neither replay calls Paykit again. Only a new identity requires Paykit configuration and creates a signed invoice with `{ bundle_id, lock_resource, reader }`.
+`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material conflicts without calling Paykit. New and exact-replay payment submissions require Paykit configuration and call the signed idempotent invoice endpoint with `{ bundle_id, lock_resource, reader }`; replay refreshes current Noise `connection_state` without creating another invoice or verification task.
 
 The worker checks payment through a signed canonical `{ creator, bundle_id }` request to `POST /transactions/status`. Valid `undetected`, `detected`, and `confirmed` responses are evaluated against amount matching and the configured confirmation threshold. Transport, timeout, HTTP (including `404` or authorization), and response-decoding failures all durably return the task to pending for retry; v1 has no terminal Paykit payment failure. Responses never include invoice data, payment status internals, raw proof material, or an internal task ID.
 

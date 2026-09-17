@@ -140,7 +140,7 @@ impl Viewer {
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
-        fetch_viewer_lifecycle_json(&request).await
+        fetch_submit_proof_bundle_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -374,6 +374,13 @@ fn validate_lifecycle_response_for_tests(value: Value) -> Result<Value, String> 
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
+fn validate_submit_proof_bundle_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_submit_proof_bundle_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
 fn validate_access_credential_response_for_tests(value: Value) -> Result<Value, String> {
     locks_sdk::ViewerLocks::parse_access_credential_response(value.clone())
         .map_err(|err| err.to_string())?;
@@ -388,6 +395,17 @@ async fn fetch_viewer_lifecycle_json(
     let validated = validate_lifecycle_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode lifecycle response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_submit_proof_bundle_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated =
+        validate_submit_proof_bundle_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode proof bundle response: {err:?}")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -733,6 +751,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(credential["credential"], "raw-access-credential");
+    }
+
+    #[test]
+    fn submit_proof_bundle_response_validation_requires_connection_state() {
+        let response = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "connection_state": "handshake"
+        });
+        assert_eq!(
+            validate_submit_proof_bundle_response_for_tests(response.clone()).unwrap(),
+            response
+        );
+
+        let mut missing = response;
+        missing.as_object_mut().unwrap().remove("connection_state");
+        assert!(validate_submit_proof_bundle_response_for_tests(missing).is_err());
     }
 
     #[test]

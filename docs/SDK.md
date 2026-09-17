@@ -448,15 +448,20 @@ Only `proxyReadGuardedResource` sends an `Authorization` header. It also require
 The Rust SDK also exposes typed response parsers for non-browser callers:
 
 ```rust
-use locks_sdk::{ViewerLocks, VerificationTaskLifecycleResponse, AccessCredentialResponse};
+use locks_sdk::{
+    AccessCredentialResponse, SubmitProofBundleResponse,
+    VerificationTaskLifecycleResponse, ViewerLocks,
+};
 
+let submitted: SubmitProofBundleResponse =
+    ViewerLocks::parse_submit_proof_bundle_response(response_json)?;
 let lifecycle: VerificationTaskLifecycleResponse =
     ViewerLocks::parse_lifecycle_response(response_json)?;
 let issued: AccessCredentialResponse =
     ViewerLocks::parse_access_credential_response(response_json)?;
 ```
 
-Those parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. The JS/WASM viewer methods reuse the same Rust parsers internally before returning lifecycle or access-credential JSON to browser callers.
+`parse_submit_proof_bundle_response` validates submit responses, including required `connection_state` values `none`, `handshake`, and `connected`. `parse_lifecycle_response` validates later lookup responses, which do not contain connection state. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
 
 ## Current verification commands
 

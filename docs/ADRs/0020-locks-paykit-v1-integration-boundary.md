@@ -47,11 +47,11 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 3. load and validate the current canonical Lock Resource and payment policy;
 4. resolve the current reader through Pubky discovery;
 5. compare any persisted lifecycle under `{ creator, bundle_id }`;
-6. return an exact persisted replay or reject changed submitted proof material with `409 task_state_conflict`;
-7. require configured Paykit and create an invoice only for a new identity; and
+6. reject changed submitted proof material with `409 task_state_conflict`;
+7. require configured Paykit and call its idempotent invoice endpoint for new and exact persisted payment submissions; and
 8. insert the verification task with post-invoice race reconciliation.
 
-Exact and changed persisted replays do not call Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID.
+Exact persisted payment replay calls Paykit only to refresh current Noise connection state; it does not restart terminal lifecycle state or repeat invoice side effects. Changed replay does not call Paykit. Clients needing another attempt must generate a new Bundle ID.
 
 ### Invoice request
 
@@ -67,7 +67,7 @@ For a new lifecycle identity, Locks sends RFC 8785 canonical JSON to `POST /invo
 
 Locks signs the exact canonical body bytes with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`.
 
-The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay must return the original generic success without repeating mutable lookups, allocation, address creation, or delivery side effects. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Locks accepts any Paykit 2xx response and ignores its body; other invoice failures return `502 paykit_invoice_creation_failed` without creating a new verification task.
+The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay returns the current Noise connection state without repeating mutable lookups, allocation, address creation, or delivery side effects. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Paykit returns exactly one lowercase `connection_state`: `none`, `handshake`, or `connected`. Locks rejects missing, malformed, or unknown successful response bodies as `502 paykit_invoice_creation_failed`; other invoice failures use the same error without creating a new verification task.
 
 ### Status request and access policy
 
@@ -92,7 +92,7 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 
 ### Runtime boundary
 
-- A new payment lifecycle requires `[paykit]`; exact persisted replay does not.
+- New and exact-replay payment submissions require `[paykit]`; replay uses Paykit's idempotent invoice endpoint to refresh Noise connection state.
 - Paykit HTTP connect timeout is 5 seconds and whole-request timeout is 20 seconds.
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.

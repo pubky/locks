@@ -39,6 +39,8 @@ pub enum PaykitClientError {
         operation: &'static str,
         status: StatusCode,
     },
+    #[error("Paykit invoice response was invalid: {0}")]
+    InvalidInvoiceResponse(reqwest::Error),
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
 }
@@ -55,6 +57,20 @@ pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
     pub reader: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaykitConnectionState {
+    Connected,
+    Handshake,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitInvoiceResponse {
+    pub connection_state: PaykitConnectionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -128,6 +144,14 @@ impl PaykitHttpClient {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        server_url: &str,
+        signing_keypair: Keypair,
+    ) -> Result<Self, PaykitClientError> {
+        Self::from_parts(server_url, reqwest::Client::new(), signing_keypair)
+    }
+
     fn from_parts(
         server_url: &str,
         http: reqwest::Client,
@@ -144,11 +168,14 @@ impl PaykitHttpClient {
     pub async fn create_invoice(
         &self,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceResponse, PaykitClientError> {
         let response = self.signed_post("invoices", request).await?;
 
         if response.status().is_success() {
-            Ok(())
+            response
+                .json::<PaykitInvoiceResponse>()
+                .await
+                .map_err(PaykitClientError::InvalidInvoiceResponse)
         } else {
             Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
@@ -451,12 +478,38 @@ mod tests {
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
         let expected_signature = sign_body(&keypair, &expected_body);
 
-        client.create_invoice(&invoice_request()).await.unwrap();
+        let response = client.create_invoice(&invoice_request()).await.unwrap();
 
+        assert_eq!(response.connection_state, PaykitConnectionState::Connected);
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
         assert_eq!(request.signature, Some(expected_signature));
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_missing_unknown_extra_and_malformed_connection_state() {
+        for body in [
+            "{}",
+            r#"{"connection_state":"unknown"}"#,
+            r#"{"connection_state":"connected","extra":true}"#,
+            "not-json",
+        ] {
+            let server_url = spawn_configured_invoice_server(body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                PaykitClientError::InvalidInvoiceResponse(_)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -610,6 +663,22 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_configured_invoice_server(body: &'static str) -> String {
+        async fn invoice(State(body): State<&'static str>) -> impl IntoResponse {
+            (axum::http::StatusCode::OK, body)
+        }
+
+        let app = Router::new()
+            .route("/invoices", post(invoice))
+            .with_state(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[derive(Clone)]
     struct ConfiguredStatusResponse {
         status: axum::http::StatusCode,
@@ -654,7 +723,7 @@ mod tests {
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        (axum::http::StatusCode::CREATED, "accepted")
+        Json(json!({ "connection_state": "connected" }))
     }
 
     async fn capture_status(

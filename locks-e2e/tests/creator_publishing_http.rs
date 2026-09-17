@@ -553,13 +553,14 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
 
     let submit_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(submit_json["status"], "pending");
+    assert_eq!(submit_json["connection_state"], "connected");
     assert!(submit_json.get("task_id").is_none());
     fake_paykit.assert_invoice_created(&lock_resource).await;
     fake_paykit.assert_invoice_count(1).await;
 
     let replay_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(replay_json, submit_json);
-    fake_paykit.assert_invoice_count(1).await;
+    fake_paykit.assert_invoice_count(2).await;
 
     let mut conflicting = submitted;
     conflicting.reader_public_key = Some(
@@ -569,7 +570,7 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     let conflict = client.submit_proof_bundle(conflicting).await.unwrap_err();
     assert_eq!(conflict.status, StatusCode::CONFLICT);
     assert_eq!(conflict.body["error"]["code"], "task_state_conflict");
-    fake_paykit.assert_invoice_count(1).await;
+    fake_paykit.assert_invoice_count(2).await;
 
     let task = test_app
         .state()
@@ -868,14 +869,14 @@ async fn fake_invoice_handler(
     State(state): State<Arc<Mutex<FakePaykitState>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> Json<serde_json::Value> {
     let mut state = state.lock().await;
     state.invoice_count += 1;
     state.invoice_body = Some(serde_json::from_slice(&body).unwrap());
     state.invoice_signature = headers
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
-    StatusCode::CREATED
+    Json(json!({ "connection_state": "connected" }))
 }
 
 async fn fake_status_handler(

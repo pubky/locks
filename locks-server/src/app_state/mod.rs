@@ -675,6 +675,12 @@ impl AppState {
         self.paykit_http_client.as_ref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_http_client(mut self, client: Option<Arc<PaykitHttpClient>>) -> Self {
+        self.paykit_http_client = client;
+        self
+    }
+
     pub fn paykit_setup_status_provider(&self) -> Option<&Arc<dyn PaykitSetupStatusProvider>> {
         self.paykit_setup_status_provider.as_ref()
     }

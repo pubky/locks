@@ -5,5 +5,6 @@
   "submitted_at": "<submitted_at>",
   "started_at": null,
   "completed_at": null,
-  "failure_message": null
+  "failure_message": null,
+  "connection_state": "none"
 }

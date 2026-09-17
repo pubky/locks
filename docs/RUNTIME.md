@@ -149,7 +149,7 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` lifecycle identity, the Lock Server calls `POST /invoices` during `POST /proof-bundles` before creating a verification task; exact persisted submission replay does not call Paykit. Workers call `POST /transactions/status` while completing pending payment verification tasks. Both request bodies are canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, the Lock Server calls `POST /invoices` during `POST /proof-bundles` before creating a verification task. Exact persisted payment-submission replay calls the same idempotent endpoint to refresh the current Noise `connection_state`; it does not create another invoice or verification task. Workers call `POST /transactions/status` while completing pending payment verification tasks. Both request bodies are canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
 Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; status-query timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
 
@@ -157,7 +157,7 @@ Every claimed verification task receives a fresh opaque claim token. Retry, comp
 
 `minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable.
 
-Omitting `[paykit]` prevents creation of new payment lifecycle identities. In that state, non-payment verifier flows continue to run, an exact persisted `paykit-payment` submission replay can still return its lifecycle after current canonical preflight, and a new `paykit-payment` submission returns `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
+Omitting `[paykit]` prevents creation and replay of payment lifecycle identities because their submit responses require the current Noise connection state. In that state, non-payment verifier flows continue to run, while new or exact-replay `paykit-payment` submissions return `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
 ## Runtime storage
 

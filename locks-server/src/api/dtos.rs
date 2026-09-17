@@ -19,7 +19,7 @@ use locks_service::application::use_cases::issue_access_credential::IssuedAccess
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::paykit_http_client::PaykitSetupStatusKind;
+use crate::paykit_http_client::{PaykitConnectionState, PaykitSetupStatusKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthHttpResponse {
@@ -84,6 +84,25 @@ pub struct VerificationTaskLifecycleHttpResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
     pub failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmitProofBundleHttpResponse {
+    #[serde(flatten)]
+    pub lifecycle: VerificationTaskLifecycleHttpResponse,
+    pub connection_state: PaykitConnectionState,
+}
+
+impl SubmitProofBundleHttpResponse {
+    pub fn new(
+        lifecycle: VerificationTaskLifecycleView,
+        connection_state: PaykitConnectionState,
+    ) -> Self {
+        Self {
+            lifecycle: lifecycle.into(),
+            connection_state,
+        }
+    }
 }
 
 impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpResponse {
