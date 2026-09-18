@@ -106,6 +106,8 @@ assert.match(readerAppSource, /Dev-static completion is not available on deploye
 assert.match(readerAppSource, /state\.config\.mode === 'staging'/);
 assert.doesNotMatch(readerAppSource, /state\.config\.testnet\.pkarrRelay/);
 assert.match(readerAppSource, /buildPersistedReaderState\(state\)/);
+assert.match(readerAppSource, /refreshPaykitConnectionState\(\{/);
+assert.match(readerAppSource, /state\.connectionState = connectionStateFromSubmitResponse\(refresh\)/);
 assert.doesNotMatch(readerHtmlSource, /id="reader-public-key" readonly/);
 assert.match(readerFlowSource, /export async function hasPaykitData/);
 assert.match(readerFlowSource, /Locks\.hasPaykitData\(readerPublicKey\)/);

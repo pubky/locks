@@ -1,11 +1,14 @@
 import {
   classifyPaymentLifecycle,
+  connectionStateFromSubmitResponse,
+  connectionStateIndicator,
   completeDevVerification,
   hasPaykitData,
   issueAccessCredential,
   loadContentLock,
   lookupVerificationTask,
   readGuardedContent,
+  refreshPaykitConnectionState,
   submitDevStaticProof,
   submitPaykitPaymentProof,
   creatorFromResource,
@@ -44,6 +47,7 @@ const state = {
   bundleId: null,
   submittedProofBundle: null,
   lifecycle: null,
+  connectionState: null,
   completion: null,
   accessCredential: null,
   accessCredentialResponse: null,
@@ -78,6 +82,8 @@ const el = {
   pollPayment: document.querySelector('#poll-payment'),
   submitProof: document.querySelector('#submit-proof'),
   proofStatus: document.querySelector('#proof-status'),
+  connectionStateRow: document.querySelector('#connection-state-row'),
+  connectionState: document.querySelector('#connection-state'),
   proofOutput: document.querySelector('#proof-output'),
   completeVerification: document.querySelector('#complete-verification'),
   completionStatus: document.querySelector('#completion-status'),
@@ -141,6 +147,7 @@ function bindEvents() {
       bundleId: null,
       submittedProofBundle: null,
       lifecycle: null,
+      connectionState: null,
       completion: null,
       accessCredential: null,
       accessCredentialResponse: null,
@@ -372,6 +379,7 @@ async function submitProof() {
     state.bundleId = result.bundleId;
     state.submittedProofBundle = result.submittedProofBundle;
     state.lifecycle = result.lifecycle;
+    state.connectionState = connectionStateFromSubmitResponse(result.lifecycle);
     state.completion = null;
     state.accessCredential = null;
     state.accessCredentialResponse = null;
@@ -461,6 +469,20 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
     await postClientLog('info', 'reader-payment-poll-started', handleDetails(handle));
     for (let attempt = 0; attempt < 600; attempt += 1) {
       if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+      if (handle.submittedProofBundle) {
+        try {
+          const refresh = await refreshPaykitConnectionState({
+            resource: handle.resource,
+            submittedProofBundle: handle.submittedProofBundle,
+            pkarrRelays: handle.pkarrRelays,
+          });
+          if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+          state.connectionState = connectionStateFromSubmitResponse(refresh);
+          render();
+        } catch {
+          // Connection-state refresh is best-effort; lifecycle polling remains authoritative.
+        }
+      }
       const lifecycle = await lookupVerificationTask({
         resource: handle.resource,
         creator: handle.creator,
@@ -616,6 +638,10 @@ function render() {
   const paymentMode = state.verifierType === 'paykit-payment';
   el.proofSatisfied.closest('label').hidden = paymentMode;
   el.paykitReaderCommands.hidden = !paymentMode;
+  const connectionIndicator = connectionStateIndicator(state.connectionState);
+  el.connectionStateRow.hidden = !paymentMode;
+  el.connectionState.textContent = connectionIndicator.label;
+  el.connectionState.className = connectionIndicator.className;
   el.load.disabled = state.loadingLock || state.submittingProof;
   if (stagingMode) {
     el.paykitReaderStatus.textContent = state.paykitDataMessage
@@ -848,6 +874,7 @@ function clearVerificationState({ clearLoaded = false } = {}) {
   state.bundleId = null;
   state.submittedProofBundle = null;
   state.lifecycle = null;
+  state.connectionState = null;
   state.completion = null;
   state.accessCredential = null;
   state.accessCredentialResponse = null;
@@ -920,6 +947,7 @@ function createPaymentHandle(snapshot, result) {
     resource: snapshot.resource,
     creator: result.creator,
     bundleId: result.bundleId,
+    submittedProofBundle: result.submittedProofBundle,
     primaryPath: snapshot.primaryPath,
     pkarrRelays: snapshot.pkarrRelays,
   });
@@ -942,6 +970,7 @@ function currentPaymentHandle() {
   if (!handle) return null;
   return Object.freeze({
     ...handle,
+    submittedProofBundle: state.submittedProofBundle,
     primaryPath: state.lockResources.find((resource) => resource.kind === 'primary')?.readPath ?? '',
   });
 }

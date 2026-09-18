@@ -80,7 +80,12 @@ export async function signupBestEffort(signer, homeserver) {
   try {
     return await signer.signup(homeserver, null);
   } catch (error) {
-    if (isAlreadyRegisteredError(error)) return await signer.signinCookieBlocking();
+    if (isAlreadyRegisteredError(error)) {
+      // Local testnet PKARR state is ephemeral while homeserver users persist.
+      // Restore this known binding before sign-in tries to resolve it.
+      await signer.pkdns.publishHomeserverForce(homeserver);
+      return await signer.signinCookieBlocking();
+    }
     throw error;
   }
 }

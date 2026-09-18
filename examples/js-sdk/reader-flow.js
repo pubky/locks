@@ -140,12 +140,48 @@ export async function submitPaykitPaymentProof({
   return { locks, viewer, creator, bundleId, submittedProofBundle, lifecycle };
 }
 
+export async function resubmitProofBundle({ viewer, submittedProofBundle }) {
+  return viewer.submitProofBundle(submittedProofBundle);
+}
+
+export async function refreshPaykitConnectionState({
+  resource,
+  submittedProofBundle,
+  pkarrRelays = [],
+}) {
+  const { viewer } = await loadContentLock({ resource, pkarrRelays });
+  return resubmitProofBundle({ viewer, submittedProofBundle });
+}
+
 export function classifyPaymentLifecycle(lifecycle) {
   const status = getField(lifecycle, 'status');
   if (status === 'pending' || status === 'in_progress') return 'retry';
   if (status === 'completed') return 'completed';
   if (status === 'failed' || status === 'expired') return 'failed';
   throw new Error(`unknown lifecycle status: ${String(status)}`);
+}
+
+export function connectionStateIndicator(connectionState) {
+  if (connectionState == null) {
+    return Object.freeze({ label: 'Not reported yet', className: 'muted' });
+  }
+  if (connectionState === 'none') {
+    return Object.freeze({ label: 'None — handshake has not started', className: 'muted' });
+  }
+  if (connectionState === 'handshake') {
+    return Object.freeze({ label: 'Handshake in progress', className: 'warning' });
+  }
+  if (connectionState === 'connected') {
+    return Object.freeze({ label: 'Connected — handshake completed', className: 'ok' });
+  }
+  throw new Error(`unknown Noise connection state: ${String(connectionState)}`);
+}
+
+export function connectionStateFromSubmitResponse(response) {
+  const connectionState = getField(response, 'connection_state');
+  if (connectionState == null) throw new Error('missing Noise connection state');
+  connectionStateIndicator(connectionState);
+  return connectionState;
 }
 
 export async function completeDevVerification({ resource, creator, bundleId, pkarrRelays = [] }) {
