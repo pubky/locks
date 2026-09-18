@@ -351,6 +351,7 @@ sequenceDiagram
 sequenceDiagram
   participant V as Viewer App
   participant L as Lock Server
+  participant P as Paykit Server
   participant H as Creator Homeserver
 
   Note over V,H: Step 1: Discovery
@@ -378,6 +379,10 @@ sequenceDiagram
 
   Note over V,L: Step 6: Async polling
   loop Until eligible or failed
+    V->>L: POST /paykit-connection-state-lookups { "creator": "...", "bundle_id": "..." }
+    L->>P: POST /connections/status { "creator": "...", "bundle_id": "..." }
+    P-->>L: { "state": "none|handshake|connected|recovery_required|blocked" }
+    L-->>V: { "state": "..." }
     V->>L: POST /verification-task-lookups { "creator": "...", "bundle_id": "..." }
     L-->>V: { "creator": "...", "bundle_id": "...", "status": "in_progress" }
     L->>L: Verify proof
@@ -504,7 +509,7 @@ Example:
 
 The `bundle_id` must be cryptographically random and treated as a bearer secret. The viewer is responsible for storing it for future reference.
 
-`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. An exact persisted replay returns the existing lifecycle, while changed submitted proof material conflicts; neither replay calls Paykit again. Only a new identity requires Paykit configuration and creates a signed invoice with `{ bundle_id, lock_resource, reader }`.
+`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material conflicts without calling Paykit. New payment submissions require Paykit configuration and call the signed idempotent invoice endpoint with `{ bundle_id, lock_resource, reader }`. Exact persisted replays return the existing lifecycle without calling Paykit. Connection observation is a separate read-only lookup bound to the persisted payment task.
 
 The worker checks payment through a signed canonical `{ creator, bundle_id }` request to `POST /transactions/status`. Valid `undetected`, `detected`, and `confirmed` responses are evaluated against amount matching and the configured confirmation threshold. Transport, timeout, HTTP (including `404` or authorization), and response-decoding failures all durably return the task to pending for retry; v1 has no terminal Paykit payment failure. Responses never include invoice data, payment status internals, raw proof material, or an internal task ID.
 

@@ -26,8 +26,11 @@ pub enum ApiErrorCode {
     TaskStateConflict,
     UnsupportedVerifierType,
     PaykitNotConfigured,
+    NotPaykitPayment,
     ReaderPubkyUnresolvable,
     PaykitInvoiceCreationFailed,
+    PaykitConnectionStateUnavailable,
+    PaykitConnectionStateTimeout,
     RateLimited,
     PayloadTooLarge,
     InternalError,
@@ -56,8 +59,11 @@ impl ApiErrorCode {
             Self::TaskStateConflict => "task_state_conflict",
             Self::UnsupportedVerifierType => "unsupported_verifier_type",
             Self::PaykitNotConfigured => "paykit_not_configured",
+            Self::NotPaykitPayment => "not_paykit_payment",
             Self::ReaderPubkyUnresolvable => "reader_pubky_unresolvable",
             Self::PaykitInvoiceCreationFailed => "paykit_invoice_creation_failed",
+            Self::PaykitConnectionStateUnavailable => "paykit_connection_state_unavailable",
+            Self::PaykitConnectionStateTimeout => "paykit_connection_state_timeout",
             Self::RateLimited => "rate_limited",
             Self::PayloadTooLarge => "payload_too_large",
             Self::InternalError => "internal_error",
@@ -87,8 +93,12 @@ impl ApiErrorCode {
             Self::TaskStateConflict => StatusCode::CONFLICT,
             Self::UnsupportedVerifierType
             | Self::PaykitNotConfigured
+            | Self::NotPaykitPayment
             | Self::ReaderPubkyUnresolvable => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::PaykitInvoiceCreationFailed => StatusCode::BAD_GATEWAY,
+            Self::PaykitInvoiceCreationFailed | Self::PaykitConnectionStateUnavailable => {
+                StatusCode::BAD_GATEWAY
+            }
+            Self::PaykitConnectionStateTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
