@@ -61,6 +61,7 @@ const requiredSnippets = [
   'toString(): string;',
   'submitProofBundle(submitted_proof_bundle: any): Promise<any>;',
   'lookupVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
+  'lookupPaykitConnectionState(options: VerificationTaskHandleOptions): Promise<any>;',
   'issueAccessCredential(options: VerificationTaskHandleOptions): Promise<any>;',
   'proxyReadGuardedResource(access_credential: string, path: string): Promise<Uint8Array>;',
   'proxyReadGuardedResourceResponse(access_credential: string, path: string): Promise<Response>;',

@@ -140,17 +140,21 @@ export async function submitPaykitPaymentProof({
   return { locks, viewer, creator, bundleId, submittedProofBundle, lifecycle };
 }
 
-export async function resubmitProofBundle({ viewer, submittedProofBundle }) {
-  return viewer.submitProofBundle(submittedProofBundle);
+export async function lookupPaykitConnectionState({ viewer, handle }) {
+  return viewer.lookupPaykitConnectionState(handle);
 }
 
 export async function refreshPaykitConnectionState({
   resource,
-  submittedProofBundle,
+  creator,
+  bundleId,
   pkarrRelays = [],
 }) {
   const { viewer } = await loadContentLock({ resource, pkarrRelays });
-  return resubmitProofBundle({ viewer, submittedProofBundle });
+  return lookupPaykitConnectionState({
+    viewer,
+    handle: new VerificationTaskHandleOptions(creator, bundleId),
+  });
 }
 
 export function classifyPaymentLifecycle(lifecycle) {
@@ -172,16 +176,72 @@ export function connectionStateIndicator(connectionState) {
     return Object.freeze({ label: 'Handshake in progress', className: 'warning' });
   }
   if (connectionState === 'connected') {
-    return Object.freeze({ label: 'Connected — handshake completed', className: 'ok' });
+    return Object.freeze({ label: 'Connected — Paykit Server link is usable', className: 'ok' });
+  }
+  if (connectionState === 'recovery_required') {
+    return Object.freeze({
+      label: 'Recovery required — runtime must relink; do not resubmit proof',
+      className: 'warning',
+    });
+  }
+  if (connectionState === 'blocked') {
+    return Object.freeze({ label: 'Blocked — operator action required', className: 'error' });
   }
   throw new Error(`unknown Noise connection state: ${String(connectionState)}`);
 }
 
-export function connectionStateFromSubmitResponse(response) {
-  const connectionState = getField(response, 'connection_state');
+export function connectionStateFromLookupResponse(response) {
+  const connectionState = getField(response, 'state');
   if (connectionState == null) throw new Error('missing Noise connection state');
   connectionStateIndicator(connectionState);
   return connectionState;
+}
+
+export function createPaykitConnectionPoller({
+  lookup,
+  onState = () => {},
+  onError = () => {},
+  onExhausted = () => {},
+  maxAttempts = 60,
+}) {
+  if (typeof lookup !== 'function') throw new Error('connection lookup function is required');
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new Error('max connection lookup attempts must be a positive integer');
+  }
+
+  let attempts = 0;
+  let inFlight = false;
+  let stopped = false;
+
+  return Object.freeze({
+    poll() {
+      if (stopped || inFlight || attempts >= maxAttempts) return false;
+      attempts += 1;
+      inFlight = true;
+      Promise.resolve()
+        .then(lookup)
+        .then((response) => {
+          if (stopped) return;
+          const connectionState = connectionStateFromLookupResponse(response);
+          onState(connectionState);
+          if (connectionState === 'blocked') stopped = true;
+        })
+        .catch((error) => {
+          if (!stopped) onError(error);
+        })
+        .finally(() => {
+          inFlight = false;
+          if (!stopped && attempts >= maxAttempts) {
+            stopped = true;
+            onExhausted();
+          }
+        });
+      return true;
+    },
+    stop() {
+      stopped = true;
+    },
+  });
 }
 
 export async function completeDevVerification({ resource, creator, bundleId, pkarrRelays = [] }) {

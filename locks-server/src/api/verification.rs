@@ -23,13 +23,15 @@ use locks_service::application::use_cases::validate_paykit_payment_submission::{
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
 use crate::api::dtos::{
-    SubmitProofBundleHttpRequest, SubmitProofBundleHttpResponse, VerificationTaskHandleHttpRequest,
-    VerificationTaskLifecycleHttpResponse,
+    PaykitConnectionStateHttpResponse, SubmitProofBundleHttpRequest,
+    VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
 };
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
-use crate::paykit_http_client::{PaykitClientError, PaykitConnectionState, PaykitInvoiceRequest};
+use crate::paykit_http_client::{
+    PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRequest,
+};
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 
 pub(super) async fn submit_proof_bundle(
@@ -79,16 +81,11 @@ pub(super) async fn submit_proof_bundle(
         }
     };
 
-    Ok(Json(SubmitProofBundleHttpResponse::new(
-        submitted,
-        prepared.connection_state,
-    ))
-    .into_response())
+    Ok(Json(VerificationTaskLifecycleHttpResponse::from(submitted)).into_response())
 }
 
 struct PreparedSubmission {
     existing: Option<SubmittedVerificationTask>,
-    connection_state: PaykitConnectionState,
 }
 
 async fn maybe_prepare_paykit_submission(
@@ -102,10 +99,7 @@ async fn maybe_prepare_paykit_submission(
         .filter(|proof| proof.verifier_type == VerifierType::PaykitPayment)
         .collect();
     if paykit_proofs.is_empty() {
-        return Ok(PreparedSubmission {
-            existing: None,
-            connection_state: PaykitConnectionState::None,
-        });
+        return Ok(PreparedSubmission { existing: None });
     }
     if submitted.proofs.len() != 1
         || paykit_proofs.len() != 1
@@ -141,13 +135,16 @@ async fn maybe_prepare_paykit_submission(
         ));
     }
     let existing = submit_use_case.find_existing(submitted).await?;
+    if existing.is_some() {
+        return Ok(PreparedSubmission { existing });
+    }
     let paykit = state.paykit_http_client().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::PaykitNotConfigured,
             "paykit is not configured",
         )
     })?;
-    let invoice = paykit
+    paykit
         .create_invoice(&PaykitInvoiceRequest {
             bundle_id: submitted.bundle_id.to_string(),
             lock_resource: submitted.pubky_lock_resource.to_string(),
@@ -155,10 +152,7 @@ async fn maybe_prepare_paykit_submission(
         })
         .await
         .map_err(map_paykit_invoice_error)?;
-    Ok(PreparedSubmission {
-        existing,
-        connection_state: invoice.connection_state,
-    })
+    Ok(PreparedSubmission { existing })
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
@@ -186,6 +180,61 @@ pub(super) async fn lookup_verification_task(
     let view = get_task_view_by_handle(&state, request).await?;
 
     Ok(Json(VerificationTaskLifecycleHttpResponse::from(view)))
+}
+
+pub(super) async fn lookup_paykit_connection_state(
+    State(state): State<AppState>,
+    request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
+) -> Result<Json<PaykitConnectionStateHttpResponse>, ApiError> {
+    let request = parse_json(request)?;
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(&request.creator, &request.bundle_id)
+        .await?
+        .ok_or(ApplicationError::MissingRecord {
+            record: "verification_task",
+        })?;
+
+    let is_paykit_payment = task.submitted_proof_bundle.proofs.len() == 1
+        && task.submitted_proof_bundle.proofs[0].verifier_type == VerifierType::PaykitPayment;
+    if !is_paykit_payment {
+        return Err(ApiError::new(
+            ApiErrorCode::NotPaykitPayment,
+            "verification task does not use paykit-payment",
+        ));
+    }
+
+    let paykit = state.paykit_http_client().ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCode::PaykitNotConfigured,
+            "paykit is not configured",
+        )
+    })?;
+    let response = paykit
+        .connection_status(&PaykitConnectionStatusRequest {
+            creator: task.creator.to_string(),
+            bundle_id: task.submitted_proof_bundle.bundle_id.to_string(),
+        })
+        .await
+        .map_err(map_paykit_connection_status_error)?;
+
+    Ok(Json(PaykitConnectionStateHttpResponse {
+        state: response.state,
+    }))
+}
+
+fn map_paykit_connection_status_error(error: PaykitClientError) -> ApiError {
+    if error.is_timeout() {
+        return ApiError::new(
+            ApiErrorCode::PaykitConnectionStateTimeout,
+            "paykit connection-state lookup timed out",
+        );
+    }
+
+    ApiError::new(
+        ApiErrorCode::PaykitConnectionStateUnavailable,
+        "paykit connection state is unavailable",
+    )
 }
 
 /// Dev/internal endpoint for manually triggering verifier completion.

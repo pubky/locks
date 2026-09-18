@@ -46,6 +46,11 @@ pub struct PaykitSetupStatusHttpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaykitConnectionStateHttpResponse {
+    pub state: PaykitConnectionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegisterGuardedResourceHttpResponse {
     pub creator: CreatorPubky,
     pub guarded_resource: GuardedResource,
@@ -84,25 +89,6 @@ pub struct VerificationTaskLifecycleHttpResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
     pub failure_message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SubmitProofBundleHttpResponse {
-    #[serde(flatten)]
-    pub lifecycle: VerificationTaskLifecycleHttpResponse,
-    pub connection_state: PaykitConnectionState,
-}
-
-impl SubmitProofBundleHttpResponse {
-    pub fn new(
-        lifecycle: VerificationTaskLifecycleView,
-        connection_state: PaykitConnectionState,
-    ) -> Self {
-        Self {
-            lifecycle: lifecycle.into(),
-            connection_state,
-        }
-    }
 }
 
 impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpResponse {

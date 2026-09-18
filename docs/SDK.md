@@ -427,6 +427,7 @@ const lifecycle = await viewer.submitProofBundle({
 ```ts
 const handle = new VerificationTaskHandleOptions(creator, bundleId);
 const current = await viewer.lookupVerificationTask(handle);
+const connection = await viewer.lookupPaykitConnectionState(handle);
 const issued = await viewer.issueAccessCredential(handle);
 const bytes = await viewer.proxyReadGuardedResource(issued.credential, "example.txt");
 ```
@@ -438,30 +439,33 @@ The corresponding HTTP shapes are:
 ```http
 POST /proof-bundles
 POST /verification-task-lookups
+POST /paykit-connection-state-lookups
 POST /access-credentials
 GET /priv-resources/content/example.txt
 Authorization: Bearer <access_credential>
 ```
 
-Only `proxyReadGuardedResource` sends an `Authorization` header. It also requires the relative guarded resource path to read from the authorized content lock resource set. Polling and credential issuance use `{ creator, bundle_id }` JSON bodies; they do not use internal task IDs.
+Only `proxyReadGuardedResource` sends an `Authorization` header. It also requires the relative guarded resource path to read from the authorized content lock resource set. Lifecycle polling, Paykit connection-state lookup, and credential issuance use `{ creator, bundle_id }` JSON bodies; they do not use internal task IDs.
 
 The Rust SDK also exposes typed response parsers for non-browser callers:
 
 ```rust
 use locks_sdk::{
-    AccessCredentialResponse, SubmitProofBundleResponse,
+    AccessCredentialResponse, PaykitConnectionStateResponse,
     VerificationTaskLifecycleResponse, ViewerLocks,
 };
 
-let submitted: SubmitProofBundleResponse =
+let submitted: VerificationTaskLifecycleResponse =
     ViewerLocks::parse_submit_proof_bundle_response(response_json)?;
 let lifecycle: VerificationTaskLifecycleResponse =
     ViewerLocks::parse_lifecycle_response(response_json)?;
+let connection: PaykitConnectionStateResponse =
+    ViewerLocks::parse_paykit_connection_state_response(response_json)?;
 let issued: AccessCredentialResponse =
     ViewerLocks::parse_access_credential_response(response_json)?;
 ```
 
-`parse_submit_proof_bundle_response` validates submit responses, including required `connection_state` values `none`, `handshake`, and `connected`. `parse_lifecycle_response` validates later lookup responses, which do not contain connection state. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
+`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
 
 ## Current verification commands
 

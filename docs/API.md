@@ -59,8 +59,9 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
-| `POST /proof-bundles` | `200` JSON lifecycle plus `connection_state` | Public viewer route. Every `paykit-payment` submission, including exact replay, requires `[paykit]` runtime config to read current Noise state. | No bearer secrets, invoice data, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
+| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` tasks require `[paykit]`; exact persisted replay returns lifecycle without calling Paykit. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
+| `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
 | `POST /access-credentials` | `200` JSON credential | Public viewer route after entitlement. | Response intentionally contains raw viewer access credential exactly once. | `400 invalid_request`, `403 entitlement_not_authorized`, `404 verification_task_not_found` |
 | `GET /priv-resources/content/<path>` | `200` raw bytes | Requires viewer `Authorization: Bearer <access_credential>`. | No JSON response; credential is request-only. | `401 invalid_access_credential`, `401 expired_access_credential`, `403 entitlement_not_authorized`, `404 guarded_resource_not_found` |
@@ -561,11 +562,11 @@ Request envelope:
 }
 ```
 
-Success response returns lifecycle metadata plus `connection_state`. Exact lowercase values are `none` when no handshake has started, `handshake` while a handshake is in progress, and `connected` after handshake completion. Non-payment submissions return `none`. Response does not return internal `task_id`, raw proof material, entitlement evidence, or access credentials.
+Success response returns lifecycle metadata only. It does not return connection state, internal `task_id`, raw proof material, entitlement evidence, or access credentials.
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting, validates proof shape, loads the current canonical content lock referenced by `pubky_lock_resource`, verifies its lock identity and payment policy (including recipient/creator equality), and resolves `reader_public_key` through Pubky/PKARR/homeserver discovery. It then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`. New submissions and exact persisted replays both call Paykit `POST /invoices`: Paykit preserves idempotent invoice creation and returns current Noise connection state. Task insertion retains race reconciliation after invoice creation. Signed Paykit invoice body is exactly:
+Submission processing applies rate limiting, validates proof shape, loads the current canonical content lock referenced by `pubky_lock_resource`, verifies its lock identity and payment policy (including recipient/creator equality), and resolves `reader_public_key` through Pubky/PKARR/homeserver discovery. It then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`. Exact persisted replays return the existing lifecycle without calling Paykit. New submissions call Paykit `POST /invoices`; task insertion retains race reconciliation after invoice creation. Signed Paykit invoice body is exactly:
 
 ```json
 {
@@ -575,7 +576,19 @@ Submission processing applies rate limiting, validates proof shape, loads the cu
 }
 ```
 
-Paykit invoice success must contain exactly one recognized `connection_state`. Malformed success responses fail closed as `502 paykit_invoice_creation_failed`. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
+Paykit invoice success may have no response body. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
+
+### `POST /paykit-connection-state-lookups`
+
+Reads Paykit Server's local Noise peer state for an existing payment verification task. Request body is the same `{ creator, bundle_id }` handle used for lifecycle lookup. Locks loads the persisted task, rejects non-`paykit-payment` tasks, derives the accepted Creator and bundle binding, then sends signed canonical JSON to Paykit `POST /connections/status`. Browser callers cannot supply a peer key or receiver path.
+
+Success response is exactly one of `none`, `handshake`, `connected`, `recovery_required`, or `blocked`:
+
+```json
+{ "state": "handshake" }
+```
+
+This lookup is independent from verification lifecycle. `connected` does not mean payment or verification completed. Connection lookup errors do not fabricate connection states and should not stop lifecycle polling. `blocked` requires authorized operator action; `recovery_required` means the current local cryptographic generation must be recovered or relinked.
 
 Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status` with `X-Paykit-Signature` over those exact canonical body bytes. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
 

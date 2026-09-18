@@ -39,10 +39,26 @@ pub enum PaykitClientError {
         operation: &'static str,
         status: StatusCode,
     },
-    #[error("Paykit invoice response was invalid: {0}")]
-    InvalidInvoiceResponse(reqwest::Error),
+    #[error("Paykit connection-status response was invalid: {0}")]
+    InvalidConnectionStatusResponse(reqwest::Error),
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
+}
+
+impl PaykitClientError {
+    pub(crate) fn is_timeout(&self) -> bool {
+        match self {
+            Self::Http(source)
+            | Self::InvalidConnectionStatusResponse(source)
+            | Self::InvalidStatusResponse(source) => source.is_timeout(),
+            Self::InvalidServerUrl
+            | Self::SigningSeedRead(_)
+            | Self::InvalidSigningSeed
+            | Self::PublicKeyMismatch
+            | Self::Serialize(_)
+            | Self::NonSuccess { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,17 +76,25 @@ pub struct PaykitInvoiceRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PaykitConnectionState {
     Connected,
     Handshake,
     None,
+    RecoveryRequired,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaykitConnectionStatusRequest {
+    pub creator: String,
+    pub bundle_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PaykitInvoiceResponse {
-    pub connection_state: PaykitConnectionState,
+pub struct PaykitConnectionStatusResponse {
+    pub state: PaykitConnectionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -152,6 +176,19 @@ impl PaykitHttpClient {
         Self::from_parts(server_url, reqwest::Client::new(), signing_keypair)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_timeout(
+        server_url: &str,
+        signing_keypair: Keypair,
+        request_timeout: Duration,
+    ) -> Result<Self, PaykitClientError> {
+        Self::from_parts(
+            server_url,
+            bounded_http_client(Duration::from_secs(1), request_timeout)?,
+            signing_keypair,
+        )
+    }
+
     fn from_parts(
         server_url: &str,
         http: reqwest::Client,
@@ -168,20 +205,36 @@ impl PaykitHttpClient {
     pub async fn create_invoice(
         &self,
         request: &PaykitInvoiceRequest,
-    ) -> Result<PaykitInvoiceResponse, PaykitClientError> {
+    ) -> Result<(), PaykitClientError> {
         let response = self.signed_post("invoices", request).await?;
 
         if response.status().is_success() {
-            response
-                .json::<PaykitInvoiceResponse>()
-                .await
-                .map_err(PaykitClientError::InvalidInvoiceResponse)
+            Ok(())
         } else {
             Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
                 status: response.status(),
             })
         }
+    }
+
+    pub async fn connection_status(
+        &self,
+        request: &PaykitConnectionStatusRequest,
+    ) -> Result<PaykitConnectionStatusResponse, PaykitClientError> {
+        let response = self.signed_post("connections/status", request).await?;
+
+        if !response.status().is_success() {
+            return Err(PaykitClientError::NonSuccess {
+                operation: "connection status",
+                status: response.status(),
+            });
+        }
+
+        response
+            .json::<PaykitConnectionStatusResponse>()
+            .await
+            .map_err(PaykitClientError::InvalidConnectionStatusResponse)
     }
 
     pub async fn transaction_status(
@@ -371,6 +424,7 @@ mod tests {
     use locks_core::ids::LockServerPubky;
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -422,6 +476,10 @@ mod tests {
         assert_eq!(
             client.endpoint("transactions/status").as_str(),
             "https://paykit.example/transactions/status"
+        );
+        assert_eq!(
+            client.endpoint("connections/status").as_str(),
+            "https://paykit.example/connections/status"
         );
     }
 
@@ -478,9 +536,8 @@ mod tests {
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
         let expected_signature = sign_body(&keypair, &expected_body);
 
-        let response = client.create_invoice(&invoice_request()).await.unwrap();
+        client.create_invoice(&invoice_request()).await.unwrap();
 
-        assert_eq!(response.connection_state, PaykitConnectionState::Connected);
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
@@ -488,14 +545,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_invoice_rejects_missing_unknown_extra_and_malformed_connection_state() {
+    async fn connection_status_posts_signed_composite_identity_and_parses_closed_states() {
+        for (wire, expected) in [
+            ("none", PaykitConnectionState::None),
+            ("handshake", PaykitConnectionState::Handshake),
+            ("connected", PaykitConnectionState::Connected),
+            ("recovery_required", PaykitConnectionState::RecoveryRequired),
+            ("blocked", PaykitConnectionState::Blocked),
+        ] {
+            let captured = CapturedRequests::default();
+            let server_url = spawn_connection_status_server(captured.clone(), wire).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            let request = PaykitConnectionStatusRequest {
+                creator: CREATOR.to_owned(),
+                bundle_id: BUNDLE_ID.to_owned(),
+            };
+
+            let response = client.connection_status(&request).await.unwrap();
+
+            assert_eq!(response.state, expected);
+            let captured = captured.single();
+            assert_eq!(captured.path, "/connections/status");
+            assert_eq!(
+                String::from_utf8(captured.body).unwrap(),
+                format!("{{\"bundle_id\":\"{BUNDLE_ID}\",\"creator\":\"{CREATOR}\"}}")
+            );
+            assert!(captured.signature.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_status_rejects_missing_unknown_extra_and_malformed_state() {
         for body in [
             "{}",
-            r#"{"connection_state":"unknown"}"#,
-            r#"{"connection_state":"connected","extra":true}"#,
+            r#"{"state":"future"}"#,
+            r#"{"state":"connected","extra":true}"#,
             "not-json",
         ] {
-            let server_url = spawn_configured_invoice_server(body).await;
+            let server_url = spawn_configured_connection_status_server(body).await;
             let client = PaykitHttpClient::from_parts(
                 &server_url,
                 reqwest::Client::new(),
@@ -503,13 +595,48 @@ mod tests {
             )
             .unwrap();
 
-            let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+            let error = client
+                .connection_status(&PaykitConnectionStatusRequest {
+                    creator: CREATOR.to_owned(),
+                    bundle_id: BUNDLE_ID.to_owned(),
+                })
+                .await
+                .unwrap_err();
 
             assert!(matches!(
                 error,
-                PaykitClientError::InvalidInvoiceResponse(_)
+                PaykitClientError::InvalidConnectionStatusResponse(_)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn connection_status_preserves_response_body_timeout_source() {
+        let server_url = spawn_stalled_connection_status_body().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_secs(1), Duration::from_millis(500)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let error = client
+            .connection_status(&PaykitConnectionStatusRequest {
+                creator: CREATOR.to_owned(),
+                bundle_id: BUNDLE_ID.to_owned(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                PaykitClientError::InvalidConnectionStatusResponse(source)
+                    if source.is_timeout()
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.is_timeout());
     }
 
     #[tokio::test]
@@ -663,14 +790,51 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn spawn_configured_invoice_server(body: &'static str) -> String {
-        async fn invoice(State(body): State<&'static str>) -> impl IntoResponse {
+    async fn spawn_configured_connection_status_server(body: &'static str) -> String {
+        async fn connection_status(State(body): State<&'static str>) -> impl IntoResponse {
             (axum::http::StatusCode::OK, body)
         }
 
         let app = Router::new()
-            .route("/invoices", post(invoice))
+            .route("/connections/status", post(connection_status))
             .with_state(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_stalled_connection_status_body() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 24\r\n\r\n{\"state\":",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[derive(Clone)]
+    struct ConnectionStatusState {
+        captured: CapturedRequests,
+        state: &'static str,
+    }
+
+    async fn spawn_connection_status_server(
+        captured: CapturedRequests,
+        state: &'static str,
+    ) -> String {
+        let app = Router::new()
+            .route("/connections/status", post(capture_connection_status))
+            .with_state(ConnectionStatusState { captured, state });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -723,7 +887,22 @@ mod tests {
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        Json(json!({ "connection_state": "connected" }))
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    async fn capture_connection_status(
+        State(state): State<ConnectionStatusState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        state.captured.push(CapturedRequest {
+            path: "/connections/status".to_owned(),
+            signature: headers
+                .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            body: body.to_vec(),
+        });
+        Json(json!({ "state": state.state }))
     }
 
     async fn capture_status(

@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::post;
-use axum::{Json, Router};
 use locks_core::ids::{
     BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
 };
@@ -31,6 +31,7 @@ use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -385,7 +386,7 @@ async fn post_proof_bundles_returns_public_lifecycle_handle_without_task_id() {
     );
     assert_eq!(body["bundle_id"], BUNDLE_ID);
     assert_eq!(body["status"], "pending");
-    assert_eq!(body["connection_state"], "none");
+    assert!(body.get("connection_state").is_none());
     assert!(body.get("submitted_at").and_then(Value::as_str).is_some());
     assert_no_keys(
         &body,
@@ -433,9 +434,9 @@ async fn post_proof_bundles_rejects_paykit_payment_when_paykit_is_not_configured
 }
 
 #[tokio::test]
-async fn post_proof_bundles_replays_paykit_invoice_and_returns_current_connection_state() {
+async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_invoice() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let paykit_url = spawn_paykit_invoice_sequence(Arc::clone(&calls)).await;
+    let paykit_url = spawn_counting_paykit_invoice(Arc::clone(&calls)).await;
     let paykit = Arc::new(
         PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
     );
@@ -466,7 +467,7 @@ async fn post_proof_bundles_replays_paykit_invoice_and_returns_current_connectio
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(response_json(first).await["connection_state"], "handshake");
+    assert!(response_json(first).await.get("connection_state").is_none());
 
     let replay = app
         .oneshot(json_request(
@@ -477,13 +478,18 @@ async fn post_proof_bundles_replays_paykit_invoice_and_returns_current_connectio
         .await
         .unwrap();
     assert_eq!(replay.status(), StatusCode::OK);
-    assert_eq!(response_json(replay).await["connection_state"], "connected");
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        response_json(replay)
+            .await
+            .get("connection_state")
+            .is_none()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn post_proof_bundles_maps_invalid_paykit_connection_state_to_invoice_failure() {
-    let paykit_url = spawn_paykit_invoice_body(r#"{"connection_state":"unknown"}"#).await;
+async fn paykit_connection_state_lookup_returns_server_local_recovery_state() {
+    let paykit_url = spawn_paykit_connection_status_body(r#"{"state":"recovery_required"}"#).await;
     let paykit = Arc::new(
         PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
     );
@@ -503,11 +509,78 @@ async fn post_proof_bundles_maps_invalid_paykit_connection_state_to_invoice_fail
         .with_paykit_http_client(Some(paykit));
     seed_content_lock(&state, content_lock).await;
 
-    let response = router(state)
+    let app = router(state);
+    let submit = app
+        .clone()
         .oneshot(json_request(
             "POST",
             "/proof-bundles",
-            json!({ "submitted_proof_bundle": bundle }),
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({"state": "recovery_required"})
+    );
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_maps_invalid_paykit_response_to_bad_gateway() {
+    let paykit_url = spawn_paykit_connection_status_body(r#"{"state":"unknown"}"#).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let mut content_lock = content_lock(true);
+    content_lock.criteria[0].verifier_type = VerifierType::PaykitPayment;
+    content_lock.criteria[0].params = json!({
+        "recipient_pubky": creator().to_string(),
+        "amount": "50000",
+        "asset": "BTC"
+    });
+    let mut bundle = submitted_proof_bundle_for(&content_lock);
+    bundle.reader_public_key = Some(other_creator());
+    bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+    bundle.proofs[0].payload = json!({});
+    let state = test_state()
+        .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+        .with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
         ))
         .await
         .unwrap();
@@ -515,7 +588,103 @@ async fn post_proof_bundles_maps_invalid_paykit_connection_state_to_invoice_fail
     assert_error_response(
         response,
         StatusCode::BAD_GATEWAY,
-        "paykit_invoice_creation_failed",
+        "paykit_connection_state_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_maps_response_body_timeout_to_gateway_timeout() {
+    let paykit_url = spawn_invoice_then_stalled_connection_status_body().await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test_with_timeout(
+            &paykit_url,
+            Keypair::from_secret(&[9_u8; 32]),
+            Duration::from_millis(500),
+        )
+        .unwrap(),
+    );
+    let mut content_lock = content_lock(true);
+    content_lock.criteria[0].verifier_type = VerifierType::PaykitPayment;
+    content_lock.criteria[0].params = json!({
+        "recipient_pubky": creator().to_string(),
+        "amount": "50000",
+        "asset": "BTC"
+    });
+    let mut bundle = submitted_proof_bundle_for(&content_lock);
+    bundle.reader_public_key = Some(other_creator());
+    bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+    bundle.proofs[0].payload = json!({});
+    let state = test_state()
+        .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+        .with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(
+        response,
+        StatusCode::GATEWAY_TIMEOUT,
+        "paykit_connection_state_timeout",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_rejects_non_paykit_task() {
+    let content_lock = content_lock(true);
+    let bundle = submitted_proof_bundle_for(&content_lock);
+    let state = test_state();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "not_paykit_payment",
     )
     .await;
 }
@@ -3128,14 +3297,10 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
     }
 }
 
-async fn spawn_paykit_invoice_sequence(calls: Arc<AtomicUsize>) -> String {
-    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
-        let connection_state = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            "handshake"
-        } else {
-            "connected"
-        };
-        Json(json!({ "connection_state": connection_state }))
+async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
+    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+        calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
     }
 
     let app = Router::new()
@@ -3149,18 +3314,47 @@ async fn spawn_paykit_invoice_sequence(calls: Arc<AtomicUsize>) -> String {
     format!("http://{address}")
 }
 
-async fn spawn_paykit_invoice_body(body: &'static str) -> String {
-    async fn invoice(State(body): State<&'static str>) -> impl axum::response::IntoResponse {
+async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
+    async fn invoice() -> impl axum::response::IntoResponse {
+        StatusCode::NO_CONTENT
+    }
+    async fn connection_status(
+        State(body): State<&'static str>,
+    ) -> impl axum::response::IntoResponse {
         (StatusCode::OK, body)
     }
 
     let app = Router::new()
         .route("/invoices", post(invoice))
+        .route("/connections/status", post(connection_status))
         .with_state(body);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}")
+}
+
+async fn spawn_invoice_then_stalled_connection_status_body() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut invoice_socket, _) = listener.accept().await.unwrap();
+        invoice_socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        drop(invoice_socket);
+
+        let (mut connection_status_socket, _) = listener.accept().await.unwrap();
+        connection_status_socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 24\r\n\r\n{\"state\":",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
     });
     format!("http://{address}")
 }
