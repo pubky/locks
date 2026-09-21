@@ -5,7 +5,8 @@ use locks_core::ids::LockServerPubky;
 use tempfile::tempdir;
 
 use crate::config::{
-    ConfigError, PubkyNetwork, RuntimeEnvironment, load_existing_config_from_path,
+    ConfigError, PaykitConnectionStateLookupRateLimitConfig, PubkyNetwork, RuntimeEnvironment,
+    load_existing_config_from_path,
 };
 
 #[test]
@@ -175,6 +176,99 @@ fn omits_paykit_runtime_config_when_section_is_absent() {
     let config = load_existing_config_from_path(&config_path).unwrap();
 
     assert_eq!(config.paykit, None);
+}
+
+#[test]
+fn defaults_paykit_connection_state_lookup_admission_when_section_is_absent() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        minimal_config(&secret_path, &public_key, "development"),
+    )
+    .unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(
+        config.rate_limits.paykit_connection_state_lookup,
+        PaykitConnectionStateLookupRateLimitConfig {
+            max_requests: 60,
+            window_seconds: 60,
+            max_in_flight: 16,
+            max_entries: 10_000,
+        }
+    );
+}
+
+#[test]
+fn parses_custom_paykit_connection_state_lookup_admission() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[rate_limits.paykit_connection_state_lookup]\nmax_requests = 7\nwindow_seconds = 11\nmax_in_flight = 3\nmax_entries = 101\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(
+        config.rate_limits.paykit_connection_state_lookup,
+        PaykitConnectionStateLookupRateLimitConfig {
+            max_requests: 7,
+            window_seconds: 11,
+            max_in_flight: 3,
+            max_entries: 101,
+        }
+    );
+}
+
+#[test]
+fn rejects_paykit_connection_state_lookup_concurrency_above_semaphore_limit() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let max_in_flight = tokio::sync::Semaphore::MAX_PERMITS + 1;
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        &format!(
+            "[rate_limits.paykit_connection_state_lookup]\nmax_requests = 60\nwindow_seconds = 60\nmax_in_flight = {max_in_flight}\n\n[content_locks]"
+        ),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPaykitConnectionStateLookupMaxInFlight
+    ));
+}
+
+#[test]
+fn rejects_zero_paykit_connection_state_lookup_entry_cap() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[rate_limits.paykit_connection_state_lookup]\nmax_entries = 0\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPaykitConnectionStateLookupMaxEntries
+    ));
 }
 
 #[test]

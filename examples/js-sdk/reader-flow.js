@@ -212,6 +212,21 @@ export function createPaykitConnectionPoller({
   let attempts = 0;
   let inFlight = false;
   let stopped = false;
+  let timer = null;
+  const idleWaiters = [];
+
+  function resolveIdleWaiters() {
+    if (inFlight) return;
+    for (const resolve of idleWaiters.splice(0)) resolve();
+  }
+
+  function stop() {
+    stopped = true;
+    if (timer != null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
 
   return Object.freeze({
     poll() {
@@ -224,22 +239,58 @@ export function createPaykitConnectionPoller({
           if (stopped) return;
           const connectionState = connectionStateFromLookupResponse(response);
           onState(connectionState);
-          if (connectionState === 'blocked') stopped = true;
+          if (connectionState === 'blocked') stop();
         })
         .catch((error) => {
           if (!stopped) onError(error);
         })
         .finally(() => {
           inFlight = false;
+          resolveIdleWaiters();
           if (!stopped && attempts >= maxAttempts) {
-            stopped = true;
+            stop();
             onExhausted();
           }
         });
       return true;
     },
+    start(intervalMilliseconds = 1_000) {
+      if (stopped || timer != null) return false;
+      if (!Number.isSafeInteger(intervalMilliseconds) || intervalMilliseconds <= 0) {
+        throw new Error('connection polling interval must be a positive integer');
+      }
+      this.poll();
+      if (!stopped) timer = setInterval(() => this.poll(), intervalMilliseconds);
+      return true;
+    },
+    whenIdle() {
+      if (!inFlight) return Promise.resolve();
+      return new Promise((resolve) => idleWaiters.push(resolve));
+    },
+    stop,
+  });
+}
+
+export function createPaykitConnectionObserverSlot() {
+  let active = null;
+
+  return Object.freeze({
+    start(observer, intervalMilliseconds) {
+      const previous = active;
+      previous?.stop();
+      active = observer;
+      void Promise.resolve(previous?.whenIdle()).then(() => {
+        if (active === observer) observer.start(intervalMilliseconds);
+      });
+    },
     stop() {
-      stopped = true;
+      active?.stop();
+    },
+    release(observer) {
+      observer.stop();
+      void observer.whenIdle().then(() => {
+        if (active === observer) active = null;
+      });
     },
   });
 }

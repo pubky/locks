@@ -108,7 +108,10 @@ assert.doesNotMatch(readerAppSource, /state\.config\.testnet\.pkarrRelay/);
 assert.match(readerAppSource, /buildPersistedReaderState\(state\)/);
 assert.match(readerAppSource, /refreshPaykitConnectionState\(\{/);
 assert.match(readerAppSource, /createPaykitConnectionPoller\(\{/);
-assert.match(readerAppSource, /connectionPoller\.poll\(\);[\s\S]*await lookupVerificationTask\(\{/);
+assert.match(
+  readerAppSource,
+  /connectionObserverSlot\.start\(connectionPoller, 1_000\);[\s\S]*await lookupVerificationTask\(\{/,
+);
 assert.match(readerAppSource, /maxAttempts: 30/);
 assert.doesNotMatch(readerAppSource, /submittedProofBundle: handle\.submittedProofBundle/);
 assert.doesNotMatch(readerFlowSource, /resubmitProofBundle/);

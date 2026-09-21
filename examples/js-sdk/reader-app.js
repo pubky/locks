@@ -1,6 +1,7 @@
 import {
   classifyPaymentLifecycle,
   connectionStateIndicator,
+  createPaykitConnectionObserverSlot,
   createPaykitConnectionPoller,
   completeDevVerification,
   hasPaykitData,
@@ -58,6 +59,7 @@ const state = {
 let workflowIncarnation = 0;
 const paykitReaderStatusRequests = createLatestRequestGate();
 const paykitDataChecks = createPaykitDataCheckController();
+const connectionObserverSlot = createPaykitConnectionObserverSlot();
 let activeLoadToken = null;
 let activeSubmissionToken = null;
 let activePollToken = null;
@@ -485,6 +487,7 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
         render();
       },
       onError: (error) => {
+        if (!workflowMatches(handle) || activePollToken !== pollToken) return;
         void postClientLog(
           'warn',
           'reader-paykit-connection-lookup-failed',
@@ -497,9 +500,9 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
         render();
       },
     });
+    connectionObserverSlot.start(connectionPoller, 1_000);
     for (let attempt = 0; attempt < 600; attempt += 1) {
       if (!workflowMatches(handle) || activePollToken !== pollToken) return;
-      connectionPoller.poll();
       const lifecycle = await lookupVerificationTask({
         resource: handle.resource,
         creator: handle.creator,
@@ -536,7 +539,7 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
     await postClientLog('error', 'reader-payment-poll-failed', serializeError(error));
     showError(el.proofStatus, error);
   } finally {
-    connectionPoller?.stop();
+    if (connectionPoller) connectionObserverSlot.release(connectionPoller);
     if (activePollToken === pollToken) {
       activePollToken = null;
       state.paymentPolling = false;
@@ -659,7 +662,7 @@ function render() {
   const connectionIndicator = connectionStateIndicator(state.connectionState);
   el.connectionStateRow.hidden = !paymentMode;
   el.connectionState.textContent = state.connectionPollingPaused
-    ? `${connectionIndicator.label}. Observation paused after 30 attempts; use Resume payment verification polling to retry.`
+    ? `${connectionIndicator.label}. Connection observation paused after 30 attempts.`
     : connectionIndicator.label;
   el.connectionState.className = connectionIndicator.className;
   el.load.disabled = state.loadingLock || state.submittingProof;
@@ -873,6 +876,7 @@ function invalidateWorkflow() {
   activeLoadToken = null;
   activeSubmissionToken = null;
   activePollToken = null;
+  connectionObserverSlot.stop();
   state.loadingLock = false;
   state.submittingProof = false;
   state.paymentPolling = false;

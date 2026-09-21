@@ -5,6 +5,7 @@ import {
   connectionStateFromLookupResponse,
   connectionStateIndicator,
   createPaykitConnectionPoller,
+  createPaykitConnectionObserverSlot,
   lookupPaykitConnectionState,
 } from '../reader-flow.js';
 
@@ -105,5 +106,52 @@ await new Promise((resolve) => setTimeout(resolve, 0));
 assert.equal(connectionErrors, 1);
 assert.equal(lifecycleContinues, 2, 'connection failure and exhaustion stay non-fatal');
 assert.equal(failingPoller.poll(), false, 'bounded poller stops after max attempts');
+
+let autonomousCalls = 0;
+let autonomousExhausted = 0;
+const autonomousPoller = createPaykitConnectionPoller({
+  lookup: async () => {
+    autonomousCalls += 1;
+    return { state: 'recovery_required' };
+  },
+  maxAttempts: 3,
+  onExhausted: () => { autonomousExhausted += 1; },
+});
+assert.equal(autonomousPoller.start(1), true);
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert.equal(autonomousCalls, 3, 'connection observation runs without lifecycle loop progress');
+assert.equal(autonomousExhausted, 1);
+assert.equal(autonomousPoller.start(1), false, 'exhausted observer cannot restart');
+
+let releaseOldObserver;
+let oldStops = 0;
+let oldStarts = 0;
+let newStops = 0;
+let newStarts = 0;
+const oldObserver = {
+  start() { oldStarts += 1; },
+  stop() { oldStops += 1; },
+  whenIdle() { return new Promise((resolve) => { releaseOldObserver = resolve; }); },
+};
+const newObserver = {
+  start() { newStarts += 1; },
+  stop() { newStops += 1; },
+  whenIdle() { return Promise.resolve(); },
+};
+const observerSlot = createPaykitConnectionObserverSlot();
+observerSlot.start(oldObserver, 1);
+await Promise.resolve();
+assert.equal(oldStarts, 1);
+observerSlot.stop();
+observerSlot.start(newObserver, 1);
+await Promise.resolve();
+assert.ok(oldStops >= 1, 'workflow invalidation stops old observer synchronously');
+assert.equal(newStarts, 0, 'replacement waits for old in-flight lookup to settle');
+releaseOldObserver();
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(newStarts, 1, 'replacement starts after stale lookup settles');
+observerSlot.release(oldObserver);
+observerSlot.stop();
+assert.equal(newStops, 1, 'stale release cannot detach current observer');
 
 console.log('connection state indicator tests passed');

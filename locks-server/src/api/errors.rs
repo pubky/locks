@@ -431,6 +431,11 @@ mod tests {
                 "paykit_not_configured",
             ),
             (
+                ApiErrorCode::NotPaykitPayment,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_paykit_payment",
+            ),
+            (
                 ApiErrorCode::ReaderPubkyUnresolvable,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "reader_pubky_unresolvable",
@@ -441,9 +446,24 @@ mod tests {
                 "paykit_invoice_creation_failed",
             ),
             (
+                ApiErrorCode::PaykitConnectionStateUnavailable,
+                StatusCode::BAD_GATEWAY,
+                "paykit_connection_state_unavailable",
+            ),
+            (
+                ApiErrorCode::PaykitConnectionStateTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "paykit_connection_state_timeout",
+            ),
+            (
                 ApiErrorCode::RateLimited,
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
+            ),
+            (
+                ApiErrorCode::PayloadTooLarge,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
             ),
             (
                 ApiErrorCode::InternalError,

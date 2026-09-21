@@ -202,6 +202,7 @@ mod tests {
                 max_requests: 0,
                 window_seconds: 0,
             },
+            ..RateLimitsConfig::default()
         };
         let app = TestServerApp::new_in_memory(config);
         let key = VerificationSubmissionRateLimitKey {

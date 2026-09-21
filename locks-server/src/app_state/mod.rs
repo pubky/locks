@@ -48,6 +48,7 @@ use locks_service::{
     },
 };
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::app_state::creator_authority::{
     DisabledLegacyCreatorConnectFlowClient, NoopLegacyCookieSessionRevalidator,
@@ -69,7 +70,9 @@ use crate::app_state::pubky_clients::{
 pub use crate::app_state::readiness::RuntimeStorageKind;
 use crate::config::LockServerRuntimeConfig;
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
-use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
+use crate::rate_limit::{
+    InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+};
 
 #[async_trait]
 pub trait ReaderPubkyResolver: Send + Sync {
@@ -171,6 +174,9 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     access_credential_policy: AccessCredentialPolicy,
     verification_submission_rate_limiter: Arc<InMemoryVerificationSubmissionRateLimiter>,
+    paykit_connection_state_lookup_rate_limiter:
+        Arc<InMemoryPaykitConnectionStateLookupRateLimiter>,
+    paykit_connection_status_semaphore: Arc<Semaphore>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
@@ -490,6 +496,16 @@ impl AppState {
             Arc::new(InMemoryVerificationSubmissionRateLimiter::new(
                 config.rate_limits.verification_submission.clone(),
             ));
+        let paykit_connection_state_lookup_rate_limiter =
+            Arc::new(InMemoryPaykitConnectionStateLookupRateLimiter::new(
+                config.rate_limits.paykit_connection_state_lookup.clone(),
+            ));
+        let paykit_connection_status_semaphore = Arc::new(Semaphore::new(
+            config
+                .rate_limits
+                .paykit_connection_state_lookup
+                .max_in_flight,
+        ));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
             client: build_pubky_client(&config.pubky),
         });
@@ -538,6 +554,8 @@ impl AppState {
             clock: Arc::new(SystemClock),
             access_credential_policy,
             verification_submission_rate_limiter,
+            paykit_connection_state_lookup_rate_limiter,
+            paykit_connection_status_semaphore,
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
@@ -665,6 +683,16 @@ impl AppState {
         &self,
     ) -> &Arc<InMemoryVerificationSubmissionRateLimiter> {
         &self.verification_submission_rate_limiter
+    }
+
+    pub fn paykit_connection_state_lookup_rate_limiter(
+        &self,
+    ) -> &Arc<InMemoryPaykitConnectionStateLookupRateLimiter> {
+        &self.paykit_connection_state_lookup_rate_limiter
+    }
+
+    pub fn paykit_connection_status_semaphore(&self) -> &Arc<Semaphore> {
+        &self.paykit_connection_status_semaphore
     }
 
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {

@@ -19,6 +19,7 @@ use crate::config::{
 };
 
 const SIGNATURE_HEADER: &str = "X-Paykit-Signature";
+const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaykitClientError {
@@ -41,6 +42,10 @@ pub enum PaykitClientError {
     },
     #[error("Paykit connection-status response was invalid: {0}")]
     InvalidConnectionStatusResponse(reqwest::Error),
+    #[error("Paykit connection-status response JSON was invalid: {0}")]
+    InvalidConnectionStatusJson(serde_json::Error),
+    #[error("Paykit connection-status response exceeded the allowed size")]
+    ConnectionStatusBodyTooLarge,
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
 }
@@ -56,6 +61,8 @@ impl PaykitClientError {
             | Self::InvalidSigningSeed
             | Self::PublicKeyMismatch
             | Self::Serialize(_)
+            | Self::InvalidConnectionStatusJson(_)
+            | Self::ConnectionStatusBodyTooLarge
             | Self::NonSuccess { .. } => false,
         }
     }
@@ -231,10 +238,7 @@ impl PaykitHttpClient {
             });
         }
 
-        response
-            .json::<PaykitConnectionStatusResponse>()
-            .await
-            .map_err(PaykitClientError::InvalidConnectionStatusResponse)
+        parse_connection_status_response(response).await
     }
 
     pub async fn transaction_status(
@@ -315,8 +319,34 @@ fn bounded_http_client(
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(PaykitClientError::Http)
+}
+
+async fn parse_connection_status_response(
+    mut response: reqwest::Response,
+) -> Result<PaykitConnectionStatusResponse, PaykitClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > CONNECTION_STATUS_BODY_LIMIT as u64)
+    {
+        return Err(PaykitClientError::ConnectionStatusBodyTooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(PaykitClientError::InvalidConnectionStatusResponse)?
+    {
+        if body.len().saturating_add(chunk.len()) > CONNECTION_STATUS_BODY_LIMIT {
+            return Err(PaykitClientError::ConnectionStatusBodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(PaykitClientError::InvalidConnectionStatusJson)
 }
 
 #[async_trait]
@@ -412,13 +442,14 @@ fn parse_server_url(value: &str) -> Result<Url, PaykitClientError> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::HeaderMap;
-    use axum::response::IntoResponse;
+    use axum::response::{IntoResponse, Redirect};
     use axum::routing::post;
     use axum::{Json, Router};
     use locks_core::ids::LockServerPubky;
@@ -605,7 +636,7 @@ mod tests {
 
             assert!(matches!(
                 error,
-                PaykitClientError::InvalidConnectionStatusResponse(_)
+                PaykitClientError::InvalidConnectionStatusJson(_)
             ));
         }
     }
@@ -637,6 +668,46 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert!(error.is_timeout());
+    }
+
+    #[tokio::test]
+    async fn connection_status_does_not_follow_cross_origin_redirects() {
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        let target_url = spawn_redirect_target(redirected_requests.clone()).await;
+        let server_url = spawn_connection_status_redirect(target_url).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let error = client
+            .connection_status(&PaykitConnectionStatusRequest {
+                creator: CREATOR.to_owned(),
+                bundle_id: BUNDLE_ID.to_owned(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PaykitClientError::NonSuccess {
+                status: StatusCode::TEMPORARY_REDIRECT,
+                ..
+            }
+        ));
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_status_rejects_oversized_content_length_body() {
+        assert_oversized_connection_status_body_is_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn connection_status_rejects_oversized_chunked_body() {
+        assert_oversized_connection_status_body_is_rejected(true).await;
     }
 
     #[tokio::test]
@@ -818,6 +889,96 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn assert_oversized_connection_status_body_is_rejected(chunked: bool) {
+        let server_url = spawn_oversized_connection_status_body(chunked).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let error = client
+            .connection_status(&PaykitConnectionStatusRequest {
+                creator: CREATOR.to_owned(),
+                bundle_id: BUNDLE_ID.to_owned(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PaykitClientError::ConnectionStatusBodyTooLarge
+        ));
+    }
+
+    async fn spawn_oversized_connection_status_body(chunked: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = vec![b'x'; CONNECTION_STATUS_BODY_LIMIT + 1];
+            if chunked {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n")
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&body).await.unwrap();
+                socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            } else {
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_redirect_target(requests: Arc<AtomicUsize>) -> String {
+        async fn target(State(requests): State<Arc<AtomicUsize>>) -> impl IntoResponse {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({ "state": "connected" }))
+        }
+
+        let app = Router::new()
+            .route("/target", post(target))
+            .with_state(requests);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/target")
+    }
+
+    async fn spawn_connection_status_redirect(target_url: String) -> String {
+        async fn redirect(State(target_url): State<String>) -> Redirect {
+            Redirect::temporary(&target_url)
+        }
+
+        let app = Router::new()
+            .route("/connections/status", post(redirect))
+            .with_state(target_url);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}")
     }

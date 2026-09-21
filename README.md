@@ -616,7 +616,15 @@ Default runtime config:
 enabled = true
 max_requests = 60
 window_seconds = 60
+
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
 ```
+
+Connection lookup state is capped at `max_entries`. When full, new client/task keys receive the same `429 rate_limited` response until expired windows are evicted.
 
 When the limit is exceeded, the server returns `Retry-After` with the remaining fixed-window time in seconds:
 

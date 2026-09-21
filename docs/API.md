@@ -61,7 +61,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
 | `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` tasks require `[paykit]`; exact persisted replay returns lifecycle without calling Paykit. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
-| `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
+| `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `429 rate_limited`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
 | `POST /access-credentials` | `200` JSON credential | Public viewer route after entitlement. | Response intentionally contains raw viewer access credential exactly once. | `400 invalid_request`, `403 entitlement_not_authorized`, `404 verification_task_not_found` |
 | `GET /priv-resources/content/<path>` | `200` raw bytes | Requires viewer `Authorization: Bearer <access_credential>`. | No JSON response; credential is request-only. | `401 invalid_access_credential`, `401 expired_access_credential`, `403 entitlement_not_authorized`, `404 guarded_resource_not_found` |
@@ -107,10 +107,13 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `task_state_conflict` | 409 | Submission or completion conflicts with existing task state. |
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
+| `not_paykit_payment` | 422 | Connection state was requested for a verification task that is not Paykit-backed. |
 | `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
 | `rate_limited` | 429 | Submission exceeded configured rate limits. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
 | `paykit_invoice_creation_failed` | 502 | Lock Server could not create the Paykit invoice; no verification task is created. |
+| `paykit_connection_state_unavailable` | 502 | Paykit connection-state lookup failed or returned an invalid response. |
+| `paykit_connection_state_timeout` | 504 | Paykit connection-state lookup exceeded its whole-request deadline. |
 | `internal_error` | 500 | Unexpected server-side failure. |
 
 ## Service discovery
@@ -589,6 +592,8 @@ Success response is exactly one of `none`, `handshake`, `connected`, `recovery_r
 ```
 
 This lookup is independent from verification lifecycle. `connected` does not mean payment or verification completed. Connection lookup errors do not fabricate connection states and should not stop lifecycle polling. `blocked` requires authorized operator action; `recovery_required` means the current local cryptographic generation must be recovered or relinked.
+
+Locks limits this public outbound proxy independently from proof submission. Default admission is 60 requests per 60 seconds for each `(client IP, creator, bundle_id)` plus 16 concurrent outbound Paykit status requests process-wide. Fixed-window rejection includes `Retry-After`; either limit returns `429 rate_limited` before another Paykit request is sent.
 
 Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status` with `X-Paykit-Signature` over those exact canonical body bytes. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
 
