@@ -3,14 +3,14 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const PAYKIT_SERVER_REMOTE = 'https://github.com/pubky/paykit-server.git';
-const PAYKIT_SERVER_REF = 'v0.1.0-rc2';
+const PAYKIT_SERVER_REF = 'v0.1.0-rc3';
 const RELEASE_REF = `refs/tags/${PAYKIT_SERVER_REF}`;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024;
 const MAX_SOURCE_BYTES = 256 * 1024;
 const TIMEOUT_MS = 30_000;
 
 export function parsePaykitReleaseRevision(output) {
-  const match = /^([0-9a-f]{40})\trefs\/tags\/v0\.1\.0-rc2\n?$/u.exec(output);
+  const match = /^([0-9a-f]{40})\trefs\/tags\/v0\.1\.0-rc3\n?$/u.exec(output);
   if (!match) throw new Error('Paykit Server returned an invalid release revision');
   return match[1];
 }

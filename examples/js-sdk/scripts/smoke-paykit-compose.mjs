@@ -24,7 +24,7 @@ const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const paykitReleaseRevision = '31c77c99bf73fe6e377c842b582632a832950022';
 assert.equal(
-  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc2\n`),
+  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc3\n`),
   paykitReleaseRevision,
 );
 assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
@@ -345,7 +345,7 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
-  'https://github.com/pubky/paykit-server.git#v0.1.0-rc2',
+  'https://github.com/pubky/paykit-server.git#v0.1.0-rc3',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
   'https://github.com/pubky/locks.git#v0.1.0-rc1',
@@ -487,7 +487,7 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc2'"),
+  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc3'"),
   'Compose validation must enforce the Paykit Server release ref',
 );
 assert.ok(

@@ -59,21 +59,21 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server uses `v0.1.0-rc2`',
+    'Paykit Server uses `v0.1.0-rc3`',
     "Paykit's compatible Locks context uses `v0.1.0-rc1`",
     'The local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server is pinned to `v0.1.0-rc2`',
+    'Paykit Server is pinned to `v0.1.0-rc3`',
     'compatible Locks build context is pinned to `v0.1.0-rc1`',
     'The local worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'immutable `v0.1.0-rc2` tag',
+    'immutable `v0.1.0-rc3` tag',
     'Locks context uses `v0.1.0-rc1`',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
