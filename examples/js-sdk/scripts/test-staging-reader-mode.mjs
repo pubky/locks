@@ -106,6 +106,23 @@ assert.match(readerAppSource, /Dev-static completion is not available on deploye
 assert.match(readerAppSource, /state\.config\.mode === 'staging'/);
 assert.doesNotMatch(readerAppSource, /state\.config\.testnet\.pkarrRelay/);
 assert.match(readerAppSource, /buildPersistedReaderState\(state\)/);
+assert.match(readerAppSource, /refreshPaykitConnectionState\(\{/);
+assert.match(readerAppSource, /createPaykitConnectionPoller\(\{/);
+assert.match(
+  readerAppSource,
+  /connectionObserverSlot\.start\(connectionPoller, 1_000\);[\s\S]*await lookupVerificationTask\(\{/,
+);
+assert.match(readerAppSource, /maxAttempts: 30/);
+const clearVerificationStateSource = readerAppSource.match(
+  /function clearVerificationState\([\s\S]*?\n}/,
+)?.[0];
+assert.ok(clearVerificationStateSource);
+assert.match(clearVerificationStateSource, /state\.connectionPollingPaused = false/);
+const invalidateWorkflowSource = readerAppSource.match(/function invalidateWorkflow\([\s\S]*?\n}/)?.[0];
+assert.ok(invalidateWorkflowSource);
+assert.match(invalidateWorkflowSource, /state\.connectionPollingPaused = false/);
+assert.doesNotMatch(readerAppSource, /submittedProofBundle: handle\.submittedProofBundle/);
+assert.doesNotMatch(readerFlowSource, /resubmitProofBundle/);
 assert.doesNotMatch(readerHtmlSource, /id="reader-public-key" readonly/);
 assert.match(readerFlowSource, /export async function hasPaykitData/);
 assert.match(readerFlowSource, /Locks\.hasPaykitData\(readerPublicKey\)/);

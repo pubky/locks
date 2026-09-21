@@ -12,9 +12,9 @@ use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +438,62 @@ struct RawRuntimeConfig {
 #[serde(deny_unknown_fields)]
 struct RawRateLimitsConfig {
     verification_submission: RawVerificationSubmissionRateLimitConfig,
+    #[serde(default)]
+    paykit_connection_state_lookup: RawPaykitConnectionStateLookupRateLimitConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPaykitConnectionStateLookupRateLimitConfig {
+    #[serde(default = "default_paykit_lookup_max_requests")]
+    max_requests: u32,
+    #[serde(default = "default_paykit_lookup_window_seconds")]
+    window_seconds: u64,
+    #[serde(default = "default_paykit_lookup_max_in_flight")]
+    max_in_flight: usize,
+    #[serde(default = "default_paykit_lookup_max_entries")]
+    max_entries: usize,
+    #[serde(default = "default_paykit_lookup_global_requests_per_second")]
+    global_requests_per_second: u64,
+    #[serde(default = "default_paykit_lookup_global_burst")]
+    global_burst: u64,
+}
+
+impl Default for RawPaykitConnectionStateLookupRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: default_paykit_lookup_max_requests(),
+            window_seconds: default_paykit_lookup_window_seconds(),
+            max_in_flight: default_paykit_lookup_max_in_flight(),
+            max_entries: default_paykit_lookup_max_entries(),
+            global_requests_per_second: default_paykit_lookup_global_requests_per_second(),
+            global_burst: default_paykit_lookup_global_burst(),
+        }
+    }
+}
+
+fn default_paykit_lookup_max_requests() -> u32 {
+    60
+}
+
+fn default_paykit_lookup_window_seconds() -> u64 {
+    60
+}
+
+fn default_paykit_lookup_max_in_flight() -> usize {
+    16
+}
+
+fn default_paykit_lookup_max_entries() -> usize {
+    10_000
+}
+
+fn default_paykit_lookup_global_requests_per_second() -> u64 {
+    50
+}
+
+fn default_paykit_lookup_global_burst() -> u64 {
+    50
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,6 +651,42 @@ impl RawRateLimitsConfig {
             verification_submission: self
                 .verification_submission
                 .into_verification_submission_rate_limit_config()?,
+            paykit_connection_state_lookup: self
+                .paykit_connection_state_lookup
+                .into_paykit_connection_state_lookup_rate_limit_config()?,
+        })
+    }
+}
+
+impl RawPaykitConnectionStateLookupRateLimitConfig {
+    fn into_paykit_connection_state_lookup_rate_limit_config(
+        self,
+    ) -> Result<PaykitConnectionStateLookupRateLimitConfig, ConfigError> {
+        if self.max_requests == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupRateLimitMaxRequests);
+        }
+        if self.window_seconds == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupRateLimitWindow);
+        }
+        if self.max_in_flight == 0 || self.max_in_flight > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupMaxInFlight);
+        }
+        if self.max_entries == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupMaxEntries);
+        }
+        if self.global_requests_per_second == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond);
+        }
+        if self.global_burst == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalBurst);
+        }
+        Ok(PaykitConnectionStateLookupRateLimitConfig {
+            max_requests: self.max_requests,
+            window_seconds: self.window_seconds,
+            max_in_flight: self.max_in_flight,
+            max_entries: self.max_entries,
+            global_requests_per_second: self.global_requests_per_second,
+            global_burst: self.global_burst,
         })
     }
 }
