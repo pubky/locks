@@ -109,7 +109,7 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
 | `not_paykit_payment` | 422 | Connection state was requested for a verification task that is not Paykit-backed. |
 | `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
-| `rate_limited` | 429 | Submission exceeded configured rate limits. |
+| `rate_limited` | 429 | Submission or Paykit connection-state lookup exceeded configured admission limits. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
 | `paykit_invoice_creation_failed` | 502 | Lock Server could not create the Paykit invoice; no verification task is created. |
 | `paykit_connection_state_unavailable` | 502 | Paykit connection-state lookup failed or returned an invalid response. |

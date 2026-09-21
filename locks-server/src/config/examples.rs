@@ -199,6 +199,8 @@ fn defaults_paykit_connection_state_lookup_admission_when_section_is_absent() {
             window_seconds: 60,
             max_in_flight: 16,
             max_entries: 10_000,
+            global_requests_per_second: 50,
+            global_burst: 50,
         }
     );
 }
@@ -211,7 +213,7 @@ fn parses_custom_paykit_connection_state_lookup_admission() {
     let config_path = temp_dir.path().join("config.toml");
     let config = minimal_config(&secret_path, &public_key, "development").replace(
         "[content_locks]",
-        "[rate_limits.paykit_connection_state_lookup]\nmax_requests = 7\nwindow_seconds = 11\nmax_in_flight = 3\nmax_entries = 101\n\n[content_locks]",
+        "[rate_limits.paykit_connection_state_lookup]\nmax_requests = 7\nwindow_seconds = 11\nmax_in_flight = 3\nmax_entries = 101\nglobal_requests_per_second = 5\nglobal_burst = 9\n\n[content_locks]",
     );
     std::fs::write(&config_path, config).unwrap();
 
@@ -224,6 +226,8 @@ fn parses_custom_paykit_connection_state_lookup_admission() {
             window_seconds: 11,
             max_in_flight: 3,
             max_entries: 101,
+            global_requests_per_second: 5,
+            global_burst: 9,
         }
     );
 }
@@ -268,6 +272,46 @@ fn rejects_zero_paykit_connection_state_lookup_entry_cap() {
     assert!(matches!(
         error,
         ConfigError::InvalidPaykitConnectionStateLookupMaxEntries
+    ));
+}
+
+#[test]
+fn rejects_zero_paykit_connection_state_lookup_global_rate() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[rate_limits.paykit_connection_state_lookup]\nglobal_requests_per_second = 0\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond
+    ));
+}
+
+#[test]
+fn rejects_zero_paykit_connection_state_lookup_global_burst() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[rate_limits.paykit_connection_state_lookup]\nglobal_burst = 0\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPaykitConnectionStateLookupGlobalBurst
     ));
 }
 

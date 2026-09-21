@@ -549,7 +549,7 @@ async fn paykit_connection_state_lookup_rejects_fixed_window_excess_before_outbo
         PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
     );
     let (content_lock, bundle) = paykit_content_lock_and_bundle();
-    let state = test_state_with_paykit_lookup_admission(1, 60, 16)
+    let state = test_state_with_paykit_lookup_admission(1, 60, 16, 50, 50)
         .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
         .with_paykit_http_client(Some(paykit));
     seed_content_lock(&state, content_lock).await;
@@ -606,7 +606,7 @@ async fn paykit_connection_state_lookup_rejects_global_in_flight_excess_before_o
         PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
     );
     let (content_lock, bundle) = paykit_content_lock_and_bundle();
-    let state = test_state_with_paykit_lookup_admission(60, 60, 1)
+    let state = test_state_with_paykit_lookup_admission(60, 60, 1, 50, 50)
         .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
         .with_paykit_http_client(Some(paykit));
     seed_content_lock(&state, content_lock).await;
@@ -649,9 +649,58 @@ async fn paykit_connection_state_lookup_rejects_global_in_flight_excess_before_o
         .unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rejected
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
     assert_error_response(rejected, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
     release.notify_one();
     assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unavailable_paykit_does_not_consume_connection_lookup_rate_budget() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let paykit_url = spawn_counting_paykit_connection_status(Arc::clone(&calls)).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state_with_paykit_lookup_admission(1, 60, 16, 1, 1)
+        .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+        .with_paykit_http_client(Some(Arc::clone(&paykit)));
+    seed_content_lock(&state, content_lock).await;
+    let setup_app = router(state.clone());
+    submit_task(&state, &setup_app, bundle.clone()).await;
+    let lookup = || {
+        json_request(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        )
+    };
+
+    let unavailable_app = router(state.clone().with_paykit_http_client(None));
+    let unavailable = unavailable_app.oneshot(lookup()).await.unwrap();
+    assert_error_response(
+        unavailable,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "paykit_not_configured",
+    )
+    .await;
+
+    let configured_app = router(state);
+    assert_eq!(
+        configured_app.oneshot(lookup()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -3271,6 +3320,8 @@ fn test_state_with_paykit_lookup_admission(
     max_requests: u32,
     window_seconds: u64,
     max_in_flight: usize,
+    global_requests_per_second: u64,
+    global_burst: u64,
 ) -> AppState {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.rate_limits.paykit_connection_state_lookup =
@@ -3279,6 +3330,8 @@ fn test_state_with_paykit_lookup_admission(
             window_seconds,
             max_in_flight,
             max_entries: 10_000,
+            global_requests_per_second,
+            global_burst,
         };
     AppState::new_empty_in_memory_with_creator_repositories(
         config,

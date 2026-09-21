@@ -490,6 +490,7 @@ impl AppState {
         creator_repositories: CreatorRepositoryAdapters,
         private_runtime: PrivateRuntimeAdapters,
     ) -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let access_credential_policy =
             AccessCredentialPolicy::new(config.credentials.max_ttl_seconds);
         let verification_submission_rate_limiter =
@@ -551,7 +552,7 @@ impl AppState {
             creator_connect_flow_id_generator: Arc::new(OsRandomCreatorConnectFlowIdGenerator),
             frontend_session_code_generator: Arc::new(OsRandomFrontendSessionCodeGenerator),
             frontend_session_token_generator: Arc::new(OsRandomFrontendSessionTokenGenerator),
-            clock: Arc::new(SystemClock),
+            clock,
             access_credential_policy,
             verification_submission_rate_limiter,
             paykit_connection_state_lookup_rate_limiter,

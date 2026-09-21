@@ -113,6 +113,14 @@ assert.match(
   /connectionObserverSlot\.start\(connectionPoller, 1_000\);[\s\S]*await lookupVerificationTask\(\{/,
 );
 assert.match(readerAppSource, /maxAttempts: 30/);
+const clearVerificationStateSource = readerAppSource.match(
+  /function clearVerificationState\([\s\S]*?\n}/,
+)?.[0];
+assert.ok(clearVerificationStateSource);
+assert.match(clearVerificationStateSource, /state\.connectionPollingPaused = false/);
+const invalidateWorkflowSource = readerAppSource.match(/function invalidateWorkflow\([\s\S]*?\n}/)?.[0];
+assert.ok(invalidateWorkflowSource);
+assert.match(invalidateWorkflowSource, /state\.connectionPollingPaused = false/);
 assert.doesNotMatch(readerAppSource, /submittedProofBundle: handle\.submittedProofBundle/);
 assert.doesNotMatch(readerFlowSource, /resubmitProofBundle/);
 assert.doesNotMatch(readerHtmlSource, /id="reader-public-key" readonly/);

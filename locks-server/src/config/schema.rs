@@ -195,6 +195,8 @@ pub struct PaykitConnectionStateLookupRateLimitConfig {
     pub window_seconds: u64,
     pub max_in_flight: usize,
     pub max_entries: usize,
+    pub global_requests_per_second: u64,
+    pub global_burst: u64,
 }
 
 impl Default for PaykitConnectionStateLookupRateLimitConfig {
@@ -204,6 +206,8 @@ impl Default for PaykitConnectionStateLookupRateLimitConfig {
             window_seconds: 60,
             max_in_flight: 16,
             max_entries: 10_000,
+            global_requests_per_second: 50,
+            global_burst: 50,
         }
     }
 }
@@ -336,6 +340,12 @@ pub enum ConfigError {
     InvalidPaykitConnectionStateLookupMaxInFlight,
     #[error("rate_limits.paykit_connection_state_lookup.max_entries must be greater than zero")]
     InvalidPaykitConnectionStateLookupMaxEntries,
+    #[error(
+        "rate_limits.paykit_connection_state_lookup.global_requests_per_second must be greater than zero"
+    )]
+    InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond,
+    #[error("rate_limits.paykit_connection_state_lookup.global_burst must be greater than zero")]
+    InvalidPaykitConnectionStateLookupGlobalBurst,
     #[error("content_locks.max_resource_bytes must be greater than zero")]
     InvalidMaxResourceBytes,
     #[error("content_locks.max_resources must be greater than zero")]

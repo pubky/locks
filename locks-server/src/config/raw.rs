@@ -453,6 +453,10 @@ struct RawPaykitConnectionStateLookupRateLimitConfig {
     max_in_flight: usize,
     #[serde(default = "default_paykit_lookup_max_entries")]
     max_entries: usize,
+    #[serde(default = "default_paykit_lookup_global_requests_per_second")]
+    global_requests_per_second: u64,
+    #[serde(default = "default_paykit_lookup_global_burst")]
+    global_burst: u64,
 }
 
 impl Default for RawPaykitConnectionStateLookupRateLimitConfig {
@@ -462,6 +466,8 @@ impl Default for RawPaykitConnectionStateLookupRateLimitConfig {
             window_seconds: default_paykit_lookup_window_seconds(),
             max_in_flight: default_paykit_lookup_max_in_flight(),
             max_entries: default_paykit_lookup_max_entries(),
+            global_requests_per_second: default_paykit_lookup_global_requests_per_second(),
+            global_burst: default_paykit_lookup_global_burst(),
         }
     }
 }
@@ -480,6 +486,14 @@ fn default_paykit_lookup_max_in_flight() -> usize {
 
 fn default_paykit_lookup_max_entries() -> usize {
     10_000
+}
+
+fn default_paykit_lookup_global_requests_per_second() -> u64 {
+    50
+}
+
+fn default_paykit_lookup_global_burst() -> u64 {
+    50
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,11 +674,19 @@ impl RawPaykitConnectionStateLookupRateLimitConfig {
         if self.max_entries == 0 {
             return Err(ConfigError::InvalidPaykitConnectionStateLookupMaxEntries);
         }
+        if self.global_requests_per_second == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond);
+        }
+        if self.global_burst == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalBurst);
+        }
         Ok(PaykitConnectionStateLookupRateLimitConfig {
             max_requests: self.max_requests,
             window_seconds: self.window_seconds,
             max_in_flight: self.max_in_flight,
             max_entries: self.max_entries,
+            global_requests_per_second: self.global_requests_per_second,
+            global_burst: self.global_burst,
         })
     }
 }

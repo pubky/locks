@@ -217,6 +217,8 @@ max_requests = {} # Maximum Paykit connection-state lookups allowed per client/t
 window_seconds = {} # Connection-state lookup rate-limit window size in seconds.
 max_in_flight = {} # Maximum concurrent outbound Paykit connection-status requests across this process.
 max_entries = {} # Maximum retained client/task windows; new keys wait for expired-window eviction.
+global_requests_per_second = {} # Sustained process-wide Paykit connection-status request rate.
+global_burst = {} # Process-wide Paykit connection-status token-bucket capacity.
 
 [content_locks]
 max_resource_bytes = {} # Maximum bytes for one guarded resource upload. Raise for larger files; lower to cap memory/storage exposure.
@@ -276,6 +278,14 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
             .rate_limits
             .paykit_connection_state_lookup
             .max_entries,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .global_requests_per_second,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .global_burst,
         config.content_locks.max_resource_bytes,
         config.content_locks.max_resources,
         config.content_locks.max_total_resource_bytes

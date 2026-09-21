@@ -622,11 +622,14 @@ max_requests = 60
 window_seconds = 60
 max_in_flight = 16
 max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
 ```
 
 Connection lookup state is capped at `max_entries`. When full, new client/task keys receive the same `429 rate_limited` response until expired windows are evicted.
+The process-wide token bucket permits `global_requests_per_second` sustained lookups with a `global_burst` burst. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must tune aggregate Locks limits below Paykit's signed-request budget.
 
-When the limit is exceeded, the server returns `Retry-After` with the remaining fixed-window time in seconds:
+When any admission limit is exceeded, the server returns `Retry-After` (fixed-window remainder, or one second for process-wide rate/concurrency saturation):
 
 ```http
 429 Too Many Requests

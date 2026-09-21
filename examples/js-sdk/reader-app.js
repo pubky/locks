@@ -877,6 +877,7 @@ function invalidateWorkflow() {
   activeSubmissionToken = null;
   activePollToken = null;
   connectionObserverSlot.stop();
+  state.connectionPollingPaused = false;
   state.loadingLock = false;
   state.submittingProof = false;
   state.paymentPolling = false;
@@ -899,6 +900,7 @@ function clearVerificationState({ clearLoaded = false } = {}) {
   state.submittedProofBundle = null;
   state.lifecycle = null;
   state.connectionState = null;
+  state.connectionPollingPaused = false;
   state.completion = null;
   state.accessCredential = null;
   state.accessCredentialResponse = null;

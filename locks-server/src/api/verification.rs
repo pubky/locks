@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -208,6 +209,27 @@ pub(super) async fn lookup_paykit_connection_state(
         ));
     }
 
+    let paykit = state.paykit_http_client().ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCode::PaykitNotConfigured,
+            "paykit is not configured",
+        )
+    })?;
+    let _permit = match Arc::clone(state.paykit_connection_status_semaphore()).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "1")],
+                Json(
+                    ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded")
+                        .error_response(),
+                ),
+            )
+                .into_response());
+        }
+    };
+
     let decision = state.paykit_connection_state_lookup_rate_limiter().check(
         &PaykitConnectionStateLookupRateLimitKey {
             client_address: client_address.ip(),
@@ -215,6 +237,7 @@ pub(super) async fn lookup_paykit_connection_state(
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
         },
         state.clock().now(),
+        Instant::now(),
     );
     if !decision.allowed {
         return Ok((
@@ -228,15 +251,6 @@ pub(super) async fn lookup_paykit_connection_state(
             .into_response());
     }
 
-    let paykit = state.paykit_http_client().ok_or_else(|| {
-        ApiError::new(
-            ApiErrorCode::PaykitNotConfigured,
-            "paykit is not configured",
-        )
-    })?;
-    let _permit = Arc::clone(state.paykit_connection_status_semaphore())
-        .try_acquire_owned()
-        .map_err(|_| ApiError::new(ApiErrorCode::RateLimited, "rate limit exceeded"))?;
     let response = paykit
         .connection_status(&PaykitConnectionStatusRequest {
             creator: task.creator.to_string(),
