@@ -33,11 +33,27 @@ assert.equal(
 assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
-  serverSource: '.merge(http::setup_status::setup_status_router(service))',
+  connectionStatusSource: '.route("/connections/status", post(status))',
+  serverSource: [
+    '.merge(http::setup_status::setup_status_router(service))',
+    '.merge(http::connection_status::connection_status_router(service))',
+  ].join('\n'),
 }));
 assert.throws(
-  () => validatePaykitSetupStatusSources({ setupStatusSource: '', serverSource: '' }),
+  () => validatePaykitSetupStatusSources({
+    setupStatusSource: '',
+    connectionStatusSource: '',
+    serverSource: '',
+  }),
   /setup-status contract/,
+);
+assert.throws(
+  () => validatePaykitSetupStatusSources({
+    setupStatusSource: '.route("/setup/status", post(status))',
+    connectionStatusSource: '',
+    serverSource: '.merge(http::setup_status::setup_status_router(service))',
+  }),
+  /connection-status contract/,
 );
 let oversizedSourceCancelled = false;
 const oversizedSourceResponse = new Response(new ReadableStream({
@@ -369,7 +385,7 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
-  'https://github.com/pubky/paykit-server.git#26bda476b9fa1d29feb87cbb24a90042d00f42c4',
+  'https://github.com/pubky/paykit-server.git#v0.1.0-rc3',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
   'locks: .',
@@ -515,8 +531,8 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_SERVER_REF = '26bda476b9fa1d29feb87cbb24a90042d00f42c4'"),
-  'Compose validation must enforce the merged Paykit Server revision',
+  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc3'"),
+  'Compose validation must enforce Paykit Server v0.1.0-rc3 with connection status',
 );
 assert.ok(
   validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),

@@ -59,22 +59,22 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server uses merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'Paykit Server uses release tag `v0.1.0-rc3`',
     'and is built against the current Locks worktree',
     'The local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'release tag `v0.1.0-rc3`',
     'built against the current Locks worktree',
     'An absolute local `PAYKIT_SERVER_CONTEXT` remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'merged commit',
-    '`26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
+    'release tag',
+    '`v0.1.0-rc3`',
     'For coordinated Paykit Server work',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',

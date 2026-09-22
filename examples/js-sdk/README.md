@@ -211,9 +211,9 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build uses merged commit
-`26bda476b9fa1d29feb87cbb24a90042d00f42c4`, the active Locks checkout, Paykit Rust
-`v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. No sibling repository checkout is required.
+The Paykit Server build uses release tag `v0.1.0-rc3`, the active Locks checkout,
+Paykit Rust `v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. This release provides the setup-status
+and Noise connection-status APIs required by Locks. No sibling repository checkout is required.
 
 For coordinated Paykit Server work, select an explicit absolute local worktree
 without changing the committed public default:

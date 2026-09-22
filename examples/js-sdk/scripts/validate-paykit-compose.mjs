@@ -6,7 +6,7 @@ import { repoRoot } from './lib/paths.mjs';
 
 const MAX_MODEL_BYTES = 2 * 1024 * 1024;
 const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
-const PAYKIT_SERVER_REF = '26bda476b9fa1d29feb87cbb24a90042d00f42c4';
+const PAYKIT_SERVER_REF = 'v0.1.0-rc3';
 const DEFAULT_PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
 const REQUIRED_SERVICES = [
   'postgres',
@@ -36,7 +36,7 @@ export function validateSafeComposeModel(
     if (!model.services[service]) throw new Error(`Compose model is missing service ${service}`);
   }
   if (model.services['paykit-server'].build?.context !== expectedPaykitServerContext) {
-    throw new Error('paykit-server build context does not provide the setup-status contract');
+    throw new Error('paykit-server build context does not provide required Locks contracts');
   }
   if (
     model.services['paykit-server'].build?.additional_contexts?.locks
