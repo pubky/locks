@@ -366,6 +366,7 @@ fn test_config_with_rate_limit(
             max_requests,
             window_seconds,
         },
+        ..RateLimitsConfig::default()
     };
     config
 }

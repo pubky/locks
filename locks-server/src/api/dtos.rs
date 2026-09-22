@@ -19,7 +19,7 @@ use locks_service::application::use_cases::issue_access_credential::IssuedAccess
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::paykit_http_client::PaykitSetupStatusKind;
+use crate::paykit_http_client::{PaykitConnectionState, PaykitSetupStatusKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthHttpResponse {
@@ -43,6 +43,11 @@ pub struct WellKnownLocksServerHttpResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaykitSetupStatusHttpResponse {
     pub status: PaykitSetupStatusKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaykitConnectionStateHttpResponse {
+    pub state: PaykitConnectionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

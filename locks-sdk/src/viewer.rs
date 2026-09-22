@@ -44,6 +44,16 @@ pub enum VerificationTaskStatus {
     Expired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaykitConnectionState {
+    Connected,
+    Handshake,
+    None,
+    RecoveryRequired,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationTaskLifecycleResponse {
@@ -57,6 +67,12 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<time::OffsetDateTime>,
     pub failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitConnectionStateResponse {
+    pub state: PaykitConnectionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -89,6 +105,13 @@ impl ViewerLocks {
         request: VerificationTaskHandleRequest,
     ) -> SdkViewerRequest {
         self.post_json("/verification-task-lookups", request)
+    }
+
+    pub fn lookup_paykit_connection_state(
+        &self,
+        request: VerificationTaskHandleRequest,
+    ) -> SdkViewerRequest {
+        self.post_json("/paykit-connection-state-lookups", request)
     }
 
     pub fn issue_access_credential(
@@ -129,6 +152,18 @@ impl ViewerLocks {
     }
 
     pub fn parse_lifecycle_response(value: Value) -> Result<VerificationTaskLifecycleResponse> {
+        serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
+    }
+
+    pub fn parse_submit_proof_bundle_response(
+        value: Value,
+    ) -> Result<VerificationTaskLifecycleResponse> {
+        serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
+    }
+
+    pub fn parse_paykit_connection_state_response(
+        value: Value,
+    ) -> Result<PaykitConnectionStateResponse> {
         serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
     }
 
@@ -200,6 +235,23 @@ mod tests {
     }
 
     #[test]
+    fn paykit_connection_state_lookup_uses_task_handle_body() {
+        let viewer = ViewerLocks::new();
+        let request = viewer.lookup_paykit_connection_state(VerificationTaskHandleRequest {
+            creator: CREATOR.parse().unwrap(),
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+        });
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/paykit-connection-state-lookups");
+        assert_eq!(request.authorization, None);
+        assert_eq!(
+            request.body,
+            json!({ "creator": CREATOR, "bundle_id": BUNDLE_ID })
+        );
+    }
+
+    #[test]
     fn issue_access_credential_request_uses_handle_body_without_task_id() {
         let viewer = ViewerLocks::new();
         let request = viewer.issue_access_credential(VerificationTaskHandleRequest {
@@ -258,8 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_response_parses_public_view_without_task_id_or_credentials() {
-        let response = ViewerLocks::parse_lifecycle_response(json!({
+    fn submit_proof_bundle_response_is_lifecycle_only() {
+        let response = ViewerLocks::parse_submit_proof_bundle_response(json!({
             "creator": CREATOR,
             "bundle_id": BUNDLE_ID,
             "status": "completed",
@@ -274,6 +326,43 @@ mod tests {
         assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
         assert_eq!(response.status, VerificationTaskStatus::Completed);
         assert!(response.failure_message.is_none());
+    }
+
+    #[test]
+    fn paykit_connection_state_response_parses_closed_vocabulary() {
+        for (wire, expected) in [
+            ("none", PaykitConnectionState::None),
+            ("handshake", PaykitConnectionState::Handshake),
+            ("connected", PaykitConnectionState::Connected),
+            ("recovery_required", PaykitConnectionState::RecoveryRequired),
+            ("blocked", PaykitConnectionState::Blocked),
+        ] {
+            let response = ViewerLocks::parse_paykit_connection_state_response(json!({
+                "state": wire
+            }))
+            .unwrap();
+            assert_eq!(response.state, expected);
+        }
+    }
+
+    #[test]
+    fn connection_state_is_rejected_from_submit_and_unknown_state_is_rejected_from_lookup() {
+        assert!(
+            ViewerLocks::parse_submit_proof_bundle_response(json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null,
+                "connection_state": "connected"
+            }))
+            .is_err()
+        );
+        for response in [json!({}), json!({"state": "future"})] {
+            assert!(ViewerLocks::parse_paykit_connection_state_response(response).is_err());
+        }
     }
 
     #[test]

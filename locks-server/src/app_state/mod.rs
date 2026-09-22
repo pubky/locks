@@ -48,6 +48,7 @@ use locks_service::{
     },
 };
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::app_state::creator_authority::{
     DisabledLegacyCreatorConnectFlowClient, NoopLegacyCookieSessionRevalidator,
@@ -69,7 +70,9 @@ use crate::app_state::pubky_clients::{
 pub use crate::app_state::readiness::RuntimeStorageKind;
 use crate::config::LockServerRuntimeConfig;
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
-use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
+use crate::rate_limit::{
+    InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+};
 
 #[async_trait]
 pub trait ReaderPubkyResolver: Send + Sync {
@@ -179,6 +182,9 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     access_credential_policy: AccessCredentialPolicy,
     verification_submission_rate_limiter: Arc<InMemoryVerificationSubmissionRateLimiter>,
+    paykit_connection_state_lookup_rate_limiter:
+        Arc<InMemoryPaykitConnectionStateLookupRateLimiter>,
+    paykit_connection_status_semaphore: Arc<Semaphore>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
@@ -492,12 +498,23 @@ impl AppState {
         creator_repositories: CreatorRepositoryAdapters,
         private_runtime: PrivateRuntimeAdapters,
     ) -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let access_credential_policy =
             AccessCredentialPolicy::new(config.credentials.max_ttl_seconds);
         let verification_submission_rate_limiter =
             Arc::new(InMemoryVerificationSubmissionRateLimiter::new(
                 config.rate_limits.verification_submission.clone(),
             ));
+        let paykit_connection_state_lookup_rate_limiter =
+            Arc::new(InMemoryPaykitConnectionStateLookupRateLimiter::new(
+                config.rate_limits.paykit_connection_state_lookup.clone(),
+            ));
+        let paykit_connection_status_semaphore = Arc::new(Semaphore::new(
+            config
+                .rate_limits
+                .paykit_connection_state_lookup
+                .max_in_flight,
+        ));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
             client: build_pubky_client(&config.pubky),
         });
@@ -543,9 +560,11 @@ impl AppState {
             creator_connect_flow_id_generator: Arc::new(OsRandomCreatorConnectFlowIdGenerator),
             frontend_session_code_generator: Arc::new(OsRandomFrontendSessionCodeGenerator),
             frontend_session_token_generator: Arc::new(OsRandomFrontendSessionTokenGenerator),
-            clock: Arc::new(SystemClock),
+            clock,
             access_credential_policy,
             verification_submission_rate_limiter,
+            paykit_connection_state_lookup_rate_limiter,
+            paykit_connection_status_semaphore,
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
@@ -675,12 +694,28 @@ impl AppState {
         &self.verification_submission_rate_limiter
     }
 
+    pub fn paykit_connection_state_lookup_rate_limiter(
+        &self,
+    ) -> &Arc<InMemoryPaykitConnectionStateLookupRateLimiter> {
+        &self.paykit_connection_state_lookup_rate_limiter
+    }
+
+    pub fn paykit_connection_status_semaphore(&self) -> &Arc<Semaphore> {
+        &self.paykit_connection_status_semaphore
+    }
+
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {
         &self.reader_pubky_resolver
     }
 
     pub fn paykit_http_client(&self) -> Option<&Arc<PaykitHttpClient>> {
         self.paykit_http_client.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_http_client(mut self, client: Option<Arc<PaykitHttpClient>>) -> Self {
+        self.paykit_http_client = client;
+        self
     }
 
     pub fn paykit_setup_status_provider(&self) -> Option<&Arc<dyn PaykitSetupStatusProvider>> {

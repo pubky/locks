@@ -69,7 +69,7 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
 
 3. In production, use the production Bitkit QR/deep-link path presented by Paykit. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...` commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit` in `docker compose exec`; those wrappers load private role state on the host and bridge only the bounded native-helper request into the demo container. The helper is supplied only by the Paykit local-demo image/runtime stage, not the normal production package/runtime. Follow the manual bearer-URL log retrieval and retention guidance in the example README.
 
-Its external build contexts use anonymously reachable public repositories selected by immutable version tags; no sibling Paykit or Pubky checkout is required. Pubky Testnet is built from the `pubky/pubky-homeserver` `v0.11.0` tag, Paykit libraries use the `v0.1.0-rc48` tag, Paykit Server uses `v0.1.0-rc2`, and Paykit's compatible Locks context uses `v0.1.0-rc1`. The local Paykit Server worktree override remains available through `PAYKIT_SERVER_CONTEXT`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
+Its external build contexts use anonymously reachable public repositories selected by immutable version tags; no sibling Paykit or Pubky checkout is required. Pubky Testnet is built from the `pubky/pubky-homeserver` `v0.11.0` tag, Paykit libraries use the `v0.1.0-rc48` tag, Paykit Server uses `v0.1.0-rc3`, and Paykit's compatible Locks context uses `v0.1.0-rc1`. The local Paykit Server worktree override remains available through `PAYKIT_SERVER_CONTEXT`. The full Paykit demo adds Paykit Server at <http://127.0.0.1:3001>. The reader remains at <http://127.0.0.1:8088/reader/> in every local flow. Payment remains a manual operator action.
 
 For the helper-free loopback browser demo against deployed staging Locks and Paykit services:
 
@@ -351,6 +351,7 @@ sequenceDiagram
 sequenceDiagram
   participant V as Viewer App
   participant L as Lock Server
+  participant P as Paykit Server
   participant H as Creator Homeserver
 
   Note over V,H: Step 1: Discovery
@@ -378,6 +379,10 @@ sequenceDiagram
 
   Note over V,L: Step 6: Async polling
   loop Until eligible or failed
+    V->>L: POST /paykit-connection-state-lookups { "creator": "...", "bundle_id": "..." }
+    L->>P: POST /connections/status { "creator": "...", "bundle_id": "..." }
+    P-->>L: { "state": "none|handshake|connected|recovery_required|blocked" }
+    L-->>V: { "state": "..." }
     V->>L: POST /verification-task-lookups { "creator": "...", "bundle_id": "..." }
     L-->>V: { "creator": "...", "bundle_id": "...", "status": "in_progress" }
     L->>L: Verify proof
@@ -504,7 +509,7 @@ Example:
 
 The `bundle_id` must be cryptographically random and treated as a bearer secret. The viewer is responsible for storing it for future reference.
 
-`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. An exact persisted replay returns the existing lifecycle, while changed submitted proof material conflicts; neither replay calls Paykit again. Only a new identity requires Paykit configuration and creates a signed invoice with `{ bundle_id, lock_resource, reader }`.
+`paykit-payment` v1 submissions are single-proof only: do not mix payment and non-payment proofs in the same bundle. After rate limiting and current canonical lock/reader preflight, the Lock Server checks the permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material conflicts without calling Paykit. New payment submissions require Paykit configuration and call the signed idempotent invoice endpoint with `{ bundle_id, lock_resource, reader }`. Exact persisted replays return the existing lifecycle without calling Paykit. Connection observation is a separate read-only lookup bound to the persisted payment task.
 
 The worker checks payment through a signed canonical `{ creator, bundle_id }` request to `POST /transactions/status`. Valid `undetected`, `detected`, and `confirmed` responses are evaluated against amount matching and the configured confirmation threshold. Transport, timeout, HTTP (including `404` or authorization), and response-decoding failures all durably return the task to pending for retry; v1 has no terminal Paykit payment failure. Responses never include invoice data, payment status internals, raw proof material, or an internal task ID.
 
@@ -611,9 +616,20 @@ Default runtime config:
 enabled = true
 max_requests = 60
 window_seconds = 60
+
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
 ```
 
-When the limit is exceeded, the server returns `Retry-After` with the remaining fixed-window time in seconds:
+Connection lookup state is capped at `max_entries`. When full, new client/task keys receive the same `429 rate_limited` response until expired windows are evicted.
+The process-wide token bucket permits `global_requests_per_second` sustained lookups with a `global_burst` burst. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must tune aggregate Locks limits below Paykit's signed-request budget.
+
+When any admission limit is exceeded, the server returns `Retry-After` (fixed-window remainder, or one second for process-wide rate/concurrency saturation):
 
 ```http
 429 Too Many Requests

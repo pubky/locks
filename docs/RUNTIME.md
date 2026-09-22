@@ -149,15 +149,29 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` lifecycle identity, the Lock Server calls `POST /invoices` during `POST /proof-bundles` before creating a verification task; exact persisted submission replay does not call Paykit. Workers call `POST /transactions/status` while completing pending payment verification tasks. Both request bodies are canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, the Lock Server calls `POST /invoices` during `POST /proof-bundles` before creating a verification task. Exact persisted payment-submission replay returns the existing lifecycle without calling Paykit. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Workers call `POST /transactions/status` while completing pending payment verification tasks. Every Paykit request body is canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
-Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; status-query timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
+Public connection-state lookups have independent process-local admission control. Defaults are 60 requests per 60-second window for each `(client IP, creator, bundle_id)`, a process-wide token bucket of 50 requests per second with burst 50, 16 concurrent outbound Paykit status requests, and at most 10,000 retained windows across the process:
+
+```toml
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
+```
+
+Fixed-window rejection includes its remaining window in `Retry-After`; token-bucket and concurrency rejection use one second. When `max_entries` is full, new keys are rejected until expired windows are evicted. Any bound returns `429 rate_limited` before another request reaches Paykit. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must keep aggregate Locks limits below Paykit's signed-request budget.
+
+Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Redirects are never followed for any signed Paykit request: `paykit.server_url` must name the final origin, and every `3xx` is handled as a non-success response. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; connection-state timeouts fail only that read with `paykit_connection_state_timeout`; payment-status timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
 
 Every claimed verification task receives a fresh opaque claim token. Retry, completion, and failure transitions require the exact token, worker ID, `in_progress` state, and an unexpired lease, so a stale process cannot write after the same worker ID reclaims the task. Pubky entitlement publication cannot be atomic with the Postgres transition: a stale worker may publish a valid entitlement but cannot persist terminal task state. After any publication error, Locks reads the entitlement back; the current owner recovers only when the stored entitlement decision matches in every field except verifier-owned `verified_at` timestamps. A missing or mismatched entitlement preserves the failure. The Pubky adapter remains check-then-put, so claim fencing does not make concurrent homeserver writes atomic; it only fences Postgres task state.
 
 `minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable.
 
-Omitting `[paykit]` prevents creation of new payment lifecycle identities. In that state, non-payment verifier flows continue to run, an exact persisted `paykit-payment` submission replay can still return its lifecycle after current canonical preflight, and a new `paykit-payment` submission returns `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
+Omitting `[paykit]` prevents creation of new payment lifecycle identities and connection-state lookup. Existing exact payment-submission replays still return their persisted lifecycle. Non-payment verifier flows continue to run. New `paykit-payment` submissions return `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
 ## Runtime storage
 
