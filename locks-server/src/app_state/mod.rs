@@ -41,7 +41,7 @@ use locks_service::{
             PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
             PubkyHomeserverStorageClient, PubkyLegacyCookieSessionRevalidator,
             PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
-            PubkyPrivResourceRepository,
+            PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
         verifiers::dev_static::DevStaticVerifier,
         verifiers::paykit_payment::PaykitPaymentVerifier,
@@ -134,6 +134,14 @@ impl PubkyHomeserverStorageClient for UnavailablePubkyHomeserverStorageClient {
         _creator: &CreatorPubky,
         _path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+        Err(ApplicationError::CreatorAuthorityUnavailable)
+    }
+
+    async fn get_metadata_as_creator(
+        &self,
+        _creator: &CreatorPubky,
+        _path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
         Err(ApplicationError::CreatorAuthorityUnavailable)
     }
 

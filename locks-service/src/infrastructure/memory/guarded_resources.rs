@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use locks_core::ids::{CreatorPubky, GuardedResourceHash};
+use locks_core::lock_policy::GuardedResource;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
@@ -29,7 +30,16 @@ impl GuardedResourceRepository for InMemoryGuardedResourceRepository {
     async fn upsert_guarded_resource(
         &self,
         guarded_resource: GuardedResourceRecord,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<GuardedResource, ApplicationError> {
+        let stored = GuardedResource::new(
+            guarded_resource.path.clone(),
+            guarded_resource.hash,
+            guarded_resource.content_type.clone(),
+            guarded_resource.size,
+        )
+        .map_err(|error| ApplicationError::InvalidGuardedResource {
+            message: error.to_string(),
+        })?;
         self.records.write().await.insert(
             (
                 guarded_resource.creator.clone(),
@@ -37,7 +47,7 @@ impl GuardedResourceRepository for InMemoryGuardedResourceRepository {
             ),
             guarded_resource,
         );
-        Ok(())
+        Ok(stored)
     }
 
     async fn get_guarded_resource(
@@ -97,15 +107,16 @@ mod tests {
                 .unwrap();
         let old_hash = GuardedResourceHash::from_bytes([7; 32]);
         let current_hash = GuardedResourceHash::from_bytes([8; 32]);
+        let path = "/priv/locks.app/content/file.txt";
 
         assert_eq!(
-            repo.get_guarded_resource(&creator, "/pub/file.txt", &old_hash)
+            repo.get_guarded_resource(&creator, path, &old_hash)
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
-            repo.get_current_guarded_resource(&creator, "/pub/file.txt")
+            repo.get_current_guarded_resource(&creator, path)
                 .await
                 .unwrap(),
             None
@@ -113,7 +124,7 @@ mod tests {
 
         repo.upsert_guarded_resource(GuardedResourceRecord {
             creator: creator.clone(),
-            path: "/pub/file.txt".to_owned(),
+            path: path.to_owned(),
             hash: old_hash,
             content_type: "text/plain".to_owned(),
             size: 5,
@@ -123,7 +134,7 @@ mod tests {
         .unwrap();
         repo.upsert_guarded_resource(GuardedResourceRecord {
             creator: creator.clone(),
-            path: "/pub/file.txt".to_owned(),
+            path: path.to_owned(),
             hash: current_hash,
             content_type: "image/png".to_owned(),
             size: 6,
@@ -133,18 +144,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            repo.get_guarded_resource(&creator, "/pub/file.txt", &old_hash)
+            repo.get_guarded_resource(&creator, path, &old_hash)
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
-            repo.get_guarded_resource(&creator, "/pub/file.txt", &current_hash)
+            repo.get_guarded_resource(&creator, path, &current_hash)
                 .await
                 .unwrap(),
             Some(GuardedResourceRecord {
                 creator: creator.clone(),
-                path: "/pub/file.txt".to_owned(),
+                path: path.to_owned(),
                 hash: current_hash,
                 content_type: "image/png".to_owned(),
                 size: 6,
@@ -152,12 +163,12 @@ mod tests {
             })
         );
         assert_eq!(
-            repo.get_current_guarded_resource(&creator, "/pub/file.txt")
+            repo.get_current_guarded_resource(&creator, path)
                 .await
                 .unwrap(),
             Some(GuardedResourceRecord {
                 creator,
-                path: "/pub/file.txt".to_owned(),
+                path: path.to_owned(),
                 hash: current_hash,
                 content_type: "image/png".to_owned(),
                 size: 6,

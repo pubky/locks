@@ -105,7 +105,7 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::ports::EntitlementRepository;
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyHomeserverStorageClient,
+        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
@@ -284,6 +284,14 @@ mod tests {
             _creator: &CreatorPubky,
             _path: &str,
         ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            unimplemented!("not needed by entitlement repository tests")
+        }
+
+        async fn get_metadata_as_creator(
+            &self,
+            _creator: &CreatorPubky,
+            _path: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
             unimplemented!("not needed by entitlement repository tests")
         }
 
