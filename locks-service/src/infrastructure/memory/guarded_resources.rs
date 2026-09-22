@@ -107,7 +107,7 @@ mod tests {
                 .unwrap();
         let old_hash = GuardedResourceHash::from_bytes([7; 32]);
         let current_hash = GuardedResourceHash::from_bytes([8; 32]);
-        let path = "/priv/locks.app/content/file.txt";
+        let path = "/priv/app.locks/content/file.txt";
 
         assert_eq!(
             repo.get_guarded_resource(&creator, path, &old_hash)

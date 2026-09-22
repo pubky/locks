@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn register_returns_storage_authoritative_content_type_without_downloading_bytes() {
         let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec();
-        let path = "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000";
+        let path = "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000";
         let client = FakeStorageClient::default().with_metadata_read(Some(
             PubkyResourceMetadata::from_bytes(&bytes, Some("application/octet-stream".to_owned())),
         ));
@@ -261,7 +261,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes: b"uploaded bytes".to_vec(),
             })
@@ -279,11 +279,11 @@ mod tests {
             repository.client().operations(),
             vec![
                 format!(
-                    "put_bytes {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000 text/plain",
+                    "put_bytes {} /priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000 text/plain",
                     creator()
                 ),
                 format!(
-                    "get_metadata {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000",
+                    "get_metadata {} /priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000",
                     creator()
                 ),
             ]
@@ -303,7 +303,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -331,7 +331,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -359,7 +359,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -386,7 +386,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -409,7 +409,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "image/svg+xml".to_owned(),
                 bytes: br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec(),
             })
