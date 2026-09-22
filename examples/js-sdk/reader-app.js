@@ -1,11 +1,15 @@
 import {
   classifyPaymentLifecycle,
+  connectionStateIndicator,
+  createPaykitConnectionObserverSlot,
+  createPaykitConnectionPoller,
   completeDevVerification,
   hasPaykitData,
   issueAccessCredential,
   loadContentLock,
   lookupVerificationTask,
   readGuardedContent,
+  refreshPaykitConnectionState,
   submitDevStaticProof,
   submitPaykitPaymentProof,
   creatorFromResource,
@@ -46,6 +50,8 @@ const state = {
   bundleId: null,
   submittedProofBundle: null,
   lifecycle: null,
+  connectionState: null,
+  connectionPollingPaused: false,
   completion: null,
   accessCredential: null,
   accessCredentialResponse: null,
@@ -55,6 +61,7 @@ const state = {
 let workflowIncarnation = 0;
 const paykitReaderStatusRequests = createLatestRequestGate();
 const paykitDataChecks = createPaykitDataCheckController();
+const connectionObserverSlot = createPaykitConnectionObserverSlot();
 let activeLoadToken = null;
 let activeSubmissionToken = null;
 let activePollToken = null;
@@ -80,6 +87,8 @@ const el = {
   pollPayment: document.querySelector('#poll-payment'),
   submitProof: document.querySelector('#submit-proof'),
   proofStatus: document.querySelector('#proof-status'),
+  connectionStateRow: document.querySelector('#connection-state-row'),
+  connectionState: document.querySelector('#connection-state'),
   proofOutput: document.querySelector('#proof-output'),
   completeVerification: document.querySelector('#complete-verification'),
   completionStatus: document.querySelector('#completion-status'),
@@ -144,6 +153,8 @@ function bindEvents() {
       bundleId: null,
       submittedProofBundle: null,
       lifecycle: null,
+      connectionState: null,
+      connectionPollingPaused: false,
       completion: null,
       accessCredential: null,
       accessCredentialResponse: null,
@@ -378,6 +389,7 @@ async function submitProof() {
     state.bundleId = result.bundleId;
     state.submittedProofBundle = result.submittedProofBundle;
     state.lifecycle = result.lifecycle;
+    state.connectionState = null;
     state.completion = null;
     state.accessCredential = null;
     state.accessCredentialResponse = null;
@@ -459,12 +471,42 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
   const pollToken = Symbol('payment-poll');
   activePollToken = pollToken;
   state.paymentPolling = true;
+  state.connectionPollingPaused = false;
   render();
+  let connectionPoller = null;
   try {
     if (!handle || !workflowMatches(handle)) {
       throw new Error('payment proof bundle is required before polling');
     }
     await postClientLog('info', 'reader-payment-poll-started', handleDetails(handle));
+    connectionPoller = createPaykitConnectionPoller({
+      maxAttempts: 30,
+      lookup: () => refreshPaykitConnectionState({
+        resource: handle.resource,
+        creator: handle.creator,
+        bundleId: handle.bundleId,
+        pkarrRelays: handle.pkarrRelays,
+      }),
+      onState: (connectionState) => {
+        if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+        state.connectionState = connectionState;
+        render();
+      },
+      onError: (error) => {
+        if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+        void postClientLog(
+          'warn',
+          'reader-paykit-connection-lookup-failed',
+          serializeError(error),
+        );
+      },
+      onExhausted: () => {
+        if (!workflowMatches(handle) || activePollToken !== pollToken) return;
+        state.connectionPollingPaused = true;
+        render();
+      },
+    });
+    connectionObserverSlot.start(connectionPoller, 1_000);
     for (let attempt = 0; attempt < 600; attempt += 1) {
       if (!workflowMatches(handle) || activePollToken !== pollToken) return;
       const lifecycle = await lookupVerificationTask({
@@ -503,6 +545,7 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
     await postClientLog('error', 'reader-payment-poll-failed', serializeError(error));
     showError(el.proofStatus, error);
   } finally {
+    if (connectionPoller) connectionObserverSlot.release(connectionPoller);
     if (activePollToken === pollToken) {
       activePollToken = null;
       state.paymentPolling = false;
@@ -622,6 +665,12 @@ function render() {
   const paymentMode = state.verifierType === 'paykit-payment';
   el.proofSatisfied.closest('label').hidden = paymentMode;
   el.paykitReaderCommands.hidden = !paymentMode;
+  const connectionIndicator = connectionStateIndicator(state.connectionState);
+  el.connectionStateRow.hidden = !paymentMode;
+  el.connectionState.textContent = state.connectionPollingPaused
+    ? `${connectionIndicator.label}. Connection observation paused after 30 attempts.`
+    : connectionIndicator.label;
+  el.connectionState.className = connectionIndicator.className;
   el.load.disabled = state.loadingLock || state.submittingProof;
   if (stagingMode) {
     el.paykitReaderStatus.textContent = state.paykitDataMessage
@@ -823,6 +872,8 @@ function invalidateWorkflow() {
   activeLoadToken = null;
   activeSubmissionToken = null;
   activePollToken = null;
+  connectionObserverSlot.stop();
+  state.connectionPollingPaused = false;
   state.loadingLock = false;
   state.submittingProof = false;
   state.paymentPolling = false;
@@ -844,6 +895,8 @@ function clearVerificationState({ clearLoaded = false } = {}) {
   state.bundleId = null;
   state.submittedProofBundle = null;
   state.lifecycle = null;
+  state.connectionState = null;
+  state.connectionPollingPaused = false;
   state.completion = null;
   state.accessCredential = null;
   state.accessCredentialResponse = null;

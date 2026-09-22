@@ -61,20 +61,21 @@ const required = {
   rootReadme: [
     'Paykit Server uses merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
     'and is built against the current Locks worktree',
-    'local Paykit Server worktree override remains available',
+    'The local Paykit Server worktree override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
     'merged commit `26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
     'built against the current Locks worktree',
+    'An absolute local `PAYKIT_SERVER_CONTEXT` remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
     'merged commit',
     '`26bda476b9fa1d29feb87cbb24a90042d00f42c4`',
-    'For coordinated Paykit development',
+    'For coordinated Paykit Server work',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
     'npm --prefix examples/js-sdk run create-user -- --role content-creator',

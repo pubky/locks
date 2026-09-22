@@ -57,6 +57,14 @@ enabled = true
 max_requests = 60
 window_seconds = 60
 
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
+
 [content_locks]
 max_resource_bytes = 10_000_000
 max_resources = 10

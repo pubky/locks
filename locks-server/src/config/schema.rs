@@ -186,6 +186,30 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
+    pub paykit_connection_state_lookup: PaykitConnectionStateLookupRateLimitConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitConnectionStateLookupRateLimitConfig {
+    pub max_requests: u32,
+    pub window_seconds: u64,
+    pub max_in_flight: usize,
+    pub max_entries: usize,
+    pub global_requests_per_second: u64,
+    pub global_burst: u64,
+}
+
+impl Default for PaykitConnectionStateLookupRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 60,
+            window_seconds: 60,
+            max_in_flight: 16,
+            max_entries: 10_000,
+            global_requests_per_second: 50,
+            global_burst: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +332,20 @@ pub enum ConfigError {
         "rate_limits.verification_submission.window_seconds must be greater than zero when enabled"
     )]
     InvalidVerificationSubmissionRateLimitWindow,
+    #[error("rate_limits.paykit_connection_state_lookup.max_requests must be greater than zero")]
+    InvalidPaykitConnectionStateLookupRateLimitMaxRequests,
+    #[error("rate_limits.paykit_connection_state_lookup.window_seconds must be greater than zero")]
+    InvalidPaykitConnectionStateLookupRateLimitWindow,
+    #[error("rate_limits.paykit_connection_state_lookup.max_in_flight must be greater than zero")]
+    InvalidPaykitConnectionStateLookupMaxInFlight,
+    #[error("rate_limits.paykit_connection_state_lookup.max_entries must be greater than zero")]
+    InvalidPaykitConnectionStateLookupMaxEntries,
+    #[error(
+        "rate_limits.paykit_connection_state_lookup.global_requests_per_second must be greater than zero"
+    )]
+    InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond,
+    #[error("rate_limits.paykit_connection_state_lookup.global_burst must be greater than zero")]
+    InvalidPaykitConnectionStateLookupGlobalBurst,
     #[error("content_locks.max_resource_bytes must be greater than zero")]
     InvalidMaxResourceBytes,
     #[error("content_locks.max_resources must be greater than zero")]

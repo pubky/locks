@@ -140,7 +140,7 @@ impl Viewer {
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
-        fetch_viewer_lifecycle_json(&request).await
+        fetch_submit_proof_bundle_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -158,6 +158,23 @@ impl Viewer {
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
         fetch_viewer_lifecycle_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = lookupPaykitConnectionState)]
+    pub async fn lookup_paykit_connection_state(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_lookup_paykit_connection_state_request(options)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_paykit_connection_state_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -277,6 +294,18 @@ impl Viewer {
 
     #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn build_lookup_paykit_connection_state_request(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> Result<JsViewerRequestPlan, String> {
+        Ok(self.request_plan(
+            self.inner
+                .lookup_paykit_connection_state(parse_handle_options(options)?),
+        ))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn build_issue_access_credential_request(
         &self,
         options: &VerificationTaskHandleOptions,
@@ -374,6 +403,20 @@ fn validate_lifecycle_response_for_tests(value: Value) -> Result<Value, String> 
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
+fn validate_submit_proof_bundle_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_submit_proof_bundle_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_paykit_connection_state_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_paykit_connection_state_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
 fn validate_access_credential_response_for_tests(value: Value) -> Result<Value, String> {
     locks_sdk::ViewerLocks::parse_access_credential_response(value.clone())
         .map_err(|err| err.to_string())?;
@@ -388,6 +431,31 @@ async fn fetch_viewer_lifecycle_json(
     let validated = validate_lifecycle_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode lifecycle response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_submit_proof_bundle_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated =
+        validate_submit_proof_bundle_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode proof bundle response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_paykit_connection_state_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated =
+        validate_paykit_connection_state_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated).map_err(|err| {
+        invalid_input(format!(
+            "failed to encode Paykit connection-state response: {err:?}"
+        ))
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -629,6 +697,24 @@ mod tests {
     }
 
     #[test]
+    fn paykit_connection_state_lookup_uses_task_handle_body() {
+        let viewer = test_viewer();
+
+        let request = viewer
+            .build_lookup_paykit_connection_state_request(&handle_options())
+            .unwrap();
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/paykit-connection-state-lookups");
+        assert_eq!(request.authorization, None);
+        assert_eq!(
+            request.body,
+            json!({ "creator": CREATOR, "bundle_id": BUNDLE_ID })
+        );
+        assert!(!request.url.as_str().contains(BUNDLE_ID));
+    }
+
+    #[test]
     fn issue_access_credential_request_uses_handle_body_without_auth() {
         let viewer = test_viewer();
 
@@ -733,6 +819,39 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(credential["credential"], "raw-access-credential");
+    }
+
+    #[test]
+    fn submit_response_rejects_connection_state_and_lookup_accepts_closed_state() {
+        let response = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null
+        });
+        assert_eq!(
+            validate_submit_proof_bundle_response_for_tests(response.clone()).unwrap(),
+            response
+        );
+
+        let mut stale = response;
+        stale["connection_state"] = json!("handshake");
+        assert!(validate_submit_proof_bundle_response_for_tests(stale).is_err());
+
+        let connection = json!({ "state": "recovery_required" });
+        assert_eq!(
+            validate_paykit_connection_state_response_for_tests(connection.clone()).unwrap(),
+            connection
+        );
+        assert!(
+            validate_paykit_connection_state_response_for_tests(json!({
+                "state": "future"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

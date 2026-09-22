@@ -213,9 +213,17 @@ state locally and bridge only bounded helper input into the relevant container.
 
 The Paykit Server build uses merged commit
 `26bda476b9fa1d29feb87cbb24a90042d00f42c4`, the active Locks checkout, Paykit Rust
-`v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. For coordinated Paykit development,
-export an absolute `PAYKIT_SERVER_CONTEXT` worktree path before running Compose;
-validation requires the rendered context to match that override exactly.
+`v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. No sibling repository checkout is required.
+
+For coordinated Paykit Server work, select an explicit absolute local worktree
+without changing the committed public default:
+
+```bash
+PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
+  docker compose --file compose.paykit-local-demo.yaml up -d --build
+```
+
+Compose validation requires the rendered context to match that environment value exactly.
 
 `compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
 
@@ -461,7 +469,7 @@ The browser remains unauthenticated. A `paykit-payment` proof carries the public
 For `paykit-payment`:
 
 1. The in-process Paykit reader worker starts with `reader-demo`, creates or restores the durable encrypted reader state, publishes and reads back its Receiver Marker, and waits for private Paykit messages. The page polls its closed status automatically; proof submission remains disabled until the worker is prepared and its Reader Pubky matches the current `content-viewer` identity.
-2. Click **Submit proof bundle**. The browser submits one `paykit-payment` proof with the confirmed top-level `reader_public_key` and an empty `{}` criterion payload. It never calls the dev completion route.
+2. Click **Submit proof bundle**. The browser submits one `paykit-payment` proof with the confirmed top-level `reader_public_key` and an empty `{}` criterion payload. It never calls the dev completion route. While payment verification is pending, the page starts task-bound Paykit connection observation without awaiting it, then independently performs the authoritative lifecycle lookup. It displays **None — handshake has not started**, **Handshake in progress**, **Connected — Paykit Server link is usable**, **Recovery required — runtime must relink; do not resubmit proof**, or **Blocked — operator action required**. Connection timeout/failure cannot delay or stop lifecycle polling; blocked stops further connection lookups. Connection observation pauses after 30 attempts and can be restarted with **Resume payment verification polling**. The browser never replays proof submission merely to refresh this indicator.
 3. The worker advances the Paykit/Noise link and receives the real Payment Request without a foreground command. The page displays only its validated request ID, regtest address, amount in sats, canonical manual `bitcoin-cli` payment command, and optional mining command.
 4. Run the displayed payment command in a terminal. Mining is optional because local Locks uses `minimum_confirmations = 0`.
 5. The page polls `pending` and `in_progress` lifecycle states. On `completed`, it issues an access credential and reads the primary guarded resource. `failed`, `expired`, and unknown states fail closed. Use **Resume payment verification polling** after a reload.

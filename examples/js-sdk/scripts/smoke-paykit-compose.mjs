@@ -27,7 +27,7 @@ const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const paykitReleaseRevision = '31c77c99bf73fe6e377c842b582632a832950022';
 assert.equal(
-  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc2\n`),
+  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc3\n`),
   paykitReleaseRevision,
 );
 assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
