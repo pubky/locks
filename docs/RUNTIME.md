@@ -44,12 +44,25 @@ level = "info"
 ```toml
 [pubky]
 network = "testnet"
+# Optional override; omit to preserve Pubky/Pkarr defaults.
+pkarr_relays = ["http://127.0.0.1:15411"]
 ```
 
 Supported values:
 
 - `testnet`: generated/default local development network.
 - `mainnet`: public Pubky network for production/staging deployments.
+
+`pubky.pkarr_relays` is an optional non-empty array of HTTP(S) relay URL strings shared by Pubky authentication/storage clients and Lock Server PKARR publication. Relay URLs must not contain credentials, query strings, or fragments. On `mainnet`, omitting it keeps Pkarr's current default relays:
+
+```text
+https://pkarr.pubky.app
+https://pkarr.pubky.org
+```
+
+On `testnet`, omitting it preserves the Pubky SDK's local testnet relay (`http://127.0.0.1:15411`).
+
+`resolution = "relay-only"` still disables Mainline DHT while retaining either configured relays or these defaults. The same relay list is used to publish and republish the Lock Server's own PKARR record.
 
 ## Runtime environment and route gates
 
@@ -111,11 +124,10 @@ public_ip = "203.0.113.10"
 public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "locks.example"
-pkarr_relays = []
 key_republisher_interval_seconds = 3600
 ```
 
-`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pkarr_relays = ["http://localhost:15411"]`.
+`public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pubky.pkarr_relays = ["http://127.0.0.1:15411"]`.
 
 PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds.
 
@@ -137,15 +149,29 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` is the standalone Paykit Server base URL. Any configured path prefix is preserved when appending `invoices` and `transactions/status`, with or without a trailing slash. With PostgreSQL runtime storage, a new `{ creator, bundle_id }` first commits an internal, unclaimable admission reservation under the same per-lock database fence used by deletion start. The Lock Server then calls `POST /invoices`; only success makes the task publicly visible and worker-claimable. Durable handle replay is checked before mutable public-lock lookup and reader discovery. Exact replay of a ready task does not call Paykit; exact retry of an incomplete reservation uses its persisted canonical request fields to replay the same idempotent invoice request, even after the public lock is tombstoned. A deletion job cannot advance from withdrawal to Paykit drain start while any snapshotted reservation remains unready; this ensures Paykit's drain sees every pre-cutoff invoice. Workers call `POST /transactions/status` while completing ready payment verification tasks. Both request bodies are canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. With PostgreSQL runtime storage, a new `{ creator, bundle_id }` first commits an internal, unclaimable admission reservation under the same per-lock database fence used by deletion start. The Lock Server then calls `POST /invoices`; only success makes the task publicly visible and worker-claimable. Durable handle replay is checked before mutable public-lock lookup and reader discovery. Exact replay of a ready task does not call Paykit; exact retry of an incomplete reservation uses its persisted canonical request fields to replay the same idempotent invoice request, even after the public lock is tombstoned. A deletion job cannot advance from withdrawal to Paykit drain start while any snapshotted reservation remains unready; this ensures Paykit's drain sees every pre-cutoff invoice. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Workers call `POST /transactions/status` while completing ready payment verification tasks. Every Paykit request body is canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
-Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; status-query timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
+Public connection-state lookups have independent process-local admission control. Defaults are 60 requests per 60-second window for each `(client IP, creator, bundle_id)`, a process-wide token bucket of 50 requests per second with burst 50, 16 concurrent outbound Paykit status requests, and at most 10,000 retained windows across the process:
+
+```toml
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
+```
+
+Fixed-window rejection includes its remaining window in `Retry-After`; token-bucket and concurrency rejection use one second. When `max_entries` is full, new keys are rejected until expired windows are evicted. Any bound returns `429 rate_limited` before another request reaches Paykit. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must keep aggregate Locks limits below Paykit's signed-request budget.
+
+Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Redirects are never followed for any signed Paykit request: `paykit.server_url` must name the final origin, and every `3xx` is handled as a non-success response. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; connection-state timeouts fail only that read with `paykit_connection_state_timeout`; payment-status timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
 
 Every claimed verification task receives a fresh opaque claim token. Retry, completion, and failure transitions require the exact token, worker ID, `in_progress` state, and an unexpired lease, so a stale process cannot write after the same worker ID reclaims the task. Pubky entitlement publication cannot be atomic with the Postgres transition: a stale worker may publish a valid entitlement but cannot persist terminal task state. After any publication error, Locks reads the entitlement back; the current owner recovers only when the stored entitlement decision matches in every field except verifier-owned `verified_at` timestamps. A missing or mismatched entitlement preserves the failure. The Pubky adapter remains check-then-put, so claim fencing does not make concurrent homeserver writes atomic; it only fences Postgres task state.
 
 `minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable.
 
-Omitting `[paykit]` prevents creation or reconciliation of payment lifecycle identities. In that state, non-payment verifier flows continue to run, an exact ready `paykit-payment` replay can still return its persisted lifecycle, an exact unready replay returns `422 paykit_not_configured`, and a new `paykit-payment` submission returns the same `422`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
+Omitting `[paykit]` prevents creation or reconciliation of payment lifecycle identities and connection-state lookup. In that state, non-payment verifier flows continue to run, an exact ready `paykit-payment` replay can still return its persisted lifecycle, an exact unready replay returns `422 paykit_not_configured`, and a new `paykit-payment` submission returns the same `422`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
 ## Runtime storage
 
@@ -225,6 +251,8 @@ This mounts authenticated Pubky-backed creator publishing routes, hosted legacy-
 ```toml
 [pubky]
 network = "mainnet"
+resolution = "relay-only"
+pkarr_relays = ["https://pkarr.pubky.app", "https://pkarr.pubky.org"]
 
 [runtime]
 environment = "staging" # or "production"

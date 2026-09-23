@@ -47,7 +47,7 @@ python3 -m http.server 8080 --directory locks-sdk/bindings/js
 Open:
 
 ```text
-http://localhost:8080/demo/
+http://127.0.0.1:8080/demo/
 ```
 
 The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working `legacy-connect` creator acquisition.
@@ -93,7 +93,7 @@ allowed_return_origins = ["https://pubky.app"]
 network = "mainnet"
 ```
 
-The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Runtime publication is configured under `[pkdns]`; see [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
+The Lock Server must also publish a PKARR record with a browser-usable domain endpoint. Endpoint data and republishing cadence are configured under `[pkdns]`; shared relay URLs are configured under `[pubky]`. See [`docs/RUNTIME.md`](RUNTIME.md#pkarr-and-browser-sdk-reachability).
 
 The SDK verifies the public service identity endpoint:
 
@@ -130,17 +130,17 @@ For local Pubky testnet browser development, configure the local PKARR relay exp
 import { Locks, LocksOptions } from "locks-sdk-wasm";
 
 const options = new LocksOptions();
-options.addPkarrRelay("http://localhost:15411");
+options.addPkarrRelay("http://127.0.0.1:15411");
 
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
 
-Local `pubky-core/pubky-testnet` defaults are:
+Local `pubky-homeserver/pubky-testnet` defaults are:
 
 ```text
-PKARR relay     = http://localhost:15411
-HTTP/auth relay = http://localhost:15412
-DHT bootstrap   = localhost:6881
+PKARR relay     = http://127.0.0.1:15411
+HTTP/auth relay = http://127.0.0.1:15412
+DHT bootstrap   = 127.0.0.1:6881
 ```
 
 This remains the stable browser path.
@@ -332,6 +332,51 @@ Request body:
 }
 ```
 
+### Check public Paykit data presence
+
+```ts
+const hasPaykitData = await Locks.hasPaykitData("pubky...");
+
+const options = new LocksOptions();
+options.addPkarrRelay("http://127.0.0.1:15411");
+const hasLocalPaykitData = await Locks.hasPaykitDataWithOptions("pubky...", options);
+```
+
+These static methods perform an unauthenticated, uncached homeserver listing for the
+specified user's current `/pub/paykit/v0/` namespace. They return `true` when at least
+one syntactically valid child is present and `false` when the namespace is absent or
+empty. Invalid user keys, malformed listings, resolution failures, and transport errors
+reject the promise instead of returning `false`.
+
+Malformed user keys reject with `InvalidInput`. Operational lookup failures reject with
+the coarse `PaykitDataLookupFailed` error name without exposing upstream details.
+
+This is a data-presence probe only. A `true` result does not prove a valid receiver
+marker, supported capabilities, freshness, or Paykit runtime readiness.
+
+### Check Paykit setup readiness
+
+```ts
+const result = await session.creator.paykitSetupStatus();
+
+switch (result.status) {
+  case "ready":
+    // Skip Paykit authorization.
+    break;
+  case "setup_required":
+    // Launch the Paykit setup iframe.
+    break;
+  case "unavailable":
+    // Show retry/degraded state. Do not launch authorization.
+    break;
+}
+```
+
+`paykitSetupStatus()` takes no Creator argument. It uses the current Locks frontend-session bearer
+and calls `GET /creator/paykit/setup-status` with no body. The Lock Server derives the Creator from
+that session. The returned object contains only `status: "ready" | "setup_required" |
+"unavailable"`; malformed responses reject instead of being interpreted as setup readiness.
+
 ## Viewer/access APIs
 
 Viewer calls do not require a Pubky identity in v0. Callers choose and durably store a `BundleId`; treat it as bearer-like recovery state.
@@ -382,6 +427,7 @@ const lifecycle = await viewer.submitProofBundle({
 ```ts
 const handle = new VerificationTaskHandleOptions(creator, bundleId);
 const current = await viewer.lookupVerificationTask(handle);
+const connection = await viewer.lookupPaykitConnectionState(handle);
 const issued = await viewer.issueAccessCredential(handle);
 const bytes = await viewer.proxyReadGuardedResource(issued.credential, "example.txt");
 ```
@@ -393,25 +439,33 @@ The corresponding HTTP shapes are:
 ```http
 POST /proof-bundles
 POST /verification-task-lookups
+POST /paykit-connection-state-lookups
 POST /access-credentials
 GET /priv-resources/content/example.txt
 Authorization: Bearer <access_credential>
 ```
 
-Only `proxyReadGuardedResource` sends an `Authorization` header. It also requires the relative guarded resource path to read from the authorized content lock resource set. Polling and credential issuance use `{ creator, bundle_id }` JSON bodies; they do not use internal task IDs.
+Only `proxyReadGuardedResource` sends an `Authorization` header. It also requires the relative guarded resource path to read from the authorized content lock resource set. Lifecycle polling, Paykit connection-state lookup, and credential issuance use `{ creator, bundle_id }` JSON bodies; they do not use internal task IDs.
 
 The Rust SDK also exposes typed response parsers for non-browser callers:
 
 ```rust
-use locks_sdk::{ViewerLocks, VerificationTaskLifecycleResponse, AccessCredentialResponse};
+use locks_sdk::{
+    AccessCredentialResponse, PaykitConnectionStateResponse,
+    VerificationTaskLifecycleResponse, ViewerLocks,
+};
 
+let submitted: VerificationTaskLifecycleResponse =
+    ViewerLocks::parse_submit_proof_bundle_response(response_json)?;
 let lifecycle: VerificationTaskLifecycleResponse =
     ViewerLocks::parse_lifecycle_response(response_json)?;
+let connection: PaykitConnectionStateResponse =
+    ViewerLocks::parse_paykit_connection_state_response(response_json)?;
 let issued: AccessCredentialResponse =
     ViewerLocks::parse_access_credential_response(response_json)?;
 ```
 
-Those parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. The JS/WASM viewer methods reuse the same Rust parsers internally before returning lifecycle or access-credential JSON to browser callers.
+`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
 
 ## Current verification commands
 

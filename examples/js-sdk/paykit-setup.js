@@ -1,5 +1,27 @@
 export const PAYKIT_SETUP_CALLBACK_TYPE = 'paykit-setup-callback';
 
+export function decidePaykitSetupReadiness(result) {
+  if (
+    result === null
+    || typeof result !== 'object'
+    || Array.isArray(result)
+    || Object.keys(result).length !== 1
+    || typeof result.status !== 'string'
+  ) {
+    throw new Error('invalid Paykit setup status');
+  }
+  switch (result.status) {
+    case 'ready':
+      return { setupComplete: true, openSetup: false, retry: false };
+    case 'setup_required':
+      return { setupComplete: false, openSetup: true, retry: false };
+    case 'unavailable':
+      return { setupComplete: false, openSetup: false, retry: true };
+    default:
+      throw new Error('invalid Paykit setup status');
+  }
+}
+
 export function buildPaykitSetupRequest({ paykitUrl, returnTo, state }) {
   const paykit = parseHttpUrl(paykitUrl, 'Paykit URL');
   if (paykit.username || paykit.password) {

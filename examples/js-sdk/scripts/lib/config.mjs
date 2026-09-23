@@ -4,6 +4,13 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 import { demoConfigPath, writeJson, readJson } from './paths.mjs';
+import {
+  STAGING_CREATOR_ORIGIN,
+  STAGING_LOCKS_ORIGIN,
+  STAGING_PAYKIT_ORIGIN,
+  STAGING_READER_ORIGIN,
+} from './staging-config.mjs';
+import { demoAuthRelayForConfig } from '../../demo-network.js';
 
 export const defaultLockServerConfigPath = '~/.pubky-lock/config.toml';
 
@@ -45,6 +52,31 @@ export function parseLockServerTomlPublicKey(tomlText) {
   return publicKey.startsWith('pubky') ? publicKey : `pubky${publicKey}`;
 }
 
+export function parseLockServerTomlPaykitServerUrl(tomlText) {
+  const publicMatch = tomlText.match(/^[ \t]*paykit_server_url[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#[^\r\n]*)?$/m);
+  const lines = tomlText.split(/\r?\n/);
+  const paykitStart = lines.findIndex((line) => /^[ \t]*\[paykit\][ \t]*(?:#.*)?$/.test(line));
+  const remainingLines = paykitStart < 0 ? [] : lines.slice(paykitStart + 1);
+  const nextSection = remainingLines.findIndex((line) => /^[ \t]*\[/.test(line));
+  const paykitSection = remainingLines
+    .slice(0, nextSection < 0 ? remainingLines.length : nextSection)
+    .join('\n');
+  const sectionMatch = paykitSection.match(/^[ \t]*server_url[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#[^\r\n]*)?$/m);
+  const match = publicMatch ?? sectionMatch;
+  if (!match) throw new Error('missing paykit_server_url in Lock Server public config');
+  const value = match[1].trim();
+  const url = new URL(value);
+  if (
+    !['http:', 'https:'].includes(url.protocol)
+    || url.username
+    || url.password
+    || value !== url.origin
+  ) {
+    throw new Error('invalid paykit_server_url in Lock Server public config');
+  }
+  return value;
+}
+
 export async function readLockServerPublicKey(configPath = defaultLockServerConfigPath) {
   const expanded = expandHome(configPath);
   if (!existsSync(expanded)) {
@@ -54,15 +86,11 @@ export async function readLockServerPublicKey(configPath = defaultLockServerConf
 }
 
 export function pubkyAuthRelayInboxUrl(httpRelayUrl) {
-  const url = new URL(httpRelayUrl);
-  const normalizedPath = url.pathname.endsWith('/') ? url.pathname : `${url.pathname}/`;
-  if (!normalizedPath.endsWith('/inbox/')) {
-    url.pathname = `${normalizedPath}inbox/`.replace(/\/+/g, '/');
-  }
-  return url.toString();
+  return demoAuthRelayForConfig({ testnet: { httpRelay: httpRelayUrl } });
 }
 
 export function validateDemoConfig(config) {
+  if (config?.mode === 'staging') return validateStagingDemoConfig(config);
   for (const path of [
     ['demoServer', 'url'],
     ['lockServer', 'url'],
@@ -117,6 +145,20 @@ export async function readDemoConfig(path = demoConfigPath) {
   return validateDemoConfig(await readJson(path));
 }
 
+function validateStagingDemoConfig(config) {
+  if (
+    config.demoServer?.url !== STAGING_CREATOR_ORIGIN
+    || config.readerServer?.url !== STAGING_READER_ORIGIN
+    || config.lockServer?.url !== STAGING_LOCKS_ORIGIN
+    || !/^pubky[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/u.test(config.lockServer?.pubky ?? '')
+    || config.paykit?.url !== STAGING_PAYKIT_ORIGIN
+    || config.testnet !== undefined
+  ) {
+    throw new Error('invalid staging demo config');
+  }
+  return config;
+}
+
 export function withInternalServiceUrls(config, env = process.env) {
   const internal = structuredClone(config);
   if (env.LOCKS_INTERNAL_DEMO_SERVER_URL) {
@@ -140,7 +182,9 @@ export function withInternalServiceUrls(config, env = process.env) {
 export async function buildDefaultDemoConfig(lockServerConfigPath = defaultLockServerConfigPath) {
   const config = structuredClone(defaultDemoConfig);
   config.lockServer.configPath = lockServerConfigPath;
-  config.lockServer.pubky = await readLockServerPublicKey(lockServerConfigPath);
+  const publicConfig = await readFile(expandHome(lockServerConfigPath), 'utf8');
+  config.lockServer.pubky = parseLockServerTomlPublicKey(publicConfig);
+  config.paykit.url = parseLockServerTomlPaykitServerUrl(publicConfig);
   return validateDemoConfig(config);
 }
 
@@ -156,8 +200,10 @@ trusted_public_key = "${lockServerPubky}"
 
 [setup]
 allowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
+log_authorization_url = true
 
 [paykit]
+client_id = "app.paykit.server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 network = "testnet"

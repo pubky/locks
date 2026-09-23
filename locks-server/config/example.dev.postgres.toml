@@ -47,6 +47,8 @@ level = "info"
 
 [pubky]
 network = "testnet"
+resolution = "default"
+# pkarr_relays = ["http://127.0.0.1:15411"]
 
 [pkdns]
 # Public endpoint data published in the Lock Server PKARR record.
@@ -55,13 +57,20 @@ public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "localhost"
-pkarr_relays = []
 key_republisher_interval_seconds = 3600
 
 [rate_limits.verification_submission]
 enabled = true
 max_requests = 60
 window_seconds = 60
+
+[rate_limits.paykit_connection_state_lookup]
+max_requests = 60
+window_seconds = 60
+max_in_flight = 16
+max_entries = 10000
+global_requests_per_second = 50
+global_burst = 50
 
 [content_locks]
 max_resource_bytes = 10_000_000

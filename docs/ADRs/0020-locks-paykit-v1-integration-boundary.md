@@ -53,7 +53,7 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 7. create or idempotently replay the Paykit invoice; and
 8. mark the reservation ready so the verification task becomes publicly visible and worker-claimable.
 
-Exact ready replay does not call Paykit. Exact unready replay requires configured Paykit and repeats the same persisted idempotent invoice request before marking the reservation ready. Changed replay conflicts without calling Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID.
+Exact ready replay does not call Paykit. Exact unready replay requires configured Paykit and repeats the same persisted idempotent invoice request before marking the reservation ready. Changed replay conflicts without calling Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID. Live Noise observation uses the dedicated task-bound lookup below.
 
 ### Invoice request
 
@@ -70,6 +70,8 @@ For a new lifecycle identity, Locks sends RFC 8785 canonical JSON to `POST /invo
 Locks signs the exact canonical body bytes with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`.
 
 The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay must return the original generic success without repeating mutable lookups, allocation, address creation, or delivery side effects. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Locks accepts any Paykit 2xx response and ignores its body; other invoice failures return `502 paykit_invoice_creation_failed` while the internal Locks reservation remains hidden and unclaimable for exact retry.
+
+For connection observation, the Reader sends its existing `{ creator, bundle_id }` task handle to Locks `POST /paykit-connection-state-lookups`. Locks loads the persisted task, rejects non-payment tasks, then sends signed canonical `{ creator, bundle_id }` to Paykit `POST /connections/status`. Paykit resolves its persisted invoice binding and returns exactly one local state: `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. Locks rejects missing, malformed, unknown, or extra successful response fields as `502 paykit_connection_state_unavailable`. Browser callers cannot probe arbitrary peer keys or receiver paths.
 
 ### Status request and access policy
 
@@ -94,11 +96,11 @@ V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure 
 
 ### Runtime boundary
 
-- A new payment lifecycle and exact unready reconciliation require `[paykit]`; exact ready replay does not.
+- A new payment lifecycle and exact unready reconciliation require `[paykit]`; exact ready replay does not. Dedicated connection-state lookup also requires `[paykit]`.
 - Paykit HTTP connect timeout is 5 seconds and whole-request timeout is 20 seconds.
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
-- Configured Paykit base-URL path prefixes are preserved when appending endpoint paths, with or without a trailing slash.
+- Configured Paykit `server_url` is a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash; endpoint paths are appended only after validation.
 
 ## Consequences
 
