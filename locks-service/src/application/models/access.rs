@@ -70,6 +70,28 @@ pub struct FinalCredentialContext {
     pub bundle_id: BundleId,
 }
 
+/// Secret-free identity of an eligible deletion snapshot awaiting final credential issuance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalCredentialMaterialization {
+    pub creator: CreatorPubky,
+    pub bundle_id: BundleId,
+}
+
+/// Immutable final-access windows established by the storage serialization winner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalAccessWindows {
+    pub issuance_started_at: OffsetDateTime,
+    pub credential_issuance_deadline: OffsetDateTime,
+    pub read_deadline: OffsetDateTime,
+}
+
+/// Closed result of claim-fenced final-access window initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitializeFinalAccessWindowsResult {
+    Initialized(FinalAccessWindows),
+    ClaimLost,
+}
+
 /// A deletion credential returned only after its encrypted bearer is durable.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IssuedDeletionCredential {

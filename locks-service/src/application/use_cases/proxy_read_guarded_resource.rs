@@ -72,16 +72,10 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
         &self,
         request: ProxyReadGuardedResourceRequest,
     ) -> Result<ProxiedGuardedResource, ApplicationError> {
-        let now = self.clock.now();
         let lookup_key = AccessCredentialLookupKey::derive(&request.credential);
         if let Some(authorization) = self
             .credential_store
-            .prepare_deletion_read(
-                &lookup_key,
-                &request.path,
-                now,
-                now + time::Duration::seconds(30),
-            )
+            .prepare_deletion_read(&lookup_key, &request.path, time::Duration::seconds(30))
             .await?
         {
             let claim_token = authorization.claim_token;
@@ -191,12 +185,7 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
         };
         if !self
             .credential_store
-            .consume_deletion_read(
-                &claim.lookup_key,
-                &claim.path,
-                claim.claim_token,
-                self.clock.now(),
-            )
+            .consume_deletion_read(&claim.lookup_key, &claim.path, claim.claim_token)
             .await?
         {
             return Err(ApplicationError::InvalidAccessCredential);
@@ -533,8 +522,7 @@ mod tests {
             &self,
             _lookup_key: &AccessCredentialLookupKey,
             path: &str,
-            _now: OffsetDateTime,
-            _claim_expires_at: OffsetDateTime,
+            _claim_duration: time::Duration,
         ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
             Ok((path == "/priv/locks.app/content/resource.txt").then(|| {
                 DeletionReadAuthorization {
@@ -569,7 +557,6 @@ mod tests {
             _lookup_key: &AccessCredentialLookupKey,
             _path: &str,
             claim_token: Uuid,
-            _now: OffsetDateTime,
         ) -> Result<bool, ApplicationError> {
             assert_eq!(claim_token, self.claim_token);
             self.consumes.fetch_add(1, Ordering::SeqCst);

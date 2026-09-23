@@ -7,6 +7,7 @@
 //! adapters or explicit production indexes are designed.
 
 pub mod access_credentials;
+pub mod content_lock_deletion_action_ownership;
 pub mod content_lock_deletions;
 pub mod content_lock_ownership;
 pub mod creator_authority;
@@ -23,6 +24,7 @@ pub mod verification_task_claims;
 pub mod verification_tasks;
 
 pub use access_credentials::PostgresAccessCredentialStore;
+pub use content_lock_deletion_action_ownership::PostgresContentLockDeletionActionOwnership;
 pub use content_lock_deletions::PostgresContentLockDeletionRepository;
 pub use content_lock_ownership::PostgresContentLockOwnershipRepository;
 pub use creator_authority::{CreatorAuthoritySecretCipher, PostgresCreatorAuthorityStore};

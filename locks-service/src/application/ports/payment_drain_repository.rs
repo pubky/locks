@@ -33,7 +33,6 @@ pub trait PaymentDrainRepository: Send + Sync {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         summary: &PaymentDrainSummary,
     ) -> Result<bool, ApplicationError>;
 
@@ -47,7 +46,6 @@ pub trait PaymentDrainRepository: Send + Sync {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         summary: &PaymentDrainSummary,
     ) -> Result<bool, ApplicationError>;
 
@@ -61,7 +59,6 @@ pub trait PaymentDrainRepository: Send + Sync {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         task_id: &TaskId,
     ) -> Result<Option<Uuid>, ApplicationError>;
 
@@ -70,7 +67,6 @@ pub trait PaymentDrainRepository: Send + Sync {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         task_id: &TaskId,
         transition: PaymentDrainTerminalTransition,
     ) -> Result<bool, ApplicationError>;

@@ -23,6 +23,7 @@ pub enum ContentLockDeletionState {
 pub enum ContentLockDeletionFailureCode {
     TombstoneMissing,
     TombstoneReplaced,
+    ResourceReplaced,
     RetryExhausted,
     StateCorrupt,
 }
@@ -33,6 +34,7 @@ impl ContentLockDeletionFailureCode {
         match self {
             Self::TombstoneMissing => "tombstone_missing",
             Self::TombstoneReplaced => "tombstone_replaced",
+            Self::ResourceReplaced => "resource_replaced",
             Self::RetryExhausted => "retry_exhausted",
             Self::StateCorrupt => "state_corrupt",
         }
@@ -46,6 +48,7 @@ impl FromStr for ContentLockDeletionFailureCode {
         match value {
             "tombstone_missing" => Ok(Self::TombstoneMissing),
             "tombstone_replaced" => Ok(Self::TombstoneReplaced),
+            "resource_replaced" => Ok(Self::ResourceReplaced),
             "retry_exhausted" => Ok(Self::RetryExhausted),
             "state_corrupt" => Ok(Self::StateCorrupt),
             _ => Err(ApplicationError::InvalidContentLockDeletionState {
@@ -107,6 +110,28 @@ pub struct ContentLockDeletionJob {
 pub struct ClaimedContentLockDeletionJob {
     pub job: ContentLockDeletionJob,
     pub claim_token: Uuid,
+}
+
+/// Transactionally authoritative result of a requested deletion phase advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceContentLockDeletionPhaseResult {
+    /// The exact live claim advanced and the returned job reflects the committed phase.
+    Advanced(Box<ContentLockDeletionJob>),
+    /// The claim was no longer live when the repository serialized the transition.
+    ClaimLost,
+    /// The claim remains live, but healthy access obligations must drain before advancing.
+    ObligationsPending,
+    /// The claim remains live, but a closed failure requires immediate fail-closed terminalization.
+    TerminalFailure(ContentLockDeletionFailureCode),
+}
+
+impl AdvanceContentLockDeletionPhaseResult {
+    pub fn advanced(self) -> Option<ContentLockDeletionJob> {
+        match self {
+            Self::Advanced(job) => Some(*job),
+            Self::ClaimLost | Self::ObligationsPending | Self::TerminalFailure(_) => None,
+        }
+    }
 }
 
 /// Durable decision made while serializing force deletion against graceful lifecycle state.

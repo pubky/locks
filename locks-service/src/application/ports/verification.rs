@@ -30,6 +30,28 @@ pub trait VerificationTaskRepository: Send + Sync {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError>;
 
+    /// Atomically updates a prevalidated set of verification tasks.
+    ///
+    /// Repositories that support multi-record updates must either apply every update or none.
+    /// The default supports the trivially atomic single-record case only.
+    async fn update_verification_tasks_atomically(
+        &self,
+        mut tasks: Vec<VerificationTaskRecord>,
+    ) -> Result<(), ApplicationError> {
+        if tasks.len() == 1 {
+            return self
+                .update_verification_task(tasks.pop().expect("length checked"))
+                .await;
+        }
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        Err(ApplicationError::Storage {
+            message: "atomic verification task batch update is not implemented by this repository"
+                .to_owned(),
+        })
+    }
+
     /// Loads a verification task by task ID.
     ///
     /// Returns `Ok(None)` when no task exists.
@@ -70,19 +92,16 @@ pub trait VerificationTaskClaimer: Send + Sync {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<bool, ApplicationError>;
 
     /// Claims one pending or expired in-progress verification task for a worker.
     ///
     /// Returns `Ok(None)` when no task is claimable. Every successful claim includes a fresh
-    /// opaque token. The `now` parameter defines expiration comparison time, and
-    /// `claim_expires_at` is the new lease expiry assigned to the claimed task.
+    /// opaque token. Implementations sample authoritative time after fencing the selected task.
     async fn claim_next_verification_task(
         &self,
         worker_id: &str,
-        now: time::OffsetDateTime,
-        claim_expires_at: time::OffsetDateTime,
+        claim_ttl: time::Duration,
     ) -> Result<Option<ClaimedVerificationTask>, ApplicationError>;
 
     /// Returns an actively owned in-progress task to pending with a durable retry due time.
@@ -95,8 +114,7 @@ pub trait VerificationTaskClaimer: Send + Sync {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
-        next_attempt_at: time::OffsetDateTime,
+        retry_after: time::Duration,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError>;
 
     /// Persists a terminal task transition only for the exact active lease incarnation.
@@ -107,7 +125,6 @@ pub trait VerificationTaskClaimer: Send + Sync {
         task: VerificationTaskRecord,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError>;
 }
 

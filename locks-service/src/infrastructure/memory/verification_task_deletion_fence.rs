@@ -14,7 +14,7 @@ use crate::application::{
 type LockKey = (CreatorPubky, LockId);
 
 #[derive(Debug)]
-struct SystemClock;
+pub(crate) struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> OffsetDateTime {
@@ -93,6 +93,13 @@ impl InMemoryVerificationTaskDeletionFence {
     }
 
     pub(crate) fn from_tasks(tasks: &[VerificationTaskRecord]) -> Self {
+        Self::from_tasks_with_clock(tasks, Arc::new(SystemClock))
+    }
+
+    pub(crate) fn from_tasks_with_clock(
+        tasks: &[VerificationTaskRecord],
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             records: RwLock::new(
                 tasks
@@ -124,7 +131,7 @@ impl InMemoryVerificationTaskDeletionFence {
                     .collect(),
             ),
             lock_admissions: Mutex::new(HashMap::new()),
-            clock: Arc::new(SystemClock),
+            clock,
         }
     }
 }

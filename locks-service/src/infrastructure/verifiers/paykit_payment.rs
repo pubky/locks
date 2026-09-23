@@ -76,7 +76,7 @@ where
             .client
             .transaction_status(&request.creator, &request.bundle_id)
             .await
-            .map_err(|_| ApplicationError::VerificationPending)?;
+            .map_err(|_| ApplicationError::VerificationDependencyUnavailable)?;
         if !payment_status_satisfies(status, self.minimum_confirmations) {
             return Err(ApplicationError::VerificationPending);
         }
@@ -230,12 +230,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_client_errors_leave_task_pending() {
+    async fn status_client_errors_remain_distinct_from_healthy_pending() {
         let verifier = PaykitPaymentVerifier::new(FakeStatusClient::error(), 0);
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Err(ApplicationError::VerificationDependencyUnavailable)
         );
     }
 

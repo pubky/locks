@@ -19,7 +19,7 @@ const SECRET_KEYS = [
   'paykitMasterKey',
   'bitcoinRpcUser',
   'bitcoinRpcPassword',
-  'locksCreatorAuthKey',
+  'locksRuntimeMasterKey',
   'pubkyHomeserverAdminPassword',
 ];
 const TOKEN = /^[A-Za-z0-9_-]{16,128}$/;
@@ -31,25 +31,32 @@ function randomToken(bytes = 24) {
 
 export function createComposeSecrets() {
   return Object.freeze({
-    version: 1,
+    version: 2,
     locksPostgresPassword: randomToken(),
     paykitPostgresPassword: randomToken(),
     paykitMasterKey: randomToken(32),
     bitcoinRpcUser: `bitcoin_${randomToken(12)}`,
     bitcoinRpcPassword: randomToken(32),
-    locksCreatorAuthKey: randomToken(32),
+    locksRuntimeMasterKey: randomToken(32),
     pubkyHomeserverAdminPassword: randomToken(24),
   });
 }
 
 export function validateComposeSecrets(value) {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value) && value.version === 1) {
+    const error = new Error(
+      'persisted Compose secrets version 1 requires the destructive runtime-key reset documented in examples/js-sdk/README.md',
+    );
+    error.code = 'INCOMPATIBLE_COMPOSE_SECRETS_VERSION';
+    throw error;
+  }
   if (
     value === null
     || typeof value !== 'object'
     || Array.isArray(value)
     || Object.keys(value).length !== SECRET_KEYS.length
     || !SECRET_KEYS.every((key) => Object.hasOwn(value, key))
-    || value.version !== 1
+    || value.version !== 2
   ) {
     throw new Error('invalid persisted Compose secrets');
   }
@@ -64,7 +71,7 @@ export function validateComposeSecrets(value) {
       throw new Error('invalid persisted Compose secrets');
     }
   }
-  for (const key of ['paykitMasterKey', 'locksCreatorAuthKey']) {
+  for (const key of ['paykitMasterKey', 'locksRuntimeMasterKey']) {
     if (typeof value[key] !== 'string' || !MASTER_KEY.test(value[key])) {
       throw new Error('invalid persisted Compose secrets');
     }
@@ -128,6 +135,7 @@ export async function initializePaykitCompose({
   try {
     secrets = validateComposeSecrets(JSON.parse(await readPrivateText(paths.secrets)));
   } catch (error) {
+    if (error?.code === 'INCOMPATIBLE_COMPOSE_SECRETS_VERSION') throw error;
     if (error?.code !== 'ENOENT') throw new Error('persisted Compose secrets are invalid');
     secrets = createComposeSecrets();
     await writeSecure(paths.secrets, `${JSON.stringify(secrets, null, 2)}\n`);
@@ -143,7 +151,7 @@ export async function initializePaykitCompose({
 
   await Promise.all([
     writeSecure(paths.locksPostgres, `POSTGRES_DB=locks_test\nPOSTGRES_USER=locks\nPOSTGRES_PASSWORD=${secrets.locksPostgresPassword}\n`),
-    writeSecure(paths.locksServer, `PUBKY_LOCK_DATABASE_URL=postgres://locks:${secrets.locksPostgresPassword}@postgres:5432/locks_test\nPUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY=${secrets.locksCreatorAuthKey}\n`),
+    writeSecure(paths.locksServer, `PUBKY_LOCK_DATABASE_URL=postgres://locks:${secrets.locksPostgresPassword}@postgres:5432/locks_test\nPUBKY_LOCK_RUNTIME_MASTER_KEY=${secrets.locksRuntimeMasterKey}\n`),
     writeSecure(paths.paykitPostgres, `POSTGRES_DB=paykit\nPOSTGRES_USER=paykit\nPOSTGRES_PASSWORD=${secrets.paykitPostgresPassword}\n`),
     writeSecure(paths.paykitServer, `PAYKIT_DATABASE_URL=${paykitDatabaseUrl}\nPAYKIT_MASTER_KEY=${secrets.paykitMasterKey}\n`),
     writeSecure(paths.bitcoinRpc, `BITCOIN_RPC_USER=${secrets.bitcoinRpcUser}\nBITCOIN_RPC_PASSWORD=${secrets.bitcoinRpcPassword}\nRPCUSER=${secrets.bitcoinRpcUser}\nRPCPASSWORD=${secrets.bitcoinRpcPassword}\n`),

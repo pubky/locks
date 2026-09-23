@@ -12,14 +12,16 @@ use uuid::Uuid;
 use crate::application::{
     errors::ApplicationError,
     models::{
-        ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, ContentLockDeletionState, PrepareForceDeletionResult,
+        AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
+        ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+        ContentLockDeletionState, PrepareForceDeletionResult,
     },
     ports::ContentLockDeletionRepository,
 };
 use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
 
 const ROW_COLUMNS: &str = "job_id, creator, lock_id, frozen_content_lock, deletion_started_at, state, phase, attempt_count, next_attempt_at, force_requested_at, failure_code, claimed_by, claim_token, claim_expires_at";
+const CLAIMED_ROW_COLUMNS: &str = "job.job_id, job.creator, job.lock_id, job.frozen_content_lock, job.deletion_started_at, job.state, job.phase, job.attempt_count, job.next_attempt_at, job.force_requested_at, job.failure_code, job.claimed_by, job.claim_token, job.claim_expires_at";
 
 #[derive(Debug, FromRow)]
 struct DeletionJobRow {
@@ -358,29 +360,32 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
     async fn claim_next(
         &self,
         worker_id: &str,
-        now: OffsetDateTime,
-        claim_expires_at: OffsetDateTime,
+        claim_ttl: time::Duration,
     ) -> Result<Option<ClaimedContentLockDeletionJob>, ApplicationError> {
         let claim_token = Uuid::new_v4();
+        let claim_ttl_seconds = claim_ttl.as_seconds_f64();
         let sql = format!(
-            "UPDATE content_lock_deletion_jobs
+            "WITH winner AS MATERIALIZED (SELECT clock_timestamp() AS at),
+                  candidate AS MATERIALIZED (
+                    SELECT job_id FROM content_lock_deletion_jobs, winner
+                    WHERE (state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= winner.at))
+                       OR (state = 'running' AND claim_expires_at <= winner.at)
+                    ORDER BY deletion_started_at
+                    FOR UPDATE OF content_lock_deletion_jobs SKIP LOCKED LIMIT 1
+                  )
+             UPDATE content_lock_deletion_jobs AS job
              SET state = 'running', claimed_by = $1, claim_token = $2,
-                 claim_expires_at = $3, next_attempt_at = NULL,
-                 attempt_count = attempt_count + 1, updated_at = $4
-             WHERE job_id = (
-                 SELECT job_id FROM content_lock_deletion_jobs
-                 WHERE (state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= $4))
-                    OR (state = 'running' AND claim_expires_at < $4)
-                 ORDER BY deletion_started_at
-                 FOR UPDATE SKIP LOCKED LIMIT 1
-             )
-             RETURNING {ROW_COLUMNS}"
+                 claim_expires_at = winner.at + ($3 * interval '1 second'),
+                 next_attempt_at = NULL, attempt_count = attempt_count + 1,
+                 updated_at = winner.at
+             FROM candidate, winner
+             WHERE job.job_id = candidate.job_id
+             RETURNING {CLAIMED_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, DeletionJobRow>(&sql)
             .bind(worker_id)
             .bind(claim_token)
-            .bind(claim_expires_at)
-            .bind(now)
+            .bind(claim_ttl_seconds)
             .fetch_optional(&self.pool)
             .await
             .map_err(storage_error)?;
@@ -394,28 +399,62 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
-        next_attempt_at: OffsetDateTime,
+        retry_after: time::Duration,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let Some((_current, winner_time)) =
+            load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?
+        else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
         let sql = format!(
             "UPDATE content_lock_deletion_jobs
-             SET state = 'queued', next_attempt_at = $5, claimed_by = NULL,
-                 claim_token = NULL, claim_expires_at = NULL, updated_at = $4
-             WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-               AND claim_token = $3 AND claim_expires_at >= $4
-             RETURNING {ROW_COLUMNS}"
+             SET state = 'queued', next_attempt_at = $2, claimed_by = NULL,
+                 claim_token = NULL, claim_expires_at = NULL, updated_at = $3
+             WHERE job_id = $1 RETURNING {ROW_COLUMNS}"
         );
-        fetch_optional_job(
-            sqlx::query_as::<_, DeletionJobRow>(&sql)
-                .bind(job_id)
-                .bind(worker_id)
-                .bind(claim_token)
-                .bind(now)
-                .bind(next_attempt_at)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(storage_error)?,
-        )
+        let row = sqlx::query_as::<_, DeletionJobRow>(&sql)
+            .bind(job_id)
+            .bind(winner_time + retry_after)
+            .bind(winner_time)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        fetch_optional_job(Some(row))
+    }
+
+    async fn defer(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        defer_for: time::Duration,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let Some((_current, winner_time)) =
+            load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?
+        else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
+        let sql = format!(
+            "UPDATE content_lock_deletion_jobs
+             SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0),
+                 next_attempt_at = $2, claimed_by = NULL, claim_token = NULL,
+                 claim_expires_at = NULL, updated_at = $3
+             WHERE job_id = $1 RETURNING {ROW_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, DeletionJobRow>(&sql)
+            .bind(job_id)
+            .bind(winner_time + defer_for)
+            .bind(winner_time)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        fetch_optional_job(Some(row))
     }
 
     async fn advance_phase(
@@ -423,22 +462,20 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         next_phase: ContentLockDeletionPhase,
-    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+    ) -> Result<AdvanceContentLockDeletionPhaseResult, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let current =
-            load_owned_claim(&mut transaction, job_id, worker_id, claim_token, now).await?;
-        let Some(current) = current else {
+        let current = load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?;
+        let Some((current, now)) = current else {
             transaction.rollback().await.map_err(storage_error)?;
-            return Ok(None);
+            return Ok(AdvanceContentLockDeletionPhaseResult::ClaimLost);
         };
         if !current.phase.permits(next_phase) {
             return Err(ApplicationError::InvalidContentLockDeletionState {
                 message: "deletion phase must advance to its immediate successor".to_owned(),
             });
         }
-        check_access_obligations_for_phase(
+        let access_status = check_access_obligations_for_phase(
             &mut transaction,
             job_id,
             current.phase,
@@ -446,6 +483,19 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             now,
         )
         .await?;
+        match access_status {
+            AccessPhaseAdvanceStatus::Ready => {}
+            AccessPhaseAdvanceStatus::ObligationsPending => {
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending);
+            }
+            AccessPhaseAdvanceStatus::FinalCredentialIssuanceMissed => {
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(AdvanceContentLockDeletionPhaseResult::TerminalFailure(
+                    ContentLockDeletionFailureCode::StateCorrupt,
+                ));
+            }
+        }
         if current.phase == ContentLockDeletionPhase::DrainPayments
             && next_phase == ContentLockDeletionPhase::DrainExistingCredentials
         {
@@ -533,7 +583,80 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             .await
             .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
-        Ok(Some(row_to_job(updated)?))
+        Ok(AdvanceContentLockDeletionPhaseResult::Advanced(Box::new(
+            row_to_job(updated)?,
+        )))
+    }
+
+    async fn expire_unresolved_non_paykit_tasks(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let Some((current, now)) =
+            load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?
+        else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        };
+        if !matches!(
+            current.phase,
+            ContentLockDeletionPhase::StartPaymentDrain | ContentLockDeletionPhase::DrainPayments
+        ) {
+            return Err(invalid_state(
+                "non-Paykit deletion drain requires a payment drain phase",
+            ));
+        }
+        let has_paykit_or_unknown: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM content_lock_deletion_task_snapshot
+                 WHERE deletion_job_id = $1
+                   AND paykit_admission_required IS DISTINCT FROM FALSE
+             )",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if has_paykit_or_unknown {
+            return Err(invalid_state(
+                "non-Paykit deletion drain cannot process a Paykit snapshot",
+            ));
+        }
+        sqlx::query(
+            "UPDATE verification_tasks AS task
+             SET status = 'expired', completed_at = $2, failure_message = NULL,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 entitlement_publication_claim_token = NULL, next_attempt_at = NULL,
+                 last_attempt_error = NULL, updated_at = $2
+             FROM content_lock_deletion_task_snapshot AS snapshot
+             WHERE snapshot.deletion_job_id = $1
+               AND snapshot.verification_task_id = task.task_id
+               AND snapshot.paykit_admission_required = FALSE
+               AND snapshot.resolved_status IS NULL
+               AND task.status IN ('pending', 'in_progress')",
+        )
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET resolved_status = 'expired', resolved_at = $2
+             WHERE deletion_job_id = $1
+               AND paykit_admission_required = FALSE
+               AND resolved_status IS NULL",
+        )
+        .bind(job_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(true)
     }
 
     async fn finish(
@@ -541,13 +664,11 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         failure_code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let current =
-            load_owned_claim(&mut transaction, job_id, worker_id, claim_token, now).await?;
-        let Some(current) = current else {
+        let current = load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?;
+        let Some((current, now)) = current else {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
         };
@@ -662,10 +783,13 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let forced_at: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
         let publication_in_progress = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2)",
         )
@@ -757,6 +881,68 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         Ok(PrepareForceDeletionResult::Synchronous(None))
     }
 
+    async fn complete_force_deletion(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let key = sqlx::query_as::<_, (String, String)>(
+            "SELECT creator, lock_id FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some((creator, lock_id)) = key else {
+            return Ok(false);
+        };
+        let creator = CreatorPubky::from_str(&creator).map_err(storage_display)?;
+        let lock_id = LockId::from_str(&lock_id).map_err(storage_display)?;
+
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, &creator, &lock_id).await?;
+        let current = load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?;
+        let Some((current, _now)) = current else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        };
+        let Some(forced_at) = current.force_requested_at else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        };
+
+        sqlx::query(
+            "INSERT INTO content_lock_force_deletion_receipts (creator, lock_id, forced_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(current.creator.to_string())
+        .bind(current.lock_id.to_string())
+        .bind(forced_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE verification_tasks SET deletion_job_id = NULL WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let deleted = sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if deleted.rows_affected() != 1 {
+            return Err(invalid_state(
+                "force completion lost its locked deletion job",
+            ));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(true)
+    }
+
     async fn has_force_receipt(
         &self,
         creator: &CreatorPubky,
@@ -774,13 +960,20 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessPhaseAdvanceStatus {
+    Ready,
+    ObligationsPending,
+    FinalCredentialIssuanceMissed,
+}
+
 async fn check_access_obligations_for_phase(
     transaction: &mut Transaction<'_, Postgres>,
     job_id: Uuid,
     current_phase: ContentLockDeletionPhase,
     next_phase: ContentLockDeletionPhase,
     now: OffsetDateTime,
-) -> Result<(), ApplicationError> {
+) -> Result<AccessPhaseAdvanceStatus, ApplicationError> {
     if current_phase == ContentLockDeletionPhase::DrainExistingCredentials
         && next_phase == ContentLockDeletionPhase::IssueFinalCredentials
     {
@@ -797,9 +990,7 @@ async fn check_access_obligations_for_phase(
         .await
         .map_err(storage_error)?;
         if ordinary_active {
-            return Err(invalid_state(
-                "existing credentials must reach their original expiry before final issuance",
-            ));
+            return Ok(AccessPhaseAdvanceStatus::ObligationsPending);
         }
     }
 
@@ -819,25 +1010,43 @@ async fn check_access_obligations_for_phase(
         .await
         .map_err(storage_error)?;
         if has_unissued_eligible {
-            return Err(invalid_state(
-                "every eligible final credential must be durably issued before final-read draining",
-            ));
+            let issuance_deadline: Option<OffsetDateTime> = sqlx::query_scalar(
+                "SELECT final_credential_issuance_deadline
+                 FROM content_lock_deletion_jobs WHERE job_id = $1",
+            )
+            .bind(job_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            return Ok(
+                if issuance_deadline.is_some_and(|deadline| now >= deadline) {
+                    AccessPhaseAdvanceStatus::FinalCredentialIssuanceMissed
+                } else {
+                    AccessPhaseAdvanceStatus::ObligationsPending
+                },
+            );
         }
     }
 
     if current_phase == ContentLockDeletionPhase::DrainFinalReads
         && next_phase == ContentLockDeletionPhase::DeleteContent
     {
-        ensure_no_live_access_obligations(transaction, job_id, now).await?;
+        return Ok(
+            if has_live_access_obligations(transaction, job_id, now).await? {
+                AccessPhaseAdvanceStatus::ObligationsPending
+            } else {
+                AccessPhaseAdvanceStatus::Ready
+            },
+        );
     }
-    Ok(())
+    Ok(AccessPhaseAdvanceStatus::Ready)
 }
 
-async fn ensure_no_live_access_obligations(
+async fn has_live_access_obligations(
     transaction: &mut Transaction<'_, Postgres>,
     job_id: Uuid,
     now: OffsetDateTime,
-) -> Result<(), ApplicationError> {
+) -> Result<bool, ApplicationError> {
     sqlx::query(
         "UPDATE content_lock_access_drain_reads AS read
          SET claim_token = NULL, claim_expires_at = NULL
@@ -884,7 +1093,15 @@ async fn ensure_no_live_access_obligations(
     .fetch_one(&mut **transaction)
     .await
     .map_err(storage_error)?;
-    if has_live_obligation {
+    Ok(has_live_obligation)
+}
+
+async fn ensure_no_live_access_obligations(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), ApplicationError> {
+    if has_live_access_obligations(transaction, job_id, now).await? {
         return Err(invalid_state(
             "credential expiry and final-read obligations must drain before destructive deletion",
         ));
@@ -929,9 +1146,21 @@ async fn ensure_payment_drain_completed(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(storage_error)?;
-    if !aggregate
-        .is_some_and(|(status, accepted_count)| status == "completed" && accepted_count == 0)
-    {
+    let completed = aggregate
+        .as_ref()
+        .is_some_and(|(status, accepted_count)| status == "completed" && *accepted_count == 0);
+    let has_paykit_snapshot: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1
+               AND paykit_admission_required IS DISTINCT FROM FALSE
+         )",
+    )
+    .bind(job_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if !completed && (aggregate.is_some() || has_paykit_snapshot) {
         return Err(invalid_state(
             "payment drain aggregate must be durably completed before credential draining",
         ));
@@ -989,23 +1218,33 @@ async fn load_owned_claim(
     job_id: Uuid,
     worker_id: &str,
     claim_token: Uuid,
-    now: OffsetDateTime,
-) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+) -> Result<Option<(ContentLockDeletionJob, OffsetDateTime)>, ApplicationError> {
     let sql = format!(
         "SELECT {ROW_COLUMNS} FROM content_lock_deletion_jobs
          WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-           AND claim_token = $3 AND claim_expires_at >= $4 FOR UPDATE"
+           AND claim_token = $3 FOR UPDATE"
     );
-    sqlx::query_as::<_, DeletionJobRow>(&sql)
+    let row = sqlx::query_as::<_, DeletionJobRow>(&sql)
         .bind(job_id)
         .bind(worker_id)
         .bind(claim_token)
-        .bind(now)
         .fetch_optional(&mut **transaction)
         .await
-        .map_err(storage_error)?
-        .map(row_to_job)
-        .transpose()
+        .map_err(storage_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let winner_time: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    if row
+        .claim_expires_at
+        .is_none_or(|claim_expires_at| winner_time >= claim_expires_at)
+    {
+        return Ok(None);
+    }
+    Ok(Some((row_to_job(row)?, winner_time)))
 }
 
 fn fetch_optional_job(
@@ -1125,7 +1364,14 @@ fn storage_display(error: impl std::fmt::Display) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, str::FromStr, sync::Mutex};
+    use std::{
+        collections::BTreeMap,
+        str::FromStr,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use locks_core::{
@@ -1147,29 +1393,389 @@ mod tests {
             errors::ApplicationError,
             models::{
                 AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
-                ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-                ContentLockDeletionState, PrepareForceDeletionResult, VerificationTaskRecord,
-                VerificationTaskStatus,
+                AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
+                ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
+                InitializeFinalAccessWindowsResult, PrepareForceDeletionResult,
+                VerificationTaskRecord, VerificationTaskStatus,
             },
             ports::{
-                AccessCredentialStore, Clock, ContentLockDeletionRepository, EntitlementRepository,
-                PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError,
-                PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
-                PaymentDrainTerminalTransition, PaymentRequestState, PaymentRequestStatus,
-                PaymentState, VerificationTaskClaimer, VerificationTaskRepository,
+                AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
+                ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
+                ContentLockDeletionRepository, EntitlementRepository, PaymentDrainCleanupToken,
+                PaymentDrainClient, PaymentDrainClientError, PaymentDrainRepository,
+                PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+                PaymentRequestState, PaymentRequestStatus, PaymentState, VerificationTaskClaimer,
+                VerificationTaskRepository,
             },
             use_cases::drain_lock_payments::DrainLockPaymentsUseCase,
         },
         infrastructure::memory::entitlements::InMemoryEntitlementRepository,
         infrastructure::postgres::{
-            PostgresAccessCredentialStore, PostgresPaymentDrainRepository,
-            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
-            testing::TestDatabase,
+            PostgresAccessCredentialStore, PostgresContentLockDeletionActionOwnership,
+            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
+            PostgresVerificationTaskRepository, testing::TestDatabase,
         },
     };
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const NOW: time::OffsetDateTime = datetime!(2026-08-12 05:00:00 UTC);
+
+    #[tokio::test]
+    async fn healthy_defer_restores_the_postgres_attempt_budget_and_fences_stale_tokens() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+
+        let first = repository
+            .claim_next("worker", (NOW + time::Duration::minutes(5)) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.attempt_count, 1);
+        assert!(
+            repository
+                .defer(
+                    job.job_id,
+                    "worker",
+                    Uuid::new_v4(),
+                    (NOW + time::Duration::minutes(1)) - (NOW),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let deferred = repository
+            .defer(
+                job.job_id,
+                "worker",
+                first.claim_token,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.attempt_count, 0);
+        let (first_due, first_updated_at): (time::OffsetDateTime, time::OffsetDateTime) =
+            sqlx::query_as(
+                "SELECT next_attempt_at, updated_at
+                 FROM content_lock_deletion_jobs WHERE job_id = $1",
+            )
+            .bind(job.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(deferred.next_attempt_at, Some(first_due));
+        assert_eq!(first_due - first_updated_at, time::Duration::minutes(1));
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET next_attempt_at = clock_timestamp()
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let second = repository
+            .claim_next("worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.job.attempt_count, 1);
+        let deferred = repository
+            .defer(
+                job.job_id,
+                "worker",
+                second.claim_token,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.attempt_count, 0);
+        let (second_due, second_updated_at): (time::OffsetDateTime, time::OffsetDateTime) =
+            sqlx::query_as(
+                "SELECT next_attempt_at, updated_at
+                 FROM content_lock_deletion_jobs WHERE job_id = $1",
+            )
+            .bind(job.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(deferred.next_attempt_at, Some(second_due));
+        assert_eq!(second_due - second_updated_at, time::Duration::minutes(1));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn active_force_completion_persists_original_receipt_and_removes_operational_job() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([99; 16]));
+        PostgresVerificationTaskRepository::new(database.pool().clone())
+            .insert_verification_task(task.clone())
+            .await
+            .unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let revoked = repository
+            .claim_next("worker-old", (NOW + time::Duration::minutes(1)) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        let forced_at = match repository
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+        {
+            PrepareForceDeletionResult::Active(job) => job.force_requested_at.unwrap(),
+            result => panic!("expected active force deletion, got {result:?}"),
+        };
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&job.creator, &job.lock_id,)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Active(_)
+        ));
+        assert!(
+            !repository
+                .complete_force_deletion(job.job_id, "worker-old", revoked.claim_token)
+                .await
+                .unwrap()
+        );
+
+        let live = repository
+            .claim_next("worker-live", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !repository
+                .complete_force_deletion(job.job_id, "worker-live", Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .complete_force_deletion(job.job_id, "worker-live", live.claim_token)
+                .await
+                .unwrap()
+        );
+
+        let receipt: (String, String, time::OffsetDateTime) = sqlx::query_as(
+            "SELECT creator, lock_id, forced_at
+             FROM content_lock_force_deletion_receipts",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt.0, job.creator.to_string());
+        assert_eq!(receipt.1, job.lock_id.to_string());
+        assert_eq!(receipt.2, forced_at);
+        assert!(
+            repository
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retained_task_job: Option<Uuid> =
+            sqlx::query_scalar("SELECT deletion_job_id FROM verification_tasks WHERE task_id = $1")
+                .bind(task.task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained_task_job, None);
+        let snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_lock_deletion_task_snapshot WHERE deletion_job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(snapshot_count, 0);
+        assert!(
+            !repository
+                .complete_force_deletion(job.job_id, "worker-live", live.claim_token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository
+                .begin_publication(&job.creator, &job.lock_id, Uuid::new_v4())
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn expired_or_unforced_postgres_claim_cannot_finalize_force_deletion() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let unforced = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(unforced.clone()).await.unwrap();
+        let claim = repository
+            .claim_next("worker", (NOW + time::Duration::minutes(1)) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !repository
+                .complete_force_deletion(unforced.job_id, "worker", claim.claim_token)
+                .await
+                .unwrap()
+        );
+        repository
+            .prepare_force_deletion(&unforced.creator, &unforced.lock_id)
+            .await
+            .unwrap();
+        let expiring = repository
+            .claim_next("worker", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp()
+             WHERE job_id = $1 AND claim_token = $2",
+        )
+        .bind(unforced.job_id)
+        .bind(expiring.claim_token)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            !repository
+                .complete_force_deletion(unforced.job_id, "worker", expiring.claim_token,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .get_job(&unforced.creator, &unforced.lock_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !repository
+                .has_force_receipt(&unforced.creator, &unforced.lock_id)
+                .await
+                .unwrap()
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_action_ownership_validates_exact_live_claim_after_locking() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let first_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let second_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job).await.unwrap();
+        let claimed = repository
+            .claim_next("worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = || ContentLockDeletionActionClaim {
+            job_id: claimed.job.job_id,
+            worker_id: "worker",
+            claim_token: claimed.claim_token,
+            expected_phase: claimed.job.phase,
+            force: false,
+        };
+
+        let ContentLockDeletionActionAcquireResult::Acquired(first) =
+            first_owner.try_acquire(request()).await.unwrap()
+        else {
+            panic!("live claim must acquire")
+        };
+        assert!(matches!(
+            second_owner.try_acquire(request()).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::Busy
+        ));
+
+        first.release().await.unwrap();
+        let ContentLockDeletionActionAcquireResult::Acquired(reacquired) =
+            second_owner.try_acquire(request()).await.unwrap()
+        else {
+            panic!("released live claim must reacquire")
+        };
+        reacquired.release().await.unwrap();
+
+        let stale = ContentLockDeletionActionClaim {
+            worker_id: "other-worker",
+            ..request()
+        };
+        assert!(matches!(
+            second_owner.try_acquire(stale).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+        let wrong_phase = ContentLockDeletionActionClaim {
+            expected_phase: ContentLockDeletionPhase::DrainPayments,
+            ..request()
+        };
+        assert!(matches!(
+            second_owner.try_acquire(wrong_phase).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+        let wrong_mode = ContentLockDeletionActionClaim {
+            force: true,
+            ..request()
+        };
+        assert!(matches!(
+            second_owner.try_acquire(wrong_mode).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_action_ownership_rejects_lease_expiry_equality_and_releases_session_lock() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let ownership = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job).await.unwrap();
+        let claimed = repository
+            .claim_next("worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE content_lock_deletion_jobs SET claim_expires_at = clock_timestamp() WHERE job_id = $1")
+            .bind(claimed.job.job_id)
+            .execute(database.pool()).await.unwrap();
+        let request = ContentLockDeletionActionClaim {
+            job_id: claimed.job.job_id,
+            worker_id: "worker",
+            claim_token: claimed.claim_token,
+            expected_phase: claimed.job.phase,
+            force: false,
+        };
+        assert!(matches!(
+            ownership.try_acquire(request).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+
+        let value: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+
+        database.cleanup().await;
+    }
 
     #[tokio::test]
     async fn admission_cutoff_timestamp_is_established_after_the_canonical_fence() {
@@ -1369,12 +1975,7 @@ mod tests {
                 .unwrap()
         );
         let authorization = credentials
-            .prepare_deletion_read(
-                &lookup_key,
-                &guarded_path,
-                NOW,
-                NOW + time::Duration::seconds(30),
-            )
+            .prepare_deletion_read(&lookup_key, &guarded_path, time::Duration::seconds(30))
             .await
             .unwrap()
             .unwrap();
@@ -1385,8 +1986,7 @@ mod tests {
                 .prepare_deletion_read(
                     &lookup_key,
                     "/priv/locks.app/content/not-frozen.json",
-                    NOW,
-                    NOW + time::Duration::seconds(30),
+                    time::Duration::seconds(30),
                 )
                 .await
                 .unwrap()
@@ -1512,7 +2112,7 @@ mod tests {
 
             let (graceful, force) = tokio::join!(
                 repository.insert_job(job.clone()),
-                repository.prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                repository.prepare_force_deletion(&job.creator, &job.lock_id)
             );
             let persisted_job = repository
                 .get_job(&job.creator, &job.lock_id)
@@ -1558,7 +2158,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             repository
-                .prepare_force_deletion(&lock.creator, &lock_id, NOW)
+                .prepare_force_deletion(&lock.creator, &lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -1577,7 +2177,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .prepare_force_deletion(&lock.creator, &lock_id, NOW)
+                .prepare_force_deletion(&lock.creator, &lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(None)
@@ -1671,7 +2271,7 @@ mod tests {
             .await
             .unwrap();
         let claim = repository
-            .claim_next("worker", NOW, NOW + time::Duration::seconds(60))
+            .claim_next("worker", (NOW + time::Duration::seconds(60)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -1681,7 +2281,6 @@ mod tests {
                 claim.job.job_id,
                 "worker",
                 claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await;
@@ -1719,12 +2318,12 @@ mod tests {
                 claim.job.job_id,
                 "worker",
                 claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         assert_eq!(advanced.phase, ContentLockDeletionPhase::StartPaymentDrain);
 
         database.cleanup().await;
@@ -1757,7 +2356,7 @@ mod tests {
             .await
             .unwrap();
         let claim = repository
-            .claim_next("worker", NOW, NOW + time::Duration::seconds(60))
+            .claim_next("worker", (NOW + time::Duration::seconds(60)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -1767,7 +2366,6 @@ mod tests {
                 claim.job.job_id,
                 "worker",
                 claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await;
@@ -1842,23 +2440,29 @@ mod tests {
         assert!(reopened.insert_job(distinct_job).await.is_err());
 
         let first = reopened
-            .claim_next("worker-a", NOW, datetime!(2026-08-12 05:05:00 UTC))
+            .claim_next("worker-a", (datetime!(2026-08-12 05:05:00 UTC)) - (NOW))
             .await
             .unwrap()
             .unwrap();
         assert!(
             reopened
-                .claim_next("worker-b", NOW, datetime!(2026-08-12 05:05:00 UTC),)
+                .claim_next("worker-b", (datetime!(2026-08-12 05:05:00 UTC)) - (NOW))
                 .await
                 .unwrap()
                 .is_none()
         );
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp()
+             WHERE job_id = $1 AND claim_token = $2",
+        )
+        .bind(job.job_id)
+        .bind(first.claim_token)
+        .execute(database.pool())
+        .await
+        .unwrap();
         let reclaimed = reopened
-            .claim_next(
-                "worker-b",
-                datetime!(2026-08-12 05:05:01 UTC),
-                datetime!(2026-08-12 05:10:00 UTC),
-            )
+            .claim_next("worker-b", time::Duration::minutes(5))
             .await
             .unwrap()
             .unwrap();
@@ -1869,25 +2473,23 @@ mod tests {
                     job.job_id,
                     "worker-a",
                     first.claim_token,
-                    datetime!(2026-08-12 05:05:01 UTC),
-                    datetime!(2026-08-12 05:06:00 UTC),
+                    (datetime!(2026-08-12 05:06:00 UTC)) - (datetime!(2026-08-12 05:05:01 UTC)),
                 )
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(
+        assert_eq!(
             reopened
                 .advance_phase(
                     job.job_id,
                     "worker-a",
                     first.claim_token,
-                    datetime!(2026-08-12 05:05:01 UTC),
                     ContentLockDeletionPhase::StartPaymentDrain,
                 )
                 .await
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            AdvanceContentLockDeletionPhaseResult::ClaimLost
         );
         assert!(
             reopened
@@ -1895,7 +2497,6 @@ mod tests {
                     job.job_id,
                     "worker-a",
                     first.claim_token,
-                    datetime!(2026-08-12 05:05:01 UTC),
                     Some(ContentLockDeletionFailureCode::StateCorrupt),
                 )
                 .await
@@ -1908,20 +2509,19 @@ mod tests {
                 job.job_id,
                 "worker-b",
                 reclaimed.claim_token,
-                datetime!(2026-08-12 05:06:00 UTC),
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         assert_eq!(advanced.state, ContentLockDeletionState::Queued);
         assert_eq!(advanced.attempt_count, 0);
 
         let final_claim = reopened
             .claim_next(
                 "worker-c",
-                datetime!(2026-08-12 05:06:01 UTC),
-                datetime!(2026-08-12 05:11:00 UTC),
+                (datetime!(2026-08-12 05:11:00 UTC)) - (datetime!(2026-08-12 05:06:01 UTC)),
             )
             .await
             .unwrap()
@@ -1931,7 +2531,6 @@ mod tests {
                 job.job_id,
                 "worker-c",
                 final_claim.claim_token,
-                datetime!(2026-08-12 05:07:00 UTC),
                 Some(ContentLockDeletionFailureCode::TombstoneMissing),
             )
             .await
@@ -1945,14 +2544,14 @@ mod tests {
 
         assert!(matches!(
             reopened
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(Some(_))
         ));
         assert!(matches!(
             reopened
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(None)
@@ -1988,8 +2587,8 @@ mod tests {
         repository.insert_job(job).await.unwrap();
 
         let (left, right) = tokio::join!(
-            repository.claim_next("worker-a", NOW, datetime!(2026-08-12 05:05:00 UTC)),
-            repository.claim_next("worker-b", NOW, datetime!(2026-08-12 05:05:00 UTC)),
+            repository.claim_next("worker-a", (datetime!(2026-08-12 05:05:00 UTC)) - (NOW)),
+            repository.claim_next("worker-b", (datetime!(2026-08-12 05:05:00 UTC)) - (NOW)),
         );
         assert_eq!(
             usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()),
@@ -2006,13 +2605,16 @@ mod tests {
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
         repository.insert_job(job.clone()).await.unwrap();
         let claimed = repository
-            .claim_next("graceful-worker", NOW, NOW + time::Duration::minutes(1))
+            .claim_next(
+                "graceful-worker",
+                (NOW + time::Duration::minutes(1)) - (NOW),
+            )
             .await
             .unwrap()
             .unwrap();
 
         let escalated = repository
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id)
             .await
             .unwrap();
         let PrepareForceDeletionResult::Active(escalated) = escalated else {
@@ -2027,8 +2629,7 @@ mod tests {
                     job.job_id,
                     "graceful-worker",
                     claimed.claim_token,
-                    NOW,
-                    NOW + time::Duration::seconds(1),
+                    (NOW + time::Duration::seconds(1)) - (NOW),
                 )
                 .await
                 .unwrap(),
@@ -2040,29 +2641,22 @@ mod tests {
                     job.job_id,
                     "graceful-worker",
                     claimed.claim_token,
-                    NOW,
                     ContentLockDeletionPhase::StartPaymentDrain,
                 )
                 .await
                 .unwrap(),
-            None
+            AdvanceContentLockDeletionPhaseResult::ClaimLost
         );
         assert_eq!(
             repository
-                .finish(
-                    job.job_id,
-                    "graceful-worker",
-                    claimed.claim_token,
-                    NOW,
-                    None,
-                )
+                .finish(job.job_id, "graceful-worker", claimed.claim_token, None,)
                 .await
                 .unwrap(),
             None
         );
 
         let force_claim = repository
-            .claim_next("force-worker", NOW, NOW + time::Duration::minutes(1))
+            .claim_next("force-worker", (NOW + time::Duration::minutes(1)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2095,7 +2689,7 @@ mod tests {
         admissions.mark_ready(&task, window).await.unwrap();
 
         let ordinary_claim = ordinary
-            .claim_next_verification_task("ordinary", NOW, NOW + time::Duration::minutes(5))
+            .claim_next_verification_task("ordinary", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2108,7 +2702,6 @@ mod tests {
                     &ordinary_claim.task.task_id,
                     "ordinary",
                     &ordinary_claim.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -2125,7 +2718,6 @@ mod tests {
                     ordinary_completed,
                     "ordinary",
                     &ordinary_claim.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -2133,7 +2725,7 @@ mod tests {
         );
 
         let withdraw_claim = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2142,14 +2734,14 @@ mod tests {
                 job.job_id,
                 "deletion",
                 withdraw_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         let start_claim = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2164,25 +2756,13 @@ mod tests {
         };
         assert!(
             drains
-                .store_payment_drain(
-                    job.job_id,
-                    "deletion",
-                    start_claim.claim_token,
-                    NOW,
-                    &summary,
-                )
+                .store_payment_drain(job.job_id, "deletion", start_claim.claim_token, &summary,)
                 .await
                 .unwrap()
         );
         assert!(
             drains
-                .store_payment_drain(
-                    job.job_id,
-                    "deletion",
-                    start_claim.claim_token,
-                    NOW,
-                    &summary,
-                )
+                .store_payment_drain(job.job_id, "deletion", start_claim.claim_token, &summary,)
                 .await
                 .unwrap()
         );
@@ -2192,13 +2772,7 @@ mod tests {
         };
         assert!(
             drains
-                .store_payment_drain(
-                    job.job_id,
-                    "deletion",
-                    start_claim.claim_token,
-                    NOW,
-                    &divergent,
-                )
+                .store_payment_drain(job.job_id, "deletion", start_claim.claim_token, &divergent,)
                 .await
                 .is_err()
         );
@@ -2218,14 +2792,14 @@ mod tests {
                 job.job_id,
                 "deletion",
                 start_claim.claim_token,
-                NOW,
                 ContentLockDeletionPhase::DrainPayments,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         let drain_claim = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2234,7 +2808,6 @@ mod tests {
                 job.job_id,
                 "deletion",
                 drain_claim.claim_token,
-                NOW,
                 &task.task_id,
             )
             .await
@@ -2246,7 +2819,6 @@ mod tests {
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW,
                     &task.task_id,
                 )
                 .await
@@ -2255,7 +2827,7 @@ mod tests {
         );
         assert_eq!(
             deletions
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -2266,7 +2838,6 @@ mod tests {
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW,
                     &task.task_id,
                     PaymentDrainTerminalTransition {
                         status: VerificationTaskStatus::Completed,
@@ -2282,7 +2853,6 @@ mod tests {
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW,
                     &task.task_id,
                     PaymentDrainTerminalTransition {
                         status: VerificationTaskStatus::Completed,
@@ -2303,15 +2873,30 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .unwrap();
-        assert_eq!(final_credential_eligible_at, Some(NOW));
-        let issuance_deadline = NOW + time::Duration::minutes(15);
+        let resolved_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
+            "SELECT resolved_at FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1 AND verification_task_id = $2",
+        )
+        .bind(job.job_id)
+        .bind(task.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(final_credential_eligible_at, resolved_at);
+        let final_access_started_at: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let issuance_deadline = final_access_started_at + time::Duration::minutes(15);
         let read_deadline = issuance_deadline + time::Duration::minutes(15);
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
-             SET phase = 'issue_final_credentials'
+             SET phase = 'issue_final_credentials', claim_expires_at = $2
              WHERE job_id = $1",
         )
         .bind(job.job_id)
+        .bind(read_deadline + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -2319,31 +2904,32 @@ mod tests {
             database.pool().clone(),
             crate::infrastructure::final_credentials::FinalCredentialCipher::new([8; 32]),
         );
-        assert!(
+        let initialized = access
+            .initialize_final_access_windows(
+                job.job_id,
+                "deletion",
+                drain_claim.claim_token,
+                time::Duration::minutes(15),
+                time::Duration::minutes(15),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            initialized,
+            InitializeFinalAccessWindowsResult::Initialized(_)
+        ));
+        assert_eq!(
             access
                 .initialize_final_access_windows(
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW,
-                    issuance_deadline,
-                    read_deadline,
+                    time::Duration::hours(1),
+                    time::Duration::hours(1),
                 )
                 .await
-                .unwrap()
-        );
-        assert!(
-            access
-                .initialize_final_access_windows(
-                    job.job_id,
-                    "deletion",
-                    drain_claim.claim_token,
-                    NOW + time::Duration::seconds(1),
-                    issuance_deadline + time::Duration::hours(1),
-                    read_deadline + time::Duration::hours(1),
-                )
-                .await
-                .unwrap()
+                .unwrap(),
+            initialized
         );
         let persisted_windows: (
             Option<time::OffsetDateTime>,
@@ -2359,15 +2945,22 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .unwrap();
+        let InitializeFinalAccessWindowsResult::Initialized(windows) = initialized else {
+            unreachable!()
+        };
         assert_eq!(
             persisted_windows,
-            (Some(NOW), Some(issuance_deadline), Some(read_deadline))
+            (
+                Some(windows.issuance_started_at),
+                Some(windows.credential_issuance_deadline),
+                Some(windows.read_deadline),
+            )
         );
         let first = access
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("first-final-bearer"),
             )
             .await
@@ -2377,15 +2970,15 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW + time::Duration::seconds(1),
+                final_access_started_at + time::Duration::seconds(1),
                 AccessCredential::new("different-retry-candidate"),
             )
             .await
             .unwrap()
             .unwrap();
         assert_eq!(first.credential, replay.credential);
-        assert_eq!(first.expires_at, read_deadline);
-        assert_eq!(replay.expires_at, read_deadline);
+        assert_eq!(first.expires_at, windows.read_deadline);
+        assert_eq!(replay.expires_at, windows.read_deadline);
         let late_replay = access
             .issue_or_replay_final_credential(
                 &job.creator,
@@ -2430,18 +3023,8 @@ mod tests {
         let final_lookup = AccessCredentialLookupKey::derive(&first.credential);
         let guarded_path = "/priv/locks.app/content/post.json";
         let (first_attempt, second_attempt) = tokio::join!(
-            access.prepare_deletion_read(
-                &final_lookup,
-                guarded_path,
-                NOW,
-                NOW + time::Duration::seconds(30),
-            ),
-            access.prepare_deletion_read(
-                &final_lookup,
-                guarded_path,
-                NOW,
-                NOW + time::Duration::seconds(30),
-            ),
+            access.prepare_deletion_read(&final_lookup, guarded_path, time::Duration::seconds(30),),
+            access.prepare_deletion_read(&final_lookup, guarded_path, time::Duration::seconds(30),),
         );
         let first_attempt = first_attempt.unwrap();
         let second_attempt = second_attempt.unwrap();
@@ -2454,12 +3037,7 @@ mod tests {
         assert_eq!(first_claim.resource.path, guarded_path);
         assert!(
             access
-                .prepare_deletion_read(
-                    &final_lookup,
-                    guarded_path,
-                    NOW + time::Duration::seconds(1),
-                    NOW + time::Duration::seconds(31),
-                )
+                .prepare_deletion_read(&final_lookup, guarded_path, time::Duration::seconds(30),)
                 .await
                 .unwrap()
                 .is_none()
@@ -2470,7 +3048,7 @@ mod tests {
                     &final_lookup,
                     guarded_path,
                     Uuid::new_v4(),
-                    NOW + time::Duration::seconds(1),
+                    final_access_started_at + time::Duration::seconds(1),
                 )
                 .await
                 .unwrap()
@@ -2481,18 +3059,13 @@ mod tests {
                     &final_lookup,
                     guarded_path,
                     first_token,
-                    NOW + time::Duration::seconds(1),
+                    final_access_started_at + time::Duration::seconds(1),
                 )
                 .await
                 .unwrap()
         );
         let second_claim = access
-            .prepare_deletion_read(
-                &final_lookup,
-                guarded_path,
-                NOW + time::Duration::seconds(2),
-                NOW + time::Duration::seconds(32),
-            )
+            .prepare_deletion_read(&final_lookup, guarded_path, time::Duration::seconds(30))
             .await
             .unwrap()
             .unwrap();
@@ -2500,34 +3073,19 @@ mod tests {
         assert_ne!(second_token, first_token);
         assert!(
             !access
-                .consume_deletion_read(
-                    &final_lookup,
-                    guarded_path,
-                    first_token,
-                    NOW + time::Duration::seconds(3),
-                )
+                .consume_deletion_read(&final_lookup, guarded_path, first_token,)
                 .await
                 .unwrap()
         );
         assert!(
             access
-                .consume_deletion_read(
-                    &final_lookup,
-                    guarded_path,
-                    second_token,
-                    NOW + time::Duration::seconds(3),
-                )
+                .consume_deletion_read(&final_lookup, guarded_path, second_token,)
                 .await
                 .unwrap()
         );
         assert!(
             access
-                .prepare_deletion_read(
-                    &final_lookup,
-                    guarded_path,
-                    NOW + time::Duration::seconds(4),
-                    NOW + time::Duration::seconds(34),
-                )
+                .prepare_deletion_read(&final_lookup, guarded_path, time::Duration::seconds(30),)
                 .await
                 .unwrap()
                 .is_none()
@@ -2560,7 +3118,7 @@ mod tests {
         let task = verification_task(&lock, BundleId::from_bytes([11; 16]));
         tasks.insert_verification_task(task).await.unwrap();
         let claim = ordinary
-            .claim_next_verification_task("ordinary", NOW, NOW + time::Duration::minutes(5))
+            .claim_next_verification_task("ordinary", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2570,7 +3128,6 @@ mod tests {
                     &claim.task.task_id,
                     "ordinary",
                     &claim.claim_token,
-                    NOW,
                 )
                 .await
                 .unwrap()
@@ -2590,6 +3147,147 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn payment_drain_reclaim_reconciles_external_start_before_local_persistence() {
+        use crate::infrastructure::postgres::{
+            PaykitInvoiceWindow, PostgresPaykitTaskAdmissionRepository,
+        };
+
+        let database = TestDatabase::create().await;
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let drains = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
+        let entitlements = InMemoryEntitlementRepository::new();
+        let lock = content_lock();
+        let mut task = verification_task(&lock, BundleId::from_bytes([11; 16]));
+        task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+        admissions.reserve(task.clone(), 24).await.unwrap();
+        admissions
+            .mark_ready(
+                &task,
+                PaykitInvoiceWindow {
+                    invoice_created_at: NOW,
+                    payment_deadline: NOW + time::Duration::hours(24),
+                },
+            )
+            .await
+            .unwrap();
+
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        let withdraw = deletions
+            .claim_next("worker-a", (NOW + time::Duration::minutes(5)) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+        deletions
+            .advance_phase(
+                job.job_id,
+                "worker-a",
+                withdraw.claim_token,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .advanced()
+            .expect("live claim should advance phase");
+        let reclaimed = deletions
+            .claim_next("worker-b", (NOW + time::Duration::minutes(5)) - (NOW))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let summary = PaymentDrainSummary {
+            status: PaymentDrainStatus::Active,
+            accepted_count: 1,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            cleanup_token: PaymentDrainCleanupToken::parse(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            )
+            .unwrap(),
+        };
+        let paykit = ReclaimingPaymentDrainClient {
+            summary,
+            start_calls: AtomicUsize::new(0),
+        };
+        let lock_resource = PubkyLockResource::new(
+            job.creator.clone(),
+            locks_core::ids::ContentLockPath::from_lock_id(job.lock_id.clone()),
+        );
+        paykit.start_payment_drain(&lock_resource).await.unwrap();
+
+        let use_case = DrainLockPaymentsUseCase::new(
+            &deletions,
+            &drains,
+            &paykit,
+            &entitlements,
+            &FixedClock(NOW),
+            LockServerPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+                .unwrap(),
+            6,
+        );
+        assert!(
+            use_case
+                .execute_claimed(reclaimed, "worker-b")
+                .await
+                .unwrap()
+        );
+        assert_eq!(paykit.start_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            drains
+                .get_payment_drain(job.job_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            deletions
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            ContentLockDeletionPhase::DrainPayments
+        );
+
+        database.cleanup().await;
+    }
+
+    struct ReclaimingPaymentDrainClient {
+        summary: PaymentDrainSummary,
+        start_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PaymentDrainClient for ReclaimingPaymentDrainClient {
+        async fn start_payment_drain(
+            &self,
+            _lock_resource: &PubkyLockResource,
+        ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+            if self.start_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(self.summary.clone())
+            } else {
+                Err(PaymentDrainClientError::Conflict)
+            }
+        }
+
+        async fn lookup_payment_drain(
+            &self,
+            _lock_resource: &PubkyLockResource,
+        ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+            Ok(Some(self.summary.clone()))
+        }
+
+        async fn payment_request_status(
+            &self,
+            _creator: &CreatorPubky,
+            _bundle_id: &BundleId,
+        ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+            unreachable!()
+        }
     }
 
     #[tokio::test]
@@ -2615,7 +3313,7 @@ mod tests {
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
         deletions.insert_job(job.clone()).await.unwrap();
         let withdraw = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2624,14 +3322,14 @@ mod tests {
                 job.job_id,
                 "deletion",
                 withdraw.claim_token,
-                NOW,
                 ContentLockDeletionPhase::StartPaymentDrain,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         let start = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2645,13 +3343,7 @@ mod tests {
             cleanup_token: token.clone(),
         };
         drains
-            .store_payment_drain(
-                job.job_id,
-                "deletion",
-                start.claim_token,
-                NOW,
-                &initial_summary,
-            )
+            .store_payment_drain(job.job_id, "deletion", start.claim_token, &initial_summary)
             .await
             .unwrap();
         deletions
@@ -2659,14 +3351,14 @@ mod tests {
                 job.job_id,
                 "deletion",
                 start.claim_token,
-                NOW,
                 ContentLockDeletionPhase::DrainPayments,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         let claim = deletions
-            .claim_next("deletion", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("deletion", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
@@ -2756,19 +3448,20 @@ mod tests {
     #[tokio::test]
     async fn concurrent_final_issuers_replay_one_winner() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
 
         let (first, second) = tokio::join!(
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("concurrent-final-one"),
             ),
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("concurrent-final-two"),
             ),
         );
@@ -2791,12 +3484,13 @@ mod tests {
     #[tokio::test]
     async fn force_revokes_live_final_read_claim() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let issued = access
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("final-before-force"),
             )
             .await
@@ -2811,7 +3505,7 @@ mod tests {
             .path
             .clone();
         let prepared = access
-            .prepare_deletion_read(&lookup, &path, NOW, NOW + time::Duration::seconds(30))
+            .prepare_deletion_read(&lookup, &path, time::Duration::seconds(30))
             .await
             .unwrap()
             .unwrap();
@@ -2820,34 +3514,20 @@ mod tests {
         let force = PostgresContentLockDeletionRepository::new(database.pool().clone());
         assert!(matches!(
             force
-                .prepare_force_deletion(
-                    &job.creator,
-                    &job.lock_id,
-                    NOW + time::Duration::seconds(1)
-                )
+                .prepare_force_deletion(&job.creator, &job.lock_id,)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Active(_)
         ));
         assert!(
             !access
-                .consume_deletion_read(
-                    &lookup,
-                    &path,
-                    read_token,
-                    NOW + time::Duration::seconds(2),
-                )
+                .consume_deletion_read(&lookup, &path, read_token,)
                 .await
                 .unwrap()
         );
         assert!(
             access
-                .prepare_deletion_read(
-                    &lookup,
-                    &path,
-                    NOW + time::Duration::seconds(2),
-                    NOW + time::Duration::seconds(30),
-                )
+                .prepare_deletion_read(&lookup, &path, time::Duration::seconds(28),)
                 .await
                 .unwrap()
                 .is_none()
@@ -2859,7 +3539,8 @@ mod tests {
     #[tokio::test]
     async fn final_issuance_waiting_on_snapshot_observes_force_winner() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let mut blocker = database.pool().begin().await.unwrap();
         sqlx::query(
             "SELECT job_id FROM content_lock_deletion_jobs
@@ -2875,7 +3556,7 @@ mod tests {
              WHERE job_id = $1",
         )
         .bind(job.job_id)
-        .bind(NOW)
+        .bind(final_access_started_at)
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -2888,7 +3569,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &issuing_creator,
                     &issuing_bundle,
-                    NOW,
+                    final_access_started_at,
                     AccessCredential::new("must-not-escape-force"),
                 )
                 .await
@@ -2905,7 +3586,8 @@ mod tests {
     #[tokio::test]
     async fn phase_advancement_and_successful_finish_cannot_bypass_access_obligations() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let claim_token = Uuid::new_v4();
         sqlx::query(
@@ -2916,7 +3598,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::hours(1))
+        .bind(final_access_started_at + time::Duration::hours(1))
         .execute(database.pool())
         .await
         .unwrap();
@@ -2927,15 +3609,14 @@ mod tests {
                     job.job_id,
                     "worker",
                     claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DrainFinalReads,
                 )
                 .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+            Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending)
         ));
         assert!(matches!(
             repository
-                .finish(job.job_id, "worker", claim_token, NOW, None)
+                .finish(job.job_id, "worker", claim_token, None,)
                 .await,
             Err(ApplicationError::InvalidContentLockDeletionState { .. })
         ));
@@ -2944,7 +3625,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("phase-obligation-final"),
             )
             .await
@@ -2956,15 +3637,18 @@ mod tests {
                     job.job_id,
                     "worker",
                     claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DrainFinalReads,
                 )
                 .await
                 .unwrap()
+                .advanced()
                 .is_some()
         );
         let drain_claim = repository
-            .claim_next("worker", NOW, NOW + time::Duration::hours(1))
+            .claim_next(
+                "worker",
+                (final_access_started_at + time::Duration::hours(1)) - (final_access_started_at),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2974,11 +3658,10 @@ mod tests {
                     job.job_id,
                     "worker",
                     drain_claim.claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DeleteContent,
                 )
                 .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+            Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending)
         ));
         let lookup = AccessCredentialLookupKey::derive(&issued.credential);
         let path = job
@@ -2989,13 +3672,13 @@ mod tests {
             .path
             .clone();
         let read = access
-            .prepare_deletion_read(&lookup, &path, NOW, NOW + time::Duration::seconds(30))
+            .prepare_deletion_read(&lookup, &path, time::Duration::seconds(30))
             .await
             .unwrap()
             .unwrap();
         assert!(
             access
-                .consume_deletion_read(&lookup, &path, read.claim_token.unwrap(), NOW)
+                .consume_deletion_read(&lookup, &path, read.claim_token.unwrap(),)
                 .await
                 .unwrap()
         );
@@ -3005,11 +3688,11 @@ mod tests {
                     job.job_id,
                     "worker",
                     drain_claim.claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DeleteContent,
                 )
                 .await
                 .unwrap()
+                .advanced()
                 .is_some()
         );
 
@@ -3017,7 +3700,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_payments_phase_requires_durable_completed_aggregate() {
+    async fn no_paykit_drain_expires_pending_without_creating_paykit_state() {
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([60; 16]));
+        let task_id = task.task_id;
+        tasks.insert_verification_task(task).await.unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        repository.insert_job(job.clone()).await.unwrap();
+        let claim_token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET phase = 'drain_payments', state = 'running', claimed_by = 'worker',
+                 claim_token = $2, claim_expires_at = $3
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .bind(claim_token)
+        .bind(database_now(&database).await + time::Duration::minutes(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            !repository
+                .expire_unresolved_non_paykit_tasks(job.job_id, "worker", Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim_token)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .advance_phase(
+                    job.job_id,
+                    "worker",
+                    claim_token,
+                    ContentLockDeletionPhase::DrainExistingCredentials,
+                )
+                .await
+                .unwrap()
+                .advanced()
+                .is_some()
+        );
+
+        let task_status: String =
+            sqlx::query_scalar("SELECT status FROM verification_tasks WHERE task_id = $1")
+                .bind(task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let snapshot_status: Option<String> = sqlx::query_scalar("SELECT resolved_status FROM content_lock_deletion_task_snapshot WHERE deletion_job_id = $1")
+            .bind(job.job_id).fetch_one(database.pool()).await.unwrap();
+        let drain_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_lock_payment_drains WHERE deletion_job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(task_status, "expired");
+        assert_eq!(snapshot_status.as_deref(), Some("expired"));
+        assert_eq!(drain_count, 0);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn no_paykit_drain_rejects_paykit_and_missing_paykit_aggregate_still_blocks() {
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let mut task = verification_task(&lock, BundleId::from_bytes([59; 16]));
+        task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+        tasks.insert_verification_task(task).await.unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        repository.insert_job(job.clone()).await.unwrap();
+        let claim_token = Uuid::new_v4();
+        sqlx::query("UPDATE content_lock_deletion_jobs SET phase = 'drain_payments', state = 'running', claimed_by = 'worker', claim_token = $2, claim_expires_at = $3 WHERE job_id = $1")
+            .bind(job.job_id)
+            .bind(claim_token)
+            .bind(database_now(&database).await + time::Duration::minutes(5))
+            .execute(database.pool()).await.unwrap();
+        assert!(matches!(
+            repository
+                .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim_token)
+                .await,
+            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+        ));
+        sqlx::query("UPDATE content_lock_deletion_task_snapshot SET resolved_status = 'expired', resolved_at = $2 WHERE deletion_job_id = $1")
+            .bind(job.job_id).bind(NOW).execute(database.pool()).await.unwrap();
+        assert!(matches!(
+            repository
+                .advance_phase(
+                    job.job_id,
+                    "worker",
+                    claim_token,
+                    ContentLockDeletionPhase::DrainExistingCredentials,
+                )
+                .await,
+            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn drain_payments_phase_allows_missing_aggregate_for_non_paykit_snapshots() {
         let database = TestDatabase::create().await;
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
@@ -3029,18 +3823,6 @@ mod tests {
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         repository.insert_job(job.clone()).await.unwrap();
-        sqlx::query(
-            "INSERT INTO content_lock_payment_drains (
-                 deletion_job_id, status, accepted_count, terminal_count,
-                 cancellation_enqueued_count, cleanup_token, created_at, updated_at
-             ) VALUES ($1, 'active', 1, 0, 0, $2, $3, $3)",
-        )
-        .bind(job.job_id)
-        .bind("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        .bind(NOW)
-        .execute(database.pool())
-        .await
-        .unwrap();
         let claim_token = Uuid::new_v4();
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
@@ -3050,23 +3832,24 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(&database).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
 
-        assert!(matches!(
+        assert!(
             repository
                 .advance_phase(
                     job.job_id,
                     "worker",
                     claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DrainExistingCredentials,
                 )
-                .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
-        ));
+                .await
+                .unwrap()
+                .advanced()
+                .is_some()
+        );
 
         database.cleanup().await;
     }
@@ -3119,7 +3902,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(&database).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3130,7 +3913,6 @@ mod tests {
                     job.job_id,
                     "worker",
                     claim_token,
-                    NOW,
                     ContentLockDeletionPhase::DrainExistingCredentials,
                 )
                 .await,
@@ -3143,13 +3925,14 @@ mod tests {
     #[tokio::test]
     async fn expired_final_read_claim_does_not_wedge_destructive_phase_and_cannot_consume() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let issued = access
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("expires-with-final-read-window"),
             )
             .await
@@ -3164,7 +3947,7 @@ mod tests {
             .path
             .clone();
         let issue_claim = Uuid::new_v4();
-        let read_deadline = NOW + time::Duration::minutes(30);
+        let read_deadline = final_access_started_at + time::Duration::minutes(30);
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
              SET state = 'running', claimed_by = 'worker', claim_token = $2,
@@ -3182,32 +3965,60 @@ mod tests {
                 job.job_id,
                 "worker",
                 issue_claim,
-                NOW,
                 ContentLockDeletionPhase::DrainFinalReads,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
         let drain_claim = repository
             .claim_next(
                 "worker",
-                read_deadline - time::Duration::seconds(10),
-                read_deadline + time::Duration::minutes(5),
+                (read_deadline + time::Duration::minutes(5))
+                    - (read_deadline - time::Duration::seconds(10)),
             )
             .await
             .unwrap()
             .unwrap();
         let read = access
-            .prepare_deletion_read(
-                &lookup,
-                &path,
-                read_deadline - time::Duration::seconds(10),
-                read_deadline + time::Duration::minutes(1),
-            )
+            .prepare_deletion_read(&lookup, &path, time::Duration::seconds(70))
             .await
             .unwrap()
             .unwrap();
         let stale_read_token = read.claim_token.unwrap();
+        sqlx::query(
+            "WITH anchor AS (SELECT clock_timestamp() AS at)
+             UPDATE content_lock_deletion_jobs
+             SET final_credential_issuance_deadline = final_issuance_started_at
+                     + ((anchor.at - final_issuance_started_at) / 2),
+                 final_read_deadline = anchor.at
+             FROM anchor
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_access_drain_credentials
+             SET expires_at = clock_timestamp()
+             WHERE deletion_job_id = $1 AND credential_kind = 'final'",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_access_drain_reads AS read
+             SET claim_expires_at = clock_timestamp()
+             FROM content_lock_access_drain_credentials AS credential
+             WHERE read.credential_id = credential.credential_id
+               AND credential.deletion_job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 
         assert!(
             repository
@@ -3215,16 +4026,16 @@ mod tests {
                     job.job_id,
                     "worker",
                     drain_claim.claim_token,
-                    read_deadline,
                     ContentLockDeletionPhase::DeleteContent,
                 )
                 .await
                 .unwrap()
+                .advanced()
                 .is_some()
         );
         assert!(
             !access
-                .consume_deletion_read(&lookup, &path, stale_read_token, read_deadline,)
+                .consume_deletion_read(&lookup, &path, stale_read_token)
                 .await
                 .unwrap()
         );
@@ -3233,21 +4044,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unissued_eligible_snapshot_blocks_final_read_transition_after_issuance_deadline() {
+    async fn unissued_eligible_snapshot_reports_irrecoverable_miss_after_issuance_deadline() {
         let database = TestDatabase::create().await;
-        let (job, _task, _access) = eligible_final_credential_fixture(&database).await;
+        let (job, _task, _access, _final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let claim_token = Uuid::new_v4();
-        let after_deadline = NOW + time::Duration::minutes(16);
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
              SET state = 'running', claimed_by = 'worker', claim_token = $2,
-                 claim_expires_at = $3
+                 claim_expires_at = clock_timestamp() + INTERVAL '5 minutes',
+                 final_credential_issuance_deadline = clock_timestamp()
              WHERE job_id = $1",
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(after_deadline + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3258,11 +4069,12 @@ mod tests {
                     job.job_id,
                     "worker",
                     claim_token,
-                    after_deadline,
                     ContentLockDeletionPhase::DrainFinalReads,
                 )
                 .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+            Ok(AdvanceContentLockDeletionPhaseResult::TerminalFailure(
+                ContentLockDeletionFailureCode::StateCorrupt
+            ))
         ));
 
         database.cleanup().await;
@@ -3316,14 +4128,14 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(&database).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
 
         assert!(matches!(
             repository
-                .finish(job.job_id, "worker", claim_token, NOW, None)
+                .finish(job.job_id, "worker", claim_token, None)
                 .await,
             Err(ApplicationError::InvalidContentLockDeletionState { .. })
         ));
@@ -3350,7 +4162,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             repository
-                .finish(job.job_id, "worker", claim_token, NOW, None)
+                .finish(job.job_id, "worker", claim_token, None)
                 .await,
             Err(ApplicationError::InvalidContentLockDeletionState { .. })
         ));
@@ -3365,7 +4177,7 @@ mod tests {
         .await
         .unwrap();
         repository
-            .finish(job.job_id, "worker", claim_token, NOW, None)
+            .finish(job.job_id, "worker", claim_token, None)
             .await
             .unwrap();
 
@@ -3379,14 +4191,14 @@ mod tests {
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
         repository.insert_job(job.clone()).await.unwrap();
         let claimed = repository
-            .claim_next("worker", NOW, NOW + time::Duration::minutes(5))
+            .claim_next("worker", (NOW + time::Duration::minutes(5)) - (NOW))
             .await
             .unwrap()
             .unwrap();
 
         assert!(matches!(
             repository
-                .finish(job.job_id, "worker", claimed.claim_token, NOW, None)
+                .finish(job.job_id, "worker", claimed.claim_token, None)
                 .await,
             Err(ApplicationError::InvalidContentLockDeletionState { .. })
         ));
@@ -3397,8 +4209,18 @@ mod tests {
     #[tokio::test]
     async fn issuance_deadline_is_half_open_and_transition_preserves_only_exact_replay() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
-        let issuance_deadline = NOW + time::Duration::minutes(15);
+        let (job, task, access, _final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
+        let issuance_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "UPDATE content_lock_deletion_jobs
+             SET final_credential_issuance_deadline = clock_timestamp()
+             WHERE job_id = $1
+             RETURNING final_credential_issuance_deadline",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
 
         assert!(
             access
@@ -3422,6 +4244,16 @@ mod tests {
         .unwrap();
         assert_eq!(final_count, 0);
 
+        let issuance_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "UPDATE content_lock_deletion_jobs
+             SET final_credential_issuance_deadline = clock_timestamp() + INTERVAL '15 minutes'
+             WHERE job_id = $1
+             RETURNING final_credential_issuance_deadline",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
         let issued = access
             .issue_or_replay_final_credential(
                 &job.creator,
@@ -3451,12 +4283,12 @@ mod tests {
                 job.job_id,
                 "worker",
                 claim_token,
-                issuance_deadline,
                 ContentLockDeletionPhase::DrainFinalReads,
             )
             .await
             .unwrap()
-            .unwrap();
+            .advanced()
+            .expect("live claim should advance phase");
 
         let replay = access
             .issue_or_replay_final_credential(
@@ -3474,14 +4306,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_read_claim_lease_is_fixed_to_thirty_seconds_at_storage_boundary() {
+    async fn final_read_claim_lease_is_capped_at_thirty_seconds_by_storage_time() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, final_access_started_at) =
+            eligible_final_credential_fixture(&database).await;
         let issued = access
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                NOW,
+                final_access_started_at,
                 AccessCredential::new("fixed-storage-lease"),
             )
             .await
@@ -3496,11 +4329,13 @@ mod tests {
             .path
             .clone();
 
+        let before_claim = database_now(&database).await;
         access
-            .prepare_deletion_read(&lookup, &path, NOW, NOW + time::Duration::seconds(1))
+            .prepare_deletion_read(&lookup, &path, time::Duration::seconds(70))
             .await
             .unwrap()
             .unwrap();
+        let after_claim = database_now(&database).await;
         let stored_expiry: time::OffsetDateTime = sqlx::query_scalar(
             "SELECT read.claim_expires_at
              FROM content_lock_access_drain_reads AS read
@@ -3513,7 +4348,8 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .unwrap();
-        assert_eq!(stored_expiry, NOW + time::Duration::seconds(30));
+        assert!(stored_expiry >= before_claim + time::Duration::seconds(30));
+        assert!(stored_expiry <= after_claim + time::Duration::seconds(30));
 
         database.cleanup().await;
     }
@@ -3579,6 +4415,7 @@ mod tests {
         ContentLockDeletionJob,
         VerificationTaskRecord,
         PostgresAccessCredentialStore,
+        time::OffsetDateTime,
     ) {
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
@@ -3590,6 +4427,11 @@ mod tests {
             .insert_job(job.clone())
             .await
             .unwrap();
+        let final_access_started_at: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
         sqlx::query(
             "UPDATE content_lock_deletion_task_snapshot
              SET resolved_status = 'completed', resolved_at = $2,
@@ -3597,7 +4439,7 @@ mod tests {
              WHERE deletion_job_id = $1",
         )
         .bind(job.job_id)
-        .bind(NOW)
+        .bind(final_access_started_at)
         .execute(database.pool())
         .await
         .unwrap();
@@ -3608,9 +4450,9 @@ mod tests {
              WHERE job_id = $1",
         )
         .bind(job.job_id)
-        .bind(NOW)
-        .bind(NOW + time::Duration::minutes(15))
-        .bind(NOW + time::Duration::minutes(30))
+        .bind(final_access_started_at)
+        .bind(final_access_started_at + time::Duration::minutes(15))
+        .bind(final_access_started_at + time::Duration::minutes(30))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3618,7 +4460,14 @@ mod tests {
             database.pool().clone(),
             crate::infrastructure::final_credentials::FinalCredentialCipher::new([9; 32]),
         );
-        (job, task, access)
+        (job, task, access, final_access_started_at)
+    }
+
+    async fn database_now(database: &TestDatabase) -> time::OffsetDateTime {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
     }
 
     fn verification_task(lock: &ContentLock, bundle_id: BundleId) -> VerificationTaskRecord {

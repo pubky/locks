@@ -2,7 +2,9 @@ pub mod semantics {}
 
 mod access;
 mod content_lock_deletion;
+pub mod content_lock_deletion_action_ownership;
 mod content_lock_ownership;
+pub mod content_lock_tombstone;
 mod creator_authority;
 mod entitlement;
 mod guarded_resources;
@@ -14,7 +16,9 @@ mod verification;
 
 pub use access::*;
 pub use content_lock_deletion::*;
+pub use content_lock_deletion_action_ownership::*;
 pub use content_lock_ownership::*;
+pub use content_lock_tombstone::*;
 pub use creator_authority::*;
 pub use entitlement::*;
 pub use guarded_resources::*;

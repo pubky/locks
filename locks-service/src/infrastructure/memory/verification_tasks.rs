@@ -101,6 +101,29 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         Ok(())
     }
 
+    async fn update_verification_tasks_atomically(
+        &self,
+        tasks: Vec<VerificationTaskRecord>,
+    ) -> Result<(), ApplicationError> {
+        let mut fence_records = self.deletion_fence.records.write().await;
+        let mut records = self.records.write().await;
+        if tasks
+            .iter()
+            .any(|task| !records.contains_key(&task.task_id))
+        {
+            return Err(ApplicationError::MissingRecord {
+                record: "verification_task",
+            });
+        }
+        for task in tasks {
+            if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
+                fence_record.status = task.status;
+            }
+            records.insert(task.task_id, task);
+        }
+        Ok(())
+    }
+
     async fn get_verification_task(
         &self,
         task_id: &TaskId,

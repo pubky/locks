@@ -68,12 +68,11 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         summary: &PaymentDrainSummary,
     ) -> Result<bool, ApplicationError> {
         let counts = summary_counts(summary)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
         if !owns_live_drain_claim(
             ownership.as_ref(),
             worker_id,
@@ -158,12 +157,11 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         summary: &PaymentDrainSummary,
     ) -> Result<bool, ApplicationError> {
         let counts = summary_counts(summary)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
         if !owns_live_drain_claim(
             ownership.as_ref(),
             worker_id,
@@ -227,28 +225,18 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         task_id: &TaskId,
     ) -> Result<Option<Uuid>, ApplicationError> {
         let publication_token = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let owns_claim: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1 FROM content_lock_deletion_jobs
-                WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-                  AND claim_token = $3 AND claim_expires_at >= $4
-                  AND phase = 'drain_payments' AND force_requested_at IS NULL
-                FOR UPDATE
-            )",
-        )
-        .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(now)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        if !owns_claim {
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
         }
@@ -290,7 +278,6 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         deletion_job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         task_id: &TaskId,
         transition: PaymentDrainTerminalTransition,
     ) -> Result<bool, ApplicationError> {
@@ -307,7 +294,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             });
         }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let ownership = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
         if !owns_live_drain_claim(
             ownership.as_ref(),
             worker_id,
@@ -415,8 +402,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
 async fn lock_deletion_ownership(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     deletion_job_id: Uuid,
-) -> Result<Option<DeletionOwnershipRow>, ApplicationError> {
-    sqlx::query_as::<_, DeletionOwnershipRow>(
+) -> Result<(Option<DeletionOwnershipRow>, OffsetDateTime), ApplicationError> {
+    let ownership = sqlx::query_as::<_, DeletionOwnershipRow>(
         "SELECT state, phase, force_requested_at, claimed_by, claim_token, claim_expires_at
          FROM content_lock_deletion_jobs
          WHERE job_id = $1
@@ -425,7 +412,12 @@ async fn lock_deletion_ownership(
     .bind(deletion_job_id)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(storage_error)
+    .map_err(storage_error)?;
+    let winner_time = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    Ok((ownership, winner_time))
 }
 
 fn owns_live_drain_claim(
@@ -443,7 +435,7 @@ fn owns_live_drain_claim(
             && ownership.claim_token == Some(claim_token)
             && ownership
                 .claim_expires_at
-                .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                .is_some_and(|claim_expires_at| now < claim_expires_at)
     })
 }
 
@@ -626,7 +618,7 @@ mod tests {
         };
         assert!(
             repository
-                .reconcile_payment_drain(job_id, "worker", claim_token, now, &completed)
+                .reconcile_payment_drain(job_id, "worker", claim_token, &completed)
                 .await
                 .unwrap()
         );
@@ -644,13 +636,13 @@ mod tests {
         };
         assert!(
             !repository
-                .reconcile_payment_drain(job_id, "worker", claim_token, now, &divergent)
+                .reconcile_payment_drain(job_id, "worker", claim_token, &divergent)
                 .await
                 .unwrap()
         );
         assert!(
             !repository
-                .reconcile_payment_drain(job_id, "worker", Uuid::new_v4(), now, &divergent)
+                .reconcile_payment_drain(job_id, "worker", Uuid::new_v4(), &divergent)
                 .await
                 .unwrap()
         );
@@ -689,7 +681,7 @@ mod tests {
         };
         assert!(
             repository
-                .store_payment_drain(job_id, "worker", claim_token, now, &active)
+                .store_payment_drain(job_id, "worker", claim_token, &active)
                 .await
                 .unwrap()
         );
@@ -703,7 +695,7 @@ mod tests {
         };
         assert!(
             repository
-                .store_payment_drain(job_id, "worker", claim_token, now, &completed)
+                .store_payment_drain(job_id, "worker", claim_token, &completed)
                 .await
                 .unwrap()
         );
@@ -752,7 +744,7 @@ mod tests {
         };
         let stale = tokio::spawn(async move {
             repository
-                .store_payment_drain(job_id, "worker", stale_claim_token, now, &summary)
+                .store_payment_drain(job_id, "worker", stale_claim_token, &summary)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -813,7 +805,7 @@ mod tests {
         };
         let stale = tokio::spawn(async move {
             repository
-                .store_payment_drain(job_id, "worker", stale_claim_token, now, &summary)
+                .store_payment_drain(job_id, "worker", stale_claim_token, &summary)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -880,7 +872,7 @@ mod tests {
         };
         let stale = tokio::spawn(async move {
             repository
-                .reconcile_payment_drain(job_id, "worker", stale_claim_token, now, &completed)
+                .reconcile_payment_drain(job_id, "worker", stale_claim_token, &completed)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -946,7 +938,6 @@ mod tests {
                     job_id,
                     "worker",
                     stale_claim_token,
-                    now,
                     &task_id,
                     PaymentDrainTerminalTransition {
                         status: VerificationTaskStatus::Completed,

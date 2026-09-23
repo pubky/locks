@@ -7,13 +7,19 @@ use locks_core::verification::{
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    ClaimedContentLockDeletionJob, ContentLockDeletionPhase, VerificationTaskStatus,
+    AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob, ContentLockDeletionPhase,
+    VerificationTaskStatus,
 };
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, EntitlementRepository, PaymentDrainClient,
     PaymentDrainClientError, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
     PaymentDrainTerminalTransition, PaymentRequestState, PaymentRequestStatus, PaymentState,
     same_entitlement_decision,
+};
+
+use super::execute_content_lock_deletion_phase::{
+    DeletionDependencyEvidence, DeletionDependencySource, DeletionExecutionErrorClass,
+    DeletionPhaseExecution, DeletionPhaseExecutionOutcome, classify_deletion_execution_error,
 };
 
 pub struct DrainLockPaymentsUseCase<'a> {
@@ -52,9 +58,49 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
     ) -> Result<bool, ApplicationError> {
+        self.execute_claimed_observed(claim, worker_id, &mut DeletionDependencyEvidence::none())
+            .await
+    }
+
+    pub async fn execute_claimed_with_evidence(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> DeletionPhaseExecution {
+        let mut evidence = DeletionDependencyEvidence::none();
+        match self
+            .execute_claimed_observed(claim, worker_id, &mut evidence)
+            .await
+        {
+            Ok(true) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Progressed)
+                .with_evidence(evidence),
+            Ok(false) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Deferred)
+                .with_evidence(evidence),
+            Err(error) => {
+                let outcome = match classify_deletion_execution_error(&error) {
+                    DeletionExecutionErrorClass::TransientDependency => {
+                        DeletionPhaseExecutionOutcome::TransientDependencyFailure
+                    }
+                    DeletionExecutionErrorClass::Fatal => {
+                        DeletionPhaseExecutionOutcome::FatalFailure
+                    }
+                };
+                DeletionPhaseExecution::new(outcome).with_evidence(evidence)
+            }
+        }
+    }
+
+    async fn execute_claimed_observed(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
         match claim.job.phase {
-            ContentLockDeletionPhase::StartPaymentDrain => self.start(claim, worker_id).await,
-            ContentLockDeletionPhase::DrainPayments => self.drain(claim, worker_id).await,
+            ContentLockDeletionPhase::StartPaymentDrain => {
+                self.start(claim, worker_id, evidence).await
+            }
+            ContentLockDeletionPhase::DrainPayments => self.drain(claim, worker_id, evidence).await,
             _ => Err(ApplicationError::InvalidContentLockDeletionState {
                 message: "payment drain use case requires a payment drain phase".to_owned(),
             }),
@@ -65,85 +111,143 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         &self,
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
+        evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
         let lock_resource = lock_resource(&claim);
         let summary = match self.paykit.start_payment_drain(&lock_resource).await {
-            Ok(summary) => summary,
-            Err(PaymentDrainClientError::Conflict) => self
-                .paykit
-                .lookup_payment_drain(&lock_resource)
-                .await
-                .map_err(map_client_error)?
-                .ok_or_else(|| ApplicationError::Verifier {
-                    message: "Paykit payment drain conflict could not be reconciled".to_owned(),
-                })?,
-            Err(error) => return Err(map_client_error(error)),
+            Ok(summary) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                summary
+            }
+            Err(PaymentDrainClientError::Conflict) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                match self.paykit.lookup_payment_drain(&lock_resource).await {
+                    Ok(Some(summary)) => {
+                        observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                        summary
+                    }
+                    Ok(None) => {
+                        observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                        return Err(ApplicationError::Verifier {
+                            message: "Paykit payment drain conflict could not be reconciled"
+                                .to_owned(),
+                        });
+                    }
+                    Err(error) => {
+                        observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                        return Err(map_client_error(error));
+                    }
+                }
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                return Err(map_client_error(error));
+            }
         };
-        let now = self.clock.now();
-        if !self
+        let _now = self.clock.now();
+        match self
             .drains
-            .store_payment_drain(
-                claim.job.job_id,
-                worker_id,
-                claim.claim_token,
-                now,
-                &summary,
-            )
-            .await?
+            .store_payment_drain(claim.job.job_id, worker_id, claim.claim_token, &summary)
+            .await
         {
-            return Ok(false);
+            Ok(true) => observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository),
+            Ok(false) => return Ok(false),
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
         }
-        Ok(self
+        match self
             .deletions
             .advance_phase(
                 claim.job.job_id,
                 worker_id,
                 claim.claim_token,
-                now,
                 ContentLockDeletionPhase::DrainPayments,
             )
-            .await?
-            .is_some())
+            .await
+        {
+            Ok(AdvanceContentLockDeletionPhaseResult::Advanced(_)) => {
+                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Ok(true)
+            }
+            Ok(AdvanceContentLockDeletionPhaseResult::ClaimLost) => Ok(false),
+            Ok(_) => {
+                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Ok(false)
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Err(error)
+            }
+        }
     }
 
     async fn drain(
         &self,
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
+        evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
         let lock_resource = lock_resource(&claim);
-        let summary = self
-            .paykit
-            .lookup_payment_drain(&lock_resource)
-            .await
-            .map_err(map_client_error)?
-            .ok_or_else(|| ApplicationError::Verifier {
-                message: "Paykit payment drain not found".to_owned(),
-            })?;
-        let persisted = self
-            .drains
-            .get_payment_drain(claim.job.job_id)
-            .await?
-            .ok_or_else(|| ApplicationError::InvalidContentLockDeletionState {
-                message: "payment drain cleanup token is missing".to_owned(),
-            })?;
+        let summary = match self.paykit.lookup_payment_drain(&lock_resource).await {
+            Ok(Some(summary)) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                summary
+            }
+            Ok(None) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                return Err(ApplicationError::Verifier {
+                    message: "Paykit payment drain not found".to_owned(),
+                });
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                return Err(map_client_error(error));
+            }
+        };
+        let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
+            Ok(Some(persisted)) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                persisted
+            }
+            Ok(None) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(ApplicationError::InvalidContentLockDeletionState {
+                    message: "payment drain cleanup token is missing".to_owned(),
+                });
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        };
         validate_aggregate_progress(&persisted, &summary)?;
-        let now = self.clock.now();
-        if !self
+        let _now = self.clock.now();
+        match self
             .drains
-            .reconcile_payment_drain(
-                claim.job.job_id,
-                worker_id,
-                claim.claim_token,
-                now,
-                &summary,
-            )
-            .await?
+            .reconcile_payment_drain(claim.job.job_id, worker_id, claim.claim_token, &summary)
+            .await
         {
-            return Ok(false);
+            Ok(true) => observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository),
+            Ok(false) => return Ok(false),
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
         }
 
-        for obligation in self.drains.list_obligations(claim.job.job_id).await? {
+        let obligations = match self.drains.list_obligations(claim.job.job_id).await {
+            Ok(obligations) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                obligations
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        };
+        for obligation in obligations {
             if matches!(
                 obligation.status,
                 VerificationTaskStatus::Completed
@@ -152,14 +256,26 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             ) {
                 continue;
             }
-            let status = self
+            let status = match self
                 .paykit
                 .payment_request_status(&obligation.creator, &obligation.bundle_id)
                 .await
-                .map_err(map_client_error)?
-                .ok_or_else(|| ApplicationError::Verifier {
-                    message: "Paykit payment request not found".to_owned(),
-                })?;
+            {
+                Ok(Some(status)) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                    status
+                }
+                Ok(None) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                    return Err(ApplicationError::Verifier {
+                        message: "Paykit payment request not found".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                    return Err(map_client_error(error));
+                }
+            };
             if status.invoice_created_at != obligation.invoice_created_at
                 || status.payment_deadline != obligation.payment_deadline
             {
@@ -174,18 +290,28 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             let now = self.clock.now();
             let mut entitlement_publication_token = None;
             if next_status == VerificationTaskStatus::Completed {
-                let Some(publication_token) = self
+                let publication_token = match self
                     .drains
                     .begin_entitlement_publication(
                         claim.job.job_id,
                         worker_id,
                         claim.claim_token,
-                        now,
                         &obligation.task_id,
                     )
-                    .await?
-                else {
-                    return Ok(false);
+                    .await
+                {
+                    Ok(Some(token)) => {
+                        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                        token
+                    }
+                    Ok(None) => return Ok(false),
+                    Err(error) => {
+                        observe_unavailable(
+                            evidence,
+                            DeletionDependencySource::PaymentDrainRepository,
+                        );
+                        return Err(error);
+                    }
                 };
                 let entitlement = VerifiedProofBundle {
                     version: VERIFIED_PROOF_BUNDLE_VERSION,
@@ -202,47 +328,72 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     },
                     entitlement_lifetime: EntitlementLifetime::Unbounded,
                 };
-                persist_entitlement(self.entitlements, entitlement).await?;
+                persist_entitlement(self.entitlements, entitlement, evidence).await?;
                 entitlement_publication_token = Some(publication_token);
             }
-            if !self
+            match self
                 .drains
                 .persist_terminal_obligation(
                     claim.job.job_id,
                     worker_id,
                     claim.claim_token,
-                    now,
                     &obligation.task_id,
                     PaymentDrainTerminalTransition {
                         status: next_status,
                         entitlement_publication_token,
                     },
                 )
-                .await?
+                .await
             {
-                return Ok(false);
+                Ok(true) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository)
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(error);
+                }
             }
         }
 
-        if summary.status != PaymentDrainStatus::Completed
-            || !self
-                .drains
-                .all_obligations_terminal(claim.job.job_id)
-                .await?
-        {
+        if summary.status != PaymentDrainStatus::Completed {
             return Ok(false);
         }
-        Ok(self
+        match self.drains.all_obligations_terminal(claim.job.job_id).await {
+            Ok(true) => observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository),
+            Ok(false) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Ok(false);
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        }
+        match self
             .deletions
             .advance_phase(
                 claim.job.job_id,
                 worker_id,
                 claim.claim_token,
-                self.clock.now(),
                 ContentLockDeletionPhase::DrainExistingCredentials,
             )
-            .await?
-            .is_some())
+            .await
+        {
+            Ok(AdvanceContentLockDeletionPhaseResult::Advanced(_)) => {
+                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Ok(true)
+            }
+            Ok(AdvanceContentLockDeletionPhaseResult::ClaimLost) => Ok(false),
+            Ok(_) => {
+                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Ok(false)
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::RepositoryPhaseMutation);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -256,25 +407,57 @@ fn lock_resource(claim: &ClaimedContentLockDeletionJob) -> PubkyLockResource {
 async fn persist_entitlement(
     entitlements: &dyn EntitlementRepository,
     entitlement: VerifiedProofBundle,
+    evidence: &mut DeletionDependencyEvidence,
 ) -> Result<(), ApplicationError> {
     if let Err(error) = entitlements
         .insert_verified_proof_bundle(entitlement.clone())
         .await
     {
-        let existing = entitlements
+        let expected_duplicate = matches!(
+            &error,
+            ApplicationError::DuplicateRecord { record }
+                if *record == "verified_proof_bundle"
+        );
+        if !expected_duplicate {
+            observe_unavailable(evidence, DeletionDependencySource::EntitlementRepository);
+        }
+        let existing = match entitlements
             .get_verified_proof_bundle(
                 entitlement.pubky_lock_resource.creator(),
                 &entitlement.bundle_id,
             )
-            .await?;
+            .await
+        {
+            Ok(existing) => {
+                observe_healthy(evidence, DeletionDependencySource::EntitlementRepository);
+                existing
+            }
+            Err(read_error) => {
+                observe_unavailable(evidence, DeletionDependencySource::EntitlementRepository);
+                return Err(read_error);
+            }
+        };
         if !existing
             .as_ref()
             .is_some_and(|existing| same_entitlement_decision(existing, &entitlement))
         {
             return Err(error);
         }
+    } else {
+        observe_healthy(evidence, DeletionDependencySource::EntitlementRepository);
     }
     Ok(())
+}
+
+fn observe_healthy(evidence: &mut DeletionDependencyEvidence, source: DeletionDependencySource) {
+    *evidence = evidence.merge(DeletionDependencyEvidence::healthy(source));
+}
+
+fn observe_unavailable(
+    evidence: &mut DeletionDependencyEvidence,
+    source: DeletionDependencySource,
+) {
+    *evidence = evidence.merge(DeletionDependencyEvidence::unavailable(source));
 }
 
 fn map_client_error(error: PaymentDrainClientError) -> ApplicationError {
@@ -362,17 +545,94 @@ pub(crate) fn classify_payment_task(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use async_trait::async_trait;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use time::macros::datetime;
 
-    use crate::application::models::VerificationTaskStatus;
-    use crate::application::ports::{
-        PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary, PaymentRequestState,
-        PaymentRequestStatus, PaymentState,
+    use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, PubkyLockResource};
+    use locks_core::verification::{
+        EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
     };
 
-    use super::{classify_payment_task, validate_aggregate_progress};
+    use crate::application::errors::ApplicationError;
+    use crate::application::models::VerificationTaskStatus;
+    use crate::application::ports::{
+        EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary,
+        PaymentRequestState, PaymentRequestStatus, PaymentState,
+    };
+
+    use crate::application::use_cases::execute_content_lock_deletion_phase::DeletionDependencyStatus;
+
+    use super::{
+        DeletionDependencyEvidence, DeletionDependencySource, classify_payment_task,
+        persist_entitlement, validate_aggregate_progress,
+    };
+
+    #[tokio::test]
+    async fn exact_duplicate_entitlement_replay_finishes_with_healthy_evidence() {
+        let entitlement = entitlement();
+        let repository = DuplicateEntitlementRepository(entitlement.clone());
+        let mut evidence = DeletionDependencyEvidence::none();
+
+        persist_entitlement(&repository, entitlement, &mut evidence)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            evidence.status(DeletionDependencySource::EntitlementRepository),
+            Some(DeletionDependencyStatus::Healthy)
+        );
+    }
+
+    struct DuplicateEntitlementRepository(VerifiedProofBundle);
+
+    #[async_trait]
+    impl EntitlementRepository for DuplicateEntitlementRepository {
+        async fn insert_verified_proof_bundle(
+            &self,
+            _: VerifiedProofBundle,
+        ) -> Result<(), ApplicationError> {
+            Err(ApplicationError::DuplicateRecord {
+                record: "verified_proof_bundle",
+            })
+        }
+
+        async fn get_verified_proof_bundle(
+            &self,
+            _: &CreatorPubky,
+            _: &BundleId,
+        ) -> Result<Option<VerifiedProofBundle>, ApplicationError> {
+            Ok(Some(self.0.clone()))
+        }
+
+        async fn delete_verified_proof_bundle(
+            &self,
+            _: &CreatorPubky,
+            _: &BundleId,
+        ) -> Result<(), ApplicationError> {
+            unreachable!()
+        }
+    }
+
+    fn entitlement() -> VerifiedProofBundle {
+        let creator =
+            CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap();
+        let path = ContentLockPath::from_str(
+            "/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+        )
+        .unwrap();
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+            pubky_lock_resource: PubkyLockResource::new(creator, path),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        }
+    }
 
     #[test]
     fn aggregate_progress_accepts_only_equal_monotonic_transfer() {
