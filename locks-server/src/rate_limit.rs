@@ -1,11 +1,148 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::time::Instant;
 
-use locks_core::ids::CreatorPubky;
+use locks_core::ids::{BundleId, CreatorPubky};
 use time::OffsetDateTime;
 
-use crate::config::VerificationSubmissionRateLimitConfig;
+use crate::config::{
+    PaykitConnectionStateLookupRateLimitConfig, VerificationSubmissionRateLimitConfig,
+};
+
+#[derive(Debug)]
+struct TokenBucketState {
+    tokens: u64,
+    remainder: u128,
+    last: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaykitConnectionStateLookupRateLimitKey {
+    pub client_address: IpAddr,
+    pub creator: CreatorPubky,
+    pub bundle_id: BundleId,
+}
+
+#[derive(Debug)]
+pub struct InMemoryPaykitConnectionStateLookupRateLimiter {
+    config: PaykitConnectionStateLookupRateLimitConfig,
+    state: Mutex<PaykitConnectionStateLookupRateLimitState>,
+}
+
+#[derive(Debug)]
+struct PaykitConnectionStateLookupRateLimitState {
+    windows: HashMap<PaykitConnectionStateLookupRateLimitKey, WindowCounter>,
+    global: TokenBucketState,
+}
+
+impl InMemoryPaykitConnectionStateLookupRateLimiter {
+    pub fn new(config: PaykitConnectionStateLookupRateLimitConfig) -> Self {
+        Self::new_at(config, Instant::now())
+    }
+
+    fn new_at(config: PaykitConnectionStateLookupRateLimitConfig, now: Instant) -> Self {
+        Self {
+            state: Mutex::new(PaykitConnectionStateLookupRateLimitState {
+                windows: HashMap::new(),
+                global: TokenBucketState {
+                    tokens: config.global_burst,
+                    remainder: 0,
+                    last: now,
+                },
+            }),
+            config,
+        }
+    }
+
+    pub fn check(
+        &self,
+        key: &PaykitConnectionStateLookupRateLimitKey,
+        wall_now: OffsetDateTime,
+        monotonic_now: Instant,
+    ) -> RateLimitDecision {
+        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
+        if !state.windows.contains_key(key) && state.windows.len() >= self.config.max_entries {
+            state.windows.retain(|_, window| {
+                !window_has_expired(window.started_at, wall_now, self.config.window_seconds)
+            });
+            if state.windows.len() >= self.config.max_entries {
+                let retry_after = state
+                    .windows
+                    .values()
+                    .map(|window| {
+                        retry_after_seconds(window.started_at, wall_now, self.config.window_seconds)
+                    })
+                    .min()
+                    .unwrap_or(self.config.window_seconds);
+                return RateLimitDecision::rejected(retry_after);
+            }
+        }
+
+        match state.windows.get(key) {
+            Some(window)
+                if !window_has_expired(window.started_at, wall_now, self.config.window_seconds)
+                    && window.count >= self.config.max_requests =>
+            {
+                return RateLimitDecision::rejected(retry_after_seconds(
+                    window.started_at,
+                    wall_now,
+                    self.config.window_seconds,
+                ));
+            }
+            _ => {}
+        }
+
+        refill_token_bucket(
+            &mut state.global,
+            monotonic_now,
+            self.config.global_requests_per_second,
+            self.config.global_burst,
+        );
+        if state.global.tokens == 0 {
+            return RateLimitDecision::rejected(1);
+        }
+
+        state.global.tokens -= 1;
+        let window = state.windows.entry(key.clone()).or_insert(WindowCounter {
+            started_at: wall_now,
+            count: 0,
+        });
+        if window_has_expired(window.started_at, wall_now, self.config.window_seconds) {
+            window.started_at = wall_now;
+            window.count = 0;
+        }
+        window.count += 1;
+        RateLimitDecision::allowed()
+    }
+}
+
+fn refill_token_bucket(
+    state: &mut TokenBucketState,
+    now: Instant,
+    rate_per_second: u64,
+    burst: u64,
+) {
+    let elapsed_nanos = now.saturating_duration_since(state.last).as_nanos();
+    state.last = now;
+    if state.tokens == burst {
+        state.remainder = 0;
+        return;
+    }
+
+    let accrued = elapsed_nanos
+        .saturating_mul(u128::from(rate_per_second))
+        .saturating_add(state.remainder);
+    let added = accrued / 1_000_000_000;
+    state.remainder = accrued % 1_000_000_000;
+    state.tokens = state
+        .tokens
+        .saturating_add(u64::try_from(added).unwrap_or(u64::MAX))
+        .min(burst);
+    if state.tokens == burst {
+        state.remainder = 0;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VerificationSubmissionRateLimitKey {
@@ -112,12 +249,162 @@ fn retry_after_seconds(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
-    use locks_core::ids::CreatorPubky;
+    use locks_core::ids::{BundleId, CreatorPubky};
     use time::macros::datetime;
 
-    use super::{InMemoryVerificationSubmissionRateLimiter, VerificationSubmissionRateLimitKey};
-    use crate::config::VerificationSubmissionRateLimitConfig;
+    use super::{
+        InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+        PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey,
+    };
+    use crate::config::{
+        PaykitConnectionStateLookupRateLimitConfig, VerificationSubmissionRateLimitConfig,
+    };
+
+    #[test]
+    fn global_rejection_does_not_consume_fixed_window_budget() {
+        let monotonic_start = Instant::now();
+        let limiter = InMemoryPaykitConnectionStateLookupRateLimiter::new_at(
+            PaykitConnectionStateLookupRateLimitConfig {
+                max_requests: 1,
+                window_seconds: 60,
+                max_in_flight: 16,
+                max_entries: 10_000,
+                global_requests_per_second: 1,
+                global_burst: 1,
+            },
+            monotonic_start,
+        );
+        let wall_now = datetime!(2026-06-03 12:00:00 UTC);
+        let first = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G40R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+        let second = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G50R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+
+        assert!(limiter.check(&first, wall_now, monotonic_start).allowed);
+        assert_eq!(
+            limiter
+                .check(&second, wall_now, monotonic_start)
+                .retry_after_seconds,
+            Some(1)
+        );
+        assert!(
+            limiter
+                .check(
+                    &second,
+                    wall_now + time::Duration::seconds(1),
+                    monotonic_start + Duration::from_secs(1),
+                )
+                .allowed
+        );
+    }
+
+    #[test]
+    fn paykit_lookup_limiter_is_independent_per_ip_creator_and_bundle() {
+        let monotonic_now = Instant::now();
+        let limiter = InMemoryPaykitConnectionStateLookupRateLimiter::new(
+            PaykitConnectionStateLookupRateLimitConfig {
+                max_requests: 1,
+                window_seconds: 60,
+                max_in_flight: 16,
+                max_entries: 10_000,
+                global_requests_per_second: 50,
+                global_burst: 50,
+            },
+        );
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        let first = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G40R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+        let other_bundle = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G50R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+
+        assert!(limiter.check(&first, now, monotonic_now).allowed);
+        let rejected = limiter.check(&first, now, monotonic_now);
+        assert!(!rejected.allowed);
+        assert_eq!(rejected.retry_after_seconds, Some(60));
+        assert!(limiter.check(&other_bundle, now, monotonic_now).allowed);
+    }
+
+    #[test]
+    fn paykit_lookup_limiter_rejects_new_keys_at_entry_cap() {
+        let monotonic_now = Instant::now();
+        let limiter = InMemoryPaykitConnectionStateLookupRateLimiter::new(
+            PaykitConnectionStateLookupRateLimitConfig {
+                max_requests: 60,
+                window_seconds: 60,
+                max_in_flight: 16,
+                max_entries: 1,
+                global_requests_per_second: 50,
+                global_burst: 50,
+            },
+        );
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        let first = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G40R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+        let second = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G50R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+
+        assert!(limiter.check(&first, now, monotonic_now).allowed);
+        let rejected = limiter.check(&second, now, monotonic_now);
+        assert!(!rejected.allowed);
+        assert_eq!(rejected.retry_after_seconds, Some(60));
+    }
+
+    #[test]
+    fn paykit_lookup_limiter_evicts_expired_keys_before_applying_entry_cap() {
+        let monotonic_now = Instant::now();
+        let limiter = InMemoryPaykitConnectionStateLookupRateLimiter::new(
+            PaykitConnectionStateLookupRateLimitConfig {
+                max_requests: 60,
+                window_seconds: 60,
+                max_in_flight: 16,
+                max_entries: 1,
+                global_requests_per_second: 50,
+                global_burst: 50,
+            },
+        );
+        let now = datetime!(2026-06-03 12:00:00 UTC);
+        let expired = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G40R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+        let replacement = paykit_key(
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G50R40M30E209185GR38E1W",
+            [127, 0, 0, 1],
+        );
+
+        assert!(limiter.check(&expired, now, monotonic_now).allowed);
+        assert!(
+            limiter
+                .check(
+                    &replacement,
+                    now + time::Duration::seconds(60),
+                    monotonic_now + Duration::from_secs(60),
+                )
+                .allowed
+        );
+    }
 
     #[test]
     fn allows_requests_under_limit() {
@@ -231,6 +518,18 @@ mod tests {
         VerificationSubmissionRateLimitKey {
             client_address: IpAddr::V4(Ipv4Addr::from(ip_octets)),
             creator: CreatorPubky::from_str(creator).unwrap(),
+        }
+    }
+
+    fn paykit_key(
+        creator: &str,
+        bundle_id: &str,
+        ip_octets: [u8; 4],
+    ) -> PaykitConnectionStateLookupRateLimitKey {
+        PaykitConnectionStateLookupRateLimitKey {
+            client_address: IpAddr::V4(Ipv4Addr::from(ip_octets)),
+            creator: CreatorPubky::from_str(creator).unwrap(),
+            bundle_id: BundleId::from_str(bundle_id).unwrap(),
         }
     }
 }

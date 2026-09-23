@@ -132,6 +132,18 @@ impl LocalCreatorPublishingClient {
         .await
     }
 
+    pub async fn lookup_paykit_connection_state(
+        &self,
+        creator: CreatorPubky,
+        bundle_id: &str,
+    ) -> Result<Value, HttpTestError> {
+        self.post_json(
+            "/paykit-connection-state-lookups",
+            public_handle_body(creator, bundle_id),
+        )
+        .await
+    }
+
     pub async fn dev_complete_verification(
         &self,
         creator: CreatorPubky,

@@ -149,7 +149,7 @@ fn initialize_default_config(
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
         paykit: Some(PaykitConfig {
-            server_url: "http://127.0.0.1:3001/".to_owned(),
+            server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
         }),
     };
@@ -197,19 +197,28 @@ level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or En
 
 [pubky]
 network = "testnet" # One of: testnet, mainnet. Selects Pubky SDK network defaults; testnet expects local pubky-testnet services.
+resolution = "default" # One of: default, relay-only. relay-only disables direct Mainline DHT resolution while retaining PKARR relays on mainnet.
+# pkarr_relays = ["http://127.0.0.1:15411"] # Optional shared PKARR relay URL array for Pubky auth/storage resolution and Lock Server record publication. Omit to use network defaults.
 
 [pkdns]
 public_ip = "{}" # Public IP advertised in PKARR/PKDNS records. Local default is loopback; production must use the externally reachable address.
 public_pubky_tls_port = {} # Public PubkyTLS port advertised for the Lock Server. Set to the externally reachable TLS port, or omit only if unsupported by config policy.
 public_icann_http_port = {} # Public HTTP port advertised for ICANN/HTTP access. Use the proxy/listener port clients reach, commonly 80 or 443.
 icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default is localhost; production should be the public hostname.
-pkarr_relays = [] # Optional PKARR relay URLs to publish through. Empty uses SDK/default behavior; set explicit relays for controlled staging/prod publication.
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
 
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
 max_requests = {} # Maximum verification submissions allowed per rate-limit window.
 window_seconds = {} # Rate-limit window size in seconds.
+
+[rate_limits.paykit_connection_state_lookup]
+max_requests = {} # Maximum Paykit connection-state lookups allowed per client/task window.
+window_seconds = {} # Connection-state lookup rate-limit window size in seconds.
+max_in_flight = {} # Maximum concurrent outbound Paykit connection-status requests across this process.
+max_entries = {} # Maximum retained client/task windows; new keys wait for expired-window eviction.
+global_requests_per_second = {} # Sustained process-wide Paykit connection-status request rate.
+global_burst = {} # Process-wide Paykit connection-status token-bucket capacity.
 
 [content_locks]
 max_resource_bytes = {} # Maximum bytes for one guarded resource upload. Raise for larger files; lower to cap memory/storage exposure.
@@ -253,6 +262,30 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.rate_limits.verification_submission.enabled,
         config.rate_limits.verification_submission.max_requests,
         config.rate_limits.verification_submission.window_seconds,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .max_requests,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .window_seconds,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .max_in_flight,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .max_entries,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .global_requests_per_second,
+        config
+            .rate_limits
+            .paykit_connection_state_lookup
+            .global_burst,
         config.content_locks.max_resource_bytes,
         config.content_locks.max_resources,
         config.content_locks.max_total_resource_bytes
@@ -301,10 +334,10 @@ mod tests {
                 .paykit
                 .expect("generated paykit config")
                 .server_url,
-            "http://127.0.0.1:3001/"
+            "http://127.0.0.1:3001"
         );
         assert!(config_text.contains("[paykit]"));
-        assert!(config_text.contains("server_url = \"http://127.0.0.1:3001/\""));
+        assert!(config_text.contains("server_url = \"http://127.0.0.1:3001\""));
         assert!(config_text.contains("minimum_confirmations = 0"));
     }
 

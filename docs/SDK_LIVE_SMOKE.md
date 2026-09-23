@@ -17,7 +17,7 @@ The command is informational and exits 0. It reports whether the following envir
 | Variable | Meaning |
 | --- | --- |
 | `LOCKS_LIVE_LOCK_SERVER` | Lock Server Pubky with a browser-usable PKARR endpoint |
-| `LOCKS_LIVE_PKARR_RELAY` | PKARR relay URL. Local `pubky-testnet` uses `http://localhost:15411` |
+| `LOCKS_LIVE_PKARR_RELAY` | PKARR relay URL. Local `pubky-testnet` uses `http://127.0.0.1:15411` |
 | `LOCKS_LIVE_CREATOR` | Creator Pubky publishing `/pub/locks.app/config.json` |
 | `LOCKS_LIVE_CONTENT_LOCK_RESOURCE` | Canonical `pubky.../pub/locks.app/<lock_id>.json` resource |
 | `LOCKS_LIVE_DEMO_ORIGIN` | Browser origin allowed by `creator_authority_acquisition.legacy_connect.allowed_return_origins` |
@@ -34,7 +34,7 @@ python3 -m http.server 8080 --directory locks-sdk/bindings/js
 Open:
 
 ```text
-http://localhost:8080/demo/
+http://127.0.0.1:8080/demo/
 ```
 
 Then verify:
@@ -43,7 +43,7 @@ Then verify:
 
    ```ts
    const options = new LocksOptions();
-   options.addPkarrRelay(process.env.LOCKS_LIVE_PKARR_RELAY ?? "http://localhost:15411");
+   options.addPkarrRelay(process.env.LOCKS_LIVE_PKARR_RELAY ?? "http://127.0.0.1:15411");
    ```
 
 2. `Locks.forServerWithOptions(lockServer, options)` displays the configured Lock Server Pubky.

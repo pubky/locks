@@ -5,6 +5,7 @@ mod creator_publishing;
 pub mod dtos;
 pub mod errors;
 mod extractors;
+mod paykit;
 pub mod routes;
 mod runtime;
 mod verification;

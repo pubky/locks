@@ -33,15 +33,30 @@ export async function acquirePaykitReaderOwnership(
   path = paykitReaderOwnershipPath,
   { spawnProcess = spawn } = {},
 ) {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await chmod(dirname(path), 0o700);
-  const handle = await open(path, 'a', 0o600);
-  await handle.close();
-  await chmod(path, 0o600);
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+
+  let existing;
+  try {
+    existing = await lstat(path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    existing = null;
+  }
+  if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
+    throw new Error('Paykit reader ownership lock must be a regular file');
+  }
+  if (!existing) {
+    const created = await open(path, 'wx', 0o600);
+    await created.close();
+  }
+
+  await chmod(directory, 0o700);
   const metadata = await lstat(path);
-  if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) {
     throw new Error('Paykit reader ownership lock permissions are unsafe');
   }
+  await chmod(path, 0o600);
 
   const holder = spawnProcess('/usr/bin/flock', [
     '--nonblock',

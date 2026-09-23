@@ -53,6 +53,8 @@ impl Default for ContentLocksConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubkyConfig {
     pub network: PubkyNetwork,
+    pub resolution: PubkyResolution,
+    pub pkarr_relays: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -62,10 +64,20 @@ pub enum PubkyNetwork {
     Testnet,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PubkyResolution {
+    #[default]
+    Default,
+    RelayOnly,
+}
+
 impl Default for PubkyConfig {
     fn default() -> Self {
         Self {
             network: PubkyNetwork::Testnet,
+            resolution: PubkyResolution::Default,
+            pkarr_relays: None,
         }
     }
 }
@@ -76,7 +88,6 @@ pub struct PkdnsConfig {
     pub public_pubky_tls_port: Option<u16>,
     pub public_icann_http_port: Option<u16>,
     pub icann_domain: Option<String>,
-    pub pkarr_relays: Vec<String>,
     pub key_republisher_interval_seconds: u64,
 }
 
@@ -87,7 +98,6 @@ impl Default for PkdnsConfig {
             public_pubky_tls_port: Some(6287),
             public_icann_http_port: Some(80),
             icann_domain: Some("localhost".to_owned()),
-            pkarr_relays: Vec::new(),
             key_republisher_interval_seconds: 3600,
         }
     }
@@ -176,6 +186,30 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
     pub verification_submission: VerificationSubmissionRateLimitConfig,
+    pub paykit_connection_state_lookup: PaykitConnectionStateLookupRateLimitConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitConnectionStateLookupRateLimitConfig {
+    pub max_requests: u32,
+    pub window_seconds: u64,
+    pub max_in_flight: usize,
+    pub max_entries: usize,
+    pub global_requests_per_second: u64,
+    pub global_burst: u64,
+}
+
+impl Default for PaykitConnectionStateLookupRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 60,
+            window_seconds: 60,
+            max_in_flight: 16,
+            max_entries: 10_000,
+            global_requests_per_second: 50,
+            global_burst: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +332,20 @@ pub enum ConfigError {
         "rate_limits.verification_submission.window_seconds must be greater than zero when enabled"
     )]
     InvalidVerificationSubmissionRateLimitWindow,
+    #[error("rate_limits.paykit_connection_state_lookup.max_requests must be greater than zero")]
+    InvalidPaykitConnectionStateLookupRateLimitMaxRequests,
+    #[error("rate_limits.paykit_connection_state_lookup.window_seconds must be greater than zero")]
+    InvalidPaykitConnectionStateLookupRateLimitWindow,
+    #[error("rate_limits.paykit_connection_state_lookup.max_in_flight must be greater than zero")]
+    InvalidPaykitConnectionStateLookupMaxInFlight,
+    #[error("rate_limits.paykit_connection_state_lookup.max_entries must be greater than zero")]
+    InvalidPaykitConnectionStateLookupMaxEntries,
+    #[error(
+        "rate_limits.paykit_connection_state_lookup.global_requests_per_second must be greater than zero"
+    )]
+    InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond,
+    #[error("rate_limits.paykit_connection_state_lookup.global_burst must be greater than zero")]
+    InvalidPaykitConnectionStateLookupGlobalBurst,
     #[error("content_locks.max_resource_bytes must be greater than zero")]
     InvalidMaxResourceBytes,
     #[error("content_locks.max_resources must be greater than zero")]
@@ -320,10 +368,14 @@ pub enum ConfigError {
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
-    #[error("pkdns.pkarr_relays must contain valid http(s) URLs: {0}")]
-    InvalidPkarrRelayUrl(String),
-    #[error("paykit.server_url must be a valid http(s) URL: {0}")]
-    InvalidPaykitServerUrl(String),
+    #[error("pubky.pkarr_relays must contain at least one relay when configured")]
+    EmptyPubkyPkarrRelays,
+    #[error(
+        "pubky.pkarr_relays must contain valid http(s) URLs without credentials, query, or fragment"
+    )]
+    InvalidPubkyPkarrRelayUrl,
+    #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
+    InvalidPaykitServerUrl,
     #[error(
         "paykit requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
     )]

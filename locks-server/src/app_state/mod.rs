@@ -47,13 +47,14 @@ use locks_service::{
             PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
             PubkyHomeserverStorageClient, PubkyLegacyCookieSessionRevalidator,
             PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
-            PubkyPrivResourceRepository,
+            PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
         verifiers::dev_static::DevStaticVerifier,
         verifiers::paykit_payment::PaykitPaymentVerifier,
     },
 };
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::app_state::creator_authority::{
     DisabledLegacyCreatorConnectFlowClient, NoopLegacyCookieSessionRevalidator,
@@ -68,13 +69,16 @@ use crate::app_state::private_runtime::{
     InMemoryCreatorAuthorityStore, InMemoryCreatorConnectFlowStore,
     InMemoryFrontendSessionCodeStore, InMemoryFrontendSessionStore, PrivateRuntimeAdapters,
 };
+pub(crate) use crate::app_state::pubky_clients::configure_pkarr_builder;
 use crate::app_state::pubky_clients::{
     build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
 };
 pub use crate::app_state::readiness::RuntimeStorageKind;
 use crate::config::LockServerRuntimeConfig;
-use crate::paykit_http_client::PaykitHttpClient;
-use crate::rate_limit::InMemoryVerificationSubmissionRateLimiter;
+use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
+use crate::rate_limit::{
+    InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+};
 
 #[async_trait]
 pub trait ReaderPubkyResolver: Send + Sync {
@@ -92,7 +96,10 @@ impl ReaderPubkyResolver for PubkyReaderPubkyResolver {
         let Ok(public_key) = pubky_common::crypto::PublicKey::from_str(&reader.to_string()) else {
             return false;
         };
-        self.client.get_homeserver_of(&public_key).await.is_some()
+        self.client
+            .get_homeserver_of(&public_key)
+            .await
+            .is_ok_and(|homeserver| homeserver.is_some())
     }
 }
 
@@ -136,6 +143,14 @@ impl PubkyHomeserverStorageClient for UnavailablePubkyHomeserverStorageClient {
         Err(ApplicationError::CreatorAuthorityUnavailable)
     }
 
+    async fn get_metadata_as_creator(
+        &self,
+        _creator: &CreatorPubky,
+        _path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        Err(ApplicationError::CreatorAuthorityUnavailable)
+    }
+
     async fn delete_as_creator(
         &self,
         _creator: &CreatorPubky,
@@ -176,9 +191,13 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
     access_credential_policy: AccessCredentialPolicy,
     verification_submission_rate_limiter: Arc<InMemoryVerificationSubmissionRateLimiter>,
+    paykit_connection_state_lookup_rate_limiter:
+        Arc<InMemoryPaykitConnectionStateLookupRateLimiter>,
+    paykit_connection_status_semaphore: Arc<Semaphore>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
+    paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -415,7 +434,7 @@ impl AppState {
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
-        let pubky_http_client = build_pubky_http_client(config.pubky.network);
+        let pubky_http_client = build_pubky_http_client(&config.pubky);
         let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
             Arc::new(LegacyCookieCreatorAuthorityManager::new(
                 creator_authority_store.clone(),
@@ -425,7 +444,7 @@ impl AppState {
             CreatorRepositoryAdapters::pubky_homeserver(creator_authority_store, pubky_http_client);
         let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
             if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(config.pubky.network);
+                let pubky = build_pubky_client(&config.pubky);
                 match pubky_auth_relay_for_network(config.pubky.network) {
                     Some(auth_relay) => Arc::new(
                         PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
@@ -479,7 +498,7 @@ impl AppState {
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
-        let pubky_http_client = build_pubky_http_client(config.pubky.network);
+        let pubky_http_client = build_pubky_http_client(&config.pubky);
         let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
             Arc::new(LegacyCookieCreatorAuthorityManager::new(
                 creator_authority_store,
@@ -487,7 +506,7 @@ impl AppState {
             ));
         let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
             if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(config.pubky.network);
+                let pubky = build_pubky_client(&config.pubky);
                 match pubky_auth_relay_for_network(config.pubky.network) {
                     Some(auth_relay) => Arc::new(
                         PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
@@ -537,14 +556,25 @@ impl AppState {
         creator_repositories: CreatorRepositoryAdapters,
         private_runtime: PrivateRuntimeAdapters,
     ) -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let access_credential_policy =
             AccessCredentialPolicy::new(config.credentials.max_ttl_seconds);
         let verification_submission_rate_limiter =
             Arc::new(InMemoryVerificationSubmissionRateLimiter::new(
                 config.rate_limits.verification_submission.clone(),
             ));
+        let paykit_connection_state_lookup_rate_limiter =
+            Arc::new(InMemoryPaykitConnectionStateLookupRateLimiter::new(
+                config.rate_limits.paykit_connection_state_lookup.clone(),
+            ));
+        let paykit_connection_status_semaphore = Arc::new(Semaphore::new(
+            config
+                .rate_limits
+                .paykit_connection_state_lookup
+                .max_in_flight,
+        ));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
-            client: build_pubky_client(config.pubky.network),
+            client: build_pubky_client(&config.pubky),
         });
         let paykit_http_client = config.paykit.as_ref().map(|paykit| {
             Arc::new(
@@ -566,6 +596,9 @@ impl AppState {
         let payment_drain_client = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaymentDrainClient>);
+        let paykit_setup_status_provider = paykit_http_client
+            .as_ref()
+            .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
 
         Self {
             config,
@@ -594,12 +627,15 @@ impl AppState {
             creator_connect_flow_id_generator: Arc::new(OsRandomCreatorConnectFlowIdGenerator),
             frontend_session_code_generator: Arc::new(OsRandomFrontendSessionCodeGenerator),
             frontend_session_token_generator: Arc::new(OsRandomFrontendSessionTokenGenerator),
-            clock: Arc::new(SystemClock),
+            clock,
             access_credential_policy,
             verification_submission_rate_limiter,
+            paykit_connection_state_lookup_rate_limiter,
+            paykit_connection_status_semaphore,
             reader_pubky_resolver,
             paykit_http_client,
             payment_drain_client,
+            paykit_setup_status_provider,
         }
     }
 
@@ -742,12 +778,41 @@ impl AppState {
         &self.verification_submission_rate_limiter
     }
 
+    pub fn paykit_connection_state_lookup_rate_limiter(
+        &self,
+    ) -> &Arc<InMemoryPaykitConnectionStateLookupRateLimiter> {
+        &self.paykit_connection_state_lookup_rate_limiter
+    }
+
+    pub fn paykit_connection_status_semaphore(&self) -> &Arc<Semaphore> {
+        &self.paykit_connection_status_semaphore
+    }
+
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {
         &self.reader_pubky_resolver
     }
 
     pub fn paykit_http_client(&self) -> Option<&Arc<PaykitHttpClient>> {
         self.paykit_http_client.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_http_client(mut self, client: Option<Arc<PaykitHttpClient>>) -> Self {
+        self.paykit_http_client = client;
+        self
+    }
+
+    pub fn paykit_setup_status_provider(&self) -> Option<&Arc<dyn PaykitSetupStatusProvider>> {
+        self.paykit_setup_status_provider.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_paykit_setup_status_provider(
+        mut self,
+        provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
+    ) -> Self {
+        self.paykit_setup_status_provider = provider;
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]

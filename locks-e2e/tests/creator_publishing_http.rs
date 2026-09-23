@@ -556,9 +556,17 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
 
     let submit_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(submit_json["status"], "pending");
+    assert!(submit_json.get("connection_state").is_none());
     assert!(submit_json.get("task_id").is_none());
     fake_paykit.assert_invoice_created(&lock_resource).await;
     fake_paykit.assert_invoice_count(1).await;
+
+    let connection = client
+        .lookup_paykit_connection_state(creator(), BUNDLE_ID)
+        .await
+        .unwrap();
+    assert_eq!(connection, json!({ "state": "connected" }));
+    fake_paykit.assert_connection_status_checked().await;
 
     let replay_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(replay_json, submit_json);
@@ -801,6 +809,8 @@ struct FakePaykitState {
     invoice_body: Option<serde_json::Value>,
     invoice_signature: Option<String>,
     invoice_count: usize,
+    connection_body: Option<serde_json::Value>,
+    connection_signature: Option<String>,
     status_body: Option<serde_json::Value>,
     status_signature: Option<String>,
 }
@@ -810,6 +820,7 @@ impl FakePaykitServer {
         let state = Arc::new(Mutex::new(FakePaykitState::default()));
         let app = Router::new()
             .route("/invoices", post(fake_invoice_handler))
+            .route("/connections/status", post(fake_connection_status_handler))
             .route("/transactions/status", post(fake_status_handler))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -867,6 +878,23 @@ impl FakePaykitServer {
         assert!(!signature.is_empty());
         assert!(!signature.contains('='));
     }
+
+    async fn assert_connection_status_checked(&self) {
+        let state = self.state.lock().await;
+        assert_eq!(
+            state.connection_body,
+            Some(json!({
+                "creator": creator().to_string(),
+                "bundle_id": BUNDLE_ID
+            }))
+        );
+        let signature = state
+            .connection_signature
+            .as_deref()
+            .expect("connection request has X-Paykit-Signature");
+        assert!(!signature.is_empty());
+        assert!(!signature.contains('='));
+    }
 }
 
 async fn fake_invoice_handler(
@@ -887,6 +915,19 @@ async fn fake_invoice_handler(
             "payment_deadline": "2026-08-13T10:00:00Z",
         })),
     )
+}
+
+async fn fake_connection_status_handler(
+    State(state): State<Arc<Mutex<FakePaykitState>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Json<serde_json::Value> {
+    let mut state = state.lock().await;
+    state.connection_body = Some(serde_json::from_slice(&body).unwrap());
+    state.connection_signature = headers
+        .get("X-Paykit-Signature")
+        .map(|value| value.to_str().unwrap().to_owned());
+    Json(json!({ "state": "connected" }))
 }
 
 async fn fake_status_handler(

@@ -6,6 +6,11 @@ pub fn invalid_input(message: impl AsRef<str>) -> JsValue {
     js_sys_error("InvalidInput", message.as_ref())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn paykit_data_lookup_failed() -> JsValue {
+    js_sys_error("PaykitDataLookupFailed", "Paykit data lookup failed")
+}
+
 fn js_sys_error(name: &str, message: &str) -> JsValue {
     #[cfg(target_arch = "wasm32")]
     {
