@@ -22,6 +22,6 @@ pub use storage_client::{
     CreatorScopedPubkyStorageProvider, ImportedPubkySession,
     LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
     PubkyBytesResource, PubkyHomeserverStorageClient, PubkyImportedSession,
-    PubkyLegacyCookieSessionImporter, PubkySessionImporter, SdkCreatorScopedPubkyStorage,
-    pubky_storage_error,
+    PubkyLegacyCookieSessionImporter, PubkyResourceMetadata, PubkySessionImporter,
+    SdkCreatorScopedPubkyStorage, pubky_storage_error,
 };

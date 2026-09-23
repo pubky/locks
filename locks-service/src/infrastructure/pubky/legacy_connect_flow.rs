@@ -2,7 +2,11 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::CreatorPubky;
-use pubky::{AuthFlowKind, Capabilities, PubkyAuthFlow};
+#[allow(
+    deprecated,
+    reason = "legacy cookie auth remains the current creator authority contract"
+)]
+use pubky::{AuthFlowKind, Capabilities, PubkyCookieAuthFlow};
 use url::Url;
 
 use crate::application::errors::ApplicationError;
@@ -37,19 +41,23 @@ impl PubkyLegacyCreatorConnectFlowClient {
 }
 
 #[async_trait]
+#[allow(
+    deprecated,
+    reason = "legacy cookie auth remains the current creator authority contract"
+)]
 impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
     async fn start_legacy_creator_connect_flow(
         &self,
         requested_scopes: &[String],
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
-        let capabilities = requested_scopes_to_capabilities(requested_scopes);
+        let capabilities = requested_scopes_to_capabilities(requested_scopes)?;
         let flow = match &self.auth_relay {
-            Some(auth_relay) => PubkyAuthFlow::builder(&capabilities, AuthFlowKind::signin())
+            Some(auth_relay) => PubkyCookieAuthFlow::builder(&capabilities, AuthFlowKind::signin())
                 .relay(auth_relay.clone())
                 .start(),
             None => self
                 .pubky
-                .start_auth_flow(&capabilities, AuthFlowKind::signin()),
+                .start_cookie_auth_flow(&capabilities, AuthFlowKind::signin()),
         }
         .map_err(|_| legacy_connect_flow_error("failed to start legacy creator connect flow"))?;
         Ok(CreatorConnectAuthorizationUrl::new(
@@ -63,7 +71,7 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
         let flow = self
             .pubky
-            .resume_auth_flow(authorization_url.expose_url())
+            .resume_cookie_auth_flow(authorization_url.expose_url())
             .map_err(|_| {
                 legacy_connect_flow_error("failed to resume legacy creator connect flow")
             })?;
@@ -71,7 +79,13 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
             legacy_connect_flow_error("legacy creator connect flow approval failed or expired")
         })?;
         let creator = creator_from_pubky_public_key_z32(&session.info().public_key().z32())?;
-        let session_secret = CreatorAuthoritySecret::new(session.export_secret());
+        let session_secret = session
+            .as_cookie()
+            .and_then(|cookie| cookie.export_secret())
+            .map(CreatorAuthoritySecret::new)
+            .ok_or_else(|| {
+                legacy_connect_flow_error("legacy creator connect flow returned no cookie secret")
+            })?;
         Ok(LegacyCreatorConnectFlowApproval {
             creator,
             session_secret,
@@ -83,7 +97,9 @@ impl LegacyCreatorConnectFlowClient for PubkyLegacyCreatorConnectFlowClient {
 pub fn legacy_locks_connect_capabilities() -> Capabilities {
     Capabilities::builder()
         .read_write("/priv/locks.app/")
+        .expect("static private Locks capability is canonical")
         .read_write("/pub/locks.app/")
+        .expect("static public Locks capability is canonical")
         .finish()
 }
 
@@ -107,16 +123,20 @@ pub fn creator_z32_from_creator_pubky(creator: &CreatorPubky) -> Result<String, 
         })
 }
 
-fn requested_scopes_to_capabilities(requested_scopes: &[String]) -> Capabilities {
+fn requested_scopes_to_capabilities(
+    requested_scopes: &[String],
+) -> Result<Capabilities, ApplicationError> {
     if requested_scopes.is_empty() {
-        return legacy_locks_connect_capabilities();
+        return Ok(legacy_locks_connect_capabilities());
     }
 
     let mut builder = Capabilities::builder();
     for scope in requested_scopes {
-        builder = builder.read_write(scope.trim_end_matches(":rw"));
+        builder = builder
+            .read_write(scope.trim_end_matches(":rw"))
+            .map_err(|_| legacy_connect_flow_error("invalid legacy creator capability scope"))?;
     }
-    builder.finish()
+    Ok(builder.finish())
 }
 
 fn legacy_connect_flow_error(message: &'static str) -> ApplicationError {
@@ -131,6 +151,7 @@ mod tests {
 
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
+    use url::Url;
 
     use super::{
         PubkyLegacyCreatorConnectFlowClient, creator_from_pubky_public_key_z32,
@@ -218,12 +239,29 @@ mod tests {
 
         let authorization_url = client.start_legacy_creator_connect_flow(&[]).await.unwrap();
 
-        assert!(
-            authorization_url
-                .expose_url()
-                .contains("relay=http://localhost:15412/inbox/"),
-            "unexpected authorization URL: {}",
-            authorization_url.expose_url()
+        let parsed = Url::parse(authorization_url.expose_url()).unwrap();
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find_map(|(name, value)| (name == "relay").then(|| value.into_owned())),
+            Some("http://localhost:15412/inbox/".to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_backed_client_rejects_invalid_requested_scope_before_starting_flow() {
+        let client = PubkyLegacyCreatorConnectFlowClient::new(pubky::Pubky::testnet().unwrap());
+
+        let error = client
+            .start_legacy_creator_connect_flow(&["relative-scope:rw".to_owned()])
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::CreatorAuthoritySecret {
+                message: "invalid legacy creator capability scope".to_owned(),
+            }
         );
     }
 

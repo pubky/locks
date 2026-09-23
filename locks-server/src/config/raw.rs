@@ -12,9 +12,9 @@ use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -52,15 +52,23 @@ struct RawPaykitConfig {
 
 impl RawPaykitConfig {
     fn into_paykit_config(self) -> Result<PaykitConfig, ConfigError> {
-        let parsed = Url::parse(&self.server_url)
-            .map_err(|_| ConfigError::InvalidPaykitServerUrl(self.server_url.clone()))?;
-        match parsed.scheme() {
-            "http" | "https" => Ok(PaykitConfig {
-                server_url: parsed.to_string(),
-                minimum_confirmations: self.minimum_confirmations,
-            }),
-            _ => Err(ConfigError::InvalidPaykitServerUrl(self.server_url)),
+        let parsed =
+            Url::parse(&self.server_url).map_err(|_| ConfigError::InvalidPaykitServerUrl)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.cannot_be_a_base()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.origin().ascii_serialization() != self.server_url
+        {
+            return Err(ConfigError::InvalidPaykitServerUrl);
         }
+        Ok(PaykitConfig {
+            server_url: self.server_url,
+            minimum_confirmations: self.minimum_confirmations,
+        })
     }
 }
 
@@ -69,26 +77,139 @@ impl RawPaykitConfig {
 struct RawPubkyConfig {
     #[serde(default = "default_pubky_network")]
     network: PubkyNetwork,
+    #[serde(default)]
+    resolution: PubkyResolution,
+    #[serde(default)]
+    pkarr_relays: Option<Vec<String>>,
 }
 
 impl Default for RawPubkyConfig {
     fn default() -> Self {
         Self {
             network: default_pubky_network(),
+            resolution: PubkyResolution::default(),
+            pkarr_relays: None,
         }
     }
 }
 
 impl RawPubkyConfig {
-    fn into_pubky_config(self) -> PubkyConfig {
-        PubkyConfig {
+    fn into_pubky_config(self) -> Result<PubkyConfig, ConfigError> {
+        let pkarr_relays = match self.pkarr_relays {
+            Some(relays) if relays.is_empty() => return Err(ConfigError::EmptyPubkyPkarrRelays),
+            Some(relays) => Some(
+                relays
+                    .into_iter()
+                    .map(normalize_pubky_pkarr_relay_url)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+
+        Ok(PubkyConfig {
             network: self.network,
-        }
+            resolution: self.resolution,
+            pkarr_relays,
+        })
     }
 }
 
 fn default_pubky_network() -> PubkyNetwork {
     PubkyNetwork::Testnet
+}
+
+#[cfg(test)]
+mod pubky_tests {
+    use super::*;
+
+    #[test]
+    fn parses_relay_only_resolution() {
+        let raw: RawPubkyConfig = toml::from_str(
+            r#"
+network = "mainnet"
+resolution = "relay-only"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw.into_pubky_config().unwrap(),
+            PubkyConfig {
+                network: PubkyNetwork::Mainnet,
+                resolution: PubkyResolution::RelayOnly,
+                pkarr_relays: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_and_normalizes_configured_pubky_pkarr_relays() {
+        let raw: RawPubkyConfig = toml::from_str(
+            r#"
+network = "mainnet"
+resolution = "relay-only"
+pkarr_relays = ["https://relay.example", "http://127.0.0.1:15411"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw.into_pubky_config().unwrap().pkarr_relays,
+            Some(vec![
+                "https://relay.example/".to_owned(),
+                "http://127.0.0.1:15411/".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_empty_configured_pubky_pkarr_relay_array() {
+        let raw: RawPubkyConfig = toml::from_str(
+            r#"
+network = "mainnet"
+resolution = "relay-only"
+pkarr_relays = []
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            raw.into_pubky_config(),
+            Err(ConfigError::EmptyPubkyPkarrRelays)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_configured_pubky_pkarr_relay_url() {
+        let raw: RawPubkyConfig = toml::from_str(
+            r#"
+pkarr_relays = ["not-a-url"]
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            raw.into_pubky_config(),
+            Err(ConfigError::InvalidPubkyPkarrRelayUrl)
+        ));
+    }
+
+    #[test]
+    fn rejects_secret_bearing_pubky_pkarr_relay_urls_without_echoing_values() {
+        for relay in [
+            "https://sentinel-user:sentinel-password@relay.example",
+            "https://relay.example?token=sentinel-query",
+            "https://relay.example#sentinel-fragment",
+        ] {
+            let raw: RawPubkyConfig =
+                toml::from_str(&format!("pkarr_relays = [{relay:?}]")).unwrap();
+
+            let error = raw.into_pubky_config().unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidPubkyPkarrRelayUrl));
+            let display = error.to_string();
+            assert!(!display.contains("sentinel"));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,8 +223,6 @@ struct RawPkdnsConfig {
     public_icann_http_port: Option<u16>,
     #[serde(default)]
     icann_domain: Option<String>,
-    #[serde(default)]
-    pkarr_relays: Vec<String>,
     #[serde(default = "default_key_republisher_interval_seconds")]
     key_republisher_interval_seconds: u64,
 }
@@ -115,7 +234,6 @@ impl Default for RawPkdnsConfig {
             public_pubky_tls_port: Some(6287),
             public_icann_http_port: Some(80),
             icann_domain: Some("localhost".to_owned()),
-            pkarr_relays: Vec::new(),
             key_republisher_interval_seconds: default_key_republisher_interval_seconds(),
         }
     }
@@ -128,23 +246,24 @@ impl RawPkdnsConfig {
             public_pubky_tls_port: self.public_pubky_tls_port,
             public_icann_http_port: self.public_icann_http_port,
             icann_domain: self.icann_domain,
-            pkarr_relays: self
-                .pkarr_relays
-                .into_iter()
-                .map(normalize_pkarr_relay_url)
-                .collect::<Result<Vec<_>, _>>()?,
             key_republisher_interval_seconds: self.key_republisher_interval_seconds,
         })
     }
 }
 
-fn normalize_pkarr_relay_url(value: String) -> Result<String, ConfigError> {
-    let parsed =
-        Url::parse(&value).map_err(|_| ConfigError::InvalidPkarrRelayUrl(value.clone()))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(parsed.to_string()),
-        _ => Err(ConfigError::InvalidPkarrRelayUrl(value)),
+fn normalize_pubky_pkarr_relay_url(value: String) -> Result<String, ConfigError> {
+    let parsed = Url::parse(&value).map_err(|_| ConfigError::InvalidPubkyPkarrRelayUrl)?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidPubkyPkarrRelayUrl);
     }
+    pkarr::Client::builder()
+        .relays(std::slice::from_ref(&value))
+        .map_err(|_| ConfigError::InvalidPubkyPkarrRelayUrl)?;
+    Ok(parsed.to_string())
 }
 
 fn default_pkdns_public_ip() -> IpAddr {
@@ -319,6 +438,62 @@ struct RawRuntimeConfig {
 #[serde(deny_unknown_fields)]
 struct RawRateLimitsConfig {
     verification_submission: RawVerificationSubmissionRateLimitConfig,
+    #[serde(default)]
+    paykit_connection_state_lookup: RawPaykitConnectionStateLookupRateLimitConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPaykitConnectionStateLookupRateLimitConfig {
+    #[serde(default = "default_paykit_lookup_max_requests")]
+    max_requests: u32,
+    #[serde(default = "default_paykit_lookup_window_seconds")]
+    window_seconds: u64,
+    #[serde(default = "default_paykit_lookup_max_in_flight")]
+    max_in_flight: usize,
+    #[serde(default = "default_paykit_lookup_max_entries")]
+    max_entries: usize,
+    #[serde(default = "default_paykit_lookup_global_requests_per_second")]
+    global_requests_per_second: u64,
+    #[serde(default = "default_paykit_lookup_global_burst")]
+    global_burst: u64,
+}
+
+impl Default for RawPaykitConnectionStateLookupRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: default_paykit_lookup_max_requests(),
+            window_seconds: default_paykit_lookup_window_seconds(),
+            max_in_flight: default_paykit_lookup_max_in_flight(),
+            max_entries: default_paykit_lookup_max_entries(),
+            global_requests_per_second: default_paykit_lookup_global_requests_per_second(),
+            global_burst: default_paykit_lookup_global_burst(),
+        }
+    }
+}
+
+fn default_paykit_lookup_max_requests() -> u32 {
+    60
+}
+
+fn default_paykit_lookup_window_seconds() -> u64 {
+    60
+}
+
+fn default_paykit_lookup_max_in_flight() -> usize {
+    16
+}
+
+fn default_paykit_lookup_max_entries() -> usize {
+    10_000
+}
+
+fn default_paykit_lookup_global_requests_per_second() -> u64 {
+    50
+}
+
+fn default_paykit_lookup_global_burst() -> u64 {
+    50
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,6 +651,42 @@ impl RawRateLimitsConfig {
             verification_submission: self
                 .verification_submission
                 .into_verification_submission_rate_limit_config()?,
+            paykit_connection_state_lookup: self
+                .paykit_connection_state_lookup
+                .into_paykit_connection_state_lookup_rate_limit_config()?,
+        })
+    }
+}
+
+impl RawPaykitConnectionStateLookupRateLimitConfig {
+    fn into_paykit_connection_state_lookup_rate_limit_config(
+        self,
+    ) -> Result<PaykitConnectionStateLookupRateLimitConfig, ConfigError> {
+        if self.max_requests == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupRateLimitMaxRequests);
+        }
+        if self.window_seconds == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupRateLimitWindow);
+        }
+        if self.max_in_flight == 0 || self.max_in_flight > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupMaxInFlight);
+        }
+        if self.max_entries == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupMaxEntries);
+        }
+        if self.global_requests_per_second == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalRequestsPerSecond);
+        }
+        if self.global_burst == 0 {
+            return Err(ConfigError::InvalidPaykitConnectionStateLookupGlobalBurst);
+        }
+        Ok(PaykitConnectionStateLookupRateLimitConfig {
+            max_requests: self.max_requests,
+            window_seconds: self.window_seconds,
+            max_in_flight: self.max_in_flight,
+            max_entries: self.max_entries,
+            global_requests_per_second: self.global_requests_per_second,
+            global_burst: self.global_burst,
         })
     }
 }
@@ -510,7 +721,7 @@ impl RawConfig {
             .into_creator_authority_acquisition_config(runtime.environment)?;
         let secrets = self.secrets.into_secrets_config()?;
         let logging = self.logging.into_logging_config()?;
-        let pubky = self.pubky.into_pubky_config();
+        let pubky = self.pubky.into_pubky_config()?;
         let pkdns = self.pkdns.into_pkdns_config()?;
         let rate_limits = self.rate_limits.into_rate_limits_config()?;
         let content_locks = self.content_locks.into_content_locks_config()?;

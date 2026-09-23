@@ -17,7 +17,7 @@ Homeservers remain responsible for Pubky sessions, path-scoped capabilities, and
 
 Positive:
 
-- Minimal disturbance to Pubky-Core.
+- Minimal disturbance to the Pubky protocol.
 - Lock types can evolve independently.
 - The domain model can stay application-owned.
 
@@ -28,5 +28,5 @@ Negative:
 
 ## Open Follow-ups
 
-- Confirm final Pubky-Core path capability model for `/priv/locks.app/`.
+- Confirm the final Pubky Homeserver path capability model for `/priv/locks.app/`.
 - Confirm whether app sessions can write verified proof bundles under `/priv/locks.app/proofs/`.

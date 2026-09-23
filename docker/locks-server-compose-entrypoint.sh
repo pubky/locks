@@ -47,12 +47,6 @@ if [ -z "$lock_server_public_key" ] || [ "$lock_server_public_key" = "<derived-o
   exit 1
 fi
 
-mkdir -p "$(dirname "$public_config")"
-public_config_tmp="$public_config.tmp.$$"
-printf 'lock_server_public_key = "%s"\n' "$lock_server_public_key" > "$public_config_tmp"
-chmod 0644 "$public_config_tmp"
-mv "$public_config_tmp" "$public_config"
-
 cat > "$compose_config" <<EOF
 bind_addr = "0.0.0.0:3000"
 
@@ -96,13 +90,13 @@ level = "info,pubky::actors::session=warn"
 
 [pubky]
 network = "testnet"
+pkarr_relays = ["http://127.0.0.1:15411"]
 
 [pkdns]
 public_ip = "127.0.0.1"
 public_pubky_tls_port = 6287
 public_icann_http_port = 3000
 icann_domain = "127.0.0.1"
-pkarr_relays = ["http://127.0.0.1:15411"]
 key_republisher_interval_seconds = 86400
 
 [rate_limits.verification_submission]
@@ -115,6 +109,23 @@ max_resource_bytes = 10000000
 max_resources = 10
 max_total_resource_bytes = 100000000
 EOF
+
+paykit_server_url="$(
+  sed -n '/^\[paykit\]$/,/^\[/p' "$compose_config" \
+    | grep -E '^server_url = ' \
+    | head -n 1 \
+    | cut -d '"' -f 2
+)"
+if [ -z "$paykit_server_url" ]; then
+  echo "[locks-compose] generated config has no Paykit Server URL" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$public_config")"
+public_config_tmp="$public_config.tmp.$$"
+printf 'lock_server_public_key = "%s"\npaykit_server_url = "%s"\n' \
+  "$lock_server_public_key" "$paykit_server_url" > "$public_config_tmp"
+chmod 0644 "$public_config_tmp"
+mv "$public_config_tmp" "$public_config"
 
 echo "[locks-compose] starting locks-server with $compose_config"
 exec locks-server --config "$compose_config"
