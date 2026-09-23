@@ -22,12 +22,15 @@ use locks_core::lock_policy::{
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    ContentLockDeletionFailureCode, ContentLockDeletionState, CreatorAuthorityAuthKind,
-    CreatorAuthorityRecord, CreatorAuthoritySecret, CreatorConnectAuthorizationUrl,
-    CreatorConnectFlowId, FrontendSessionRecord, FrontendSessionToken, GuardedResourceRecord,
+    AccessCredentialLookupKey, AccessCredentialRecord, ContentLockDeletionFailureCode,
+    ContentLockDeletionState, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
+    CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
+    DeletionReadAuthorization, FrontendSessionRecord, FrontendSessionToken, GuardedResourceRecord,
     LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
-use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
+use locks_service::application::ports::{
+    AccessCredentialStore, Clock, GuardedResourceRepository, LegacyCreatorConnectFlowClient,
+};
 use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -78,6 +81,156 @@ struct AlwaysResolvesReader;
 impl ReaderPubkyResolver for AlwaysResolvesReader {
     async fn reader_has_homeserver(&self, _reader: &CreatorPubky) -> bool {
         true
+    }
+}
+
+struct ResponseBoundaryAccessCredentialStore {
+    content_type: String,
+    claim_token: Uuid,
+    consume_succeeds: bool,
+    releases: AtomicUsize,
+    consumes: AtomicUsize,
+}
+
+impl ResponseBoundaryAccessCredentialStore {
+    fn new(content_type: &str) -> Self {
+        Self {
+            content_type: content_type.to_owned(),
+            claim_token: Uuid::new_v4(),
+            consume_succeeds: true,
+            releases: AtomicUsize::new(0),
+            consumes: AtomicUsize::new(0),
+        }
+    }
+
+    fn losing_consume(content_type: &str) -> Self {
+        Self {
+            consume_succeeds: false,
+            ..Self::new(content_type)
+        }
+    }
+}
+
+#[async_trait]
+impl AccessCredentialStore for ResponseBoundaryAccessCredentialStore {
+    async fn insert_access_credential(
+        &self,
+        _lock_id: &LockId,
+        _lookup_key: AccessCredentialLookupKey,
+        _record: AccessCredentialRecord,
+    ) -> Result<(), ApplicationError> {
+        unreachable!("response-boundary fake does not issue credentials")
+    }
+
+    async fn get_access_credential(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<Option<AccessCredentialRecord>, ApplicationError> {
+        Ok(None)
+    }
+
+    async fn delete_access_credential(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    async fn prepare_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        path: &str,
+        _now: time::OffsetDateTime,
+        _claim_expires_at: time::OffsetDateTime,
+    ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
+        Ok(Some(DeletionReadAuthorization {
+            claim_token: Some(self.claim_token),
+            creator: creator(),
+            resource: GuardedResource {
+                path: path.to_owned(),
+                hash: GuardedResourceHash::from_bytes([7; 32]),
+                content_type: self.content_type.clone(),
+                size: 13,
+            },
+        }))
+    }
+
+    async fn deletion_credential_enrolled(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<bool, ApplicationError> {
+        Ok(true)
+    }
+
+    async fn release_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _path: &str,
+        claim_token: Uuid,
+        _now: time::OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        assert_eq!(claim_token, self.claim_token);
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn consume_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _path: &str,
+        claim_token: Uuid,
+        _now: time::OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        assert_eq!(claim_token, self.claim_token);
+        self.consumes.fetch_add(1, Ordering::SeqCst);
+        Ok(self.consume_succeeds)
+    }
+}
+
+struct ResponseBoundaryGuardedResourceRepository {
+    content_type: String,
+}
+
+#[async_trait]
+impl GuardedResourceRepository for ResponseBoundaryGuardedResourceRepository {
+    async fn upsert_guarded_resource(
+        &self,
+        _guarded_resource: GuardedResourceRecord,
+    ) -> Result<GuardedResource, ApplicationError> {
+        unreachable!("response-boundary fake does not store resources")
+    }
+
+    async fn get_guarded_resource(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        hash: &GuardedResourceHash,
+    ) -> Result<Option<GuardedResourceRecord>, ApplicationError> {
+        Ok(Some(GuardedResourceRecord {
+            creator: creator.clone(),
+            path: path.to_owned(),
+            hash: *hash,
+            content_type: self.content_type.clone(),
+            size: 13,
+            bytes: b"guarded bytes".to_vec(),
+        }))
+    }
+
+    async fn get_current_guarded_resource(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<GuardedResourceRecord>, ApplicationError> {
+        self.get_guarded_resource(creator, path, &GuardedResourceHash::from_bytes([7; 32]))
+            .await
+    }
+
+    async fn delete_guarded_resource(
+        &self,
+        _creator: &CreatorPubky,
+        _path: &str,
+    ) -> Result<bool, ApplicationError> {
+        Ok(false)
     }
 }
 
@@ -888,6 +1041,7 @@ async fn readyz_returns_not_ready_for_persisted_runtime_when_pool_ping_fails() {
         test_config(RuntimeEnvironment::Development, true),
         pool,
         CreatorAuthoritySecretCipher::new([7; 32]),
+        locks_service::infrastructure::final_credentials::FinalCredentialCipher::new([8; 32]),
     );
 
     let response = router(state)
@@ -2442,6 +2596,72 @@ async fn proxy_read_with_valid_bearer_credential_returns_raw_guarded_resource_by
             .is_none()
     );
     assert_eq!(response_bytes(response).await, b"guarded bytes".to_vec());
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_releases_claim_when_http_response_construction_fails() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new(
+        "invalid\ncontent-type",
+    ));
+    let state = test_state()
+        .with_access_credentials(store.clone())
+        .with_guarded_resources(Arc::new(ResponseBoundaryGuardedResourceRepository {
+            content_type: "invalid\ncontent-type".to_owned(),
+        }));
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_consumes_claim_before_returning_http_200() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new("text/plain"));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_does_not_return_constructed_response_when_consume_loses() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::losing_consume(
+        "text/plain",
+    ));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), StatusCode::OK);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -4069,6 +4289,7 @@ fn test_config(
         pkdns: crate::config::PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        deletion: crate::config::DeletionConfig::default(),
         paykit: None,
     }
 }
@@ -4277,6 +4498,21 @@ async fn seed_content_lock(state: &AppState, content_lock: ContentLock) {
             content_lock.content_lock_path().unwrap(),
             content_lock,
         )
+        .await
+        .unwrap();
+}
+
+async fn seed_response_boundary_resource(state: &AppState, content_type: &str) {
+    state
+        .guarded_resources()
+        .upsert_guarded_resource(GuardedResourceRecord {
+            creator: creator(),
+            path: "/priv/locks.app/content/hello.txt".to_owned(),
+            hash: GuardedResourceHash::from_bytes([7; 32]),
+            content_type: content_type.to_owned(),
+            size: 13,
+            bytes: b"guarded bytes".to_vec(),
+        })
         .await
         .unwrap();
 }

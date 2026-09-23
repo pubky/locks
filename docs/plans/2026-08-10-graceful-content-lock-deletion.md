@@ -14,7 +14,7 @@
 
 ## Status and provenance
 
-- Plan status: **accepted product design; Tasks 1, 2, 4, 5, and 6 committed; the omitted Task 3 prerequisite is implemented pending commit; Tasks 7–10 remain**.
+- Plan status: **accepted product design; Tasks 1–7 committed; Tasks 8–11 remain**.
 - Repository inspected: `/home/u/Projects/Synonym/Pubky/locks-public`.
 - Planning base when written: clean `master` at `ba49a77`.
 - There has been no production deployment. New persistence may require a clean pre-production database; no historical backfill is required.
@@ -66,6 +66,11 @@
 32. `force=true` against an active graceful job persists `force_requested`, revokes the current claim token/lease, requeues the same frozen job, and returns `202`; a fresh worker claim escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
 33. Graceful job insertion/resume and permanent force-receipt establishment acquire the same canonical per-lock PostgreSQL fence. The durable result is either an active graceful job or a permanent force receipt, never both. Failed graceful replay requeues the same job and frozen manifest. Force against a terminal job atomically replaces that operational row with the permanent receipt before synchronous external deletion.
 34. Any Content Lock fetched from Pubky for deletion must hash to the requested Lock ID and name the authenticated creator before its manifest is frozen or used for resource deletion.
+35. Runtime encryption uses one environment-only 32-byte unpadded-base64url master key selected by `secrets.runtime_master_key_env`. Creator-authority and final-credential encryption keys are derived from it with distinct fixed domain labels. The retired `creator_authority_key_env` key is rejected as unknown configuration; no compatibility alias is retained.
+36. The closed `[deletion]` configuration contract is `retry_max_attempts = 10`, `retry_initial_backoff_seconds = 1`, `retry_max_backoff_seconds = 300`, `final_credential_issuance_window_seconds = 900`, and `final_read_window_seconds = 900` by default. All values are positive; initial backoff cannot exceed maximum backoff; both credential windows are bounded to at most 3600 seconds. Retry jitter remains an implementation policy rather than a configurable field.
+37. Deletion admission immutably records whether each paid snapshot Bundle had any active credential at cutoff and enrolls every such ordinary credential with its original expiry. Enrolled ordinary credentials remain reusable against the frozen manifest until that expiry; they do not acquire one-shot resource-read rows. When the claimed job first enters `issue_final_credentials`, it persists `final_issuance_started_at`, `final_credential_issuance_deadline = final_issuance_started_at + final_credential_issuance_window`, and `final_read_deadline = final_credential_issuance_deadline + final_read_window` once; replay and later config changes never extend them. A paid snapshot resolved completed without an active ordinary credential at cutoff becomes durably final-credential eligible and receives exactly one encrypted replayable final credential expiring at `final_read_deadline`. Every final credential receives one claimable row per frozen manifest path. Final-read claims precede Pubky fetch, are released on pre-response failure, expire for crash recovery, and are consumed only after the complete HTTP response is constructed; consumption is permanent. Phase advancement waits until every enrolled ordinary credential is expired and every final resource is consumed or its credential/read window is expired.
+38. Ordinary credential insertion and deletion admission acquire the same canonical per-lock fence. Deletion-first rejects the insert; insertion-first is attached and classified at cutoff. Database lock order is canonical per-lock fence, deletion job row, snapshot/credential row, then resource-read row. No transaction spans Pubky I/O. Final read claims use fixed 30-second leases clamped to credential expiry; stale claim tokens cannot consume or release a reclaimed row.
+39. This pre-production migration intentionally has no creator-authority ciphertext compatibility path. Moving the same bytes to `runtime_master_key_env` changes the derived creator-authority key; existing local encrypted authority rows must be discarded and reacquired or the local database recreated.
 
 ### Source-derived constraints
 
@@ -458,7 +463,7 @@ cargo test --workspace --no-run
 
 **RED:** Cover exact encrypted replay, wrong-key/corrupt/version rejection, no secret Debug/log output, issuance/read deadlines, no deadline extension, existing/final access through the frozen manifest while the public path is a tombstone, denial outside the persisted drain, one concurrent success per path, claim release before response construction, consumption after construction, and automatic revocation when complete/expired.
 
-**GREEN:** Use versioned AEAD and domain-separated key derivation; retain lookup hashes. Resolve draining reads from the frozen manifest rather than parsing the tombstone. Do not store plaintext bearer.
+**GREEN:** Snapshot and enroll active credentials atomically at deletion admission, and initialize final-window timestamps once when entering final issuance under the deletion lease. Fence ordinary insertion against deletion admission. Use versioned AEAD and domain-separated key derivation; retain lookup hashes. Enroll cutoff-active credentials at their original expiry and create one final credential only for an eligible completed snapshot without one. Resolve draining reads from the frozen manifest rather than parsing the tombstone. Claim each credential/path before fetch, release on pre-response failure, consume only after the server constructs the complete response, and allow only expired claims to be reclaimed. Do not store plaintext bearer.
 
 **Suggested commit:** `feat(access): drain final deletion credentials`
 
@@ -560,9 +565,7 @@ Cross-service acceptance must additionally prove:
 
 ## Remaining implementation-contract gates
 
-These do not reopen accepted product semantics, but code must not start for the affected slice until both plans are patched identically:
-
-1. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
+None. The exact Locks-only deletion configuration and runtime-master-key contracts are fixed above. Paykit Server has no corresponding credential or deletion-worker configuration.
 
 ## Out of scope
 

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::lock_policy::VerifierType;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::VerificationTaskRecord;
@@ -67,6 +68,13 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                     .pubky_lock_resource
                     .lock_id()
                     .clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                paykit_admission_required: task
+                    .submitted_proof_bundle
+                    .proofs
+                    .iter()
+                    .any(|proof| proof.verifier_type == VerifierType::PaykitPayment),
+                status: task.status,
                 entitlement_publication_claim_token: None,
                 deletion_job_id: None,
             },
@@ -79,11 +87,15 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if !records.contains_key(&task.task_id) {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
+        }
+        if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
+            fence_record.status = task.status;
         }
         records.insert(task.task_id, task);
         Ok(())

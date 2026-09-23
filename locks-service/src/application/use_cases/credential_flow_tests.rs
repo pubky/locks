@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 
 use locks_core::ids::{
-    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockServerPubky,
+    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockId, LockServerPubky,
     PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
@@ -583,6 +583,7 @@ impl FakeAccessCredentialStore {
 impl AccessCredentialStore for FakeAccessCredentialStore {
     async fn insert_access_credential(
         &self,
+        _lock_id: &LockId,
         lookup_key: AccessCredentialLookupKey,
         record: AccessCredentialRecord,
     ) -> Result<(), ApplicationError> {

@@ -415,6 +415,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::RateLimited
         | ApplicationError::UnsupportedCredentialTtl { .. }
         | ApplicationError::CredentialGeneration { .. }
+        | ApplicationError::FinalCredentialSecret { .. }
         | ApplicationError::CreatorAuthorityUnavailable
         | ApplicationError::CreatorAuthoritySecret { .. }
         | ApplicationError::InvalidCreatorAuthorityAuthKind { .. }
