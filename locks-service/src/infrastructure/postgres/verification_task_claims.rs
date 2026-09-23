@@ -26,6 +26,34 @@ impl PostgresVerificationTaskClaimer {
 
 #[async_trait]
 impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
+    async fn begin_claimed_entitlement_publication(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let updated = sqlx::query(
+            "UPDATE verification_tasks
+             SET entitlement_publication_claim_token = $3, updated_at = $4
+             WHERE task_id = $1::uuid AND status = 'in_progress'
+               AND claimed_by = $2 AND claim_token = $3 AND claim_expires_at >= $4
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
+                   WHERE snapshot.verification_task_id = verification_tasks.task_id
+               )",
+        )
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn claim_next_verification_task(
         &self,
         worker_id: &str,
@@ -50,10 +78,23 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                 WHERE ((status = 'pending'
                         AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
                        OR (status = 'in_progress' AND claim_expires_at < $3))
+                  AND deletion_job_id IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM paykit_task_admissions
                       WHERE verification_task_id = verification_tasks.task_id
-                        AND ready = FALSE
+                        AND (
+                            ready = FALSE
+                            OR payment_in_hours IS NULL
+                            OR payment_in_hours <= 0
+                            OR invoice_created_at IS NULL
+                            OR payment_deadline IS NULL
+                            OR invoice_created_at > payment_deadline
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM content_lock_deletion_task_snapshot AS snapshot
+                      WHERE snapshot.verification_task_id = verification_tasks.task_id
                   )
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
@@ -103,6 +144,12 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
               AND claimed_by = $2
               AND claim_token = $3
               AND claim_expires_at >= $4
+              AND deletion_job_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM content_lock_deletion_task_snapshot AS snapshot
+                  WHERE snapshot.verification_task_id = verification_tasks.task_id
+              )
             RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -144,6 +191,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                  claimed_by = NULL,
                  claim_token = NULL,
                  claim_expires_at = NULL,
+                 entitlement_publication_claim_token = NULL,
                  next_attempt_at = NULL,
                  last_attempt_error = NULL,
                  updated_at = $4
@@ -152,6 +200,12 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                AND claimed_by = $2
                AND claim_token = $3
                AND claim_expires_at >= $4
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM content_lock_deletion_task_snapshot AS snapshot
+                   WHERE snapshot.verification_task_id = verification_tasks.task_id
+               )
              RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -202,6 +256,172 @@ mod tests {
     const CLAIM_EXPIRES_AT: time::OffsetDateTime = datetime!(2026-05-29 12:15:00 UTC);
 
     #[tokio::test]
+    async fn waiting_publication_update_rechecks_task_row_deletion_fence() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d13",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+        repository
+            .insert_verification_task(pending.clone())
+            .await
+            .unwrap();
+        let claim = claimer
+            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut transaction = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT task_id FROM verification_tasks WHERE task_id = $1 FOR UPDATE")
+            .bind(pending.task_id.as_uuid())
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+
+        let waiting_claimer = claimer.clone();
+        let task_id = pending.task_id;
+        let claim_token = claim.claim_token;
+        let publication = tokio::spawn(async move {
+            waiting_claimer
+                .begin_claimed_entitlement_publication(&task_id, "worker-a", &claim_token, NOW)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!publication.is_finished());
+
+        let deletion_job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+             (job_id, creator, lock_id, frozen_content_lock, deletion_started_at, state, phase)
+             VALUES ($1, $2, $3, '{}'::jsonb, $4, 'queued', 'withdraw')",
+        )
+        .bind(deletion_job_id)
+        .bind(pending.creator.to_string())
+        .bind(LOCK_ID)
+        .bind(NOW)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE verification_tasks SET deletion_job_id = $1 WHERE task_id = $2")
+            .bind(deletion_job_id)
+            .bind(pending.task_id.as_uuid())
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        assert!(!publication.await.unwrap().unwrap());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn retry_retains_publication_marker_until_reconciled_terminal_transition() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d17",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+        repository
+            .insert_verification_task(pending.clone())
+            .await
+            .unwrap();
+        let first = claimer
+            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            claimer
+                .begin_claimed_entitlement_publication(
+                    &pending.task_id,
+                    "worker-a",
+                    &first.claim_token,
+                    NOW,
+                )
+                .await
+                .unwrap()
+        );
+        let retry_at = NOW + time::Duration::seconds(10);
+        claimer
+            .schedule_verification_task_retry(
+                &pending.task_id,
+                "worker-a",
+                &first.claim_token,
+                NOW,
+                retry_at,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let retained: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT entitlement_publication_claim_token
+             FROM verification_tasks
+             WHERE task_id = $1",
+        )
+        .bind(pending.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained, Some(first.claim_token));
+
+        let second = claimer
+            .claim_next_verification_task(
+                "worker-b",
+                retry_at,
+                retry_at + time::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            claimer
+                .begin_claimed_entitlement_publication(
+                    &pending.task_id,
+                    "worker-b",
+                    &second.claim_token,
+                    retry_at,
+                )
+                .await
+                .unwrap()
+        );
+        let completed = second
+            .task
+            .transition_to(VerificationTaskStatus::Completed, retry_at, None)
+            .unwrap();
+        claimer
+            .persist_claimed_verification_task_transition(
+                completed,
+                "worker-b",
+                &second.claim_token,
+                retry_at,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let cleared: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT entitlement_publication_claim_token
+             FROM verification_tasks
+             WHERE task_id = $1",
+        )
+        .bind(pending.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(cleared, None);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn claims_oldest_pending_task_first() {
         let database = TestDatabase::create().await;
         let repository = PostgresVerificationTaskRepository::new(database.pool().clone());
@@ -248,7 +468,7 @@ mod tests {
             datetime!(2026-05-29 12:00:00 UTC),
         );
 
-        let first = admissions.reserve(pending.clone()).await.unwrap();
+        let first = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(first.requires_paykit);
         assert!(
             claimer
@@ -258,14 +478,33 @@ mod tests {
                 .is_none()
         );
 
-        let replay = admissions.reserve(pending.clone()).await.unwrap();
+        let replay = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(replay.requires_paykit);
         assert_eq!(replay.task, pending);
 
-        admissions.mark_ready(&pending).await.unwrap();
-        let ready_replay = admissions.reserve(pending.clone()).await.unwrap();
+        let invoice_window = crate::infrastructure::postgres::PaykitInvoiceWindow {
+            invoice_created_at: datetime!(2026-05-29 12:00:00 UTC),
+            payment_deadline: datetime!(2026-05-30 12:00:00 UTC),
+        };
+        admissions
+            .mark_ready(&pending, invoice_window)
+            .await
+            .unwrap();
+        let divergent_window = crate::infrastructure::postgres::PaykitInvoiceWindow {
+            invoice_created_at: datetime!(2026-05-29 12:00:01 UTC),
+            payment_deadline: datetime!(2026-05-30 12:00:01 UTC),
+        };
+        assert!(
+            admissions
+                .mark_ready(&pending, divergent_window)
+                .await
+                .is_err()
+        );
+        let ready_replay = admissions.reserve(pending.clone(), 24).await.unwrap();
         assert!(!ready_replay.requires_paykit);
         assert_eq!(ready_replay.task, pending);
+        assert_eq!(ready_replay.payment_in, 24);
+        assert_eq!(ready_replay.invoice_window, Some(invoice_window));
         assert_eq!(
             claimer
                 .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
@@ -275,6 +514,50 @@ mod tests {
                 .task
                 .task_id,
             pending.task_id
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_paykit_admission_without_authoritative_window_fails_closed() {
+        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
+
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d16",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+        tasks
+            .insert_verification_task(pending.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO paykit_task_admissions
+                 (verification_task_id, ready, ready_at)
+             VALUES ($1::uuid, TRUE, now())",
+        )
+        .bind(pending.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            admissions
+                .find_existing(&pending.submitted_proof_bundle)
+                .await
+                .is_err()
+        );
+        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        assert!(
+            claimer
+                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         database.cleanup().await;

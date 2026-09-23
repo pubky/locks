@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use locks_core::ids::{LockServerPubky, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, TaskId};
 use locks_core::lock_policy::ContentLock;
 use locks_core::verification::{
     EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
@@ -15,7 +15,7 @@ use crate::application::models::{
 };
 use crate::application::ports::{
     Clock, ContentLockRepository, CriterionVerifierRegistry, EntitlementRepository,
-    VerificationTaskClaimer, VerificationTaskRepository,
+    VerificationTaskClaimer, VerificationTaskRepository, same_entitlement_decision,
 };
 use crate::application::use_cases::entitlement_check::verify_content_lock_identity;
 
@@ -52,6 +52,56 @@ struct ClaimFencedTaskRepository<'a> {
     claimer: &'a dyn VerificationTaskClaimer,
     worker_id: &'a str,
     clock: &'a dyn Clock,
+}
+
+struct ClaimFencedEntitlementRepository<'a> {
+    inner: &'a dyn EntitlementRepository,
+    claim: &'a ClaimedVerificationTask,
+    claimer: &'a dyn VerificationTaskClaimer,
+    worker_id: &'a str,
+    clock: &'a dyn Clock,
+}
+
+#[async_trait]
+impl EntitlementRepository for ClaimFencedEntitlementRepository<'_> {
+    async fn insert_verified_proof_bundle(
+        &self,
+        entitlement: VerifiedProofBundle,
+    ) -> Result<(), ApplicationError> {
+        if !self
+            .claimer
+            .begin_claimed_entitlement_publication(
+                &self.claim.task.task_id,
+                self.worker_id,
+                &self.claim.claim_token,
+                self.clock.now(),
+            )
+            .await?
+        {
+            return Err(ApplicationError::VerificationTaskClaimLost);
+        }
+        self.inner.insert_verified_proof_bundle(entitlement).await
+    }
+
+    async fn get_verified_proof_bundle(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<VerifiedProofBundle>, ApplicationError> {
+        self.inner
+            .get_verified_proof_bundle(creator, bundle_id)
+            .await
+    }
+
+    async fn delete_verified_proof_bundle(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<(), ApplicationError> {
+        self.inner
+            .delete_verified_proof_bundle(creator, bundle_id)
+            .await
+    }
 }
 
 #[async_trait]
@@ -213,19 +263,8 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
                 .await
             {
                 Ok(Some(existing)) if same_entitlement_decision(&existing, &entitlement) => {}
-                Ok(_) => {
-                    self.persist_failed_task(task, viewer_safe_failure_message(&error).to_owned())
-                        .await?;
-                    return Err(error);
-                }
-                Err(lookup_error) => {
-                    self.persist_failed_task(
-                        task,
-                        viewer_safe_failure_message(&lookup_error).to_owned(),
-                    )
-                    .await?;
-                    return Err(lookup_error);
-                }
+                Ok(Some(_)) => return Err(error),
+                Ok(None) | Err(_) => return Err(ApplicationError::VerificationPending),
             }
         }
 
@@ -257,7 +296,14 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
             });
         }
         let fenced_tasks = ClaimFencedTaskRepository {
-            claim,
+            claim: claim.clone(),
+            claimer,
+            worker_id,
+            clock: self.clock,
+        };
+        let fenced_entitlements = ClaimFencedEntitlementRepository {
+            inner: self.entitlements,
+            claim: &claim,
             claimer,
             worker_id,
             clock: self.clock,
@@ -265,7 +311,7 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         CompleteVerificationTaskUseCase::new(
             &fenced_tasks,
             self.content_locks,
-            self.entitlements,
+            &fenced_entitlements,
             self.verifiers,
             self.clock,
             self.verified_by.clone(),
@@ -389,26 +435,6 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
     }
 }
 
-fn same_entitlement_decision(
-    existing: &VerifiedProofBundle,
-    candidate: &VerifiedProofBundle,
-) -> bool {
-    if existing.verification_result.criteria.len() != candidate.verification_result.criteria.len() {
-        return false;
-    }
-
-    let mut normalized_candidate = candidate.clone();
-    for (candidate_result, existing_result) in normalized_candidate
-        .verification_result
-        .criteria
-        .iter_mut()
-        .zip(&existing.verification_result.criteria)
-    {
-        candidate_result.verified_at = existing_result.verified_at;
-    }
-    existing == &normalized_candidate
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -476,6 +502,7 @@ mod tests {
             datetime!(2026-05-29 12:01:00 UTC),
             datetime!(2026-05-29 12:02:00 UTC),
             datetime!(2026-05-29 12:03:00 UTC),
+            datetime!(2026-05-29 12:04:00 UTC),
         ]);
         let use_case = CompleteVerificationTaskUseCase::new(
             &tasks,
@@ -584,6 +611,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_entitlement_write_without_read_back_stays_pending() {
+        let content_lock = content_lock_fixture(true);
+        let tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let content_locks = FakeContentLocks::new(Some(content_lock));
+        let entitlements = FakeEntitlements::with_ambiguous_write_and_absent_read_back();
+        let verifier = FakeVerifier {
+            satisfied: true,
+            error: None,
+        };
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+        ]);
+
+        let result = CompleteVerificationTaskUseCase::new(
+            &tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await;
+
+        assert_eq!(result, Err(ApplicationError::VerificationPending));
+        assert!(
+            !tasks
+                .updates()
+                .iter()
+                .any(|task| task.status == VerificationTaskStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_entitlement_write_with_failed_read_back_stays_pending() {
+        let content_lock = content_lock_fixture(true);
+        let tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let content_locks = FakeContentLocks::new(Some(content_lock));
+        let entitlements = FakeEntitlements::with_ambiguous_write_and_failed_read_back();
+        let verifier = FakeVerifier {
+            satisfied: true,
+            error: None,
+        };
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+        ]);
+
+        let result = CompleteVerificationTaskUseCase::new(
+            &tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await;
+
+        assert_eq!(result, Err(ApplicationError::VerificationPending));
+        assert!(
+            !tasks
+                .updates()
+                .iter()
+                .any(|task| task.status == VerificationTaskStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
     async fn current_claim_owner_completes_after_equivalent_entitlement_was_published() {
         let content_lock = content_lock_fixture(true);
         let content_locks = FakeContentLocks::new(Some(content_lock.clone()));
@@ -628,6 +731,7 @@ mod tests {
             datetime!(2026-05-29 12:05:00 UTC),
             datetime!(2026-05-29 12:06:00 UTC),
             datetime!(2026-05-29 12:07:00 UTC),
+            datetime!(2026-05-29 12:08:00 UTC),
         ]);
         let completed = CompleteVerificationTaskUseCase::new(
             &tasks,
@@ -707,10 +811,10 @@ mod tests {
                 record: "verified_proof_bundle"
             })
         );
-        assert_eq!(
-            retry_tasks.updates().last().unwrap().status,
-            VerificationTaskStatus::Failed
-        );
+        let updates = retry_tasks.updates();
+        let stored = updates.last().unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::InProgress);
+        assert_eq!(stored.failure_message, None);
     }
 
     #[tokio::test]
@@ -1127,6 +1231,16 @@ mod tests {
 
     #[async_trait]
     impl VerificationTaskClaimer for LostClaimClaimer {
+        async fn begin_claimed_entitlement_publication(
+            &self,
+            _task_id: &TaskId,
+            _worker_id: &str,
+            _claim_token: &uuid::Uuid,
+            _now: time::OffsetDateTime,
+        ) -> Result<bool, ApplicationError> {
+            Ok(true)
+        }
+
         async fn claim_next_verification_task(
             &self,
             _worker_id: &str,
@@ -1250,6 +1364,8 @@ mod tests {
     struct FakeEntitlements {
         stored: Mutex<Vec<VerifiedProofBundle>>,
         fail_after_store: bool,
+        hide_stored: bool,
+        fail_read: bool,
     }
 
     impl FakeEntitlements {
@@ -1257,6 +1373,26 @@ mod tests {
             Self {
                 stored: Mutex::new(Vec::new()),
                 fail_after_store: true,
+                hide_stored: false,
+                fail_read: false,
+            }
+        }
+
+        fn with_ambiguous_write_and_absent_read_back() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                fail_after_store: true,
+                hide_stored: true,
+                fail_read: false,
+            }
+        }
+
+        fn with_ambiguous_write_and_failed_read_back() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                fail_after_store: true,
+                hide_stored: false,
+                fail_read: true,
             }
         }
 
@@ -1295,6 +1431,14 @@ mod tests {
             creator: &CreatorPubky,
             bundle_id: &BundleId,
         ) -> Result<Option<VerifiedProofBundle>, ApplicationError> {
+            if self.fail_read {
+                return Err(ApplicationError::Storage {
+                    message: "entitlement read unavailable".to_owned(),
+                });
+            }
+            if self.hide_stored {
+                return Ok(None);
+            }
             Ok(self
                 .stored
                 .lock()

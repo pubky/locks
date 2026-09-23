@@ -11,10 +11,10 @@ use locks_service::application::{
         PendingCreatorConnectFlowRecord,
     },
     ports::{
-        AccessCredentialStore, ContentLockOwnershipRepository, CreatorAuthorityManager,
-        CreatorAuthorityStore, CreatorConnectFlowStore, FrontendSessionCodeStore,
-        FrontendSessionStore, LegacyCreatorConnectFlowClient, VerificationTaskClaimer,
-        VerificationTaskRepository,
+        AccessCredentialStore, ContentLockDeletionRepository, ContentLockOwnershipRepository,
+        CreatorAuthorityManager, CreatorAuthorityStore, CreatorConnectFlowStore,
+        FrontendSessionCodeStore, FrontendSessionStore, LegacyCreatorConnectFlowClient,
+        VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
 use time::OffsetDateTime;
@@ -23,6 +23,7 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub(super) struct PrivateRuntimeAdapters {
     pub(super) content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
+    pub(super) content_lock_deletions: Arc<dyn ContentLockDeletionRepository>,
     pub(super) verification_tasks: Arc<dyn VerificationTaskRepository>,
     pub(super) verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     pub(super) access_credentials: Arc<dyn AccessCredentialStore>,

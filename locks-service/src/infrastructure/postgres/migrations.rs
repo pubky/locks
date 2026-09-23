@@ -55,6 +55,24 @@ mod tests {
         assert_table_exists(&mut connection, "content_lock_publication_intents").await;
         assert_table_exists(&mut connection, "content_lock_deletion_task_snapshot").await;
         assert_table_exists(&mut connection, "paykit_task_admissions").await;
+        assert_column_exists(
+            &mut connection,
+            "paykit_task_admissions",
+            "payment_in_hours",
+        )
+        .await;
+        assert_column_exists(
+            &mut connection,
+            "paykit_task_admissions",
+            "invoice_created_at",
+        )
+        .await;
+        assert_column_exists(
+            &mut connection,
+            "paykit_task_admissions",
+            "payment_deadline",
+        )
+        .await;
         assert_column_exists(&mut connection, "verification_tasks", "creator").await;
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;

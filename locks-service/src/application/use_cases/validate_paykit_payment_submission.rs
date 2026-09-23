@@ -12,6 +12,12 @@ pub struct ValidatePaykitPaymentSubmissionRequest {
     pub submitted_proof_bundle: SubmittedProofBundle,
 }
 
+/// Immutable canonical payment facts required before Paykit invoice side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedPaykitPaymentSubmission {
+    pub payment_in: u64,
+}
+
 /// Validates payment proof identity before invoice side effects are allowed.
 pub struct ValidatePaykitPaymentSubmissionUseCase<'a> {
     content_locks: &'a dyn ContentLockRepository,
@@ -27,7 +33,7 @@ impl<'a> ValidatePaykitPaymentSubmissionUseCase<'a> {
     pub async fn execute(
         &self,
         request: ValidatePaykitPaymentSubmissionRequest,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<ValidatedPaykitPaymentSubmission, ApplicationError> {
         let submitted = request.submitted_proof_bundle;
         let content_lock = self
             .content_locks
@@ -53,15 +59,22 @@ impl<'a> ValidatePaykitPaymentSubmissionUseCase<'a> {
         if proof.verifier_type != VerifierType::PaykitPayment {
             return Err(ApplicationError::InvalidPaykitPaymentSubmission);
         }
-        let criterion_matches = content_lock.criteria.iter().any(|criterion| {
-            criterion.criterion_id == proof.criterion_id
-                && criterion.verifier_type == VerifierType::PaykitPayment
-        });
-        if !criterion_matches {
-            return Err(ApplicationError::InvalidPaykitPaymentSubmission);
-        }
+        let criterion = content_lock
+            .criteria
+            .iter()
+            .find(|criterion| {
+                criterion.criterion_id == proof.criterion_id
+                    && criterion.verifier_type == VerifierType::PaykitPayment
+            })
+            .ok_or(ApplicationError::InvalidPaykitPaymentSubmission)?;
+        let params = criterion
+            .paykit_payment_params()
+            .map_err(|_| ApplicationError::InvalidPaykitPaymentSubmission)?
+            .ok_or(ApplicationError::InvalidPaykitPaymentSubmission)?;
 
-        Ok(())
+        Ok(ValidatedPaykitPaymentSubmission {
+            payment_in: params.payment_in(),
+        })
     }
 }
 
@@ -84,7 +97,10 @@ mod tests {
     };
     use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 
-    use super::{ValidatePaykitPaymentSubmissionRequest, ValidatePaykitPaymentSubmissionUseCase};
+    use super::{
+        ValidatePaykitPaymentSubmissionRequest, ValidatePaykitPaymentSubmissionUseCase,
+        ValidatedPaykitPaymentSubmission,
+    };
     use crate::application::errors::ApplicationError;
     use crate::application::ports::ContentLockRepository;
 
@@ -177,7 +193,10 @@ mod tests {
             })
             .await;
 
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(ValidatedPaykitPaymentSubmission { payment_in: 24 })
+        );
     }
 
     #[tokio::test]

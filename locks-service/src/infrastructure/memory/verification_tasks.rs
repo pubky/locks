@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -8,17 +8,34 @@ use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use crate::application::errors::ApplicationError;
 use crate::application::models::VerificationTaskRecord;
 use crate::application::ports::VerificationTaskRepository;
+use crate::infrastructure::memory::verification_task_deletion_fence::{
+    InMemoryVerificationTaskDeletionFence, InMemoryVerificationTaskFenceRecord,
+};
 
 /// In-memory verification task repository.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
+    deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+}
+
+impl Default for InMemoryVerificationTaskRepository {
+    fn default() -> Self {
+        Self::with_deletion_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+    }
 }
 
 impl InMemoryVerificationTaskRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_deletion_fence(deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>) -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            deletion_fence,
+        }
     }
 }
 
@@ -28,6 +45,7 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if records.contains_key(&task.task_id)
             || records.values().any(|existing| {
@@ -40,6 +58,19 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 record: "verification_task",
             });
         }
+        fence_records.insert(
+            task.task_id,
+            InMemoryVerificationTaskFenceRecord {
+                creator: task.creator.clone(),
+                lock_id: task
+                    .submitted_proof_bundle
+                    .pubky_lock_resource
+                    .lock_id()
+                    .clone(),
+                entitlement_publication_claim_token: None,
+                deletion_job_id: None,
+            },
+        );
         records.insert(task.task_id, task);
         Ok(())
     }
@@ -82,7 +113,9 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
     }
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
+        let mut fence_records = self.deletion_fence.records.write().await;
         self.records.write().await.remove(task_id);
+        fence_records.remove(task_id);
         Ok(())
     }
 }

@@ -4,6 +4,7 @@ pub mod create_content_lock;
 #[cfg(test)]
 mod credential_flow_tests;
 pub mod delete_guarded_resource;
+pub mod drain_lock_payments;
 mod entitlement_check;
 pub mod exchange_frontend_session_code;
 pub mod get_creator_authority_status;

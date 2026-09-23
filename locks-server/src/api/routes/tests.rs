@@ -4135,10 +4135,15 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
     }
 }
 
+const PAYKIT_INVOICE_RESPONSE: &str = r#"{
+    "invoice_created_at":"2026-01-01T00:00:00Z",
+    "payment_deadline":"2026-01-02T00:00:00Z"
+}"#;
+
 async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
-    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> impl axum::response::IntoResponse {
         calls.fetch_add(1, Ordering::SeqCst);
-        StatusCode::NO_CONTENT
+        (StatusCode::CREATED, PAYKIT_INVOICE_RESPONSE)
     }
 
     let app = Router::new()
@@ -4154,7 +4159,7 @@ async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
 
 async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
     async fn invoice() -> impl axum::response::IntoResponse {
-        StatusCode::NO_CONTENT
+        (StatusCode::CREATED, PAYKIT_INVOICE_RESPONSE)
     }
     async fn connection_status(
         State(body): State<&'static str>,
@@ -4175,8 +4180,8 @@ async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
 }
 
 async fn spawn_counting_paykit_connection_status(calls: Arc<AtomicUsize>) -> String {
-    async fn invoice() -> StatusCode {
-        StatusCode::NO_CONTENT
+    async fn invoice() -> impl axum::response::IntoResponse {
+        (StatusCode::CREATED, PAYKIT_INVOICE_RESPONSE)
     }
     async fn connection_status(
         State(calls): State<Arc<AtomicUsize>>,
@@ -4209,8 +4214,8 @@ async fn spawn_blocking_paykit_connection_status(
     started: Arc<Semaphore>,
     release: Arc<Notify>,
 ) -> String {
-    async fn invoice() -> StatusCode {
-        StatusCode::NO_CONTENT
+    async fn invoice() -> impl axum::response::IntoResponse {
+        (StatusCode::CREATED, PAYKIT_INVOICE_RESPONSE)
     }
     async fn connection_status(
         State(state): State<BlockingPaykitStatusState>,
@@ -4245,7 +4250,9 @@ async fn spawn_invoice_then_stalled_connection_status_body() -> String {
     tokio::spawn(async move {
         let (mut invoice_socket, _) = listener.accept().await.unwrap();
         invoice_socket
-            .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"invoice_created_at\":\"2026-01-01T00:00:00Z\",\"payment_deadline\":\"2026-01-02T00:00:00Z\"}",
+            )
             .await
             .unwrap();
         drop(invoice_socket);
