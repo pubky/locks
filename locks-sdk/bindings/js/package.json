@@ -1,6 +1,6 @@
 {
   "name": "@pubky/locks-sdk",
-  "version": "0.1.0",
+  "version": "0.1.0-rc4",
   "private": true,
   "description": "Browser JS/WASM bindings for the Pubky Locks Creator SDK",
   "type": "module",

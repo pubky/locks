@@ -41,4 +41,4 @@ This demo does not claim:
 - a networked creator publishing surface without frontend-session auth exists
 - live Pubky homeserver I/O is exercised
 
-Those are follow-up decisions after Pubky-Core integration questions are resolved.
+Those are follow-up decisions after Pubky integration questions are resolved.

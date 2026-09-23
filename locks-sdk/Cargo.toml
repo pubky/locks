@@ -10,9 +10,14 @@ description = "Client SDK for Pubky Locks creator and viewer flows"
 [dependencies]
 locks-core.workspace = true
 percent-encoding.workspace = true
+pubky.workspace = true
 pubky-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 url.workspace = true
+
+[build-dependencies]
+paykit-lib.workspace = true
+pubky-noise.workspace = true

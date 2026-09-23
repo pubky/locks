@@ -56,10 +56,10 @@ Required tools/services:
 - Postgres reachable by the Lock Server.
 - A local Pubky testnet exposing:
   ```text
-  PKARR relay      http://localhost:15411
-  HTTP/auth relay  http://localhost:15412
-  Auth inbox       http://localhost:15412/inbox/
-  DHT bootstrap    localhost:6881
+  PKARR relay      http://127.0.0.1:15411
+  HTTP/auth relay  http://127.0.0.1:15412
+  Auth inbox       http://127.0.0.1:15412/inbox/
+  DHT bootstrap    127.0.0.1:6881
   ```
 
 For direct npm development, build the local WASM SDK package first:
@@ -105,11 +105,11 @@ The compose stack starts:
 
 - Postgres on host port `55433`
 - Pubky testnet on `15411`, `15412`, `6881`, homeserver HTTP on `6286`, and homeserver admin on `6288`
-- Lock Server on `http://localhost:3000`
-- creator demo on `http://localhost:8080/examples/js-sdk/`
-- reader demo on `http://localhost:8081/reader/`
+- Lock Server on `http://127.0.0.1:3000`
+- creator demo on `http://127.0.0.1:8080/examples/js-sdk/`
+- reader demo on `http://127.0.0.1:8088/reader/`
 
-The Pubky testnet image is built from the public `pubky/pubky-core` repository at
+The Pubky testnet image is built from the public `pubky/pubky-homeserver` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
 
 Compose keeps the Lock Server identity, config, and generated runtime master key in
@@ -126,18 +126,18 @@ If writer authentication fails after a local testnet restart with a malformed or
 docker compose exec creator-demo npm --prefix examples/js-sdk run create-user -- --role content-creator --force
 ```
 
-The browser-facing demo config still uses `localhost`; container-internal health checks/auth use Docker service names through `LOCKS_INTERNAL_*` environment overrides.
+The browser-facing demo config uses `127.0.0.1`; container-internal health checks/auth use explicit loopback or Docker service names through `LOCKS_INTERNAL_*` environment overrides.
 
 ## Local Pubky testnet defaults
 
-`pubky-core/pubky-testnet` local static development uses:
+`pubky-homeserver/pubky-testnet` local static development uses:
 
 ```text
-PKARR relay     = http://localhost:15411
-HTTP/auth relay = http://localhost:15412
-Pubky Auth inbox = http://localhost:15412/inbox/
-DHT bootstrap   = localhost:6881
-Paykit browser  = http://localhost:3001
+PKARR relay     = http://127.0.0.1:15411
+HTTP/auth relay = http://127.0.0.1:15412
+Pubky Auth inbox = http://127.0.0.1:15412/inbox/
+DHT bootstrap   = 127.0.0.1:6881
+Paykit browser  = http://127.0.0.1:3001
 ```
 
 These values are written to:
@@ -174,42 +174,97 @@ Existing keypairs are reused. To regenerate one role:
 npm --prefix examples/js-sdk run create-user -- --role content-creator --force
 ```
 
+Deleting `.local` deletes the local recovery-file identities as well as disposable demo state.
+Authentication never silently regenerates a missing identity because that would approve as a
+different Pubky. Recreate the fallback identity explicitly before authenticating:
+
+```bash
+npm --prefix examples/js-sdk run create-user -- --role content-creator
+```
+
 Replacing the content-creator identity clears any persisted demo-auth session for the old key before and after rotation. The demo server also validates persisted and newly approved sessions against the current role profile, so an approval that completes during rotation cannot restore the old identity. Authenticate the demo again before continuing.
 
 ## Run the demo server
 
-### Complete local Compose stack
+### Complete local Compose stack: quickstart
 
-Build and start the complete stack:
+1. From the repository root, build and start the complete stack in the background:
 
 ```bash
-docker compose -f compose.paykit-local-demo.yaml up --build
+docker compose --file compose.paykit-local-demo.yaml up -d --build
 ```
 
-The Paykit Server, Paykit Rust, Locks, and Pubky Core build inputs are fetched from
-anonymous public Git URLs pinned to immutable commits. The active Locks checkout is
-used only for the Locks and browser-demo images being developed. No sibling repository
-checkout is required.
+2. Open the content-creator demo:
 
-`compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose -f compose.paykit-local-demo.yaml config --no-env-resolution` model.
+```text
+http://127.0.0.1:8080/examples/js-sdk/
+```
 
-This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://localhost:3001`, the Homegate bridge at `http://localhost:6288`, and Fulcrum at `tcp://localhost:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
+3. Approve browser requests with the external wallet under test. When using the local
+   recovery-file fallback, run authentication commands from the repository host:
+
+```bash
+npm --prefix examples/js-sdk run authenticate -- --role content-creator
+npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+```
+
+Do not wrap these commands in `docker compose exec`. The host wrappers load private role
+state locally and bridge only bounded helper input into the relevant container.
+
+The Paykit Server build context uses the immutable `v0.1.0-rc3` tag, its compatible
+Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Homeserver uses
+`v0.11.0`. The active Locks checkout is used only for the Locks and browser-demo
+images being developed. No sibling repository checkout is required.
+
+For coordinated pre-merge Paykit Server work, select an explicit absolute local worktree
+without changing the committed public default:
+
+```bash
+PAYKIT_SERVER_CONTEXT=/absolute/path/to/paykit-server \
+  docker compose --file compose.paykit-local-demo.yaml up -d --build
+```
+
+Compose validation requires the rendered context to match that environment value exactly.
+
+`compose.paykit-local-demo.yaml` is intentionally limited to local development and demonstration. When `.local` is absent, the one-shot `compose-bootstrap` service creates the ignored owner-only credentials and non-state configuration before dependent services start. Existing generated credentials are validated and reused. For a quiet configuration check without printing generated environment values, run `npm --prefix examples/js-sdk run validate:paykit-compose`; the wrapper inspects a captured `docker compose --file compose.paykit-local-demo.yaml config --no-env-resolution` model.
+
+This starts separate Locks and Paykit PostgreSQL services, Bitcoin Core regtest, a 101-block wallet bootstrap, Fulcrum readiness through `server.version`, Pubky testnet, a local Homegate-compatible signup bridge, Locks, Paykit Server, and both browser demos. All published ports bind to host loopback. Paykit is browser-visible at `http://127.0.0.1:3001`, the Homegate bridge at `http://127.0.0.1:6288`, and Fulcrum at `tcp://127.0.0.1:60001`. Locks reaches Paykit at `http://127.0.0.1:3001` inside the shared Pubky network namespace. The unprivileged creator and reader images contain the reviewed native helpers and a package built in the image; they receive only their explicit runtime directories, never the repository root or Lock Server identity volume.
 
 Open:
 
 ```text
-Creator: http://localhost:8080/examples/js-sdk/
-Reader:  http://localhost:8088/reader/
-Paykit:  http://localhost:3001/setup
+Creator: http://127.0.0.1:8080/examples/js-sdk/
+Reader:  http://127.0.0.1:8088/reader/
+Paykit:  http://127.0.0.1:3001/setup
 ```
 
-The Compose reader process still listens on container port `8081`; only its host mapping is `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
+The reader uses port `8088` for both direct npm and Compose; there is no host/container remap.
+
+The reader displays directly runnable Bitcoin commands without JSON-style escaped quotes.
+The generated send command has this shape, with the current request address and amount
+substituted for `BCRT_ADDRESS` and `BTC_AMOUNT`:
+
+```bash
+docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress BCRT_ADDRESS BTC_AMOUNT'
+```
+
+The Compose reader process listens on port `8088`. To remove the four explicit disposable database/Bitcoin/Fulcrum volumes, empty bootstrap scratch directory, and encrypted reader-helper state while preserving generated credentials/config, role identities, and Lock Server identity:
 
 ```bash
 npm --prefix examples/js-sdk run reset-paykit-demo
 ```
 
-Do not use `docker compose -f compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
+Do not use `docker compose --file compose.paykit-local-demo.yaml down -v` unless you intentionally want to delete the persistent Lock Server identity volume.
+
+### Helper-free staging services demo
+
+To run only the Creator and reader browser apps against fixed deployed staging services:
+
+```bash
+docker compose --file compose.paykit-staging-demo.yaml up -d --build
+```
+
+This path uses two distinct external Bitkit staging identities, the standard public Pubky network, and no native Paykit helpers or local backend services. Creator and reader remain on ports 8080 and 8088. See [`docs/PAYKIT_STAGING_DEMO.md`](../../docs/PAYKIT_STAGING_DEMO.md) for the exact role split, pasted-reader-Pubky gate, local-client reset, known external setup blocker, and full acceptance milestones.
 
 ### Migrating version 1 Compose secrets
 
@@ -239,12 +294,13 @@ npm --prefix examples/js-sdk run start-server -- --allow-unhealthy
 Open:
 
 ```text
-http://localhost:8080/examples/js-sdk/
+http://127.0.0.1:8080/examples/js-sdk/
 ```
 
-## Run the reader demo server
+## Run the reader demo server directly with npm
 
-The reader demo is a separate static/debug server on port `8081` inside the same package:
+Outside the Paykit Compose flow, the reader demo is a separate static/debug server on the
+same port `8088` inside the same package:
 
 ```bash
 npm --prefix examples/js-sdk run start-reader-server
@@ -259,7 +315,7 @@ npm --prefix examples/js-sdk run start-reader-server -- --allow-unhealthy
 Open:
 
 ```text
-http://localhost:8081/reader/
+http://127.0.0.1:8088/reader/
 ```
 
 Reader-server responsibilities are intentionally narrow:
@@ -312,7 +368,7 @@ Both creator pages open the Lock Server `/connect` shell in an iframe modal. The
 The shell returns `{ state, code }` directly to the parent with `postMessage`. The parent accepts the result only from the exact Lock Server origin and iframe window, then validates the state before exchanging the one-time code. The configured callback URL supplies the parent target origin; the browser does not navigate to it:
 
 ```text
-http://localhost:8080/auth/lock-server/callback
+http://127.0.0.1:8080/auth/lock-server/callback
 ```
 
 Approve the Lock Server auth string with the same identity. In Compose, scan or paste it into the same external wallet. For direct npm development, use:
@@ -346,23 +402,54 @@ Rules:
 - payment recipient is the authenticated content creator; it is not user-editable
 - payment is the content lock's sole criterion and the lock logic references exactly that criterion
 - payment publishing is rejected until Paykit setup succeeds for the current authenticated creator
-- selecting `paykit-payment` opens `GET http://localhost:3001/setup` in a Paykit-origin iframe
+- selecting `paykit-payment` queries setup readiness through the current authenticated Locks frontend session
+- `ready` skips authorization, `setup_required` opens `GET http://127.0.0.1:3001/setup` in a Paykit-origin iframe, and `unavailable` shows a retry state without opening authorization
 - the parent accepts completion only from that exact iframe window and origin with the pending state
 - the success callback is only `{ type: "paykit-setup-callback", state }`; failures add only `error: "setup-failed"`, and account data stays inside Paykit
 
-The Paykit iframe displays the auth URL and both approved local commands. First create or load the dedicated Bitcoin Core descriptor wallet and print its external BIP84 account `tpub` and account index:
+The Paykit iframe is owned by Paykit and displays only the production Bitkit QR/deep-link path; it contains no local-helper instructions. In production, scan that QR with Bitkit. There is no production handle/helper surface.
+
+For the local Compose fallback, first create or load the dedicated Bitcoin Core descriptor wallet and print its external BIP84 account `tpub` and account index:
 
 ```bash
 npm --prefix examples/js-sdk run generate-paykit-account-tpub
 ```
 
-This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key. In the external-wallet flow, scan or paste the Paykit authorization request into the same wallet. For direct npm development with a generated creator recovery file, the companion-auth wrapper remains available:
+This command uses the running Compose regtest node, requests public descriptors only, selects `m/84'/1'/0'`, and intentionally prints only the account-level `tpub` and index at this explicit setup boundary. It never prints or exports the account private key.
+
+Next, inspect the latest Paykit Server logs manually:
 
 ```bash
-docker compose -f compose.paykit-local-demo.yaml exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+docker compose --file compose.paykit-local-demo.yaml logs --tail=100 paykit-server
 ```
 
-The command loads the existing encrypted content-creator recovery file and starts `/usr/local/bin/paykit-companion-auth` directly with no arguments. `PAYKIT_COMPANION_AUTH_BIN` may override that executable path for local testing. Interactive input prompts for the Paykit auth URL, account xpub/tpub, and account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline. Sensitive inputs are sent only through the helper's stdin and are never forwarded in wrapper output.
+Find the event labeled `paykit_setup_authorization_url` and copy its `authorization_url` value. Do not automate log parsing. The URL is a local-only bearer secret: the operator owns Paykit log access and retention. Do not publish, reuse, or retain it beyond this local setup operation.
+
+Then run the host helper wrapper:
+
+```bash
+npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
+```
+
+Run it from the repository host, where the encrypted content-creator recovery file is stored. The wrapper loads that local identity and streams one bounded JSON request over stdin to `/usr/local/bin/paykit-companion-auth` in the running `creator-demo` container; private role files are not mounted into the container. `PAYKIT_COMPANION_AUTH_BIN` may override the helper executable path for local testing.
+
+Interactive input is prompted in this exact order: Paykit pubkyauth URL, account xpub/tpub, account index. Non-TTY stdin is exactly those three ordered lines, with one optional final newline:
+
+```text
+pubkyauth://...
+tpub...
+0
+```
+
+The wrapper sends the helper this closed schema over stdin only. Its fields are `version`, `auth_url`, `creator_secret`, `account_xpub`, and `account_index`:
+
+```json
+{"version":1,"auth_url":"pubkyauth://...","creator_secret":"<base64url-32>","account_xpub":"tpub...","account_index":0}
+```
+
+The example trusts the operator-supplied URL. A modified URL can substitute the requester key (`cpk`), relay, or encryption secret and redirect the grant or encrypted xpub claim; that risk is accepted only for the controlled local demo. The auth URL, Creator secret, and xpub are never placed in process arguments, wrapper output, or `postMessage`.
+
+The helper comes only from the Paykit local-demo image/runtime stage consumed by this Compose demo. It is not part of the normal production Paykit package or runtime.
 
 The browser uses the Locks JS/WASM SDK for publishing:
 
@@ -396,7 +483,7 @@ The browser remains unauthenticated. A `paykit-payment` proof carries the public
 For `paykit-payment`:
 
 1. The in-process Paykit reader worker starts with `reader-demo`, creates or restores the durable encrypted reader state, publishes and reads back its Receiver Marker, and waits for private Paykit messages. The page polls its closed status automatically; proof submission remains disabled until the worker is prepared and its Reader Pubky matches the current `content-viewer` identity.
-2. Click **Submit proof bundle**. The browser submits one `paykit-payment` proof with the confirmed top-level `reader_public_key` and an empty `{}` criterion payload. It never calls the dev completion route.
+2. Click **Submit proof bundle**. The browser submits one `paykit-payment` proof with the confirmed top-level `reader_public_key` and an empty `{}` criterion payload. It never calls the dev completion route. While payment verification is pending, the page starts task-bound Paykit connection observation without awaiting it, then independently performs the authoritative lifecycle lookup. It displays **None — handshake has not started**, **Handshake in progress**, **Connected — Paykit Server link is usable**, **Recovery required — runtime must relink; do not resubmit proof**, or **Blocked — operator action required**. Connection timeout/failure cannot delay or stop lifecycle polling; blocked stops further connection lookups. Connection observation pauses after 30 attempts and can be restarted with **Resume payment verification polling**. The browser never replays proof submission merely to refresh this indicator.
 3. The worker advances the Paykit/Noise link and receives the real Payment Request without a foreground command. The page displays only its validated request ID, regtest address, amount in sats, canonical manual `bitcoin-cli` payment command, and optional mining command.
 4. Run the displayed payment command in a terminal. Mining is optional because local Locks uses `minimum_confirmations = 0`.
 5. The page polls `pending` and `in_progress` lifecycle states. On `completed`, it issues an access credential and reads the primary guarded resource. `failed`, `expired`, and unknown states fail closed. Use **Resume payment verification polling** after a reload.

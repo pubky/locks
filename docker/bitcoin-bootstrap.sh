@@ -34,9 +34,15 @@ elif ! bitcoin_cli listwallets | grep -q '"miner"'; then
 fi
 
 height="$(bitcoin_cli getblockcount)"
+blocks_to_mine=0
 if (( height < 101 )); then
+  blocks_to_mine="$((101 - height))"
+elif bitcoin_cli getblockchaininfo | grep -q '"initialblockdownload": true'; then
+  blocks_to_mine=1
+fi
+if (( blocks_to_mine > 0 )); then
   address="$(bitcoin_cli -rpcwallet=miner getnewaddress)"
-  bitcoin_cli -rpcwallet=miner generatetoaddress "$((101 - height))" "$address" >/dev/null
+  bitcoin_cli -rpcwallet=miner generatetoaddress "$blocks_to_mine" "$address" >/dev/null
 fi
 
 printf '%s\n' 'bitcoin bootstrap ready'

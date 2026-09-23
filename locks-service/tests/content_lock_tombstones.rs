@@ -15,6 +15,7 @@ use locks_service::infrastructure::memory::{
 };
 use locks_service::infrastructure::pubky::{
     PubkyBytesResource, PubkyContentLockTombstoneRepository, PubkyHomeserverStorageClient,
+    PubkyResourceMetadata,
 };
 use time::macros::datetime;
 
@@ -370,6 +371,16 @@ impl PubkyHomeserverStorageClient for FakePubkyStorage {
                 bytes,
                 content_type: Some("application/json".to_owned()),
             }))
+    }
+
+    async fn get_metadata_as_creator(
+        &self,
+        _creator: &CreatorPubky,
+        _path: &str,
+    ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+        Ok(self.bytes.lock().unwrap().as_ref().map(|bytes| {
+            PubkyResourceMetadata::from_bytes(bytes, Some("application/json".to_owned()))
+        }))
     }
 
     async fn delete_as_creator(

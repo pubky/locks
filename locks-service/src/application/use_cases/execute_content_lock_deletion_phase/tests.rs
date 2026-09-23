@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use locks_core::{
     content_lock_deletion::ContentLockDeletionTombstone,
     ids::{ContentLockPath, CreatorPubky, GuardedResourceHash, LockId},
-    lock_policy::ContentLock,
+    lock_policy::{ContentLock, GuardedResource},
 };
 use time::{Duration, OffsetDateTime, macros::datetime};
 use uuid::Uuid;
@@ -953,7 +953,7 @@ impl GuardedResourceRepository for FakeResources {
     async fn upsert_guarded_resource(
         &self,
         _: GuardedResourceRecord,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<GuardedResource, ApplicationError> {
         unreachable!()
     }
     async fn get_guarded_resource(

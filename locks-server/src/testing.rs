@@ -169,6 +169,7 @@ impl TestServerApp {
                 bytes,
             })
             .await
+            .map(|_| ())
     }
 
     pub async fn insert_frontend_session_for_test(
@@ -212,6 +213,7 @@ mod tests {
                 max_requests: 0,
                 window_seconds: 0,
             },
+            ..RateLimitsConfig::default()
         };
         let app = TestServerApp::new_in_memory(config);
         let key = VerificationSubmissionRateLimitKey {

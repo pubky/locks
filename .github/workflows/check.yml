@@ -49,7 +49,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.89.0
+        uses: dtolnay/rust-toolchain@1.91.1
         with:
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
@@ -104,6 +104,12 @@ jobs:
 
       - name: Install JS example dependencies
         run: npm --prefix examples/js-sdk ci
+
+      - name: Staging config tests
+        run: npm --prefix examples/js-sdk run test:staging-config
+
+      - name: Paykit setup-status contract
+        run: npm --prefix examples/js-sdk run check:paykit-setup-contract
 
       - name: JS/WASM SDK tests
         run: npm --prefix locks-sdk/bindings/js run test

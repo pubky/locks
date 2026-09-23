@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -41,6 +42,8 @@ const requiredSnippets = [
   'static forContentLockWithOptions(resource: string, options: LocksOptions): Promise<Locks>;',
   'static readContentLock(resource: string): Promise<any>;',
   'static readContentLockWithOptions(resource: string, options: LocksOptions): Promise<any>;',
+  'static hasPaykitData(user: string): Promise<boolean>;',
+  'static hasPaykitDataWithOptions(user: string, options: LocksOptions): Promise<boolean>;',
   'export class LocksOptions',
   'constructor();',
   'addPkarrRelay(relay_url: string): LocksOptions;',
@@ -58,6 +61,7 @@ const requiredSnippets = [
   'toString(): string;',
   'submitProofBundle(submitted_proof_bundle: any): Promise<any>;',
   'lookupVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
+  'lookupPaykitConnectionState(options: VerificationTaskHandleOptions): Promise<any>;',
   'issueAccessCredential(options: VerificationTaskHandleOptions): Promise<any>;',
   'proxyReadGuardedResource(access_credential: string, path: string): Promise<Uint8Array>;',
   'proxyReadGuardedResourceResponse(access_credential: string, path: string): Promise<Response>;',
@@ -72,6 +76,7 @@ const requiredSnippets = [
   'createContentLock(body: any): Promise<any>;',
   'deleteGuardedResource(options: DeleteGuardedResourceOptions): Promise<void>;',
   'setLockServicePointer(options: SetLockServicePointerOptions): Promise<void>;',
+  'paykitSetupStatus(): Promise<any>;',
   'export class CreateContentLockRequestBuilder',
   'primaryResource(resource: any): CreateContentLockRequestBuilder;',
   'secondaryResource(resource: any): CreateContentLockRequestBuilder;',
@@ -94,6 +99,42 @@ for (const snippet of requiredSnippets) {
 
 const sdk = await import(pathToFileURL(jsPath));
 await sdk.default(await readFile(wasmPath));
+
+if (typeof sdk.Creator.prototype.paykitSetupStatus !== 'function') {
+  throw new Error('generated Creator missing paykitSetupStatus');
+}
+if (sdk.Creator.prototype.paykitSetupStatus.length !== 0) {
+  throw new Error('paykitSetupStatus must not accept a caller-supplied Creator');
+}
+if (typeof sdk.Locks.hasPaykitData !== 'function') {
+  throw new Error('generated Locks missing hasPaykitData');
+}
+if (typeof sdk.Locks.hasPaykitDataWithOptions !== 'function') {
+  throw new Error('generated Locks missing hasPaykitDataWithOptions');
+}
+await assert.rejects(
+  () => sdk.Locks.hasPaykitData('not-a-pubky'),
+  /invalid user pubky/,
+);
+await assert.rejects(
+  () => sdk.Locks.hasPaykitDataWithOptions('not-a-pubky', new sdk.LocksOptions()),
+  /invalid user pubky/,
+);
+const unavailableOptions = new sdk.LocksOptions();
+unavailableOptions.addPkarrRelay('http://127.0.0.1:1');
+await Promise.race([
+  assert.rejects(
+    () => sdk.Locks.hasPaykitDataWithOptions(
+      'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo',
+      unavailableOptions,
+    ),
+    (error) => error?.name === 'PaykitDataLookupFailed'
+      && error?.message === 'Paykit data lookup failed',
+  ),
+  new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Paykit data failure smoke timed out')), 10_000);
+  }),
+]);
 
 const primaryResource = {
   path: '/priv/locks.app/content/primary.txt',

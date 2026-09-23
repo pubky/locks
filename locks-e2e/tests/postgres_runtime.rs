@@ -1214,12 +1214,23 @@ impl GuardedResourceRepository for CrashExternalRepository {
     async fn upsert_guarded_resource(
         &self,
         resource: GuardedResourceRecord,
-    ) -> Result<(), locks_service::application::errors::ApplicationError> {
+    ) -> Result<GuardedResource, locks_service::application::errors::ApplicationError> {
+        let stored = GuardedResource::new(
+            resource.path.clone(),
+            resource.hash,
+            resource.content_type.clone(),
+            resource.size,
+        )
+        .map_err(|error| {
+            locks_service::application::errors::ApplicationError::InvalidGuardedResource {
+                message: error.to_string(),
+            }
+        })?;
         self.resources
             .lock()
             .unwrap()
             .insert(resource.path.clone(), resource);
-        Ok(())
+        Ok(stored)
     }
 
     async fn get_guarded_resource(

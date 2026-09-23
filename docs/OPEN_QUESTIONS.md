@@ -6,7 +6,7 @@ This file tracks only unresolved decisions before production implementation. Con
 
 Plan 0018 SDK-backed Pubky repository runtime composition is implemented through the server binary: persisted runtime can compose `creator_repositories.backend = "pubky-homeserver"` using encrypted creator-authority records and session-scoped SDK storage. Plan 0019 implemented the production-shaped `legacy-connect` Creator Authority Acquisition JSON protocol. Plan 0024 removes the abandoned `legacy-self-relay` / `srvr/caps/sign` auth surface; `legacy-connect` is the only accepted acquisition method for now, and `method` remains as the future extension point for homeserver grant-based auth.
 
-There are no unresolved Pubky-Core or deferred design questions blocking repository runtime composition or the backend acquisition protocol itself.
+There are no unresolved Pubky integration or deferred design questions blocking repository runtime composition or the backend acquisition protocol itself.
 
 Resolved decisions from the previous open-question set are captured in:
 
@@ -24,4 +24,4 @@ A live Pubky smoke test remains deferred until Pubky/testnet setup and credentia
 
 Resolved role-wrapper decision: keep `CreatorPubky` / `LockServerPubky` as domain role wrappers for now, with validation and canonical parsing delegated to Pubky/common public-key parsing. Revisit only if a concrete cross-crate API simplification requires replacing them.
 
-If new Pubky-Core, pubky-app, or lock-type-specific questions arise during the next integration slice, add only the unresolved question here and move the answer into the relevant ADR/domain/runtime doc once resolved.
+If new Pubky integration, pubky-app, or lock-type-specific questions arise during the next integration slice, add only the unresolved question here and move the answer into the relevant ADR/domain/runtime doc once resolved.
