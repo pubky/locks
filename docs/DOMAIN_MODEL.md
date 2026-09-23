@@ -11,7 +11,7 @@ Locks is application-layer logic. Homeservers should not need to understand paym
 ## Architectural Stance
 
 - Stay lock-type agnostic for now.
-- Keep Pubky-Core integration behind ports. Pubky-backed repository adapters exist. Plan 0018 wires real SDK-backed server-binary runtime composition through infrastructure-only storage/session seams while keeping domain and application ports unchanged.
+- Keep Pubky integration behind ports. Pubky-backed repository adapters exist. Plan 0018 wires real SDK-backed server-binary runtime composition through infrastructure-only storage/session seams while keeping domain and application ports unchanged.
 - Treat the Lock Server as a trusted proxy with explicit creator-granted authority; see [ADR 0017](ADRs/0017-creator-granted-auth-boundary.md).
 - Distinguish durable entitlement records from short-lived access credentials.
 - Preserve credible exit by storing successful entitlement records on the creator's homeserver, not only in Lock Server private storage.
@@ -247,7 +247,7 @@ Responsibilities:
 - Treat private `/priv/locks.app/...` writes as non-public: they emit no public events, private paths are not visible to clients, and Locks discovery relies on public `/pub/locks.app/...` resources.
 - Revalidate creator sessions lazily before Pubky writes and proxy reads; if the SDK can refresh or revalidate an expired/refreshable session, attempt one refresh/revalidation before returning `creator_authority_unavailable`.
 - Provide the production replacement for today's dev/test creator publishing routes by requiring both a Locks-local frontend session for `pubky.app/browser -> Lock Server` authorization and creator-granted homeserver authority for Pubky reads/writes.
-- Hide unstable Pubky-Core details behind ports.
+- Hide unstable Pubky integration details behind ports.
 
 ## Actors
 
@@ -541,7 +541,7 @@ Creates or replaces public content locks by creator and canonical `content_lock_
 
 ### LockConfigurationRepository
 
-Deferred until Pubky-Core questions about creator-owned Locks config and Lock Server discovery are resolved. Reads creator-owned Locks config such as the default Lock Server pointer. The default pointer lives in creator-owned public config, not in a dedicated PKDNS record.
+Deferred until Pubky integration questions about creator-owned Locks config and Lock Server discovery are resolved. Reads creator-owned Locks config such as the default Lock Server pointer. The default pointer lives in creator-owned public config, not in a dedicated PKDNS record.
 
 ### EntitlementRepository
 
@@ -730,9 +730,9 @@ These are conceptual events for internal organization. They do not imply Pubky `
 - Existing entitlements remain intact unless the verified proof bundle is deleted or the corresponding content lock file is removed.
 - Entitlements are not honored if the content lock file content does not hash to the Lock ID embedded in `pubky_lock_resource`.
 
-## Implementation Guidance Before Pubky-Core Clarification
+## Implementation Guidance Before Pubky Integration Clarification
 
-The completed first implementation organized core logic around the workspace split and retrieval/access vertical slice. While Pubky-Core questions remain open, the next product slice may implement local Creator Publishing / Lock Authoring without real Pubky I/O:
+The completed first implementation organized core logic around the workspace split and retrieval/access vertical slice. While Pubky integration questions remain open, the next product slice may implement local Creator Publishing / Lock Authoring without real Pubky I/O:
 
 - Keep placeholder `locks-sdk`, `locks-admin`, or `creator-ui` members documented but not created until their responsibilities are concrete.
 - Do not hard-code final Pubky path or session-storage behavior into `locks-core`.
@@ -741,7 +741,7 @@ The completed first implementation organized core logic around the workspace spl
 - Use opaque access credentials for the first access model.
 - Persist minimal criterion-level verification result evidence in verified proof bundles.
 - Implement local creator publishing only through dev/test-gated routes and in-memory repositories.
-- Keep production Pubky-backed creator publishing behind Pubky-Core answers.
+- Keep production Pubky-backed creator publishing behind Pubky integration answers.
 - Keep credential issuance as an explicit mutation route; task polling remains read-only and secret-free.
 - Use a non-production `dev-static` verifier in dev/test runtime mode only; production-mode workers must leave it unregistered.
 - Put in-memory repositories and `dev-static` under `locks-service`, not `locks-core`.

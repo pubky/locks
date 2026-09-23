@@ -3,11 +3,15 @@ use std::str::FromStr;
 use locks_core::ids::LockServerPubky;
 #[cfg(any(test, target_arch = "wasm32"))]
 use locks_core::ids::{CreatorPubky, PubkyLockResource};
+#[cfg(any(test, target_arch = "wasm32"))]
+use pubky::{Pubky, PubkyHttpClient, PublicKey, PublicStorage};
 use serde_json::Value;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
+use crate::js_error::paykit_data_lookup_failed;
 use crate::js_error::{JsResult, invalid_input};
 #[cfg(target_arch = "wasm32")]
 use crate::json::serializable_to_plain_js_value;
@@ -258,6 +262,25 @@ impl Locks {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = hasPaykitData)]
+    pub async fn has_paykit_data(user: &str) -> JsResult<bool> {
+        Self::has_paykit_data_with_options(user, &LocksOptions::new()).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = hasPaykitDataWithOptions)]
+    pub async fn has_paykit_data_with_options(
+        user: &str,
+        options: &LocksOptions,
+    ) -> JsResult<bool> {
+        let user = parse_paykit_user(user).map_err(invalid_input)?;
+        let storage = paykit_public_storage(options).map_err(|_| paykit_data_lookup_failed())?;
+        locks_sdk::has_paykit_data(&storage, &user)
+            .await
+            .map_err(|_| paykit_data_lookup_failed())
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = forContentLock)]
     pub async fn for_content_lock(resource: &str) -> JsResult<Locks> {
         Self::for_content_lock_with_options(resource, &LocksOptions::new()).await
@@ -351,6 +374,36 @@ impl Locks {
             Some(response.creator.to_string()),
         ))
     }
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn parse_paykit_user(user: &str) -> Result<PublicKey, String> {
+    if !user.starts_with("pubky") {
+        return Err("invalid user pubky".to_owned());
+    }
+    let canonical = CreatorPubky::from_str(user)
+        .map_err(|err| format!("invalid user pubky: {err}"))?
+        .to_string();
+    let raw = canonical
+        .strip_prefix("pubky")
+        .ok_or_else(|| "invalid user pubky".to_owned())?;
+    PublicKey::try_from_z32(raw).map_err(|err| format!("invalid user pubky: {err}"))
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn paykit_public_storage(options: &LocksOptions) -> Result<PublicStorage, String> {
+    let mut builder = PubkyHttpClient::builder();
+    if !options.pkarr_relay_urls().is_empty() {
+        builder.pkarr(|pkarr| {
+            pkarr
+                .relays(options.pkarr_relay_urls())
+                .expect("LocksOptions stores validated PKARR relay URLs")
+        });
+    }
+    let client = builder
+        .build()
+        .map_err(|err| format!("failed to build Pubky client: {err}"))?;
+    Ok(Pubky::with_client(client).public_storage())
 }
 
 impl Locks {
@@ -814,6 +867,26 @@ mod tests {
             vec!["http://localhost:15411/".to_owned()]
         );
         assert!(options.try_add_pkarr_relay("not a url".to_owned()).is_err());
+    }
+
+    #[test]
+    fn paykit_data_user_requires_canonical_pubky_key() {
+        let canonical = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+
+        assert_eq!(parse_paykit_user(canonical).unwrap().z32(), &canonical[5..]);
+        assert!(parse_paykit_user(&canonical[5..]).is_err());
+        assert!(parse_paykit_user("not-a-pubky").is_err());
+    }
+
+    #[test]
+    fn paykit_data_storage_accepts_default_and_custom_relay_options() {
+        assert!(paykit_public_storage(&LocksOptions::new()).is_ok());
+
+        let mut options = LocksOptions::new();
+        options
+            .add_pkarr_relay("http://localhost:15411".to_owned())
+            .unwrap();
+        assert!(paykit_public_storage(&options).is_ok());
     }
 
     #[test]

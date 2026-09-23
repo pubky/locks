@@ -30,8 +30,8 @@ const received = {
   address: 'bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202',
   asset: 'BTC',
   amount_sats: '50000',
-  payment_command: "docker compose --file ./compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner sendtoaddress \"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202\" \"0.00050000\"'",
-  optional_mining_command: "docker compose --file ./compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'",
+  payment_command: "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner sendtoaddress bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202 0.00050000'",
+  optional_mining_command: "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'",
 };
 
 const operations = [];

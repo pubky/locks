@@ -13,6 +13,11 @@ export function buildLocksOptions({ pkarrRelays = [] } = {}) {
   return options;
 }
 
+export async function hasPaykitData({ readerPublicKey }) {
+  await init();
+  return Locks.hasPaykitData(readerPublicKey);
+}
+
 export async function loadContentLock({ resource, pkarrRelays = [] } = {}) {
   await init();
   const options = buildLocksOptions({ pkarrRelays });
@@ -135,12 +140,159 @@ export async function submitPaykitPaymentProof({
   return { locks, viewer, creator, bundleId, submittedProofBundle, lifecycle };
 }
 
+export async function lookupPaykitConnectionState({ viewer, handle }) {
+  return viewer.lookupPaykitConnectionState(handle);
+}
+
+export async function refreshPaykitConnectionState({
+  resource,
+  creator,
+  bundleId,
+  pkarrRelays = [],
+}) {
+  const { viewer } = await loadContentLock({ resource, pkarrRelays });
+  return lookupPaykitConnectionState({
+    viewer,
+    handle: new VerificationTaskHandleOptions(creator, bundleId),
+  });
+}
+
 export function classifyPaymentLifecycle(lifecycle) {
   const status = getField(lifecycle, 'status');
   if (status === 'pending' || status === 'in_progress') return 'retry';
   if (status === 'completed') return 'completed';
   if (status === 'failed' || status === 'expired') return 'failed';
   throw new Error(`unknown lifecycle status: ${String(status)}`);
+}
+
+export function connectionStateIndicator(connectionState) {
+  if (connectionState == null) {
+    return Object.freeze({ label: 'Not reported yet', className: 'muted' });
+  }
+  if (connectionState === 'none') {
+    return Object.freeze({ label: 'None — handshake has not started', className: 'muted' });
+  }
+  if (connectionState === 'handshake') {
+    return Object.freeze({ label: 'Handshake in progress', className: 'warning' });
+  }
+  if (connectionState === 'connected') {
+    return Object.freeze({ label: 'Connected — Paykit Server link is usable', className: 'ok' });
+  }
+  if (connectionState === 'recovery_required') {
+    return Object.freeze({
+      label: 'Recovery required — runtime must relink; do not resubmit proof',
+      className: 'warning',
+    });
+  }
+  if (connectionState === 'blocked') {
+    return Object.freeze({ label: 'Blocked — operator action required', className: 'error' });
+  }
+  throw new Error(`unknown Noise connection state: ${String(connectionState)}`);
+}
+
+export function connectionStateFromLookupResponse(response) {
+  const connectionState = getField(response, 'state');
+  if (connectionState == null) throw new Error('missing Noise connection state');
+  connectionStateIndicator(connectionState);
+  return connectionState;
+}
+
+export function createPaykitConnectionPoller({
+  lookup,
+  onState = () => {},
+  onError = () => {},
+  onExhausted = () => {},
+  maxAttempts = 60,
+}) {
+  if (typeof lookup !== 'function') throw new Error('connection lookup function is required');
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new Error('max connection lookup attempts must be a positive integer');
+  }
+
+  let attempts = 0;
+  let inFlight = false;
+  let stopped = false;
+  let timer = null;
+  const idleWaiters = [];
+
+  function resolveIdleWaiters() {
+    if (inFlight) return;
+    for (const resolve of idleWaiters.splice(0)) resolve();
+  }
+
+  function stop() {
+    stopped = true;
+    if (timer != null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  return Object.freeze({
+    poll() {
+      if (stopped || inFlight || attempts >= maxAttempts) return false;
+      attempts += 1;
+      inFlight = true;
+      Promise.resolve()
+        .then(lookup)
+        .then((response) => {
+          if (stopped) return;
+          const connectionState = connectionStateFromLookupResponse(response);
+          onState(connectionState);
+          if (connectionState === 'blocked') stop();
+        })
+        .catch((error) => {
+          if (!stopped) onError(error);
+        })
+        .finally(() => {
+          inFlight = false;
+          resolveIdleWaiters();
+          if (!stopped && attempts >= maxAttempts) {
+            stop();
+            onExhausted();
+          }
+        });
+      return true;
+    },
+    start(intervalMilliseconds = 1_000) {
+      if (stopped || timer != null) return false;
+      if (!Number.isSafeInteger(intervalMilliseconds) || intervalMilliseconds <= 0) {
+        throw new Error('connection polling interval must be a positive integer');
+      }
+      this.poll();
+      if (!stopped) timer = setInterval(() => this.poll(), intervalMilliseconds);
+      return true;
+    },
+    whenIdle() {
+      if (!inFlight) return Promise.resolve();
+      return new Promise((resolve) => idleWaiters.push(resolve));
+    },
+    stop,
+  });
+}
+
+export function createPaykitConnectionObserverSlot() {
+  let active = null;
+
+  return Object.freeze({
+    start(observer, intervalMilliseconds) {
+      const previous = active;
+      previous?.stop();
+      active = observer;
+      void Promise.resolve(previous?.whenIdle()).then(() => {
+        if (active === observer) observer.start(intervalMilliseconds);
+      });
+    },
+    stop() {
+      active?.stop();
+    },
+    release(observer) {
+      observer.stop();
+      void observer.whenIdle().then(() => {
+        if (active === observer) active = null;
+      });
+    },
+  });
 }
 
 export async function completeDevVerification({ resource, creator, bundleId, pkarrRelays = [] }) {
@@ -286,8 +438,8 @@ function hasExactKeys(value, expected) {
 }
 
 function canonicalPaymentCommandMatches(value) {
-  const payment = /^docker compose --file \.\/compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf="\$BITCOIN_DATA\/bitcoin\.conf" -regtest -rpcwallet=miner sendtoaddress "([^"]+)" "((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)"'$/.exec(value.payment_command);
-  const mining = "docker compose --file ./compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'";
+  const payment = /^docker compose --file compose\.paykit-local-demo\.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=\/home\/bitcoin\/\.bitcoin\/bitcoin\.conf -regtest -rpcwallet=miner sendtoaddress (bcrt1[02-9ac-hj-np-z]{8,86}) ((?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?)'$/.exec(value.payment_command);
+  const mining = "docker compose --file compose.paykit-local-demo.yaml exec -T bitcoin sh -ec 'bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -conf=/home/bitcoin/.bitcoin/bitcoin.conf -regtest -rpcwallet=miner getnewaddress)'";
   return Boolean(payment)
     && payment[1] === value.address
     && browserBtcToSats(payment[2]) === BigInt(value.amount_sats)

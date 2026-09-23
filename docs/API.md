@@ -31,6 +31,10 @@ The Lock Server has one non-production route family and one authenticated creato
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives creator from the Locks-local frontend session.
   - Returns secret-free missing/present creator authority status.
+- Paykit setup readiness route: `GET /creator/paykit/setup-status`
+  - Requires `Authorization: Bearer <frontend_session_token>`.
+  - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.
+  - Returns only `ready`, `setup_required`, or `unavailable`.
 - Hosted legacy creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
   - Mount when explicit `[creator_authority_acquisition].enabled = true`.
   - `DELETE /frontend-sessions/current` requires `Authorization: Bearer <frontend_session_token>` and revokes the current frontend session.
@@ -45,7 +49,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 
 | Route | Success | Auth / mount | Secret handoff | Representative errors |
 | --- | --- | --- | --- | --- |
-| `PUT /creator/priv-resources/content/<path>` | `200` JSON guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; MIME from `Content-Type`. | No bearer secrets or raw bytes in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
+| `PUT /creator/priv-resources/content/<path>` | `200` JSON storage-authoritative guarded-resource descriptor | Requires `Authorization: Bearer <frontend_session_token>`. Raw bytes body; declared `Content-Type` is validated. | No bearer secrets or raw bytes in response. The returned MIME comes from storage readback and may differ from the request header. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `413 payload_too_large`, `503 creator_authority_unavailable` |
 | `DELETE /creator/priv-resources/content/<path>` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets or raw bytes in response. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `503 creator_authority_unavailable` |
 | `POST /creator/content-locks` | `200` JSON content lock | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404 guarded_resource_not_found`, `409 content_lock_path_conflict`, `503 creator_authority_unavailable` |
 | `POST /creator/lock-service-config` | `200` JSON lock-service pointer | Requires `Authorization: Bearer <frontend_session_token>`. | No bearer secrets in response. | `400 invalid_request`, `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable` |
@@ -55,8 +59,10 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `DELETE /frontend-sessions/current` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. Mounted with creator authority acquisition. | Token is request-only and is deleted from the frontend session store. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` when route gated off |
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
-| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. A new `paykit-payment` lifecycle identity requires `[paykit]` runtime config; an exact persisted replay does not. | No bearer secrets, invoice data, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
+| `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
+| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` tasks require `[paykit]`; exact persisted replay returns lifecycle without calling Paykit. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
+| `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `429 rate_limited`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
 | `POST /access-credentials` | `200` JSON credential | Public viewer route after entitlement. | Response intentionally contains raw viewer access credential exactly once. | `400 invalid_request`, `403 entitlement_not_authorized`, `404 verification_task_not_found` |
 | `GET /priv-resources/content/<path>` | `200` raw bytes | Requires viewer `Authorization: Bearer <access_credential>`. | No JSON response; credential is request-only. | `401 invalid_access_credential`, `401 expired_access_credential`, `403 entitlement_not_authorized`, `404 guarded_resource_not_found` |
@@ -103,10 +109,13 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `task_state_conflict` | 409 | Submission or completion conflicts with existing task state. |
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
+| `not_paykit_payment` | 422 | Connection state was requested for a verification task that is not Paykit-backed. |
 | `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
-| `rate_limited` | 429 | Submission exceeded configured rate limits. |
+| `rate_limited` | 429 | Submission or Paykit connection-state lookup exceeded configured admission limits. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
 | `paykit_invoice_creation_failed` | 502 | Lock Server could not create the Paykit invoice; no verification task is created. |
+| `paykit_connection_state_unavailable` | 502 | Paykit connection-state lookup failed or returned an invalid response. |
+| `paykit_connection_state_timeout` | 504 | Paykit connection-state lookup exceeded its whole-request deadline. |
 | `internal_error` | 500 | Unexpected server-side failure. |
 
 ## Service discovery
@@ -255,6 +264,43 @@ Error cases:
 - Missing/malformed frontend session bearer: `401 frontend_session_unavailable`.
 - Expired frontend session: `401 frontend_session_expired`.
 
+## Paykit setup readiness route
+
+### `GET /creator/paykit/setup-status`
+
+Returns whether the authenticated Creator already has usable authority configured on Paykit
+Server. Creator identity comes only from the Locks frontend session.
+
+```http
+GET /creator/paykit/setup-status
+Authorization: Bearer <frontend_session_token>
+```
+
+The request has no query parameters and no body. Success is always a closed one-field object:
+
+```json
+{"status":"ready"}
+```
+
+```json
+{"status":"setup_required"}
+```
+
+```json
+{"status":"unavailable"}
+```
+
+- `ready`: skip Paykit authorization.
+- `setup_required`: launch the Paykit setup iframe.
+- `unavailable`: show a retry/degraded state. **Never** treat this as `setup_required` and never
+  launch authorization from it.
+
+For authenticated requests, missing Paykit configuration, timeout/network failure, non-success
+Paykit responses, and malformed/unsupported Paykit success bodies all project to
+`{"status":"unavailable"}`. Frontend-session failures retain the existing `401` error envelope.
+The browser response never exposes Paykit failure details, configured URLs, Creator authority
+details, or credentials.
+
 ## Creator publishing routes
 
 Creator publishing routes always use Pubky homeserver-backed repositories. Callers must pass `Authorization: Bearer <frontend_session_token>`. Handlers derive creator from the Locks-local frontend session and reject request-body `creator`; frontend session tokens must not be supplied in query strings, request bodies, or cookies.
@@ -275,7 +321,7 @@ Content-Type: text/plain
 guarded bytes
 ```
 
-The request body is raw resource bytes, not JSON. `Content-Type` is required and becomes the guarded resource MIME type returned during proxy-read.
+The request body is raw resource bytes, not JSON. `Content-Type` is required and validated before upload, but Pubky homeserver storage determines the MIME type recorded for the resource. After writing, the Lock Server performs a metadata-only `HEAD`, verifies its ETag/content hash and length against the upload, and returns a descriptor containing the storage-authoritative `content_type`. It may differ from the request header—for example, an extensionless SVG may be returned as `application/octet-stream`, and WAV may be returned as `audio/x-wav`. The resource body is not downloaded again.
 
 Path rules:
 
@@ -303,7 +349,7 @@ Upload size is limited by `[content_locks].max_resource_bytes` and defaults to 1
 }
 ```
 
-The response is descriptor-only. It does not return raw bytes.
+The response is descriptor-only. It does not return raw bytes. Clients must use the returned descriptor unchanged when creating a content lock; they do not need to predict or normalize the homeserver's MIME type.
 
 #### Error cases
 
@@ -312,6 +358,7 @@ The response is descriptor-only. It does not return raw bytes.
 - Invalid relative path: `400 invalid_request`.
 - Empty body: `400 invalid_request`.
 - Body exceeds configured upload limit: `413 payload_too_large`.
+- Missing, malformed, or mismatched metadata after a successful upload: `500 internal_error`. This includes concurrent replacement between `PUT` and `HEAD`; clients may retry.
 - Missing/revoked creator-granted homeserver authority: `503 creator_authority_unavailable`.
 - Old `POST /creator/priv-resources` JSON/base64 route: `404 Not Found`.
 
@@ -522,11 +569,11 @@ Request envelope:
 }
 ```
 
-Success response returns lifecycle metadata only. It does not return internal `task_id`, raw proof material, entitlement evidence, or access credentials.
+Success response returns lifecycle metadata only. It does not return connection state, internal `task_id`, raw proof material, entitlement evidence, or access credentials.
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting, validates proof shape, loads the current canonical content lock referenced by `pubky_lock_resource`, verifies its lock identity and payment policy (including recipient/creator equality), and resolves `reader_public_key` through Pubky/PKARR/homeserver discovery. It then checks the permanent lifecycle identity `{ creator, bundle_id }`. An exact persisted replay returns the existing lifecycle; changed submitted proof material returns `409 task_state_conflict`. Neither case calls Paykit again. Only a new identity requires `[paykit]` configuration and calls `POST /invoices`. Task insertion retains race reconciliation after invoice creation. The signed Paykit invoice body is exactly:
+Submission processing applies rate limiting, validates proof shape, loads the current canonical content lock referenced by `pubky_lock_resource`, verifies its lock identity and payment policy (including recipient/creator equality), and resolves `reader_public_key` through Pubky/PKARR/homeserver discovery. It then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`. Exact persisted replays return the existing lifecycle without calling Paykit. New submissions call Paykit `POST /invoices`; task insertion retains race reconciliation after invoice creation. Signed Paykit invoice body is exactly:
 
 ```json
 {
@@ -536,7 +583,21 @@ Submission processing applies rate limiting, validates proof shape, loads the cu
 }
 ```
 
-Any 2xx Paykit invoice response is accepted and its body is ignored. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no verification task is created unless invoice creation was accepted.
+Paykit invoice success may have no response body. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
+
+### `POST /paykit-connection-state-lookups`
+
+Reads Paykit Server's local Noise peer state for an existing payment verification task. Request body is the same `{ creator, bundle_id }` handle used for lifecycle lookup. Locks loads the persisted task, rejects non-`paykit-payment` tasks, derives the accepted Creator and bundle binding, then sends signed canonical JSON to Paykit `POST /connections/status`. Browser callers cannot supply a peer key or receiver path.
+
+Success response is exactly one of `none`, `handshake`, `connected`, `recovery_required`, or `blocked`:
+
+```json
+{ "state": "handshake" }
+```
+
+This lookup is independent from verification lifecycle. `connected` does not mean payment or verification completed. Connection lookup errors do not fabricate connection states and should not stop lifecycle polling. `blocked` requires authorized operator action; `recovery_required` means the current local cryptographic generation must be recovered or relinked.
+
+Locks limits this public outbound proxy independently from proof submission. Default admission is 60 requests per 60 seconds for each `(client IP, creator, bundle_id)` plus 16 concurrent outbound Paykit status requests process-wide. Fixed-window rejection includes `Retry-After`; either limit returns `429 rate_limited` before another Paykit request is sent.
 
 Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status` with `X-Paykit-Signature` over those exact canonical body bytes. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
 

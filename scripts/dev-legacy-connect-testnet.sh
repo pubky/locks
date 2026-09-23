@@ -20,7 +20,7 @@ Environment:
   LOCKS_DEV_HTTP_TRACE_SECRETS   Set to 1 to print raw secret-bearing headers/bodies instead of redacted values
 
 Assumptions:
-  - Pubky-Core local testnet is already running.
+  - The local Pubky testnet is already running.
   - Lock Server is already running and configured for [pubky].network = "testnet".
   - legacy-connect JSON routes are mounted.
   - locked-content mode expects dev integration config: mode = "dev", pubky-homeserver backend, legacy-connect enabled, and dev manual completion enabled.
