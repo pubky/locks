@@ -9,9 +9,9 @@ pub mod viewer;
 
 pub use client::LocksClient;
 pub use creator::{
-    CreateContentLockRequest, CreatorLocks, DeleteGuardedResourceRequest, PaykitSetupStatus,
-    PaykitSetupStatusKind, RegisterGuardedResourceRequest, SdkRequest, SdkRequestBody,
-    SetLockServicePointerRequest,
+    CreateContentLockRequest, CreatorLocks, DeleteContentLockMode, DeleteContentLockRequest,
+    DeleteGuardedResourceRequest, PaykitSetupStatus, PaykitSetupStatusKind,
+    RegisterGuardedResourceRequest, SdkRequest, SdkRequestBody, SetLockServicePointerRequest,
 };
 pub use discovery::{
     CreatorLockServicePointer, WellKnownLocksServer, content_lock_resource_url,

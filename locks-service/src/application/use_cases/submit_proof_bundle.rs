@@ -70,20 +70,7 @@ impl<'a> SubmitProofBundleUseCase<'a> {
         if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
             return Ok(existing);
         }
-        let creator = submitted_proof_bundle.pubky_lock_resource.creator().clone();
-
-        let task_id = self.task_ids.generate_task_id().await?;
-        let submitted_at = self.clock.now();
-        let task = VerificationTaskRecord {
-            task_id,
-            creator,
-            submitted_proof_bundle,
-            status: VerificationTaskStatus::Pending,
-            submitted_at,
-            started_at: None,
-            completed_at: None,
-            failure_message: None,
-        };
+        let task = self.prepare_task(submitted_proof_bundle).await?;
 
         match self.tasks.insert_verification_task(task.clone()).await {
             Ok(()) => Ok(VerificationTaskLifecycleView::from(task)),
@@ -108,6 +95,23 @@ impl<'a> SubmitProofBundleUseCase<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Builds a new pending task without persisting it.
+    pub async fn prepare_task(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundle,
+    ) -> Result<VerificationTaskRecord, ApplicationError> {
+        Ok(VerificationTaskRecord {
+            task_id: self.task_ids.generate_task_id().await?,
+            creator: submitted_proof_bundle.pubky_lock_resource.creator().clone(),
+            submitted_proof_bundle,
+            status: VerificationTaskStatus::Pending,
+            submitted_at: self.clock.now(),
+            started_at: None,
+            completed_at: None,
+            failure_message: None,
+        })
     }
 }
 

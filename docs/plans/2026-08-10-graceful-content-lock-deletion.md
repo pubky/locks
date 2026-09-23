@@ -14,7 +14,7 @@
 
 ## Status and provenance
 
-- Plan status: **accepted product design; implementation not started**.
+- Plan status: **accepted product design; Tasks 1–5 committed and Task 6 implemented pending commit; Tasks 7–10 remain**.
 - Repository inspected: `/home/u/Projects/Synonym/Pubky/locks-public`.
 - Planning base when written: clean `master` at `ba49a77`.
 - There has been no production deployment. New persistence may require a clean pre-production database; no historical backfill is required.
@@ -59,11 +59,13 @@
 25. Creator-visible job status is only `queued|running|completed|failed`; failed responses include a stable secret-free `failure_code` only.
 26. Missing or replaced tombstone before destructive work halts as failed. Creator restores the exact tombstone and repeats graceful DELETE to resume the same job.
 27. Guarded paths are exclusive to one managed lock. Enforce unique `(creator, guarded_path)` ownership in PostgreSQL. There is no historical backfill.
-28. Lock publication uses best-effort reservation compensation and accepts crash-orphaned ownership requiring operator cleanup; do not claim cross-system atomicity.
+28. Lock publication uses best-effort ownership compensation and a durable opaque per-lock publication intent under the same PostgreSQL fence as deletion admission. Graceful/force deletion cannot start while publication is in flight. The intent is cleared only after ownership is durably published or failed publication is safely compensated. Process death can leave operator-reconciled intent/ownership state; do not claim cross-system atomicity.
 29. Graceful final cleanup deletes guarded content first and tombstone last, purges Locks authorization/task/job state, asks Paykit to remove operational drain state, and releases path ownership. It forgets the deletion so the same canonical Lock ID may later be published fresh with new Bundle IDs.
 30. Paykit retains terminal financial invoice/payment history; delayed old lifecycle events cannot reactivate a fresh publication.
 31. New force deletion is synchronous: persist a permanent minimal blocking receipt, delete lock/tombstone first, then best-effort guarded resources. Do not drain Paykit/tasks/credentials. Return failed paths. A force-deleted Lock ID can never be republished.
-32. `force=true` against an active graceful job persists `force_requested` and returns `202`; the worker escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
+32. `force=true` against an active graceful job persists `force_requested`, revokes the current claim token/lease, requeues the same frozen job, and returns `202`; a fresh worker claim escalates asynchronously under exclusive action ownership, skips drains, deletes tombstone then content, and finishes forced.
+33. Graceful job insertion/resume and permanent force-receipt establishment acquire the same canonical per-lock PostgreSQL fence. The durable result is either an active graceful job or a permanent force receipt, never both. Failed graceful replay requeues the same job and frozen manifest. Force against a terminal job atomically replaces that operational row with the permanent receipt before synchronous external deletion.
+34. Any Content Lock fetched from Pubky for deletion must hash to the requested Lock ID and name the authenticated creator before its manifest is frozen or used for resource deletion.
 
 ### Source-derived constraints
 
@@ -144,7 +146,18 @@ POST /payment-request-drain-lookups
 { "lock_resource": "..." }
 ```
 
-Returns aggregate factual state only; no Bundle IDs, readers, Payment Request IDs, addresses, or raw errors.
+Both drain endpoints return `200` with the same closed aggregate body:
+
+```json
+{
+  "status": "active",
+  "accepted_count": 0,
+  "terminal_count": 0,
+  "cancellation_enqueued_count": 0
+}
+```
+
+`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Exact replay returns the same aggregate body.
 
 ### Per-Bundle status
 
@@ -153,11 +166,65 @@ POST /payment-requests/status
 { "creator": "pubky...", "bundle_id": "..." }
 ```
 
-Returns orthogonal `request_state` and `payment_state`, immutable invoice/deadline timestamps, confirmations, and amount match. Exact enum spellings and invalid/recovery-state HTTP mapping are an implementation-contract gate and must be synchronized in both plans before code.
+Returns this exact closed body with orthogonal lifecycle and payment facts:
 
-### Drain cleanup
+```json
+{
+  "request_state": "proposed",
+  "payment_state": "undetected",
+  "invoice_created_at": "<RFC3339 UTC>",
+  "payment_deadline": "<RFC3339 UTC>",
+  "confirmations": 0,
+  "amount_matched": false
+}
+```
 
-Paykit Server needs an idempotent signed operation to remove only the completed operational drain row after Locks has completed all external deletion effects. Exact route/body is an implementation-contract gate; it must not remove financial invoice/payment history.
+The canonical persisted `request_state` is one of these exact closed snake-case values, mapped one-to-one from Paykit SDK lifecycle state:
+
+- `proposed`
+- `proposal_expired`
+- `accepted`
+- `rejected`
+- `canceled`
+- `proof_submitted`
+- `active_recurring`
+- `recovery_required`
+- `invalid_conflict`
+
+`payment_state` is exactly one of:
+
+- `undetected`
+- `detected`
+- `confirmed`
+- `expired`
+
+`expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
+
+Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
+
+- `accepted` is accepted and blocking;
+- `rejected`, `canceled`, and `proposal_expired` are terminal and non-blocking;
+- `proposed` is unanswered and requires durable cancellation enqueue;
+- `recovery_required`, `invalid_conflict`, `proof_submitted`, and `active_recurring` fail drain classification rather than being collapsed into another lifecycle.
+
+For the later HTTP slice, `recovery_required` maps to `503 unavailable`; `invalid_conflict`, `proof_submitted`, and `active_recurring` map to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
+
+The stable drain-classification error envelopes are:
+
+- `409 {"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}`
+- `503 {"error":{"code":"unavailable","message":"payment request state is unavailable"}}`
+
+Absent drain lookups and absent per-Bundle statuses reuse `404 {"error":{"code":"not_found","message":"requested resource was not found"}}`.
+
+### Operational drain cleanup
+
+Drain creation and lookup responses include an opaque `cleanup_token`: the canonical unpadded base64url encoding of 32 server-keyed, domain-separated bytes bound to the immutable drain identity. The token is not an internal drain ID, is not reversible, is stable across restart/exact replay, and must never be logged. Add `POST /payment-request-drain-cleanups`, authenticated by the existing canonical Locks signature boundary. It accepts the exact query-free body:
+
+```json
+{"cleanup_token":"<43-character-unpadded-base64url>","lock_resource":"pubky<creator>/pub/locks.app/<lock_id>.json"}
+```
+
+On success it returns the exact closed response `200 {"status":"removed"}`. Cleanup is cycle-bound and idempotent: deleting the matching completed drain advances the publication generation once and durably retains the consumed token as the generation boundary's cleanup receipt; replay of that token while no newer drain exists returns the same response without advancing again. A token that cannot be verified against either the current drain or its retained cleanup receipt—including an arbitrary token for a never-known lock or a delayed old token after a newer drain exists—returns the existing coarse `409 conflict` envelope and cannot delete or advance the newer cycle. An active matching drain also returns `409 conflict`. Authenticated envelope mismatch, corrupt receipt/generation state, or unavailable persistence returns the existing coarse `503 unavailable` envelope. The operation rejects query strings, unknown body fields, padding, non-canonical base64url, and token lengths other than exactly 32 decoded bytes. It deletes only a completed operational drain after Locks external cleanup succeeds and must never delete invoices, Bitcoin observations, Payment Request events, cancellation intents, or financial audit history. No lock, Bundle, internal drain ID, invoice, reader, or Payment Request identifier appears in the response or error envelope.
 
 ## HTTP creator contract
 
@@ -168,6 +235,8 @@ DELETE /creator/content-locks/{lock_id}?graceful=true
 
 Starts/replays/resumes graceful deletion and returns `202` for queued/running work. A completed-and-forgotten absent lock is an idempotent absent postcondition.
 
+Queued/running deletion and deletion status use the closed body `{ "lock_id": "...", "status": "queued|running|completed|failed", "failure_code"?: "..." }`. If both the canonical lock and deletion job are absent, graceful DELETE returns `200` with `{ "lock_id": "...", "status": "completed" }`.
+
 ```http
 DELETE /creator/content-locks/{lock_id}?force=true
 ```
@@ -175,13 +244,17 @@ DELETE /creator/content-locks/{lock_id}?force=true
 - No graceful job: synchronous `200` force summary.
 - Existing graceful job: persist `force_requested`, return `202` job status.
 
+The synchronous force summary is exactly `{ "lock_id": "...", "lock_deleted": true, "failed_resource_paths": ["..."] }`. It does not expose a force mode or internal receipt.
+
 Reject `force=true&graceful=true`, unknown fields, malformed booleans, and duplicate conflicting query values.
 
 ```http
 GET /creator/content-locks/{lock_id}/deletion
 ```
 
-Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
+Authenticated response contains Lock ID and `status`; include `failure_code` only for failed jobs. The closed stable vocabulary is exactly `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. Do not expose phases, leases, retries, Bundle IDs, readers, credentials, paths, Paykit IDs, or dependency errors.
+
+If no job or force receipt exists, status returns `404 content_lock_deletion_not_found`. A permanent force receipt projects as `{ "lock_id": "...", "status": "completed" }` without exposing force mode.
 
 ## Internal state model
 
@@ -313,7 +386,7 @@ cargo test --workspace --no-run
 
 **RED:** Concurrent tests prove task-first commit joins snapshot, deletion-first commit rejects a new Bundle, exact old replay succeeds, and conflicting replay remains rejected.
 
-**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. Do not use viewer timestamps or tombstone publication as the cutoff.
+**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. For Paykit-backed submissions, atomically persist a hidden, unclaimable admission reservation before the external invoice call; classify durable exact replay/conflict before mutable lock lookup or reader resolution, and resume an unready reservation from its persisted canonical fields. Paykit success makes it ready. This guarantees that deletion either snapshots the durable obligation or commits first and prevents any Paykit call. Do not permit transition to `start_payment_drain` while a snapshotted reservation is unready: Paykit's active drain accepts exact replay only for invoices already created before drain start. Do not hold a database transaction across HTTP, and do not use viewer timestamps or tombstone publication as the cutoff.
 
 **Suggested commit:** `feat(service): enforce deletion admission cutoff`
 
@@ -479,11 +552,7 @@ Cross-service acceptance must additionally prove:
 
 These do not reopen accepted product semantics, but code must not start for the affected slice until both plans are patched identically:
 
-1. Exact `request_state` and `payment_state` wire enum values and mappings for Paykit recovery/conflict conditions.
-2. Exact aggregate drain response fields/status values.
-3. Exact signed route/body for deleting completed Paykit operational drain state.
-4. Exact Locks stable `failure_code` vocabulary.
-5. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
+1. Exact configuration keys for retry attempts/backoff and final credential windows, within the accepted defaults/maxima.
 
 ## Out of scope
 
