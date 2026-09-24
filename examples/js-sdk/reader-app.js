@@ -24,6 +24,7 @@ import {
   createPaykitDataCheckController,
 } from './reader-staging-paykit.js';
 import { buildPersistedReaderState, restorePersistedReaderState } from './reader-persistence.js';
+import { describeReaderLoadState, validateContentLockResource } from './reader-load-state.js';
 
 const STATE_KEY = 'pubky-locks-reader-demo.state';
 
@@ -41,6 +42,7 @@ const state = {
   paykitPaymentRequest: null,
   baselinePaymentRequestId: null,
   loadingLock: false,
+  loadError: '',
   submittingProof: false,
   paymentPolling: false,
   loaded: null,
@@ -143,6 +145,7 @@ function bindEvents() {
       paykitPaymentRequest: null,
       baselinePaymentRequestId: null,
       loadingLock: false,
+      loadError: '',
       submittingProof: false,
       paymentPolling: false,
       loaded: null,
@@ -163,6 +166,7 @@ function bindEvents() {
 
   el.resource.addEventListener('input', () => {
     const resource = el.resource.value.trim();
+    state.loadError = '';
     if (resource !== state.resource) {
       invalidateWorkflow();
       clearVerificationState({ clearLoaded: true });
@@ -268,6 +272,7 @@ async function loadLock() {
   invalidateWorkflow();
   clearVerificationState({ clearLoaded: true });
   state.resource = resource;
+  state.loadError = '';
   state.loadingLock = true;
   const incarnation = workflowIncarnation;
   const loadToken = Symbol('load-lock');
@@ -275,6 +280,7 @@ async function loadLock() {
   persistState();
   render();
   try {
+    validateContentLockResource(resource);
     await postClientLog('info', 'reader-load-lock-started', { resource });
     if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     el.loadStatus.textContent = 'Loading content lock...';
@@ -302,7 +308,7 @@ async function loadLock() {
   } catch (error) {
     if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     await postClientLog('error', 'reader-load-lock-failed', serializeError(error));
-    showError(el.loadStatus, error);
+    state.loadError = error?.message ?? String(error);
   } finally {
     if (activeLoadToken === loadToken) {
       activeLoadToken = null;
@@ -708,19 +714,9 @@ function render() {
     })
     : '';
 
-  if (state.loadingLock) {
-    el.loadStatus.textContent = 'Loading content lock...';
-    el.loadStatus.className = 'muted';
-  } else if (state.loaded) {
-    el.loadStatus.textContent = 'Content lock loaded.';
-    el.loadStatus.className = 'ok';
-  } else if (state.resource) {
-    el.loadStatus.textContent = 'Ready to load content lock.';
-    el.loadStatus.className = 'muted';
-  } else {
-    el.loadStatus.textContent = 'Paste a content lock resource.';
-    el.loadStatus.className = 'muted';
-  }
+  const loadStatus = describeReaderLoadState(state);
+  el.loadStatus.textContent = loadStatus.message;
+  el.loadStatus.className = loadStatus.className;
   el.loadedOutput.textContent = format(state.loaded);
   renderLockResources();
 

@@ -150,7 +150,7 @@ This remains the stable browser path.
 Creators publish their current default Lock Server at:
 
 ```text
-/pub/locks.app/config.json
+/pub/app.locks/config.json
 ```
 
 Expected pointer shape:
@@ -181,7 +181,7 @@ const locksFromPointer = Locks.fromCreatorLockServicePointer(pointer);
 const locksFromCreator = await Locks.forCreator("pubky...");
 ```
 
-`Locks.forCreator` performs a browser PKARR/domain lookup for the creator homeserver, fetches `/pub/locks.app/config.json`, validates the pointer JSON, then uses the discovered `default_lock_server`. It does not use a gateway/base URL fallback.
+`Locks.forCreator` performs a browser PKARR/domain lookup for the creator homeserver, fetches `/pub/app.locks/config.json`, validates the pointer JSON, then uses the discovered `default_lock_server`. It does not use a gateway/base URL fallback.
 
 ## Connect flow
 
@@ -268,7 +268,7 @@ import { RegisterGuardedResourceOptions } from "locks-sdk-wasm";
 const bytes = new TextEncoder().encode("guarded bytes");
 const registered = await session.creator.registerGuardedResource(
   new RegisterGuardedResourceOptions(
-    "example.txt", // relative path under /priv/locks.app/content/
+    "example.txt", // relative path under /priv/app.locks/content/
     "text/plain",
     bytes,
   ),
@@ -285,7 +285,7 @@ Content-Type: text/plain
 guarded bytes
 ```
 
-Callers supply only the relative content path, not the full `/priv/locks.app/content/` path. The request body is raw bytes (`Uint8Array` in JS/WASM), not JSON/base64.
+Callers supply only the relative content path, not the full `/priv/app.locks/content/` path. The request body is raw bytes (`Uint8Array` in JS/WASM), not JSON/base64.
 
 ### Create content lock
 
@@ -387,17 +387,17 @@ Viewer apps can read public lock policy JSON from a canonical Pubky lock resourc
 
 ```ts
 const contentLock = await Locks.readContentLock(
-  "pubky.../pub/locks.app/<lock_id>.json",
+  "pubky.../pub/app.locks/<lock_id>.json",
 );
 
 const locksForContent = await Locks.forContentLock(
-  "pubky.../pub/locks.app/<lock_id>.json",
+  "pubky.../pub/app.locks/<lock_id>.json",
 );
 ```
 
 `readContentLock` performs a browser PKARR/domain lookup for the creator homeserver, fetches the public content lock JSON without auth, validates that the returned content lock matches the requested resource, and returns the validated JSON. It does not solve lock criteria or submit proofs.
 
-`forContentLock` performs the same content lock read, then selects the Lock Server: it prefers the content lock's per-lock `lock_server.override`; if absent, it discovers the creator's default Lock Server through `/pub/locks.app/config.json`.
+`forContentLock` performs the same content lock read, then selects the Lock Server: it prefers the content lock's per-lock `lock_server.override`; if absent, it discovers the creator's default Lock Server through `/pub/app.locks/config.json`.
 
 ### Submit proof bundle
 
@@ -411,7 +411,7 @@ const creator = "pubky...";
 const lifecycle = await viewer.submitProofBundle({
   version: 1,
   bundle_id: bundleId,
-  pubky_lock_resource: `${creator}/pub/locks.app/<lock_id>.json`,
+  pubky_lock_resource: `${creator}/pub/app.locks/<lock_id>.json`,
   proofs: [
     {
       criterion_id: "criterion-1",

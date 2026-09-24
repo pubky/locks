@@ -45,7 +45,7 @@ mod tests {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             authorized: true,
-            granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+            granted_scopes: vec!["/pub/app.locks/:rw".to_owned()],
             session_expires_at: None,
         };
         let manager = FakeCreatorAuthorityManager::new(Ok(status.clone()));

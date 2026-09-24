@@ -120,7 +120,7 @@ POST /creator/lock-service-config
   -> SetLockServicePointerUseCase
   -> dev/test-gated local creator publishing route
   -> body includes creator and default Lock Server identity
-  -> stores/replaces local creator config whose canonical future Pubky path is /pub/locks.app/config.json
+  -> stores/replaces local creator config whose canonical future Pubky path is /pub/app.locks/config.json
 
 GET /healthz
   -> runtime liveness only
@@ -143,7 +143,7 @@ The proxy-read response returns raw bytes, not JSON/base64. Successful proxy-rea
 
 Creator publishing routes are local dev/test product surface, not production Pubky publishing. `POST /creator/priv-resources`, `POST /creator/content-locks`, and `POST /creator/lock-service-config` are unauthenticated while local because real creator authorization depends on Pubky capability/session work. They must be mounted only when an explicit creator-publishing config flag is enabled in dev/test runtime, and production runtime must reject configs that expose them. Do not add fake shared-secret/admin-token auth.
 
-`POST /creator/priv-resources` overwrites the current local guarded resource by creator/path. `POST /creator/content-locks` verifies that the referenced guarded resource currently exists and matches path, hash, content type, and size before creating a content lock. `POST /creator/lock-service-config` stores the creator's default Lock Service Pointer for `/pub/locks.app/config.json`, but content lock creation does not require it. These semantics exercise local creator-to-viewer flow without adding fake Pubky writes.
+`POST /creator/priv-resources` overwrites the current local guarded resource by creator/path. `POST /creator/content-locks` verifies that the referenced guarded resource currently exists and matches path, hash, content type, and size before creating a content lock. `POST /creator/lock-service-config` stores the creator's default Lock Service Pointer for `/pub/app.locks/config.json`, but content lock creation does not require it. These semantics exercise local creator-to-viewer flow without adding fake Pubky writes.
 
 Proxy-read accepts credentials only through `Authorization: Bearer <credential>`. The `Bearer` scheme is case-insensitive, but parsing is otherwise strict: exactly one `Authorization` header, exactly one non-empty token after the scheme, no query-string credential, and no body credential. Missing or malformed bearer credentials map to `401 invalid_access_credential`.
 

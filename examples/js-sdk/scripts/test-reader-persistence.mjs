@@ -7,9 +7,9 @@ import {
 } from '../reader-persistence.js';
 
 const publicState = {
-  resource: 'pubkycreator/pub/locks.app/LOCK.json',
+  resource: 'pubkycreator/pub/app.locks/LOCK.json',
   guardedResourcePath: 'file.txt',
-  lockResources: [{ path: '/priv/locks.app/content/file.txt' }],
+  lockResources: [{ path: '/priv/app.locks/content/file.txt' }],
   proofSatisfied: true,
   verifierType: 'paykit-payment',
   loaded: { creator: 'pubkycreator', contentLock: { version: 1 } },

@@ -29,8 +29,8 @@ locks-core = { path = "locks-core" }
 locks-service = { path = "locks-service" }
 mime = "0.3"
 paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
-pubky = { version = "0.11.0", features = ["json"] }
-pubky-common = "0.11.0"
+pubky = { version = "0.11.0", git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03", features = ["json"] }
+pubky-common = { version = "0.11.0", git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03" }
 pubky-noise = "=0.1.0-rc7"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 pkarr = "8.0.0"
@@ -60,3 +60,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "js"] }
+
+[patch.crates-io]
+pubky = { git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03" }
+pubky-common = { git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03" }

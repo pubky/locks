@@ -11,7 +11,10 @@ import {
 import { repoRoot, writeSecret } from './lib/paths.mjs';
 import { initializePaykitCompose } from './init-paykit-compose.mjs';
 import { readReaderCreatorProfile, resolveReaderEnvironment } from './lib/paykit-reader-helper.mjs';
-import { extractBip84AccountXpub } from './generate-paykit-account-tpub.mjs';
+import {
+  buildComposeChildEnvironment,
+  extractBip84AccountXpub,
+} from './generate-paykit-account-tpub.mjs';
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
 import {
@@ -30,11 +33,27 @@ assert.equal(
 assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
-  serverSource: '.merge(http::setup_status::setup_status_router(service))',
+  connectionStatusSource: '.route("/connections/status", post(status))',
+  serverSource: [
+    '.merge(http::setup_status::setup_status_router(service))',
+    '.merge(http::connection_status::connection_status_router(service))',
+  ].join('\n'),
 }));
 assert.throws(
-  () => validatePaykitSetupStatusSources({ setupStatusSource: '', serverSource: '' }),
+  () => validatePaykitSetupStatusSources({
+    setupStatusSource: '',
+    connectionStatusSource: '',
+    serverSource: '',
+  }),
   /setup-status contract/,
+);
+assert.throws(
+  () => validatePaykitSetupStatusSources({
+    setupStatusSource: '.route("/setup/status", post(status))',
+    connectionStatusSource: '',
+    serverSource: '.merge(http::setup_status::setup_status_router(service))',
+  }),
+  /connection-status contract/,
 );
 let oversizedSourceCancelled = false;
 const oversizedSourceResponse = new Response(new ReadableStream({
@@ -54,6 +73,7 @@ await assert.rejects(
 assert.equal(oversizedSourceCancelled, true);
 const composeSource = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
 const defaultComposeSource = await readFile(join(repoRoot, 'docker-compose.yml'), 'utf8');
+const bitcoinBootstrapSource = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap.sh'), 'utf8');
 const creatorAppSource = await readFile(join(repoRoot, 'examples/js-sdk/app-iframe.js'), 'utf8');
 const creatorServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/start-demo-server.mjs'), 'utf8');
 const lockAuthoritySource = await readFile(join(repoRoot, 'locks-server/src/api/creator_authority.rs'), 'utf8');
@@ -96,6 +116,16 @@ const readerBaseEnvironment = {
   PAYKIT_READER_SERVER_PATH: 'bitkit/server',
 };
 const testAccountXpub = `tpub${'A'.repeat(107)}`;
+assert.deepEqual(buildComposeChildEnvironment({
+  PATH: '/bin',
+  DOCKER_HOST: 'unix:///docker.sock',
+  PAYKIT_SERVER_CONTEXT: '/work/paykit-server',
+  PRIVATE_TOKEN: 'must-not-cross',
+}), {
+  PATH: '/bin',
+  DOCKER_HOST: 'unix:///docker.sock',
+  PAYKIT_SERVER_CONTEXT: '/work/paykit-server',
+});
 assert.deepEqual(
   extractBip84AccountXpub({
     walletName: 'paykit-creator',
@@ -358,7 +388,7 @@ for (const required of [
   'https://github.com/pubky/paykit-server.git#v0.1.0-rc3',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
   'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
-  'https://github.com/pubky/locks.git#v0.1.0-rc1',
+  'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
   '127.0.0.1:${LOCKS_ELECTRUM_PORT:-60001}:50001',
@@ -473,6 +503,10 @@ assert.equal(packageJson.scripts['reset-paykit-demo'], 'node scripts/reset-payki
 for (const required of ['bitcoinBootstrapDir', 'rm(bitcoinBootstrapDir']) {
   assert.ok(resetScript.includes(required), `reset script missing ${required}`);
 }
+assert.ok(
+  resetScript.includes('PAYKIT_SERVER_CONTEXT: process.env.PAYKIT_SERVER_CONTEXT'),
+  'reset script must forward the required Paykit Server context to Compose',
+);
 for (const volume of [
   'pubky-locks-paykit-demo-locks-postgres',
   'pubky-locks-paykit-demo-paykit-postgres',
@@ -498,11 +532,11 @@ assert.equal(
 );
 assert.ok(
   validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc3'"),
-  'Compose validation must enforce the Paykit Server release ref',
+  'Compose validation must enforce Paykit Server v0.1.0-rc3 with connection status',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_LOCKS_REF = 'v0.1.0-rc1'"),
-  'Compose validation must enforce the Paykit Locks release ref',
+  validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),
+  'Compose validation must enforce the current Locks worktree context',
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],

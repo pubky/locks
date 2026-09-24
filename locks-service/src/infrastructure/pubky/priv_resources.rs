@@ -142,7 +142,7 @@ fn ensure_private_resource_path(path: &str) -> Result<(), ApplicationError> {
         || path.contains("://")
     {
         return Err(ApplicationError::InvalidGuardedResource {
-            message: "guarded resource path must be under /priv/locks.app/content/".to_owned(),
+            message: "guarded resource path must be under /priv/app.locks/content/".to_owned(),
         });
     }
     Ok(())
@@ -206,8 +206,8 @@ mod tests {
         assert_eq!(
             repository.client().operations(),
             vec![
-                "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt text/plain".to_owned(),
-                "get_metadata pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt".to_owned(),
+                "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt text/plain".to_owned(),
+                "get_metadata pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
             ]
         );
         assert_eq!(repository.client().last_bytes(), record.bytes);
@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn register_returns_storage_authoritative_content_type_without_downloading_bytes() {
         let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec();
-        let path = "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000";
+        let path = "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000";
         let client = FakeStorageClient::default().with_metadata_read(Some(
             PubkyResourceMetadata::from_bytes(&bytes, Some("application/octet-stream".to_owned())),
         ));
@@ -261,7 +261,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes: b"uploaded bytes".to_vec(),
             })
@@ -279,11 +279,11 @@ mod tests {
             repository.client().operations(),
             vec![
                 format!(
-                    "put_bytes {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000 text/plain",
+                    "put_bytes {} /priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000 text/plain",
                     creator()
                 ),
                 format!(
-                    "get_metadata {} /priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000",
+                    "get_metadata {} /priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000",
                     creator()
                 ),
             ]
@@ -303,7 +303,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -331,7 +331,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -359,7 +359,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -386,7 +386,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "text/plain".to_owned(),
                 bytes,
             })
@@ -409,7 +409,7 @@ mod tests {
         let error = use_case
             .execute(RegisterGuardedResourceRequest {
                 creator: creator(),
-                path: "/priv/locks.app/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                path: "/priv/app.locks/content/550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 content_type: "image/svg+xml".to_owned(),
                 bytes: br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#.to_vec(),
             })
@@ -428,7 +428,7 @@ mod tests {
     async fn upsert_guarded_resource_rejects_paths_outside_private_content_namespace() {
         let repository = PubkyPrivResourceRepository::new(FakeStorageClient::default());
         let mut record = resource_record(b"guarded bytes".to_vec(), "text/plain");
-        record.path = "/pub/locks.app/content/example.txt".to_owned();
+        record.path = "/pub/app.locks/content/example.txt".to_owned();
 
         let error = repository
             .upsert_guarded_resource(record)
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(
             error,
             ApplicationError::InvalidGuardedResource {
-                message: "guarded resource path must be under /priv/locks.app/content/".to_owned(),
+                message: "guarded resource path must be under /priv/app.locks/content/".to_owned(),
             }
         );
         assert_eq!(repository.client().operations(), Vec::<String>::new());
@@ -457,7 +457,7 @@ mod tests {
         let loaded = repository
             .get_guarded_resource(
                 &creator(),
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 &expected_hash,
             )
             .await
@@ -467,7 +467,7 @@ mod tests {
             loaded,
             Some(GuardedResourceRecord {
                 creator: creator(),
-                path: "/priv/locks.app/content/example.txt".to_owned(),
+                path: "/priv/app.locks/content/example.txt".to_owned(),
                 hash: expected_hash,
                 content_type: "text/plain".to_owned(),
                 size: bytes.len() as u64,
@@ -487,7 +487,7 @@ mod tests {
         let loaded = repository
             .get_guarded_resource(
                 &creator(),
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 &hash(b"guarded bytes"),
             )
             .await
@@ -503,7 +503,7 @@ mod tests {
         let loaded = repository
             .get_guarded_resource(
                 &creator(),
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 &hash(b"guarded bytes"),
             )
             .await
@@ -523,7 +523,7 @@ mod tests {
         let repository = PubkyPrivResourceRepository::new(client);
 
         let loaded = repository
-            .get_current_guarded_resource(&creator(), "/priv/locks.app/content/example.txt")
+            .get_current_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
             .await
             .unwrap();
 
@@ -531,7 +531,7 @@ mod tests {
             loaded,
             Some(GuardedResourceRecord {
                 creator: creator(),
-                path: "/priv/locks.app/content/example.txt".to_owned(),
+                path: "/priv/app.locks/content/example.txt".to_owned(),
                 hash: hash(&bytes),
                 content_type: "application/octet-stream".to_owned(),
                 size: bytes.len() as u64,
@@ -549,7 +549,7 @@ mod tests {
         let repository = PubkyPrivResourceRepository::new(client);
 
         let deleted = repository
-            .delete_guarded_resource(&creator(), "/priv/locks.app/content/example.txt")
+            .delete_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
             .await
             .unwrap();
 
@@ -557,8 +557,8 @@ mod tests {
         assert_eq!(
             repository.client().operations(),
             vec![
-                "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt".to_owned(),
-                "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt".to_owned(),
+                "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
+                "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
             ]
         );
     }
@@ -568,7 +568,7 @@ mod tests {
         let repository = PubkyPrivResourceRepository::new(FakeStorageClient::default());
 
         let deleted = repository
-            .delete_guarded_resource(&creator(), "/priv/locks.app/content/example.txt")
+            .delete_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
             .await
             .unwrap();
 
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(
             repository.client().operations(),
             vec![
-                "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/example.txt".to_owned(),
+                "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
             ]
         );
     }
@@ -704,7 +704,7 @@ mod tests {
     fn resource_record(bytes: Vec<u8>, content_type: &str) -> GuardedResourceRecord {
         GuardedResourceRecord {
             creator: creator(),
-            path: "/priv/locks.app/content/example.txt".to_owned(),
+            path: "/priv/app.locks/content/example.txt".to_owned(),
             hash: hash(&bytes),
             content_type: content_type.to_owned(),
             size: bytes.len() as u64,

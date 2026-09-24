@@ -28,5 +28,5 @@ Negative:
 
 ## Open Follow-ups
 
-- Confirm the final Pubky Homeserver path capability model for `/priv/locks.app/`.
-- Confirm whether app sessions can write verified proof bundles under `/priv/locks.app/proofs/`.
+- Confirm the final Pubky Homeserver path capability model for `/priv/app.locks/`.
+- Confirm whether app sessions can write verified proof bundles under `/priv/app.locks/proofs/`.

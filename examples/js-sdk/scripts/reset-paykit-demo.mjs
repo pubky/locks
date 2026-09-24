@@ -10,6 +10,7 @@ const dockerEnvironment = Object.fromEntries(Object.entries({
   PATH: process.env.PATH,
   DOCKER_HOST: process.env.DOCKER_HOST,
   DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
+  PAYKIT_SERVER_CONTEXT: process.env.PAYKIT_SERVER_CONTEXT,
 }).filter(([, value]) => typeof value === 'string'));
 const disposableVolumes = [
   'pubky-locks-paykit-demo-locks-postgres',

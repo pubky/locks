@@ -314,7 +314,7 @@ mod tests {
 
         let replacement = CreatorAuthorityRecord {
             auth_kind: CreatorAuthorityAuthKind::Grant,
-            granted_scopes: vec!["/pub/locks.app/:rw".to_owned()],
+            granted_scopes: vec!["/pub/app.locks/:rw".to_owned()],
             secret: CreatorAuthoritySecret::new("grant-credential-secret"),
             session_expires_at: None,
             last_revalidated_at: Some(datetime!(2026-05-29 12:30:00 UTC)),
@@ -507,7 +507,7 @@ mod tests {
 
         assert_eq!(
             stored_scopes,
-            serde_json::json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+            serde_json::json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
         );
 
         database.cleanup().await;
@@ -527,8 +527,8 @@ mod tests {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new(secret),
             session_expires_at: Some(datetime!(2026-05-29 12:15:00 UTC)),

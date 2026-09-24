@@ -67,7 +67,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Content Lock, Creator Publishing, Guarded Resource Registration, Lock ID
 
 ### Lock ID
-- **Definition**: Identifier for a content lock, encoded by the Rust `base32` crate as fixed-length 52-character Crockford base32 of the full 32-byte BLAKE3 lock hash with no prefix or checksum; canonical form is uppercase and used in `/pub/locks.app/<lock_id>.json` so changing the lock creates a new content lock file.
+- **Definition**: Identifier for a content lock, encoded by the Rust `base32` crate as fixed-length 52-character Crockford base32 of the full 32-byte BLAKE3 lock hash with no prefix or checksum; canonical form is uppercase and used in `/pub/app.locks/<lock_id>.json` so changing the lock creates a new content lock file.
 - **NOT**: A mutable arbitrary label or bearer secret.
 - **Synonyms to AVOID**: lock name, policy id, file id
 - **Related terms**: Content Lock, Lock Hash
@@ -80,13 +80,13 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 
 ### Pubky Lock Resource
 
-- **Definition**: Protocol-facing addressed Pubky resource for a public content lock, exactly `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`, matching the preferred `PubkyResource` form from the `pubky` crate. It derives creator, content lock path, and Lock ID.
+- **Definition**: Protocol-facing addressed Pubky resource for a public content lock, exactly `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`, matching the preferred `PubkyResource` form from the `pubky` crate. It derives creator, content lock path, and Lock ID.
 - **NOT**: `pubky://...`, an HTTP(S) transport URL, a creator-relative path alone, or a guarded resource path.
 - **Synonyms to AVOID**: content lock URL, homeserver URL, lock URL
 - **Related terms**: Content Lock Path, Lock ID, Creator Pubky
 
 ### Content Lock Path
-- **Definition**: Canonical creator-homeserver-relative public path to a content lock file, exactly `/pub/locks.app/<lock_id>.json`; the embedded Lock ID must parse and match the content lock file hash before an entitlement is honored.
+- **Definition**: Canonical creator-homeserver-relative public path to a content lock file, exactly `/pub/app.locks/<lock_id>.json`; the embedded Lock ID must parse and match the content lock file hash before an entitlement is honored.
 - **NOT**: The content lock payload itself, a guarded path, full Pubky URL, homeserver URL, or another `/pub/...` path.
 - **Synonyms to AVOID**: lock path, lock file path, policy path
 - **Related terms**: Content Lock, Lock ID, Public Lock Path, Verified Proof Bundle
@@ -116,7 +116,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Guarded Content, Guarded Resource Hash, Guarded Resource Registration, Proxy Read
 
 ### Guarded Resource Registration
-- **Definition**: Authenticated creator publishing action exposed as `PUT /creator/priv-resources/content/<path>`; it stores or replaces current guarded bytes and metadata for the session-derived creator and canonical guarded path under `/priv/locks.app/content/`, then returns a guarded resource descriptor.
+- **Definition**: Authenticated creator publishing action exposed as `PUT /creator/priv-resources/content/<path>`; it stores or replaces current guarded bytes and metadata for the session-derived creator and canonical guarded path under `/priv/app.locks/content/`, then returns a guarded resource descriptor.
 - **NOT**: A creator authorization proof, public content lock, or viewer proxy-read.
 - **Synonyms to AVOID**: seed endpoint, locked resource upload
 - **Related terms**: Guarded Resource, Content Creator, Creator Publishing, Guarded Path
@@ -134,7 +134,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Guarded Resource, Lock Hash, Entitlement Record
 
 ### Lock Service Pointer
-- **Definition**: Creator-owned public configuration at `/pub/locks.app/config.json` that tells viewers which Lock Server to use by default when a content lock does not specify `lock_server.override`; authored through authenticated `POST /creator/lock-service-config`.
+- **Definition**: Creator-owned public configuration at `/pub/app.locks/config.json` that tells viewers which Lock Server to use by default when a content lock does not specify `lock_server.override`; authored through authenticated `POST /creator/lock-service-config`.
 - **NOT**: A PKDNS/Pkarr record, the per-lock Lock Server override itself, production creator authorization, or a content lock.
 - **Synonyms to AVOID**: service url, server config, migration pointer, _locks record
 - **Related terms**: Lock Server, Credible Exit, Creator Publishing

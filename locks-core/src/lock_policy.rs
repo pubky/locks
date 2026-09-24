@@ -15,13 +15,13 @@ use crate::ids::{
 pub const CONTENT_LOCK_VERSION: u16 = 1;
 
 /// Canonical public Locks application namespace on a creator homeserver.
-pub const PUBLIC_LOCKS_APP_PATH_PREFIX: &str = "/pub/locks.app/";
+pub const PUBLIC_LOCKS_APP_PATH_PREFIX: &str = "/pub/app.locks/";
 
 /// Canonical private Locks content namespace on a creator homeserver.
-pub const PRIVATE_RESOURCE_CONTENT_PATH_PREFIX: &str = "/priv/locks.app/content/";
+pub const PRIVATE_RESOURCE_CONTENT_PATH_PREFIX: &str = "/priv/app.locks/content/";
 
 /// Canonical private Locks proof-bundle namespace on a creator homeserver.
-pub const PRIVATE_PROOF_BUNDLE_PATH_PREFIX: &str = "/priv/locks.app/proofs/";
+pub const PRIVATE_PROOF_BUNDLE_PATH_PREFIX: &str = "/priv/app.locks/proofs/";
 
 /// Canonical guarded resource content namespace for local creator publishing v0.
 pub const GUARDED_RESOURCE_CONTENT_PATH_PREFIX: &str = PRIVATE_RESOURCE_CONTENT_PATH_PREFIX;
@@ -295,7 +295,7 @@ pub enum ContentLockValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GuardedResourceValidationError {
-    #[error("guarded resource path must be under /priv/locks.app/content/")]
+    #[error("guarded resource path must be under /priv/app.locks/content/")]
     InvalidPath,
     #[error("guarded resource content_type must be a valid MIME type")]
     InvalidContentType,
@@ -511,7 +511,7 @@ mod tests {
     fn content_lock_fixture() -> ContentLock {
         let mut secondary_resources = BTreeMap::new();
         secondary_resources.insert(
-            "/priv/locks.app/content/attachments/image.png".to_owned(),
+            "/priv/app.locks/content/attachments/image.png".to_owned(),
             secondary_resource(8, "image/png", 9),
         );
 
@@ -519,7 +519,7 @@ mod tests {
             version: CONTENT_LOCK_VERSION,
             creator: CreatorPubky::from_str(&test_pubky_identity()).unwrap(),
             primary_resource: Some(guarded_resource(
-                "/priv/locks.app/content/post.json",
+                "/priv/app.locks/content/post.json",
                 7,
                 "application/json",
                 5,
@@ -646,13 +646,13 @@ mod tests {
             "version": CONTENT_LOCK_VERSION,
             "creator": expected_creator,
             "primary_resource": {
-                "path": "/priv/locks.app/content/post.json",
+                "path": "/priv/app.locks/content/post.json",
                 "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
                 "content_type": "application/json",
                 "size": 5u64
             },
             "secondary_resources": {
-                "/priv/locks.app/content/attachments/image.png": {
+                "/priv/app.locks/content/attachments/image.png": {
                     "hash": "1040G2081040G2081040G2081040G2081040G2081040G2081040",
                     "content_type": "image/png",
                     "size": 9u64
@@ -682,7 +682,7 @@ mod tests {
         let primary = &serialized["primary_resource"];
         assert_eq!(
             primary["path"].as_str(),
-            Some("/priv/locks.app/content/post.json")
+            Some("/priv/app.locks/content/post.json")
         );
         assert_eq!(
             primary["hash"].as_str(),
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(primary["content_type"].as_str(), Some("application/json"));
         assert_eq!(primary["size"].as_u64(), Some(5));
         let secondary =
-            &serialized["secondary_resources"]["/priv/locks.app/content/attachments/image.png"];
+            &serialized["secondary_resources"]["/priv/app.locks/content/attachments/image.png"];
         assert_eq!(
             secondary["hash"].as_str(),
             Some("1040G2081040G2081040G2081040G2081040G2081040G2081040")
@@ -707,12 +707,12 @@ mod tests {
 
     #[test]
     fn private_locks_paths_define_confirmed_pubky_homeserver_namespaces() {
-        assert_eq!(PUBLIC_LOCKS_APP_PATH_PREFIX, "/pub/locks.app/");
+        assert_eq!(PUBLIC_LOCKS_APP_PATH_PREFIX, "/pub/app.locks/");
         assert_eq!(
             PRIVATE_RESOURCE_CONTENT_PATH_PREFIX,
-            "/priv/locks.app/content/"
+            "/priv/app.locks/content/"
         );
-        assert_eq!(PRIVATE_PROOF_BUNDLE_PATH_PREFIX, "/priv/locks.app/proofs/");
+        assert_eq!(PRIVATE_PROOF_BUNDLE_PATH_PREFIX, "/priv/app.locks/proofs/");
     }
 
     #[test]
@@ -721,21 +721,21 @@ mod tests {
 
         assert_eq!(
             verified_proof_bundle_path(&bundle_id),
-            "/priv/locks.app/proofs/000G40R40M30E209185GR38E1W.json"
+            "/priv/app.locks/proofs/000G40R40M30E209185GR38E1W.json"
         );
     }
 
     #[test]
     fn guarded_resource_constructor_accepts_mime_content_type_and_positive_size() {
         let guarded_resource = GuardedResource::new(
-            "/priv/locks.app/content/hello.txt",
+            "/priv/app.locks/content/hello.txt",
             GuardedResourceHash::from_bytes([7; 32]),
             "text/plain",
             5,
         )
         .unwrap();
 
-        assert_eq!(guarded_resource.path, "/priv/locks.app/content/hello.txt");
+        assert_eq!(guarded_resource.path, "/priv/app.locks/content/hello.txt");
         assert_eq!(guarded_resource.content_type, "text/plain");
         assert_eq!(guarded_resource.size, 5);
     }
@@ -743,8 +743,8 @@ mod tests {
     #[test]
     fn guarded_resource_path_accepts_content_namespace_paths() {
         for path in [
-            "/priv/locks.app/content/example.txt",
-            "/priv/locks.app/content/nested/example.json",
+            "/priv/app.locks/content/example.txt",
+            "/priv/app.locks/content/nested/example.json",
         ] {
             let guarded_resource = GuardedResource::new(
                 path,
@@ -761,12 +761,12 @@ mod tests {
     #[test]
     fn guarded_resource_path_rejects_paths_outside_content_namespace() {
         for path in [
-            "/pub/locks.app/content/example.txt",
-            "/priv/locks.app/proofs/example.json",
-            "/priv/locks.app/content/",
-            "/priv/locks.app/content/../secret.txt",
-            "/priv/locks.app/content//double.txt",
-            "https://example.com/priv/locks.app/content/file.txt",
+            "/pub/app.locks/content/example.txt",
+            "/priv/app.locks/proofs/example.json",
+            "/priv/app.locks/content/",
+            "/priv/app.locks/content/../secret.txt",
+            "/priv/app.locks/content//double.txt",
+            "https://example.com/priv/app.locks/content/file.txt",
             "guarded/locks.app/content/missing-leading-slash.txt",
         ] {
             let err = GuardedResource::new(
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn guarded_resource_constructor_rejects_invalid_mime_content_type() {
         let result = GuardedResource::new(
-            "/priv/locks.app/content/hello.txt",
+            "/priv/app.locks/content/hello.txt",
             GuardedResourceHash::from_bytes([7; 32]),
             "not a mime type",
             5,
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn guarded_resource_constructor_rejects_zero_size() {
         let result = GuardedResource::new(
-            "/priv/locks.app/content/hello.txt",
+            "/priv/app.locks/content/hello.txt",
             GuardedResourceHash::from_bytes([7; 32]),
             "text/plain",
             0,
@@ -1031,14 +1031,14 @@ mod tests {
         let mut content_lock = content_lock_fixture();
         content_lock.secondary_resources.clear();
         content_lock.secondary_resources.insert(
-            "/pub/locks.app/content/image.png".to_owned(),
+            "/pub/app.locks/content/image.png".to_owned(),
             secondary_resource(8, "image/png", 9),
         );
 
         assert_eq!(
             content_lock.validate_resource_set(),
             Err(ContentLockValidationError::InvalidSecondaryResource {
-                path: "/pub/locks.app/content/image.png".to_owned(),
+                path: "/pub/app.locks/content/image.png".to_owned(),
                 reason: GuardedResourceValidationError::InvalidPath,
             })
         );
@@ -1049,14 +1049,14 @@ mod tests {
         let mut content_lock = content_lock_fixture();
         content_lock.secondary_resources.clear();
         content_lock.secondary_resources.insert(
-            "/priv/locks.app/content/image.png".to_owned(),
+            "/priv/app.locks/content/image.png".to_owned(),
             secondary_resource(8, "not mime", 9),
         );
 
         assert_eq!(
             content_lock.validate_resource_set(),
             Err(ContentLockValidationError::InvalidSecondaryResource {
-                path: "/priv/locks.app/content/image.png".to_owned(),
+                path: "/priv/app.locks/content/image.png".to_owned(),
                 reason: GuardedResourceValidationError::InvalidContentType,
             })
         );
@@ -1067,14 +1067,14 @@ mod tests {
         let mut content_lock = content_lock_fixture();
         content_lock.secondary_resources.clear();
         content_lock.secondary_resources.insert(
-            "/priv/locks.app/content/image.png".to_owned(),
+            "/priv/app.locks/content/image.png".to_owned(),
             secondary_resource(8, "image/png", 0),
         );
 
         assert_eq!(
             content_lock.validate_resource_set(),
             Err(ContentLockValidationError::InvalidSecondaryResource {
-                path: "/priv/locks.app/content/image.png".to_owned(),
+                path: "/priv/app.locks/content/image.png".to_owned(),
                 reason: GuardedResourceValidationError::ZeroSize,
             })
         );
@@ -1091,7 +1091,7 @@ mod tests {
         assert_eq!(
             content_lock.validate_resource_set(),
             Err(ContentLockValidationError::DuplicatePrimarySecondaryPath {
-                path: "/priv/locks.app/content/post.json".to_owned(),
+                path: "/priv/app.locks/content/post.json".to_owned(),
             })
         );
     }
@@ -1101,17 +1101,17 @@ mod tests {
         let content_lock = content_lock_fixture();
 
         let primary = content_lock
-            .resource_for_path("/priv/locks.app/content/post.json")
+            .resource_for_path("/priv/app.locks/content/post.json")
             .unwrap();
         assert_eq!(primary.content_type, "application/json");
         assert_eq!(primary.size, 5);
 
         let secondary = content_lock
-            .resource_for_path("/priv/locks.app/content/attachments/image.png")
+            .resource_for_path("/priv/app.locks/content/attachments/image.png")
             .unwrap();
         assert_eq!(
             secondary.path,
-            "/priv/locks.app/content/attachments/image.png"
+            "/priv/app.locks/content/attachments/image.png"
         );
         assert_eq!(secondary.content_type, "image/png");
         assert_eq!(secondary.size, 9);
@@ -1122,11 +1122,11 @@ mod tests {
         let mut content_lock = content_lock_fixture();
         content_lock.secondary_resources.clear();
         content_lock.secondary_resources.insert(
-            "/priv/locks.app/content/z.txt".to_owned(),
+            "/priv/app.locks/content/z.txt".to_owned(),
             secondary_resource(9, "text/plain", 1),
         );
         content_lock.secondary_resources.insert(
-            "/priv/locks.app/content/a.txt".to_owned(),
+            "/priv/app.locks/content/a.txt".to_owned(),
             secondary_resource(8, "text/plain", 1),
         );
 
@@ -1134,10 +1134,10 @@ mod tests {
 
         assert!(
             canonical_json
-                .find("/priv/locks.app/content/a.txt")
+                .find("/priv/app.locks/content/a.txt")
                 .unwrap()
                 < canonical_json
-                    .find("/priv/locks.app/content/z.txt")
+                    .find("/priv/app.locks/content/z.txt")
                     .unwrap()
         );
     }
@@ -1199,7 +1199,7 @@ mod tests {
         assert_eq!(content_lock_path.lock_id(), &lock_id);
         assert_eq!(
             content_lock_path,
-            ContentLockPath::from_str(&format!("/pub/locks.app/{lock_id}.json")).unwrap()
+            ContentLockPath::from_str(&format!("/pub/app.locks/{lock_id}.json")).unwrap()
         );
     }
 

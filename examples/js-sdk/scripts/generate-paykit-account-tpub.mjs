@@ -37,6 +37,16 @@ export function extractBip84AccountXpub(value) {
   return matches[0];
 }
 
+export function buildComposeChildEnvironment(env = process.env) {
+  return Object.fromEntries(Object.entries({
+    PATH: env.PATH,
+    DOCKER_HOST: env.DOCKER_HOST,
+    DOCKER_CONTEXT: env.DOCKER_CONTEXT,
+    DOCKER_CONFIG: env.DOCKER_CONFIG,
+    PAYKIT_SERVER_CONTEXT: env.PAYKIT_SERVER_CONTEXT,
+  }).filter(([, value]) => typeof value === 'string'));
+}
+
 export function generatePaykitAccountXpub({
   run = runBitcoinDescriptorCommand,
 } = {}) {
@@ -77,12 +87,7 @@ fi
       shell: false,
       timeout: COMMAND_TIMEOUT_MS,
       maxBuffer: MAX_OUTPUT_BYTES,
-      env: {
-        PATH: process.env.PATH,
-        DOCKER_HOST: process.env.DOCKER_HOST,
-        DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
-        DOCKER_CONFIG: process.env.DOCKER_CONFIG,
-      },
+      env: buildComposeChildEnvironment(),
     },
   );
 }

@@ -4,7 +4,7 @@ use time::OffsetDateTime;
 use crate::ids::LockServerPubky;
 
 pub const LOCK_SERVICE_POINTER_VERSION: u16 = 1;
-pub const LOCK_SERVICE_POINTER_PATH: &str = "/pub/locks.app/config.json";
+pub const LOCK_SERVICE_POINTER_PATH: &str = "/pub/app.locks/config.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -103,8 +103,8 @@ mod tests {
 
     #[test]
     fn lock_service_pointer_path_is_canonical_pubky_path() {
-        assert_eq!(LOCK_SERVICE_POINTER_PATH, "/pub/locks.app/config.json");
-        assert_eq!(lock_service_pointer_path(), "/pub/locks.app/config.json");
+        assert_eq!(LOCK_SERVICE_POINTER_PATH, "/pub/app.locks/config.json");
+        assert_eq!(lock_service_pointer_path(), "/pub/app.locks/config.json");
     }
 
     #[test]

@@ -973,10 +973,10 @@ mod tests {
         let request = build_creator_pointer_request(&creator).unwrap();
 
         assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/pub/locks.app/config.json");
+        assert_eq!(request.path, "/pub/app.locks/config.json");
         assert_eq!(
             request.url.as_str(),
-            "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/config.json"
+            "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/config.json"
         );
     }
 
@@ -996,10 +996,10 @@ mod tests {
             prepare_creator_pointer_request_for_endpoint(&request, &endpoint, None).unwrap();
 
         assert_eq!(prepared.method, "GET");
-        assert_eq!(prepared.path, "/pub/locks.app/config.json");
+        assert_eq!(prepared.path, "/pub/app.locks/config.json");
         assert_eq!(
             prepared.url.as_str(),
-            "https://creator.example:8443/pub/locks.app/config.json"
+            "https://creator.example:8443/pub/app.locks/config.json"
         );
         assert_eq!(
             prepared.pubky_host.as_deref(),
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn content_lock_request_uses_public_lock_resource_path_without_auth() {
         let resource = PubkyLockResource::from_str(
-            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
         )
         .unwrap();
 
@@ -1019,18 +1019,18 @@ mod tests {
         assert_eq!(request.method, "GET");
         assert_eq!(
             request.path,
-            "/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            "/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
         assert_eq!(
             request.url.as_str(),
-            "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
     }
 
     #[test]
     fn content_lock_request_prepares_browser_fetch_url_and_pubky_host() {
         let resource = PubkyLockResource::from_str(
-            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
         )
         .unwrap();
         let request = build_content_lock_request(&resource).unwrap();
@@ -1046,11 +1046,11 @@ mod tests {
         assert_eq!(prepared.method, "GET");
         assert_eq!(
             prepared.path,
-            "/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            "/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
         assert_eq!(
             prepared.url.as_str(),
-            "https://creator.example:8443/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            "https://creator.example:8443/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
         assert_eq!(
             prepared.pubky_host.as_deref(),

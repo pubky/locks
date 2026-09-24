@@ -211,12 +211,11 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build context uses the immutable `v0.1.0-rc3` tag, its compatible
-Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Homeserver uses
-`v0.11.0`. The active Locks checkout is used only for the Locks and browser-demo
-images being developed. No sibling repository checkout is required.
+The Paykit Server build uses release tag `v0.1.0-rc3`, the active Locks checkout,
+Paykit Rust `v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. This release provides the setup-status
+and Noise connection-status APIs required by Locks. No sibling repository checkout is required.
 
-For coordinated pre-merge Paykit Server work, select an explicit absolute local worktree
+For coordinated Paykit Server work, select an explicit absolute local worktree
 without changing the committed public default:
 
 ```bash
@@ -379,7 +378,7 @@ Rules:
 - file upload only
 - guarded path prefix is fixed:
   ```text
-  /priv/locks.app/content/
+  /priv/app.locks/content/
   ```
 - only the filename segment is editable
 - `/` in filename is rejected
@@ -449,7 +448,7 @@ The Node demo server does not write Locks resources directly to the homeserver.
 After success, the page displays the **Viewer content lock resource**:
 
 ```text
-<creator_pubky>/pub/locks.app/<lock_id>.json
+<creator_pubky>/pub/app.locks/<lock_id>.json
 ```
 
 ## Reader browser flow

@@ -93,8 +93,8 @@ mod tests {
             .unwrap(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new("legacy-cookie-session-secret"),
             session_expires_at: None,
@@ -142,8 +142,8 @@ mod tests {
                 "pubkyauth://relay.example/connect?client_secret=super-secret-client-secret",
             ),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: datetime!(2026-06-17 12:00:00 UTC),
             expires_at: datetime!(2026-06-17 12:05:00 UTC),
@@ -422,7 +422,7 @@ mod tests {
             version: SUBMITTED_PROOF_BUNDLE_VERSION,
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             reader_public_key: None,

@@ -62,7 +62,7 @@ async fn creator_publishing_http_flow_registers_locks_verifies_and_proxy_reads_g
         .await
         .unwrap();
     assert_eq!(pointer_json["creator"], creator().to_string());
-    assert_eq!(pointer_json["path"], "/pub/locks.app/config.json");
+    assert_eq!(pointer_json["path"], "/pub/app.locks/config.json");
     assert_eq!(
         pointer_json["lock_service_pointer"]["default_lock_server"],
         "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
@@ -76,7 +76,7 @@ async fn creator_publishing_http_flow_registers_locks_verifies_and_proxy_reads_g
     assert_eq!(guarded_json["creator"], creator().to_string());
     assert_eq!(
         guarded_resource["path"],
-        "/priv/locks.app/content/creator-e2e.txt"
+        "/priv/app.locks/content/creator-e2e.txt"
     );
     assert_eq!(guarded_resource["content_type"], "text/plain");
     assert_eq!(guarded_resource["size"], GUARDED_BYTES.len() as u64);
