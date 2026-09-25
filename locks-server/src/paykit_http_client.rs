@@ -151,9 +151,12 @@ pub enum PaykitTransactionStatusKind {
     Undetected,
     Detected,
     Confirmed,
+    Cancelled,
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaykitTransactionStatus {
     pub status: PaykitTransactionStatusKind,
     pub confirmations: u32,
@@ -366,11 +369,21 @@ impl PaykitPaymentStatusClient for PaykitHttpClient {
         .await
         .map_err(|_| PaykitPaymentStatusError)?;
 
+        if matches!(
+            status.status,
+            PaykitTransactionStatusKind::Cancelled | PaykitTransactionStatusKind::Expired
+        ) && (status.confirmations != 0 || status.amount_matched)
+        {
+            return Err(PaykitPaymentStatusError);
+        }
+
         Ok(PaykitPaymentStatus {
             status: match status.status {
                 PaykitTransactionStatusKind::Undetected => PaykitPaymentStatusKind::Undetected,
                 PaykitTransactionStatusKind::Detected => PaykitPaymentStatusKind::Detected,
                 PaykitTransactionStatusKind::Confirmed => PaykitPaymentStatusKind::Confirmed,
+                PaykitTransactionStatusKind::Cancelled => PaykitPaymentStatusKind::Cancelled,
+                PaykitTransactionStatusKind::Expired => PaykitPaymentStatusKind::Expired,
             },
             confirmations: status.confirmations,
             amount_matched: status.amount_matched,
@@ -785,6 +798,14 @@ mod tests {
         for (status, body) in [
             (axum::http::StatusCode::NOT_FOUND, "not found"),
             (axum::http::StatusCode::OK, "not-json"),
+            (
+                axum::http::StatusCode::OK,
+                r#"{"status":"expired","confirmations":6,"amount_matched":true}"#,
+            ),
+            (
+                axum::http::StatusCode::OK,
+                r#"{"status":"expired","confirmations":0,"amount_matched":false,"extra":true}"#,
+            ),
         ] {
             let server_url = spawn_configured_status_server(status, body).await;
             let client = PaykitHttpClient::from_parts(
@@ -804,6 +825,33 @@ mod tests {
 
             assert_eq!(error, PaykitPaymentStatusError);
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_cancelled_status_is_terminal() {
+        let server_url = spawn_configured_status_server(
+            axum::http::StatusCode::OK,
+            r#"{"status":"cancelled","confirmations":0,"amount_matched":false}"#,
+        )
+        .await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let status = PaykitPaymentStatusClient::transaction_status(
+            &client,
+            &CreatorPubky::from_str(CREATOR).unwrap(),
+            &BundleId::from_str(BUNDLE_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status.status, PaykitPaymentStatusKind::Cancelled);
+        assert_eq!(status.confirmations, 0);
+        assert!(!status.amount_matched);
     }
 
     fn invoice_request() -> PaykitInvoiceRequest {

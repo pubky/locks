@@ -220,6 +220,8 @@ impl From<ApplicationError> for ApiError {
             | ApplicationError::InvalidVerificationTaskState { .. }
             | ApplicationError::InvalidVerificationTaskFailureMessage
             | ApplicationError::VerificationPending
+            | ApplicationError::VerificationCancelled
+            | ApplicationError::VerificationExpired
             | ApplicationError::VerificationTaskClaimLost
             | ApplicationError::VerificationTaskConflict => Self::new(
                 ApiErrorCode::TaskStateConflict,

@@ -90,7 +90,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 
 The response also contains non-negative `confirmations` and `amount_matched`. Paykit reports those facts; Locks alone applies `minimum_confirmations` and decides whether access is satisfied.
 
-V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure status. Every status-call transport, timeout, HTTP, authentication/authorization, protocol, and decoding failure leaves verification pending and schedules durable retry. This includes `404` and malformed successful responses.
+V1 invoices have no local TTL or `expires_at`. Paykit lifecycle reconciliation later added terminal `cancelled` for canonical SDK rejection/cancellation and terminal `expired` for canonical proposal expiry. Every status-call transport, timeout, HTTP, authentication/authorization, protocol, tuple-validation, and decoding failure still leaves verification pending and schedules durable retry. This includes `404` and malformed successful responses.
 
 ### Runtime boundary
 

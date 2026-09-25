@@ -288,6 +288,7 @@ pub(super) fn status_to_database(status: VerificationTaskStatus) -> &'static str
         VerificationTaskStatus::InProgress => "in_progress",
         VerificationTaskStatus::Completed => "completed",
         VerificationTaskStatus::Failed => "failed",
+        VerificationTaskStatus::Cancelled => "cancelled",
         VerificationTaskStatus::Expired => "expired",
     }
 }
@@ -298,6 +299,7 @@ fn status_from_database(status: &str) -> Result<VerificationTaskStatus, Applicat
         "in_progress" => Ok(VerificationTaskStatus::InProgress),
         "completed" => Ok(VerificationTaskStatus::Completed),
         "failed" => Ok(VerificationTaskStatus::Failed),
+        "cancelled" => Ok(VerificationTaskStatus::Cancelled),
         "expired" => Ok(VerificationTaskStatus::Expired),
         _ => Err(ApplicationError::Storage {
             message: format!("invalid verification task status stored in Postgres: {status}"),

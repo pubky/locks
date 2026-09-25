@@ -162,7 +162,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Submitted Proof Bundle, Verified Proof Bundle, Credible Exit
 
 ### Verification Task
-- **Definition**: Asynchronous Lock Server work item created when a viewer submits a proof bundle; statuses are `pending`, `in_progress`, `completed`, `failed`, and `expired`; retained for a few hours; publicly addressed by `{ creator, bundle_id }`.
+- **Definition**: Asynchronous Lock Server work item created when a viewer submits a proof bundle; statuses are `pending`, `in_progress`, `completed`, `failed`, `cancelled`, and `expired`; retained for a few hours; publicly addressed by `{ creator, bundle_id }`.
 - **NOT**: A persisted entitlement record or a public Task ID resource.
 - **Synonyms to AVOID**: job, async request, background check
 - **Related terms**: Submitted Proof Bundle, Public Verification Attempt Handle, Task ID, Verification Result, Verification Task Claim

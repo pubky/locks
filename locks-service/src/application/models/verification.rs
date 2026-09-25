@@ -17,6 +17,8 @@ pub enum VerificationTaskStatus {
     Completed,
     /// Verification failed and no entitlement should be created.
     Failed,
+    /// Payment request was cancelled before verification completed.
+    Cancelled,
     /// Task state aged out before completion.
     Expired,
 }
@@ -86,7 +88,7 @@ impl VerificationTaskRecord {
                 transitioned.completed_at = Some(at);
                 transitioned.failure_message = trimmed_failure_message;
             }
-            VerificationTaskStatus::Expired => {
+            VerificationTaskStatus::Cancelled | VerificationTaskStatus::Expired => {
                 transitioned.completed_at = Some(at);
             }
         }
@@ -95,15 +97,17 @@ impl VerificationTaskRecord {
     }
 
     fn validate_transition(&self, next: VerificationTaskStatus) -> Result<(), ApplicationError> {
-        use VerificationTaskStatus::{Completed, Expired, Failed, InProgress, Pending};
+        use VerificationTaskStatus::{Cancelled, Completed, Expired, Failed, InProgress, Pending};
 
         let allowed = matches!(
             (self.status, next),
             (Pending, InProgress)
+                | (Pending, Cancelled)
                 | (Pending, Expired)
                 | (InProgress, Pending)
                 | (InProgress, Completed)
                 | (InProgress, Failed)
+                | (InProgress, Cancelled)
                 | (InProgress, Expired)
         );
 
@@ -118,7 +122,7 @@ impl VerificationTaskRecord {
     }
 
     fn validate_state(&self) -> Result<(), ApplicationError> {
-        use VerificationTaskStatus::{Completed, Expired, Failed, InProgress, Pending};
+        use VerificationTaskStatus::{Cancelled, Completed, Expired, Failed, InProgress, Pending};
 
         let valid = match self.status {
             Pending => {
@@ -144,7 +148,7 @@ impl VerificationTaskRecord {
                         .as_deref()
                         .is_some_and(|message| !message.trim().is_empty())
             }
-            Expired => self.completed_at.is_some() && self.failure_message.is_none(),
+            Cancelled | Expired => self.completed_at.is_some() && self.failure_message.is_none(),
         };
 
         if valid {

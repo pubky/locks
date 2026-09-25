@@ -76,15 +76,18 @@ It does not store `VerificationResult`; successful verification evidence lives i
 Allowed transitions:
 
 - `pending -> in_progress`
+- `pending -> cancelled`
 - `pending -> expired`
 - `in_progress -> completed`
 - `in_progress -> failed`
+- `in_progress -> cancelled`
 - `in_progress -> expired`
 
 Terminal states:
 
 - `completed`
 - `failed`
+- `cancelled`
 - `expired`
 
 Transition validity is enforced by `VerificationTaskRecord::transition_to` in `locks-service`.
@@ -98,7 +101,7 @@ Failure-message rules:
 
 - `failed` requires a non-empty failure message.
 - non-`failed` transitions reject failure messages.
-- expired tasks represent expiry by status, not failure message.
+- cancelled and expired tasks represent their terminal reason by status, not failure message.
 - current task state is validated before transition.
 
 Invalid lifecycle behavior uses dedicated errors, not generic storage errors:

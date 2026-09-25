@@ -1109,6 +1109,7 @@ assert.equal(classifyPaymentLifecycle({ status: 'pending' }), 'retry');
 assert.equal(classifyPaymentLifecycle({ status: 'in_progress' }), 'retry');
 assert.equal(classifyPaymentLifecycle({ status: 'completed' }), 'completed');
 assert.equal(classifyPaymentLifecycle({ status: 'failed' }), 'failed');
+assert.equal(classifyPaymentLifecycle({ status: 'cancelled' }), 'failed');
 assert.equal(classifyPaymentLifecycle({ status: 'expired' }), 'failed');
 assert.throws(() => classifyPaymentLifecycle({ status: 'unknown' }), /unknown lifecycle status/);
 const workflowHandle = { incarnation: 7, resource: paymentResource, creator: creatorPubky, bundleId: paymentBundleId };

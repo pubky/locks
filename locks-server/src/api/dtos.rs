@@ -206,6 +206,7 @@ where
         VerificationTaskStatus::InProgress => "in_progress",
         VerificationTaskStatus::Completed => "completed",
         VerificationTaskStatus::Failed => "failed",
+        VerificationTaskStatus::Cancelled => "cancelled",
         VerificationTaskStatus::Expired => "expired",
     })
 }

@@ -33,6 +33,12 @@ pub enum ApplicationError {
     /// Criterion verifier is not terminal yet and should be retried later.
     #[error("verification pending")]
     VerificationPending,
+    /// Criterion verification became terminal because its payment request was cancelled.
+    #[error("verification cancelled")]
+    VerificationCancelled,
+    /// Criterion verification became terminal because its payment request expired.
+    #[error("verification expired")]
+    VerificationExpired,
     /// Submitted payment proof does not match its canonical content lock criterion.
     #[error("invalid paykit payment submission")]
     InvalidPaykitPaymentSubmission,
