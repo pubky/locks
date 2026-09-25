@@ -96,7 +96,7 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
 
     let content_lock_json = client
         .create_content_lock(
-            guarded_resource,
+            guarded_resource.clone(),
             json!([{
                 "criterion_id": "criterion-1",
                 "verifier_type": "dev-static",
@@ -108,6 +108,23 @@ async fn production_creator_publishing_http_flow_writes_to_pubky_storage_when_fr
         )
         .await
         .unwrap();
+    let conflict = client
+        .create_content_lock(
+            guarded_resource,
+            json!([{
+                "criterion_id": "criterion-1",
+                "verifier_type": "dev-static",
+                "params": { "satisfied": false }
+            }]),
+            json!({ "type": "all", "criteria": ["criterion-1"] }),
+            json!({ "requested_credential_ttl_seconds": 900 }),
+            json!({ "override": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.body["error"]["code"], "content_lock_path_conflict");
+    assert_secret_free(&conflict.body);
     let content_lock_path = ContentLockPath::from_str(
         content_lock_json["content_lock_path"]
             .as_str()

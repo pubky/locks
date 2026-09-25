@@ -12,6 +12,12 @@ pub enum ApplicationError {
         /// Stable record kind for diagnostics.
         record: &'static str,
     },
+    /// A guarded path already has an in-flight or published ownership record.
+    #[error("content lock path conflict")]
+    ContentLockPathConflict {
+        /// Full creator-scoped guarded path for structured internal handling.
+        guarded_path: String,
+    },
     /// An update-only operation targeted a missing record.
     #[error("missing {record} record")]
     MissingRecord {
