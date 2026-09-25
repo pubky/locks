@@ -154,6 +154,12 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
 
         let verification_result = match self.verify_criteria(&task, &content_lock).await {
             Ok(verification_result) => verification_result,
+            Err(ApplicationError::VerificationCancelled) => {
+                return self.persist_cancelled_task(task, request.task_id).await;
+            }
+            Err(ApplicationError::VerificationExpired) => {
+                return self.persist_expired_task(task, request.task_id).await;
+            }
             Err(error) => {
                 if matches!(error, ApplicationError::VerificationPending) {
                     return Err(error);
@@ -337,6 +343,37 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         )?;
         self.tasks.update_verification_task(failed).await
     }
+
+    async fn persist_expired_task(
+        &self,
+        task: VerificationTaskRecord,
+        task_id: TaskId,
+    ) -> Result<CompletedVerificationTask, ApplicationError> {
+        let completed_at = self.clock.now();
+        let expired = task.transition_to(VerificationTaskStatus::Expired, completed_at, None)?;
+        self.tasks.update_verification_task(expired).await?;
+        Ok(CompletedVerificationTask {
+            task_id,
+            status: VerificationTaskStatus::Expired,
+            completed_at,
+        })
+    }
+
+    async fn persist_cancelled_task(
+        &self,
+        task: VerificationTaskRecord,
+        task_id: TaskId,
+    ) -> Result<CompletedVerificationTask, ApplicationError> {
+        let completed_at = self.clock.now();
+        let cancelled =
+            task.transition_to(VerificationTaskStatus::Cancelled, completed_at, None)?;
+        self.tasks.update_verification_task(cancelled).await?;
+        Ok(CompletedVerificationTask {
+            task_id,
+            status: VerificationTaskStatus::Cancelled,
+            completed_at,
+        })
+    }
 }
 
 fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
@@ -359,6 +396,8 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
+        | ApplicationError::VerificationCancelled
+        | ApplicationError::VerificationExpired
         | ApplicationError::InvalidVerificationTaskState { .. }
         | ApplicationError::VerificationTaskClaimLost
         | ApplicationError::InvalidVerificationTaskFailureMessage
@@ -708,6 +747,82 @@ mod tests {
             retry_tasks.updates().last().unwrap().status,
             VerificationTaskStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn expired_payment_request_marks_task_expired_without_entitlement() {
+        let content_lock = content_lock_fixture(true);
+        let tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let content_locks = FakeContentLocks::new(Some(content_lock));
+        let entitlements = FakeEntitlements::default();
+        let verifier = FakeVerifier {
+            satisfied: false,
+            error: Some(ApplicationError::VerificationExpired),
+        };
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+        ]);
+
+        let completed = CompleteVerificationTaskUseCase::new(
+            &tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await
+        .unwrap();
+
+        assert_eq!(completed.status, VerificationTaskStatus::Expired);
+        assert_eq!(
+            tasks.updates().last().unwrap().status,
+            VerificationTaskStatus::Expired
+        );
+        assert!(entitlements.stored().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_payment_request_marks_task_cancelled_without_entitlement() {
+        let content_lock = content_lock_fixture(true);
+        let tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let content_locks = FakeContentLocks::new(Some(content_lock));
+        let entitlements = FakeEntitlements::default();
+        let verifier = FakeVerifier {
+            satisfied: false,
+            error: Some(ApplicationError::VerificationCancelled),
+        };
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+        ]);
+
+        let completed = CompleteVerificationTaskUseCase::new(
+            &tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await
+        .unwrap();
+
+        assert_eq!(completed.status, VerificationTaskStatus::Cancelled);
+        assert_eq!(
+            tasks.updates().last().unwrap().status,
+            VerificationTaskStatus::Cancelled
+        );
+        assert!(entitlements.stored().is_empty());
     }
 
     #[tokio::test]

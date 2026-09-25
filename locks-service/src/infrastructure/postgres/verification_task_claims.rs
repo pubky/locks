@@ -124,6 +124,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
             task.status,
             VerificationTaskStatus::Completed
                 | VerificationTaskStatus::Failed
+                | VerificationTaskStatus::Cancelled
                 | VerificationTaskStatus::Expired
         ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
@@ -640,6 +641,15 @@ mod tests {
                     Some("failed".to_owned()),
                 )
                 .unwrap(),
+            VerificationTaskStatus::Cancelled => {
+                task(task_id, VerificationTaskStatus::Pending, started_at)
+                    .transition_to(
+                        VerificationTaskStatus::Cancelled,
+                        datetime!(2026-05-29 12:01:00 UTC),
+                        None,
+                    )
+                    .unwrap()
+            }
             VerificationTaskStatus::Expired => {
                 task(task_id, VerificationTaskStatus::Pending, started_at)
                     .transition_to(

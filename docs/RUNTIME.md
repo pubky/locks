@@ -169,7 +169,7 @@ Paykit HTTP connections have a 5-second connect timeout and every request has a 
 
 Every claimed verification task receives a fresh opaque claim token. Retry, completion, and failure transitions require the exact token, worker ID, `in_progress` state, and an unexpired lease, so a stale process cannot write after the same worker ID reclaims the task. Pubky entitlement publication cannot be atomic with the Postgres transition: a stale worker may publish a valid entitlement but cannot persist terminal task state. After any publication error, Locks reads the entitlement back; the current owner recovers only when the stored entitlement decision matches in every field except verifier-owned `verified_at` timestamps. A missing or mismatched entitlement preserves the failure. The Pubky adapter remains check-then-put, so claim fencing does not make concurrent homeserver writes atomic; it only fences Postgres task state.
 
-`minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable.
+`minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable. Canonical `cancelled` and `expired` are terminal and transition the task to the matching status without an entitlement.
 
 Omitting `[paykit]` prevents creation of new payment lifecycle identities and connection-state lookup. Existing exact payment-submission replays still return their persisted lifecycle. Non-payment verifier flows continue to run. New `paykit-payment` submissions return `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
@@ -247,7 +247,7 @@ poll_interval_ms = 250
 
 `dev-static` verification is registered only in `environment = "development"`. `paykit-payment` verification is registered when `[paykit]` is configured, regardless of environment. Staging/production completion uses the worker path, not the dev-only `POST /verification-task-completions` route.
 
-For `paykit-payment`, every Paykit status-call failure schedules a normal pending retry and is logged as retry telemetry rather than a verification failure. This includes network errors, timeouts, all non-2xx responses (including `404` and authentication/authorization failures), and malformed success bodies. V1 has no terminal Paykit payment-failure status.
+For `paykit-payment`, every Paykit status-call failure schedules a normal pending retry and is logged as retry telemetry rather than a verification failure. This includes network errors, timeouts, all non-2xx responses (including `404` and authentication/authorization failures), and malformed success bodies. Successful canonical `cancelled` and `expired` responses are distinct from dependency failure: each terminalizes the task with the matching status.
 
 Scheduled retries and crash recovery are separate mechanisms. Expected retryable results explicitly release the current claim and set `next_attempt_at`. If a worker crashes while a task is `in_progress`, another worker may reclaim it only after `claim_expires_at`; only the worker that still owns an active claim may schedule its retry.
 

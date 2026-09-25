@@ -24,7 +24,7 @@ use locks_service::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
     FrontendSessionToken, GuardedResourceRecord, LegacyCreatorConnectFlowApproval,
-    PendingCreatorConnectFlowRecord,
+    PendingCreatorConnectFlowRecord, VerificationTaskStatus,
 };
 use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
 use pubky_common::crypto::Keypair;
@@ -1080,6 +1080,108 @@ async fn lookup_verification_task_returns_pending_lifecycle_view_without_secrets
     assert_eq!(body["submitted_at"], submitted_at);
     assert_eq!(body["started_at"], Value::Null);
     assert_eq!(body["completed_at"], Value::Null);
+    assert_eq!(body["failure_message"], Value::Null);
+    assert_no_keys(&body, &["task_id", "credential", "credential_issuance"]);
+}
+
+#[tokio::test]
+async fn lookup_verification_task_returns_expired_after_payment_request_expiry() {
+    let state = test_state();
+    let app = router(state.clone());
+    let submit_response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit_response.status(), StatusCode::OK);
+
+    let bundle_id = BundleId::from_str(BUNDLE_ID).unwrap();
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(&creator(), &bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired = task
+        .transition_to(
+            VerificationTaskStatus::Expired,
+            datetime!(2026-05-29 12:01:00 UTC),
+            None,
+        )
+        .unwrap();
+    state
+        .verification_tasks()
+        .update_verification_task(expired)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            handle_request(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "expired");
+    assert_eq!(body["failure_message"], Value::Null);
+    assert_no_keys(&body, &["task_id", "credential", "credential_issuance"]);
+}
+
+#[tokio::test]
+async fn lookup_verification_task_returns_cancelled_after_payment_request_cancellation() {
+    let state = test_state();
+    let app = router(state.clone());
+    let submit_response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit_response.status(), StatusCode::OK);
+
+    let bundle_id = BundleId::from_str(BUNDLE_ID).unwrap();
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(&creator(), &bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancelled = task
+        .transition_to(
+            VerificationTaskStatus::Cancelled,
+            datetime!(2026-05-29 12:01:00 UTC),
+            None,
+        )
+        .unwrap();
+    state
+        .verification_tasks()
+        .update_verification_task(cancelled)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            handle_request(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "cancelled");
     assert_eq!(body["failure_message"], Value::Null);
     assert_no_keys(&body, &["task_id", "credential", "credential_issuance"]);
 }

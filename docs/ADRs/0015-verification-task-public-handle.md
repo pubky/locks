@@ -123,9 +123,9 @@ On `POST /proof-bundles`:
 - If a task exists and the submitted proof bundle matches the stored submitted proof bundle exactly after normal parsing/normalization, return the existing public lifecycle view without creating new work.
 - If a task exists but the submitted proof bundle differs, return the existing conflict API shape: HTTP 409 with `task_state_conflict`.
 - A different `pubky_lock_resource`, content lock path, proof set, proof payload, or verifier type for the same `{ creator, bundle_id }` is a conflict.
-- This idempotency rule applies to every task status, including `failed` and `expired`.
+- This idempotency rule applies to every task status, including `failed`, `cancelled`, and `expired`.
 
-Retrying after `failed` or `expired` requires a new Bundle ID.
+- Retrying after `failed`, `cancelled`, or `expired` requires a new Bundle ID.
 
 ### Postgres runtime invariant
 
@@ -159,7 +159,7 @@ Negative:
 - Service code needs a public lifecycle view separate from internal task records.
 - Postgres needs a migration and unique constraint over `creator` and `bundle_id`.
 - Clients must provide `{ creator, bundle_id }` for polling and dev completion.
-- Failed/expired retries require clients to generate a new Bundle ID.
+- Failed/cancelled/expired retries require clients to generate a new Bundle ID.
 
 ## Rejected alternatives
 
@@ -179,6 +179,6 @@ Rejected because Bundle ID is bearer-secret-like. JSON request bodies are less l
 
 Rejected. Product semantics are cleaner if `{ creator, bundle_id }` identifies exactly one logical verification attempt lifecycle. Duplicates are invalid runtime state.
 
-### Create retry tasks for failed/expired attempts with the same Bundle ID
+### Create retry tasks for failed/cancelled/expired attempts with the same Bundle ID
 
-Rejected. Retrying after terminal failure or expiry requires a new Bundle ID so each Bundle ID maps to one attempt lifecycle.
+Rejected. Retrying after terminal failure, cancellation, or expiry requires a new Bundle ID so each Bundle ID maps to one attempt lifecycle.

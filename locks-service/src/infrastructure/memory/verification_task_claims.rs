@@ -169,6 +169,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
             task.status,
             VerificationTaskStatus::Completed
                 | VerificationTaskStatus::Failed
+                | VerificationTaskStatus::Cancelled
                 | VerificationTaskStatus::Expired
         ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
@@ -212,6 +213,7 @@ impl ClaimableVerificationTask {
                 .is_some_and(|claim_expires_at| claim_expires_at < now),
             VerificationTaskStatus::Completed
             | VerificationTaskStatus::Failed
+            | VerificationTaskStatus::Cancelled
             | VerificationTaskStatus::Expired => false,
         }
     }

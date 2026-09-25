@@ -344,7 +344,7 @@ Fields:
 Invariants:
 
 - Verification is asynchronous even if a specific verifier completes quickly.
-- Verification task statuses are `pending`, `in_progress`, `completed`, `failed`, and `expired`.
+- Verification task statuses are `pending`, `in_progress`, `completed`, `failed`, `cancelled`, and `expired`.
 - Task IDs are UUID v4 operational identifiers distinct from Bundle IDs in both meaning and format.
 - Task IDs are internal runtime/correlation identifiers and are not exposed through the public HTTP API.
 - Public verification task status is addressed by `{ creator, bundle_id }`, which identifies one logical verification attempt lifecycle.
@@ -355,10 +355,10 @@ Invariants:
 - Task records store operational lifecycle state only; they do not store `VerificationResult` because successful verification evidence lives in `VerifiedProofBundle`.
 - Public lifecycle responses replace internal `task_id` with `creator` and `bundle_id`, keep status/timestamp/failure fields, and must not expose submitted proof material, raw credentials, entitlement evidence, or worker claim metadata.
 - `{ creator, bundle_id }` is a permanent one-attempt lifecycle identity. After current canonical preflight, re-submitting the exact same submitted proof bundle returns the existing lifecycle state without creating new work or another Paykit invoice; different proof material for the same identity is a conflict.
-- Paykit status lookup uses a signed `{ creator, bundle_id }` request. Any status-call transport, HTTP, authentication/authorization, protocol, or decoding failure returns the task to pending for durable retry; v1 has no terminal Paykit payment-failure status.
-- Retrying after `failed` or `expired` requires a new Bundle ID.
-- Allowed transitions are `pending -> in_progress`, `pending -> expired`, `in_progress -> completed`, `in_progress -> failed`, and `in_progress -> expired`.
-- `completed`, `failed`, and `expired` are terminal states; retention cleanup deletes task records rather than transitioning terminal tasks.
+- Paykit status lookup uses a signed `{ creator, bundle_id }` request. Canonical `cancelled` and `expired` responses transition the task to the matching terminal status without issuing entitlement. Any status-call transport, HTTP, authentication/authorization, protocol, tuple-validation, or decoding failure returns the task to pending for durable retry.
+- Retrying after `failed`, `cancelled`, or `expired` requires a new Bundle ID.
+- Allowed transitions are `pending -> in_progress`, `pending -> cancelled`, `pending -> expired`, `in_progress -> completed`, `in_progress -> failed`, `in_progress -> cancelled`, and `in_progress -> expired`.
+- `completed`, `failed`, `cancelled`, and `expired` are terminal states; retention cleanup deletes task records rather than transitioning terminal tasks.
 - `failed` tasks require a non-empty failure message; other statuses must not carry failure messages.
 - Transition methods validate current-state timestamp/failure-message invariants before applying a transition.
 

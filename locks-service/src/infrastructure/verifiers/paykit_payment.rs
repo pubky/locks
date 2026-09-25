@@ -13,6 +13,8 @@ pub enum PaykitPaymentStatusKind {
     Undetected,
     Detected,
     Confirmed,
+    Cancelled,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,15 @@ where
             .transaction_status(&request.creator, &request.bundle_id)
             .await
             .map_err(|_| ApplicationError::VerificationPending)?;
+        match status.status {
+            PaykitPaymentStatusKind::Cancelled => {
+                return Err(ApplicationError::VerificationCancelled);
+            }
+            PaykitPaymentStatusKind::Expired => {
+                return Err(ApplicationError::VerificationExpired);
+            }
+            _ => {}
+        }
         if !payment_status_satisfies(status, self.minimum_confirmations) {
             return Err(ApplicationError::VerificationPending);
         }
@@ -161,6 +172,40 @@ mod tests {
         assert_eq!(
             verifier.verify(request()).await,
             Err(ApplicationError::VerificationPending)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_payment_request_expires_verification() {
+        let verifier = verifier(
+            PaykitPaymentStatus {
+                status: PaykitPaymentStatusKind::Expired,
+                confirmations: 0,
+                amount_matched: false,
+            },
+            0,
+        );
+
+        assert_eq!(
+            verifier.verify(request()).await,
+            Err(ApplicationError::VerificationExpired)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_payment_request_cancels_verification() {
+        let verifier = verifier(
+            PaykitPaymentStatus {
+                status: PaykitPaymentStatusKind::Cancelled,
+                confirmations: 0,
+                amount_matched: false,
+            },
+            0,
+        );
+
+        assert_eq!(
+            verifier.verify(request()).await,
+            Err(ApplicationError::VerificationCancelled)
         );
     }
 

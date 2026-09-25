@@ -335,6 +335,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_persists_terminal_cancellation_without_entitlement() {
+        let fixture = WorkerFixture::new(content_lock(true)).await;
+        fixture.seed_task().await;
+        let worker = fixture.worker_with_verifier(&CancelledVerifier);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::Completed(task_id())
+        );
+        let stored = fixture
+            .tasks
+            .get_verification_task(&task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::Cancelled);
+        assert_eq!(stored.failure_message, None);
+        assert!(
+            fixture
+                .entitlements
+                .get_verified_proof_bundle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn worker_without_dev_static_registration_fails_dev_static_tasks() {
         let fixture = WorkerFixture::new(content_lock(true)).await;
         fixture.seed_task().await;
@@ -539,6 +567,18 @@ mod tests {
                 return Err(ApplicationError::VerificationPending);
             }
             DevStaticVerifier.verify(request).await
+        }
+    }
+
+    struct CancelledVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for CancelledVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationResult, ApplicationError> {
+            Err(ApplicationError::VerificationCancelled)
         }
     }
 

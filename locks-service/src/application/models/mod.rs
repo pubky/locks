@@ -309,6 +309,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_or_in_progress_task_can_be_cancelled_without_failure_message() {
+        let cancelled_at = datetime!(2026-05-29 12:04:00 UTC);
+
+        let from_pending = pending_task()
+            .transition_to(VerificationTaskStatus::Cancelled, cancelled_at, None)
+            .unwrap();
+        let from_in_progress = in_progress_task()
+            .transition_to(VerificationTaskStatus::Cancelled, cancelled_at, None)
+            .unwrap();
+
+        assert_eq!(from_pending.status, VerificationTaskStatus::Cancelled);
+        assert_eq!(from_pending.started_at, None);
+        assert_eq!(from_pending.completed_at, Some(cancelled_at));
+        assert_eq!(from_pending.failure_message, None);
+
+        assert_eq!(from_in_progress.status, VerificationTaskStatus::Cancelled);
+        assert!(from_in_progress.started_at.is_some());
+        assert_eq!(from_in_progress.completed_at, Some(cancelled_at));
+        assert_eq!(from_in_progress.failure_message, None);
+    }
+
+    #[test]
     fn terminal_task_states_cannot_transition() {
         let completed = completed_task();
 

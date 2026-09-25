@@ -28,7 +28,7 @@ Verification task lifecycle:
 - Task IDs are server-generated UUID v4 values serialized as canonical lowercase hyphenated UUID strings.
 - Task IDs are distinct from Bundle IDs in both meaning and format.
 - Task IDs are operational identifiers only, not bearer secrets, durable recovery handles, or credible-exit handles.
-- Minimal statuses are `pending`, `in_progress`, `completed`, `failed`, and `expired`.
+- Minimal statuses are `pending`, `in_progress`, `completed`, `failed`, `cancelled`, and `expired`.
 - Task state is stored in Lock Server private storage.
 - Relevant task status is exposed to the content viewer and content creator.
 - Task state is retained for a few hours.

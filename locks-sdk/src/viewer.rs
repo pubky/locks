@@ -41,6 +41,7 @@ pub enum VerificationTaskStatus {
     InProgress,
     Completed,
     Failed,
+    Cancelled,
     Expired,
 }
 
@@ -326,6 +327,27 @@ mod tests {
         assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
         assert_eq!(response.status, VerificationTaskStatus::Completed);
         assert!(response.failure_message.is_none());
+    }
+
+    #[test]
+    fn lifecycle_response_parses_cancelled_and_expired_as_distinct_terminal_states() {
+        for (wire, expected) in [
+            ("cancelled", VerificationTaskStatus::Cancelled),
+            ("expired", VerificationTaskStatus::Expired),
+        ] {
+            let response = ViewerLocks::parse_lifecycle_response(json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": wire,
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": "2026-06-01T12:00:01Z",
+                "completed_at": "2026-06-01T12:00:02Z",
+                "failure_message": null
+            }))
+            .unwrap();
+
+            assert_eq!(response.status, expected);
+        }
     }
 
     #[test]
