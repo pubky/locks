@@ -182,6 +182,8 @@ Operator-facing readiness uses semantic storage labels:
 
 Postgres is private runtime storage for verification tasks, task claiming, access credentials, frontend sessions, and creator-granted homeserver session material. It is not storage for Pubky-owned content locks, guarded resources, Lock Service Pointers, or verified proof bundles.
 
+Migration `0010_reset_prototype_runtime_state` performs the approved one-time destructive reset for the coordinated Locks and Paykit Server prototype deployment. It clears Locks-owned verification tasks, access credentials, creator authority, pending connect flows, frontend session codes, and frontend sessions. SQLx records the migration once; later starts preserve post-upgrade state. It does not drop the schema or migration ledger, does not touch the separate Paykit database, and does not delete Pubky-hosted content locks, guarded resources, Lock Service Pointers, or verified proof bundles. Stop all Locks Server instances before deployment, verify the configured database is the dedicated disposable Locks database, then reacquire creator authority and frontend sessions after startup. No production data migration is claimed.
+
 Creator-granted session material is encrypted before storage. The server-side encryption key comes from an env var named by config:
 
 ```toml

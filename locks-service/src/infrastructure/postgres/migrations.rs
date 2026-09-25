@@ -12,9 +12,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), PostgresError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::HashSet;
 
     use sqlx::Row;
+    use sqlx::migrate::Migrator;
 
     use super::super::testing::TestDatabase;
 
@@ -77,6 +79,119 @@ mod tests {
         )
         .await;
         drop(connection);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn reset_only_upgrade_clears_runtime_state_once() {
+        let database = TestDatabase::create_unmigrated().await;
+        let baseline = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(9).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        baseline.run(database.pool()).await.unwrap();
+
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO verification_tasks (
+                 task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id
+             ) VALUES ($1, 'pending', '{}'::jsonb, NOW(), 'creator', 'bundle')",
+        )
+        .bind(task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO access_credentials (
+                 lookup_key, creator, bundle_id, expires_at
+             ) VALUES ($1, 'creator', 'bundle', NOW() + INTERVAL '1 hour')",
+        )
+        .bind(b"prototype-credential".as_slice())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO creator_authorities (
+                 creator, auth_kind, granted_scopes, secret
+             ) VALUES ('creator', 'cookie', '[]'::jsonb, 'prototype-secret')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pending_creator_connect_flows (
+                 flow_id, return_to, state, authorization_url, requested_scopes,
+                 created_at, expires_at
+             ) VALUES (
+                 'flow', 'https://example.test/return', 'state',
+                 'pubkyauth://signin', '[]'::jsonb, NOW(), NOW() + INTERVAL '1 hour'
+             )",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO frontend_session_codes (
+                 code_hash, creator, state, return_to, created_at, expires_at
+             ) VALUES (
+                 $1, 'creator', 'state', 'https://example.test/return',
+                 NOW(), NOW() + INTERVAL '1 hour'
+             )",
+        )
+        .bind(b"prototype-code".as_slice())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)
+             VALUES ($1, 'creator', NOW(), NOW() + INTERVAL '1 hour')",
+        )
+        .bind(b"prototype-session".as_slice())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        for table in [
+            "verification_tasks",
+            "access_credentials",
+            "creator_authorities",
+            "pending_creator_connect_flows",
+            "frontend_session_codes",
+            "frontend_sessions",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "prototype rows remain in {table}");
+        }
+
+        let applied_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(applied_versions, (1..=10).collect::<Vec<_>>());
+
+        sqlx::query(
+            "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)
+             VALUES ($1, 'post-upgrade-creator', NOW(), NOW() + INTERVAL '1 hour')",
+        )
+        .bind(b"post-upgrade-session".as_slice())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        super::run_migrations(database.pool()).await.unwrap();
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM frontend_sessions")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(session_count, 1, "restart repeated the destructive reset");
 
         database.cleanup().await;
     }
