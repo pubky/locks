@@ -580,7 +580,7 @@ Submission processing applies rate limiting, validates proof shape, loads the cu
 }
 ```
 
-Paykit invoice success may have no response body. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
+Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks currently discards those response fields after confirming success. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
 
 ### `POST /paykit-connection-state-lookups`
 
@@ -596,7 +596,7 @@ This lookup is independent from verification lifecycle. `connected` does not mea
 
 Locks limits this public outbound proxy independently from proof submission. Default admission is 60 requests per 60 seconds for each `(client IP, creator, bundle_id)` plus 16 concurrent outbound Paykit status requests process-wide. Fixed-window rejection includes `Retry-After`; either limit returns `429 rate_limited` before another Paykit request is sent.
 
-Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status` with `X-Paykit-Signature` over those exact canonical body bytes. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
+Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status`. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body`; body-only signatures are unsupported. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
 
 Rate limiting, when enabled, returns `429 rate_limited` with the stable error envelope.
 

@@ -896,14 +896,17 @@ async fn fake_invoice_handler(
     State(state): State<Arc<Mutex<FakePaykitState>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> impl axum::response::IntoResponse {
     let mut state = state.lock().await;
     state.invoice_count += 1;
     state.invoice_body = Some(serde_json::from_slice(&body).unwrap());
     state.invoice_signature = headers
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
-    StatusCode::NO_CONTENT
+    Json(json!({
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z"
+    }))
 }
 
 async fn fake_connection_status_handler(

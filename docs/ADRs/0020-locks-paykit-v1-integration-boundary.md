@@ -65,7 +65,7 @@ For a new lifecycle identity, Locks sends RFC 8785 canonical JSON to `POST /invo
 }
 ```
 
-Locks signs the exact canonical body bytes with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`.
+Locks signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body` with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`. Body-only signatures are not supported.
 
 The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact proof submission replay returns the persisted verification lifecycle without calling Paykit. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Invoice creation and Noise state observation are separate operations.
 
@@ -90,7 +90,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 
 The response also contains non-negative `confirmations` and `amount_matched`. Paykit reports those facts; Locks alone applies `minimum_confirmations` and decides whether access is satisfied.
 
-V1 has no invoice expiry, TTL, `expires_at`, or terminal Paykit payment-failure status. Every status-call transport, timeout, HTTP, authentication/authorization, protocol, and decoding failure leaves verification pending and schedules durable retry. This includes `404` and malformed successful responses.
+V1 Payment Request terms have no separate proposal TTL. Paykit Server applies an application payment deadline and returns `invoice_created_at` plus `payment_deadline` from invoice creation; Locks validates that closed response but does not use those timestamps for verification policy. The transaction-status boundary above remains factual (`undetected`, `detected`, `confirmed`) and has no terminal payment-failure value. Paykit's separate Payment Request lifecycle may expose `expired`; that is distinct from proposal expiry and this transaction-observation contract. Every status-call transport, timeout, HTTP, authentication/authorization, protocol, and decoding failure leaves verification pending and schedules durable retry. This includes `404` and malformed successful responses.
 
 ### Runtime boundary
 

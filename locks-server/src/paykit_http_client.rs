@@ -11,6 +11,7 @@ use locks_service::infrastructure::verifiers::paykit_payment::{
 use pubky_common::crypto::Keypair;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
 use crate::config::{
@@ -19,6 +20,8 @@ use crate::config::{
 };
 
 const SIGNATURE_HEADER: &str = "X-Paykit-Signature";
+const SIGNATURE_DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
+const INVOICE_BODY_LIMIT: usize = 1_024;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +38,14 @@ pub enum PaykitClientError {
     Serialize(serde_json::Error),
     #[error("Paykit request failed: {0}")]
     Http(reqwest::Error),
+    #[error("Paykit invoice response was invalid: {0}")]
+    InvalidInvoiceResponse(reqwest::Error),
+    #[error("Paykit invoice response JSON was invalid: {0}")]
+    InvalidInvoiceJson(serde_json::Error),
+    #[error("Paykit invoice response exceeded the allowed size")]
+    InvoiceBodyTooLarge,
+    #[error("Paykit invoice response timestamp was invalid: {0}")]
+    InvalidInvoiceTimestamp(time::error::Parse),
     #[error("Paykit {operation} returned non-success status {status}")]
     NonSuccess {
         operation: &'static str,
@@ -54,6 +65,7 @@ impl PaykitClientError {
     pub(crate) fn is_timeout(&self) -> bool {
         match self {
             Self::Http(source)
+            | Self::InvalidInvoiceResponse(source)
             | Self::InvalidConnectionStatusResponse(source)
             | Self::InvalidStatusResponse(source) => source.is_timeout(),
             Self::InvalidServerUrl
@@ -61,6 +73,9 @@ impl PaykitClientError {
             | Self::InvalidSigningSeed
             | Self::PublicKeyMismatch
             | Self::Serialize(_)
+            | Self::InvalidInvoiceJson(_)
+            | Self::InvalidInvoiceTimestamp(_)
+            | Self::InvoiceBodyTooLarge
             | Self::InvalidConnectionStatusJson(_)
             | Self::ConnectionStatusBodyTooLarge
             | Self::NonSuccess { .. } => false,
@@ -80,6 +95,13 @@ pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
     pub reader: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaykitInvoiceResponse {
+    invoice_created_at: String,
+    payment_deadline: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,14 +237,38 @@ impl PaykitHttpClient {
     ) -> Result<(), PaykitClientError> {
         let response = self.signed_post("invoices", request).await?;
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(PaykitClientError::NonSuccess {
+        if response.status() != StatusCode::OK {
+            return Err(PaykitClientError::NonSuccess {
                 operation: "invoice creation",
                 status: response.status(),
-            })
+            });
         }
+
+        let mut response = response;
+        if response
+            .content_length()
+            .is_some_and(|length| length > INVOICE_BODY_LIMIT as u64)
+        {
+            return Err(PaykitClientError::InvoiceBodyTooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(PaykitClientError::InvalidInvoiceResponse)?
+        {
+            if body.len().saturating_add(chunk.len()) > INVOICE_BODY_LIMIT {
+                return Err(PaykitClientError::InvoiceBodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response: PaykitInvoiceResponse =
+            serde_json::from_slice(&body).map_err(PaykitClientError::InvalidInvoiceJson)?;
+        OffsetDateTime::parse(&response.invoice_created_at, &Rfc3339)
+            .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        OffsetDateTime::parse(&response.payment_deadline, &Rfc3339)
+            .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        Ok(())
     }
 
     pub async fn connection_status(
@@ -301,10 +347,12 @@ impl PaykitHttpClient {
         request: &T,
     ) -> Result<reqwest::Response, PaykitClientError> {
         let body = canonical_body_bytes(request)?;
+        let endpoint = self.endpoint(path);
+        let signature = sign_request(&self.signing_keypair, "POST", endpoint.path(), &body);
         self.http
-            .post(self.endpoint(path))
+            .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(SIGNATURE_HEADER, sign_body(&self.signing_keypair, &body))
+            .header(SIGNATURE_HEADER, signature)
             .body(body)
             .send()
             .await
@@ -419,8 +467,25 @@ fn canonical_body_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, PaykitClient
     serde_json_canonicalizer::to_vec(value).map_err(PaykitClientError::Serialize)
 }
 
-fn sign_body(keypair: &Keypair, body: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(keypair.sign(body).to_bytes())
+fn request_signature_preimage(method: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let method = method.to_ascii_uppercase();
+    let mut preimage =
+        Vec::with_capacity(SIGNATURE_DOMAIN.len() + method.len() + 1 + path.len() + 1 + body.len());
+    preimage.extend_from_slice(SIGNATURE_DOMAIN);
+    preimage.extend_from_slice(method.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(path.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(body);
+    preimage
+}
+
+fn sign_request(keypair: &Keypair, method: &str, path: &str, body: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(
+        keypair
+            .sign(&request_signature_preimage(method, path, body))
+            .to_bytes(),
+    )
 }
 
 fn parse_server_url(value: &str) -> Result<Url, PaykitClientError> {
@@ -478,15 +543,17 @@ mod tests {
     }
 
     #[test]
-    fn invoice_signature_is_base64url_no_pad_ed25519_over_canonical_body() {
+    fn invoice_signature_is_base64url_no_pad_ed25519_over_versioned_request_preimage() {
         let keypair = Keypair::from_secret(&[9_u8; 32]);
         let body = canonical_body_bytes(&invoice_request()).unwrap();
 
-        let signature = sign_body(&keypair, &body);
+        let signature = sign_request(&keypair, "POST", "/invoices", &body);
 
+        let mut preimage = b"paykit-http-signature-v1\0POST\0/invoices\0".to_vec();
+        preimage.extend_from_slice(&body);
         assert_eq!(
             signature,
-            URL_SAFE_NO_PAD.encode(keypair.sign(&body).to_bytes())
+            URL_SAFE_NO_PAD.encode(keypair.sign(&preimage).to_bytes())
         );
         assert!(!signature.contains('='));
     }
@@ -565,7 +632,7 @@ mod tests {
             PaykitHttpClient::from_parts(&server_url, reqwest::Client::new(), keypair.clone())
                 .unwrap();
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
-        let expected_signature = sign_body(&keypair, &expected_body);
+        let expected_signature = sign_request(&keypair, "POST", "/invoices", &expected_body);
 
         client.create_invoice(&invoice_request()).await.unwrap();
 
@@ -573,6 +640,42 @@ mod tests {
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
         assert_eq!(request.signature, Some(expected_signature));
+    }
+
+    #[tokio::test]
+    async fn create_invoice_requires_exact_200_with_closed_timestamp_body() {
+        for (status, body) in [
+            (StatusCode::NO_CONTENT, ""),
+            (StatusCode::OK, "{}"),
+            (
+                StatusCode::OK,
+                r#"{"invoice_created_at":"not-a-time","payment_deadline":"2026-09-25T12:00:00Z"}"#,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"invoice_created_at":"2026-09-25T11:00:00Z","payment_deadline":"2026-09-25T12:00:00Z","extra":true}"#,
+            ),
+        ] {
+            let server_url = spawn_configured_invoice_server(status, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(client.create_invoice(&invoice_request()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_oversized_content_length_body() {
+        assert_oversized_invoice_body_is_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_oversized_chunked_body() {
+        assert_oversized_invoice_body_is_rejected(true).await;
     }
 
     #[tokio::test]
@@ -723,7 +826,8 @@ mod tests {
             bundle_id: BUNDLE_ID.to_owned(),
         };
         let expected_body = canonical_body_bytes(&status_request).unwrap();
-        let expected_signature = sign_body(&keypair, &expected_body);
+        let expected_signature =
+            sign_request(&keypair, "POST", "/transactions/status", &expected_body);
 
         let status = client.transaction_status(&status_request).await.unwrap();
 
@@ -894,7 +998,7 @@ mod tests {
     }
 
     async fn assert_oversized_connection_status_body_is_rejected(chunked: bool) {
-        let server_url = spawn_oversized_connection_status_body(chunked).await;
+        let server_url = spawn_oversized_body(chunked, CONNECTION_STATUS_BODY_LIMIT).await;
         let client = PaykitHttpClient::from_parts(
             &server_url,
             bounded_http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
@@ -916,12 +1020,24 @@ mod tests {
         ));
     }
 
-    async fn spawn_oversized_connection_status_body(chunked: bool) -> String {
+    async fn assert_oversized_invoice_body_is_rejected(chunked: bool) {
+        let server_url = spawn_oversized_body(chunked, INVOICE_BODY_LIMIT).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        assert!(matches!(error, PaykitClientError::InvoiceBodyTooLarge));
+    }
+
+    async fn spawn_oversized_body(chunked: bool, limit: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let body = vec![b'x'; CONNECTION_STATUS_BODY_LIMIT + 1];
+            let body = vec![b'x'; limit + 1];
             if chunked {
                 socket
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n")
@@ -1048,7 +1164,26 @@ mod tests {
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        axum::http::StatusCode::NO_CONTENT
+        Json(json!({
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "payment_deadline": "2026-09-25T12:00:00Z"
+        }))
+    }
+
+    async fn spawn_configured_invoice_server(status: StatusCode, body: &'static str) -> String {
+        async fn invoice(State(response): State<(StatusCode, &'static str)>) -> impl IntoResponse {
+            response
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/invoices", post(invoice))
+            .with_state((status, body));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     async fn capture_connection_status(
@@ -1105,11 +1240,11 @@ mod setup_status_tests {
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
     #[test]
-    fn canonical_setup_status_body_and_signature_match_exact_contract() {
+    fn canonical_setup_status_body_and_request_preimage_signature_match_exact_contract() {
         let request = setup_status_request();
         let body = canonical_body_bytes(&request).unwrap();
         let keypair = Keypair::from_secret(&[9_u8; 32]);
-        let signature = sign_body(&keypair, &body);
+        let signature = sign_request(&keypair, "POST", "/setup/status", &body);
 
         assert_eq!(
             String::from_utf8(body.clone()).unwrap(),
@@ -1117,7 +1252,11 @@ mod setup_status_tests {
         );
         assert_eq!(
             signature,
-            URL_SAFE_NO_PAD.encode(keypair.sign(&body).to_bytes())
+            URL_SAFE_NO_PAD.encode(
+                keypair
+                    .sign(&request_signature_preimage("POST", "/setup/status", &body,))
+                    .to_bytes()
+            )
         );
         assert!(!signature.contains('='));
     }
@@ -1158,7 +1297,15 @@ mod setup_status_tests {
         let request = captured.single();
         assert_eq!(request.path, "/setup/status");
         assert_eq!(request.body, expected_body);
-        assert_eq!(request.signature, Some(sign_body(&keypair, &request.body)));
+        assert_eq!(
+            request.signature,
+            Some(sign_request(
+                &keypair,
+                "POST",
+                "/setup/status",
+                &request.body,
+            ))
+        );
     }
 
     #[tokio::test]
