@@ -31,6 +31,7 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
+use crate::log_correlation::{CorrelationRefs, failure_event, lifecycle_event, rejection_event};
 use crate::paykit_http_client::{
     PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRequest,
 };
@@ -44,11 +45,23 @@ pub(super) async fn submit_proof_bundle(
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
+    let is_paykit_submission = request
+        .submitted_proof_bundle
+        .proofs
+        .iter()
+        .any(|proof| proof.verifier_type == VerifierType::PaykitPayment);
     let creator = request
         .submitted_proof_bundle
         .pubky_lock_resource
         .creator()
         .clone();
+    let correlation_refs = is_paykit_submission.then(|| {
+        CorrelationRefs::new(
+            &creator,
+            request.submitted_proof_bundle.reader_public_key.as_ref(),
+            &request.submitted_proof_bundle.bundle_id,
+        )
+    });
     let decision = state.verification_submission_rate_limiter().check(
         &VerificationSubmissionRateLimitKey {
             client_address: client_address.ip(),
@@ -57,6 +70,9 @@ pub(super) async fn submit_proof_bundle(
         state.clock().now(),
     );
     if !decision.allowed {
+        if let Some(refs) = &correlation_refs {
+            rejection_event(refs, "proof_submission", "rate_limited");
+        }
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             [(
@@ -72,18 +88,53 @@ pub(super) async fn submit_proof_bundle(
         state.verification_tasks().as_ref(),
         state.clock().as_ref(),
     );
-    let prepared =
-        maybe_prepare_paykit_submission(&state, &request.submitted_proof_bundle, &use_case).await?;
+    let prepared = match maybe_prepare_paykit_submission(
+        &state,
+        &request.submitted_proof_bundle,
+        &use_case,
+        correlation_refs.as_ref(),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(refs) = &correlation_refs {
+                rejection_event(refs, "proof_submission", "submission_rejected");
+            }
+            return Err(error);
+        }
+    };
+    let replayed = prepared.existing.is_some();
     let submitted = match prepared.existing {
         Some(existing) => existing,
         None => {
-            use_case
+            match use_case
                 .execute(SubmitProofBundleRequest {
                     submitted_proof_bundle: request.submitted_proof_bundle,
                 })
-                .await?
+                .await
+            {
+                Ok(submitted) => submitted,
+                Err(error) => {
+                    if let Some(refs) = &correlation_refs {
+                        if error == ApplicationError::VerificationTaskConflict {
+                            rejection_event(refs, "proof_submission", "conflict");
+                        } else {
+                            failure_event(refs, "proof_submission", "task_persistence_failed");
+                        }
+                    }
+                    return Err(error.into());
+                }
+            }
         }
     };
+    if let Some(refs) = &correlation_refs {
+        lifecycle_event(
+            refs,
+            "proof_submission",
+            if replayed { "replayed" } else { "accepted" },
+        );
+    }
 
     Ok(Json(VerificationTaskLifecycleHttpResponse::from(submitted)).into_response())
 }
@@ -96,6 +147,7 @@ async fn maybe_prepare_paykit_submission(
     state: &AppState,
     submitted: &SubmittedProofBundle,
     submit_use_case: &SubmitProofBundleUseCase<'_>,
+    correlation_refs: Option<&CorrelationRefs>,
 ) -> Result<PreparedSubmission, ApiError> {
     let paykit_proofs: Vec<_> = submitted
         .proofs
@@ -148,15 +200,38 @@ async fn maybe_prepare_paykit_submission(
             "paykit is not configured",
         )
     })?;
-    paykit
+    let invoice_result = paykit
         .create_invoice(&PaykitInvoiceRequest {
             bundle_id: submitted.bundle_id.to_string(),
             lock_resource: submitted.pubky_lock_resource.to_string(),
             reader: reader.to_string(),
         })
-        .await
-        .map_err(map_paykit_invoice_error)?;
+        .await;
+    if let Err(error) = invoice_result {
+        if let Some(refs) = correlation_refs {
+            failure_event(
+                refs,
+                "invoice_creation",
+                paykit_invoice_failure_cause(&error),
+            );
+        }
+        return Err(map_paykit_invoice_error(error));
+    }
+    if let Some(refs) = correlation_refs {
+        lifecycle_event(refs, "invoice_creation", "created");
+    }
     Ok(PreparedSubmission { existing })
+}
+
+fn paykit_invoice_failure_cause(error: &PaykitClientError) -> &'static str {
+    match error {
+        PaykitClientError::NonSuccess {
+            status: StatusCode::CONFLICT,
+            ..
+        } => "conflict",
+        error if error.is_timeout() => "timeout",
+        _ => "unavailable",
+    }
 }
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
@@ -181,7 +256,14 @@ pub(super) async fn lookup_verification_task(
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
 ) -> Result<Json<VerificationTaskLifecycleHttpResponse>, ApiError> {
     let request = parse_json(request)?;
-    let view = get_task_view_by_handle(&state, request).await?;
+    let refs = CorrelationRefs::new(&request.creator, None, &request.bundle_id);
+    let view = match get_task_view_by_handle(&state, request).await {
+        Ok(view) => view,
+        Err(error) => {
+            failure_event(&refs, "verification_status_lookup", "lookup_failed");
+            return Err(error);
+        }
+    };
 
     Ok(Json(VerificationTaskLifecycleHttpResponse::from(view)))
 }
@@ -192,13 +274,35 @@ pub(super) async fn lookup_paykit_connection_state(
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
-    let task = state
+    let lookup_refs = CorrelationRefs::new(&request.creator, None, &request.bundle_id);
+    let task = match state
         .verification_tasks()
         .get_verification_task_by_handle(&request.creator, &request.bundle_id)
-        .await?
-        .ok_or(ApplicationError::MissingRecord {
-            record: "verification_task",
-        })?;
+        .await
+    {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            rejection_event(&lookup_refs, "connection_state_lookup", "task_not_found");
+            return Err(ApplicationError::MissingRecord {
+                record: "verification_task",
+            }
+            .into());
+        }
+        Err(error) => {
+            failure_event(
+                &lookup_refs,
+                "connection_state_lookup",
+                "task_lookup_failed",
+            );
+            return Err(error.into());
+        }
+    };
+
+    let task_refs = CorrelationRefs::new(
+        &task.creator,
+        task.submitted_proof_bundle.reader_public_key.as_ref(),
+        &task.submitted_proof_bundle.bundle_id,
+    );
 
     let is_paykit_payment = task.submitted_proof_bundle.proofs.len() == 1
         && task.submitted_proof_bundle.proofs[0].verifier_type == VerifierType::PaykitPayment;
@@ -218,6 +322,7 @@ pub(super) async fn lookup_paykit_connection_state(
     let _permit = match Arc::clone(state.paykit_connection_status_semaphore()).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            rejection_event(&task_refs, "connection_state_lookup", "concurrency_limited");
             return Ok((
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "1")],
@@ -240,6 +345,7 @@ pub(super) async fn lookup_paykit_connection_state(
         Instant::now(),
     );
     if !decision.allowed {
+        rejection_event(&task_refs, "connection_state_lookup", "rate_limited");
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
             [(
@@ -256,8 +362,19 @@ pub(super) async fn lookup_paykit_connection_state(
             creator: task.creator.to_string(),
             bundle_id: task.submitted_proof_bundle.bundle_id.to_string(),
         })
-        .await
-        .map_err(map_paykit_connection_status_error)?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let cause = if error.is_timeout() {
+                "timeout"
+            } else {
+                "unavailable"
+            };
+            failure_event(&task_refs, "connection_state_lookup", cause);
+            return Err(map_paykit_connection_status_error(error));
+        }
+    };
 
     Ok(Json(PaykitConnectionStateHttpResponse {
         state: response.state,

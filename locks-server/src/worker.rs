@@ -1,4 +1,5 @@
 use locks_core::ids::{LockServerPubky, TaskId};
+use locks_core::lock_policy::VerifierType;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::ports::{
     Clock, ContentLockRepository, CriterionVerifier, EntitlementRepository,
@@ -9,9 +10,9 @@ use locks_service::application::use_cases::complete_verification_task::{
 };
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 use tokio::sync::watch;
-use tracing::{debug, error, info};
 
 use crate::app_state::AppState;
+use crate::log_correlation::{CorrelationRefs, failure_event, lifecycle_event, retry_event};
 
 const PENDING_VERIFICATION_RETRY_DELAY_SECONDS: i64 = 30;
 
@@ -108,7 +109,17 @@ impl<'a> VerificationWorker<'a> {
 
         let task_id = claim.task.task_id;
         let claim_token = claim.claim_token;
-        debug!(%task_id, worker_id = %self.worker_id, "claimed verification task");
+        let correlation_refs = CorrelationRefs::new(
+            &claim.task.creator,
+            claim.task.submitted_proof_bundle.reader_public_key.as_ref(),
+            &claim.task.submitted_proof_bundle.bundle_id,
+        );
+        let is_paykit_payment = claim
+            .task
+            .submitted_proof_bundle
+            .proofs
+            .iter()
+            .any(|proof| proof.verifier_type == VerifierType::PaykitPayment);
         let mut verifiers = StaticCriterionVerifierRegistry::new();
         if self.allow_dev_static_verifier {
             verifiers = verifiers.with_dev_static(self.dev_static_verifier);
@@ -135,7 +146,20 @@ impl<'a> VerificationWorker<'a> {
             .await
         {
             Ok(completed) => {
-                info!(%task_id, status = ?completed.status, "completed verification task");
+                let outcome = match completed.status {
+                    locks_service::application::models::VerificationTaskStatus::Completed => {
+                        "completed"
+                    }
+                    locks_service::application::models::VerificationTaskStatus::Failed => "failed",
+                    locks_service::application::models::VerificationTaskStatus::Expired => {
+                        "expired"
+                    }
+                    locks_service::application::models::VerificationTaskStatus::Pending
+                    | locks_service::application::models::VerificationTaskStatus::InProgress => {
+                        "non_terminal"
+                    }
+                };
+                lifecycle_event(&correlation_refs, "verification", outcome);
                 Ok(WorkerTick::Completed(task_id))
             }
             Err(ApplicationError::VerificationPending) => {
@@ -152,31 +176,30 @@ impl<'a> VerificationWorker<'a> {
                     )
                     .await?
                 else {
-                    info!(
-                        %task_id,
-                        worker_id = %self.worker_id,
-                        "verification task claim no longer owned; retry not scheduled"
-                    );
+                    lifecycle_event(&correlation_refs, "verification", "claim_lost");
                     return Ok(WorkerTick::Idle);
                 };
-                debug!(
-                    %task_id,
-                    worker_id = %self.worker_id,
-                    %next_attempt_at,
-                    "scheduled verification task retry"
+                retry_event(
+                    &correlation_refs,
+                    "verification",
+                    if is_paykit_payment {
+                        "payment_pending"
+                    } else {
+                        "verification_pending"
+                    },
                 );
                 Ok(WorkerTick::RetryScheduled(task_id))
             }
             Err(ApplicationError::VerificationTaskClaimLost) => {
-                info!(
-                    %task_id,
-                    worker_id = %self.worker_id,
-                    "verification task claim no longer owned; terminal state not persisted"
-                );
+                lifecycle_event(&correlation_refs, "verification", "claim_lost");
                 Ok(WorkerTick::Idle)
             }
             Err(error) => {
-                error!(%task_id, error = %error, "verification task failed");
+                failure_event(
+                    &correlation_refs,
+                    "verification",
+                    verification_failure_cause(&error),
+                );
                 Ok(WorkerTick::Failed(task_id))
             }
         }
@@ -207,6 +230,15 @@ impl<'a> VerificationWorker<'a> {
                 | WorkerTick::Failed(_) => {}
             }
         }
+    }
+}
+
+fn verification_failure_cause(error: &ApplicationError) -> &'static str {
+    match error {
+        ApplicationError::EntitlementNotSatisfied => "verification_failed",
+        ApplicationError::Verifier { .. } => "verifier_unavailable",
+        ApplicationError::VerificationTaskClaimLost => "claim_lost",
+        _ => "processing_failed",
     }
 }
 
