@@ -1,12 +1,34 @@
 {
-  "name": "@pubky/locks-sdk",
-  "version": "0.1.0-rc4",
-  "private": true,
+  "name": "@synonymdev/locks-sdk",
+  "version": "0.1.0-rc5",
   "description": "Browser JS/WASM bindings for the Pubky Locks Creator SDK",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pubky/locks.git",
+    "directory": "locks-sdk/bindings/js"
+  },
+  "homepage": "https://github.com/pubky/locks#readme",
+  "bugs": "https://github.com/pubky/locks/issues",
+  "main": "./pkg/locks_sdk_wasm.js",
+  "types": "./pkg/locks_sdk_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/locks_sdk_wasm.d.ts",
+      "import": "./pkg/locks_sdk_wasm.js"
+    }
+  },
   "files": [
-    "pkg"
+    "pkg/locks_sdk_wasm.js",
+    "pkg/locks_sdk_wasm_bg.wasm",
+    "pkg/locks_sdk_wasm.d.ts",
+    "pkg/locks_sdk_wasm_bg.wasm.d.ts"
   ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "rc"
+  },
   "scripts": {
     "build": "wasm-pack build --target web --out-dir pkg",
     "check:wasm": "cargo check -p locks-sdk-wasm --target wasm32-unknown-unknown",
@@ -15,6 +37,7 @@
     "smoke:examples": "node scripts/smoke-examples.mjs",
     "release:audit": "node scripts/release-readiness.mjs",
     "live:smoke:check": "node scripts/live-smoke-check.mjs",
+    "prepack": "npm run smoke:pkg",
     "test:native": "cargo test -p locks-sdk-wasm",
     "test": "npm run test:native && npm run check:wasm && npm run smoke:pkg && npm run smoke:demo && npm run smoke:examples"
   },

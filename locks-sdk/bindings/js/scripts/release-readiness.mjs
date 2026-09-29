@@ -18,14 +18,17 @@ function add(status, name, detail) {
   checks.push({ status, name, detail });
 }
 
-add(manifest.name === '@pubky/locks-sdk' ? 'ready' : 'blocked', 'scaffold npm package name', `package.json name=${manifest.name}`);
+add(manifest.name === '@synonymdev/locks-sdk' ? 'ready' : 'blocked', 'public npm package name', `package.json name=${manifest.name}`);
 add(manifest.private === true ? 'blocked' : 'ready', 'npm publishing enabled', manifest.private === true ? 'package.json still has private=true' : 'package is publishable');
 add(existsSync(licensePath) ? 'ready' : 'blocked', 'repository LICENSE file', existsSync(licensePath) ? 'LICENSE exists' : 'workspace declares MIT but no LICENSE file exists');
 add(cargoToml.includes('license.workspace = true') ? 'ready' : 'blocked', 'Cargo license metadata', 'bindings crate inherits workspace license');
+add(manifest.publishConfig?.access === 'public' ? 'ready' : 'blocked', 'npm public access', `publishConfig.access=${manifest.publishConfig?.access}`);
+add(manifest.publishConfig?.tag === 'rc' ? 'ready' : 'blocked', 'npm RC dist-tag', `publishConfig.tag=${manifest.publishConfig?.tag}`);
+add(manifest.exports?.['.']?.import === './pkg/locks_sdk_wasm.js' ? 'ready' : 'blocked', 'package root export', `exports["."].import=${manifest.exports?.['.']?.import}`);
 
 if (existsSync(generatedPackagePath)) {
   const generated = JSON.parse(readFileSync(generatedPackagePath, 'utf8'));
-  add(generated.name === manifest.name ? 'ready' : 'blocked', 'generated wasm-pack package name', `generated name=${generated.name}; scaffold name=${manifest.name}`);
+  add(generated.version === manifest.version ? 'ready' : 'blocked', 'generated wasm-pack version', `generated version=${generated.version}; public version=${manifest.version}`);
 } else {
   add('blocked', 'generated package artifacts', 'run npm run build before publish audit can compare pkg/package.json');
 }
