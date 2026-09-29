@@ -15,12 +15,22 @@ export function parsePaykitReleaseRevision(output) {
   return match[1];
 }
 
-export function validatePaykitSetupStatusSources({ setupStatusSource, serverSource }) {
+export function validatePaykitSetupStatusSources({
+  setupStatusSource,
+  connectionStatusSource,
+  serverSource,
+}) {
   if (
     !setupStatusSource.includes('.route("/setup/status", post(status))')
     || !serverSource.includes('.merge(http::setup_status::setup_status_router(')
   ) {
     throw new Error('Paykit Server release does not provide the setup-status contract');
+  }
+  if (
+    !connectionStatusSource.includes('.route("/connections/status", post(status))')
+    || !serverSource.includes('.merge(http::connection_status::connection_status_router(')
+  ) {
+    throw new Error('Paykit Server release does not provide the connection-status contract');
   }
 }
 
@@ -38,11 +48,12 @@ export async function checkPaykitSetupContract({
   }
   const revision = parsePaykitReleaseRevision(revisionResult.stdout ?? '');
   const sourceBase = `https://raw.githubusercontent.com/pubky/paykit-server/${revision}`;
-  const [setupStatusSource, serverSource] = await Promise.all([
+  const [setupStatusSource, connectionStatusSource, serverSource] = await Promise.all([
     fetchSource(`${sourceBase}/paykit-server/src/http/setup_status.rs`),
+    fetchSource(`${sourceBase}/paykit-server/src/http/connection_status.rs`),
     fetchSource(`${sourceBase}/paykit-server/src/server.rs`),
   ]);
-  validatePaykitSetupStatusSources({ setupStatusSource, serverSource });
+  validatePaykitSetupStatusSources({ setupStatusSource, connectionStatusSource, serverSource });
   return revision;
 }
 
@@ -96,7 +107,7 @@ export async function readBoundedResponseText(response) {
 async function main() {
   try {
     const revision = await checkPaykitSetupContract();
-    process.stdout.write(`Paykit setup-status contract passed at ${revision.slice(0, 12)}\n`);
+    process.stdout.write(`Paykit setup and connection-status contracts passed at ${revision.slice(0, 12)}\n`);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : 'Paykit setup-status contract failed'}\n`);
     process.exitCode = 1;

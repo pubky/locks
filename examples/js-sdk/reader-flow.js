@@ -68,7 +68,7 @@ function objectEntries(value) {
 }
 
 function privateContentPathToReadPath(path) {
-  const prefix = '/priv/locks.app/content/';
+  const prefix = '/priv/app.locks/content/';
   if (!path?.startsWith(prefix)) throw new Error(`content lock resource path is outside ${prefix}: ${path}`);
   return path.slice(prefix.length);
 }

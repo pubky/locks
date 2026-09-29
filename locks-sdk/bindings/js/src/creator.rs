@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_primary_only_build_succeeds() {
         let builder = complete_builder();
-        let primary = resource("/priv/locks.app/content/example.txt", "hash", 13);
+        let primary = resource("/priv/app.locks/content/example.txt", "hash", 13);
         builder.state.borrow_mut().primary_resource = Some(primary.clone());
 
         let body = builder.build_value().unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let builder = complete_builder();
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -603,7 +603,7 @@ mod tests {
 
         assert!(body.get("primary_resource").is_none());
         assert_eq!(
-            body["secondary_resources"]["/priv/locks.app/content/secondary.txt"],
+            body["secondary_resources"]["/priv/app.locks/content/secondary.txt"],
             serde_json::json!({
                 "hash": "secondary-hash",
                 "content_type": "text/plain",
@@ -616,13 +616,13 @@ mod tests {
     fn create_content_lock_request_builder_primary_and_secondary_build_succeeds() {
         let builder = complete_builder();
         builder.state.borrow_mut().primary_resource = Some(resource(
-            "/priv/locks.app/content/example.txt",
+            "/priv/app.locks/content/example.txt",
             "primary-hash",
             13,
         ));
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -647,7 +647,7 @@ mod tests {
     fn create_content_lock_request_builder_rejects_missing_non_resource_fields() {
         let builder = CreateContentLockRequestBuilder::new();
         builder.state.borrow_mut().primary_resource =
-            Some(resource("/priv/locks.app/content/example.txt", "hash", 13));
+            Some(resource("/priv/app.locks/content/example.txt", "hash", 13));
 
         let err = builder.build_value().unwrap_err();
 
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_rejects_duplicate_secondary_path() {
         let builder = complete_builder();
-        let secondary = resource("/priv/locks.app/content/secondary.txt", "hash", 7);
+        let secondary = resource("/priv/app.locks/content/secondary.txt", "hash", 7);
         builder.add_secondary_resource(secondary.clone()).unwrap();
 
         let err = builder.add_secondary_resource(secondary).unwrap_err();
@@ -669,14 +669,14 @@ mod tests {
     fn create_content_lock_request_builder_rejects_primary_secondary_duplicate_path() {
         let builder = complete_builder();
         builder.state.borrow_mut().primary_resource = Some(resource(
-            "/priv/locks.app/content/example.txt",
+            "/priv/app.locks/content/example.txt",
             "primary-hash",
             13,
         ));
 
         let err = builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 "secondary-hash",
                 7,
             ))
@@ -688,12 +688,12 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_build_snapshots_do_not_mutate() {
         let builder = complete_builder();
-        let primary = resource("/priv/locks.app/content/example.txt", "hash", 13);
+        let primary = resource("/priv/app.locks/content/example.txt", "hash", 13);
         builder.state.borrow_mut().primary_resource = Some(primary.clone());
         let first = builder.build_value().unwrap();
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -770,7 +770,7 @@ mod tests {
         let creator = Creator::new(test_session());
         let body = serde_json::json!({
             "primary_resource": {
-                "path": "/priv/locks.app/content/example.txt",
+                "path": "/priv/app.locks/content/example.txt",
                 "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
                 "content_type": "text/plain",
                 "size": 13

@@ -52,7 +52,7 @@ Postgres is the finalized persistence and worker-coordination substrate for Lock
 
 Creator-granted session material is secret-bearing runtime state. It must be stored encrypted at rest in private Postgres tables using a server-side key supplied through environment/config secret. The implemented Postgres creator authority adapter supports encrypted persistence with a 32-byte key and stores only an AEAD envelope in the `creator_authorities.secret` column. Session material must never be stored in Pubky-owned resources, committed config examples, logs, readiness responses, debug formatting, error envelopes, or viewer-facing DTOs.
 
-Postgres must not become the canonical store for Pubky-owned domain resources in the next runtime phase. Content locks, guarded resources, Lock Service Pointers, and entitlement records / verified proof bundles remain behind their existing ports. Local/dev runtime composition uses in-memory adapters; Pubky-backed adapters are implemented behind the same ports for public Locks resources and private `/priv/locks.app/` resources. Do not add `dev_*` Postgres tables for those resources.
+Postgres must not become the canonical store for Pubky-owned domain resources in the next runtime phase. Content locks, guarded resources, Lock Service Pointers, and entitlement records / verified proof bundles remain behind their existing ports. Local/dev runtime composition uses in-memory adapters; Pubky-backed adapters are implemented behind the same ports for public Locks resources and private `/priv/app.locks/` resources. Do not add `dev_*` Postgres tables for those resources.
 
 Migrations are part of the runtime boundary from the first Postgres table. Schema creation must be managed by migrations rather than ad hoc test/startup SQL.
 
@@ -135,7 +135,7 @@ Rules:
 ### ContentLockPath
 
 - Relative creator-homeserver path only.
-- Must be exactly `/pub/locks.app/<lock_id>.json`.
+- Must be exactly `/pub/app.locks/<lock_id>.json`.
 - Not a full Pubky URL.
 - Not a homeserver URL.
 - Not any other `/pub/...` path.
@@ -177,7 +177,7 @@ Responsibilities:
 - Compute guarded resource hash and exact positive byte size from uploaded bytes.
 - Validate guarded resource MIME content type through Locks-native spec objects.
 - Create content locks only for currently registered guarded resource descriptors; all resources are validated all-or-nothing, at least one resource is required, and primary/secondary paths must not duplicate each other.
-- Author the Lock Service Pointer for the creator default Lock Server at canonical path `/pub/locks.app/config.json`.
+- Author the Lock Service Pointer for the creator default Lock Server at canonical path `/pub/app.locks/config.json`.
 - Require a Locks-local frontend session and derive creator identity from that session rather than trusting request-body creator fields.
 - Refuse creator publishing operations when the Lock Server has no valid creator-granted homeserver authority for the authenticated creator.
 - Keep future external-authoring mode possible, where another creator app pre-publishes guarded content and content locks while Locks only verifies, writes proof bundles, and proxy-reads through its creator-granted session.
@@ -235,16 +235,16 @@ Responsibilities:
 
 - Resolve Pubky resources and Lock Server addresses.
 - Use one creator-granted Locks app session per creator per Lock Server, reused across that creator's locks.
-- Require creator-granted capability scope for `/pub/locks.app/:rw` and `/priv/locks.app/:rw` in the production Pubky-backed flow.
+- Require creator-granted capability scope for `/pub/app.locks/:rw` and `/priv/app.locks/:rw` in the production Pubky-backed flow.
 - Persist native session secrets for the Lock Server; current expected session lifetime is 6 months.
 - Own Creator Authority Acquisition: the process by which the Lock Server obtains or refreshes creator-granted homeserver authority for Locks public and private namespaces.
 - Treat redirect, popup, iframe, and native pubky.app rendering as presentation shells over the same acquisition state machine, not as domain/application concepts. ADR 0019 chooses Lock-Server-hosted redirect/popup for legacy-connect because the legacy Pubky authorization URL is secret-bearing; iframe and pubky.app-native rendering are deferred shells.
 - Implement the existing Pubky QR/deeplink auth flow as the legacy/cookie creator authorization path first, then migrate to the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the durable production auth primitive.
 - Reject manual operator provisioning and direct raw-session submission as production paths for creator-granted session acquisition.
 - Treat creator authority status-check UX/API semantics as part of the authenticated `pubky.app/browser -> Lock Server` relationship; if exposed, derive creator from that authenticated context rather than accepting an arbitrary public key query parameter.
-- Read and write public Locks app resources under `/pub/locks.app/`.
-- Read and write private Locks app resources under `/priv/locks.app/`, including guarded content bytes and verified proof bundles.
-- Treat private `/priv/locks.app/...` writes as non-public: they emit no public events, private paths are not visible to clients, and Locks discovery relies on public `/pub/locks.app/...` resources.
+- Read and write public Locks app resources under `/pub/app.locks/`.
+- Read and write private Locks app resources under `/priv/app.locks/`, including guarded content bytes and verified proof bundles.
+- Treat private `/priv/app.locks/...` writes as non-public: they emit no public events, private paths are not visible to clients, and Locks discovery relies on public `/pub/app.locks/...` resources.
 - Revalidate creator sessions lazily before Pubky writes and proxy reads; if the SDK can refresh or revalidate an expired/refreshable session, attempt one refresh/revalidation before returning `creator_authority_unavailable`.
 - Provide the production replacement for today's dev/test creator publishing routes by requiring both a Locks-local frontend session for `pubky.app/browser -> Lock Server` authorization and creator-granted homeserver authority for Pubky reads/writes.
 - Hide unstable Pubky integration details behind ports.
@@ -253,7 +253,7 @@ Responsibilities:
 
 ### Content Creator
 
-Publishes guarded resources and content locks. Grants the Lock Server one reusable Locks app session scoped to `/pub/locks.app/:rw` and `/priv/locks.app/:rw` so the Lock Server can author public Locks resources, manage guarded Locks resources, write verified proof bundles, and proxy-read guarded content across that creator's locks.
+Publishes guarded resources and content locks. Grants the Lock Server one reusable Locks app session scoped to `/pub/app.locks/:rw` and `/priv/app.locks/:rw` so the Lock Server can author public Locks resources, manage guarded Locks resources, write verified proof bundles, and proxy-read guarded content across that creator's locks.
 
 ### Content Viewer
 
@@ -265,7 +265,7 @@ Verifies viewer proof, writes successful entitlement records to creator-owned gu
 
 ### Homeserver
 
-In the production design, stores public lock policies, public Locks configuration, private guarded content bytes, and private verified proof bundles. Enforces Pubky sessions and path-scoped capabilities. The confirmed Locks private data namespace is `/priv/locks.app/`; Locks should depend on that homeserver capability rather than implementing a parallel guarded storage/auth namespace. The current local creator publishing implementation stores these resources in in-memory repositories instead of writing to a homeserver.
+In the production design, stores public lock policies, public Locks configuration, private guarded content bytes, and private verified proof bundles. Enforces Pubky sessions and path-scoped capabilities. The confirmed Locks private data namespace is `/priv/app.locks/`; Locks should depend on that homeserver capability rather than implementing a parallel guarded storage/auth namespace. The current local creator publishing implementation stores these resources in in-memory repositories instead of writing to a homeserver.
 
 ## Aggregates, Entities, and Value Objects
 
@@ -289,7 +289,7 @@ Invariants:
 - Lock hash is `BLAKE3` over the canonical JSON representation of all serialized content lock payload fields.
 - Lock ID is the Crockford-base32 encoding of the lock hash, without a readability prefix.
 - Lock ID and lock hash are derived values, not serialized fields inside the content lock payload, to avoid circular hashing.
-- Public content lock path includes a `.json` extension: `/pub/locks.app/<lock_id>.json`.
+- Public content lock path includes a `.json` extension: `/pub/app.locks/<lock_id>.json`.
 - Criteria referenced by lock logic must exist in the lock.
 - Guarded resource must include enough information to identify the content version: creator-relative path, guarded resource hash, MIME content type, and positive byte size.
 - Guarded resource `content_type` must parse as MIME.
@@ -380,7 +380,7 @@ Invariants:
 - Stores minimal criterion-level verification result evidence, not raw proof material.
 - Stored under creator-owned guarded Locks storage.
 - Resolvable by Bundle ID.
-- References the content lock using `pubky_lock_resource`, exactly `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`.
+- References the content lock using `pubky_lock_resource`, exactly `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`.
 - To honor the entitlement, the Lock Server derives creator, content lock path, and Lock ID from `pubky_lock_resource`, reads the content lock, and verifies that the content lock file hashes to the embedded Lock ID.
 - Remains intact when a changed lock creates a new Lock ID.
 - Revoked by deleting the verified proof bundle.
@@ -593,15 +593,15 @@ The domain model should allow verifier implementations without depending on paym
 
 ### RegisterGuardedResource
 
-Local dev/test creator publishing use case that accepts creator, guarded resource path, MIME content type, and bytes; computes hash and positive size; validates the guarded resource descriptor; and stores/replaces the current guarded resource by creator/path. The local HTTP contract and Pubky-backed repository adapters both use `/priv/locks.app/content/` for private guarded bytes; the difference is the configured repository backend, not the path.
+Local dev/test creator publishing use case that accepts creator, guarded resource path, MIME content type, and bytes; computes hash and positive size; validates the guarded resource descriptor; and stores/replaces the current guarded resource by creator/path. The local HTTP contract and Pubky-backed repository adapters both use `/priv/app.locks/content/` for private guarded bytes; the difference is the configured repository backend, not the path.
 
 ### CreateContentLock
 
-Local dev/test creator publishing use case that verifies a registered guarded resource descriptor, builds a content lock, derives its Lock ID/content lock path, and stores the content lock through the configured repository port. Default local runtime uses in-memory storage; Pubky-backed repository tests prove the same use case writes public content locks under `/pub/locks.app/<lock_id>.json` when composed with Pubky homeserver adapters.
+Local dev/test creator publishing use case that verifies a registered guarded resource descriptor, builds a content lock, derives its Lock ID/content lock path, and stores the content lock through the configured repository port. Default local runtime uses in-memory storage; Pubky-backed repository tests prove the same use case writes public content locks under `/pub/app.locks/<lock_id>.json` when composed with Pubky homeserver adapters.
 
 ### SetLockServicePointer
 
-Local dev/test creator publishing use case that stores or replaces the creator's default Lock Service Pointer for `/pub/locks.app/config.json` through the configured repository port. Content lock creation does not require this pointer, but viewer discovery uses it when a content lock has no `lock_server.override`.
+Local dev/test creator publishing use case that stores or replaces the creator's default Lock Service Pointer for `/pub/app.locks/config.json` through the configured repository port. Content lock creation does not require this pointer, but viewer discovery uses it when a content lock has no `lock_server.override`.
 
 ### CreatorAuthorityAcquisition
 
@@ -670,7 +670,7 @@ These are conceptual events for internal organization. They do not imply Pubky `
 4. Content creator defines lock criteria and lock logic.
 5. System canonicalizes the content lock.
 6. System derives Lock ID from the lock hash using Crockford base32.
-7. Content creator publishes public content lock under `/pub/locks.app/<lock_id>.json`.
+7. Content creator publishes public content lock under `/pub/app.locks/<lock_id>.json`.
 8. Content creator optionally publishes a preview post pointing to the content lock.
 
 ## Main Flow: Content Retrieval

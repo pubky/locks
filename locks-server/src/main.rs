@@ -13,6 +13,17 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+const SENSITIVE_PUBKY_LOG_DIRECTIVES: &[&str] = &[
+    "pkarr=off",
+    "pubky::actors::auth::relay::auth_relay_listener=off",
+    "pubky::actors::auth::relay::http_relay_inbox_channel=off",
+    "pubky::actors::auth::relay::http_relay_link_channel=off",
+    "pubky::actors::auth::cookie::credential=off",
+    "pubky::actors::pkdns=off",
+    "pubky::client::http_targets::native=off",
+    "tower_http::trace=off",
+];
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = parse_config_arg(env::args())?;
@@ -62,5 +73,33 @@ async fn shutdown_signal() {
 fn init_tracing(configured_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(configured_level));
+    let filter = with_sensitive_pubky_logs_disabled(filter);
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn with_sensitive_pubky_logs_disabled(filter: EnvFilter) -> EnvFilter {
+    SENSITIVE_PUBKY_LOG_DIRECTIVES
+        .iter()
+        .fold(filter, |filter, directive| {
+            filter.add_directive(
+                directive
+                    .parse()
+                    .expect("hard-coded Pubky log directive must be valid"),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SENSITIVE_PUBKY_LOG_DIRECTIVES, with_sensitive_pubky_logs_disabled};
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn pubky_auth_identifier_logs_stay_disabled_with_trace_base_filter() {
+        let filter = with_sensitive_pubky_logs_disabled(EnvFilter::new("trace")).to_string();
+
+        for directive in SENSITIVE_PUBKY_LOG_DIRECTIVES {
+            assert!(filter.contains(directive));
+        }
+    }
 }

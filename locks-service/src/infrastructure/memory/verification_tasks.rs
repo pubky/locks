@@ -266,7 +266,7 @@ mod tests {
                 version: SUBMITTED_PROOF_BUNDLE_VERSION,
                 bundle_id: BundleId::from_str(bundle_id).unwrap(),
                 pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                    "{creator}/pub/locks.app/{LOCK_ID}.json"
+                    "{creator}/pub/app.locks/{LOCK_ID}.json"
                 ))
                 .unwrap(),
                 reader_public_key: None,

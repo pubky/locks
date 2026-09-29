@@ -45,4 +45,9 @@ if (( blocks_to_mine > 0 )); then
   bitcoin_cli -rpcwallet=miner generatetoaddress "$blocks_to_mine" "$address" >/dev/null
 fi
 
+if bitcoin_cli getblockchaininfo | grep -q '"initialblockdownload": true'; then
+  address="$(bitcoin_cli -rpcwallet=miner getnewaddress)"
+  bitcoin_cli -rpcwallet=miner generatetoaddress 1 "$address" >/dev/null
+fi
+
 printf '%s\n' 'bitcoin bootstrap ready'

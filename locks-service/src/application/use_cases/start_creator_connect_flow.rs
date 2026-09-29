@@ -9,7 +9,7 @@ use crate::application::ports::{
 };
 
 const CREATOR_CONNECT_FLOW_TTL: Duration = Duration::minutes(5);
-const DEFAULT_REQUESTED_SCOPES: [&str; 2] = ["/pub/locks.app/:rw", "/priv/locks.app/:rw"];
+const DEFAULT_REQUESTED_SCOPES: [&str; 2] = ["/pub/app.locks/:rw", "/priv/app.locks/:rw"];
 
 /// Request to start a legacy Pubky creator connect flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(stored.expires_at, response.expires_at);
         assert_eq!(
             stored.requested_scopes,
-            vec!["/pub/locks.app/:rw", "/priv/locks.app/:rw"]
+            vec!["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
     }
 

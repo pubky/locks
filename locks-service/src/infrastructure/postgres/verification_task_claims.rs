@@ -665,7 +665,7 @@ mod tests {
                 version: SUBMITTED_PROOF_BUNDLE_VERSION,
                 bundle_id: BundleId::from_str(bundle_id_for_task_id(task_id)).unwrap(),
                 pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                    "{}/pub/locks.app/{LOCK_ID}.json",
+                    "{}/pub/app.locks/{LOCK_ID}.json",
                     creator_for_task_id(task_id)
                 ))
                 .unwrap(),

@@ -746,7 +746,7 @@ function renderSelectedResources() {
 
 function appendSelectedResource(kind, path, file) {
   const item = document.createElement('li');
-  item.textContent = `${kind}: /priv/locks.app/content/${path} (${file.name}, ${file.size} bytes)`;
+  item.textContent = `${kind}: /priv/app.locks/content/${path} (${file.name}, ${file.size} bytes)`;
   el.selectedResourceList.append(item);
 }
 

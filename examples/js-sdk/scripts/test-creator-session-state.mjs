@@ -14,7 +14,7 @@ const creator = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const record = {
   role: 'content-creator',
   pubky: creator,
-  capabilities: ['/pub/locks.app/:rw', '/priv/locks.app/:rw'],
+  capabilities: ['/pub/app.locks/:rw', '/priv/app.locks/:rw'],
   exported_session: 'exported-session-secret',
   authenticated_at: '2026-09-02T00:00:00.000Z',
 };

@@ -26,7 +26,7 @@ Canonicalization and encoding:
 - Lock ID parsing uses `base32::decode` with the Crockford alphabet, including that crate's built-in lowercase and ambiguous-character normalization.
 - Lock ID parsing rejects hyphens/readability separators.
 - Lock ID uses no Crockford checksum.
-- Public lock path: `/pub/locks.app/<lock_id>.json`.
+- Public lock path: `/pub/app.locks/<lock_id>.json`.
 
 Lock ID and lock hash are derived values, not serialized fields inside the content lock payload, to avoid circular hashing.
 
@@ -51,4 +51,4 @@ Negative:
 
 ## Open Follow-ups
 
-- Add test vectors for canonical JSON, BLAKE3, Crockford-base32 Lock ID encoding, and final `/pub/locks.app/<lock_id>.json` path.
+- Add test vectors for canonical JSON, BLAKE3, Crockford-base32 Lock ID encoding, and final `/pub/app.locks/<lock_id>.json` path.
