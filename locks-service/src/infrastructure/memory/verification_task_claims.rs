@@ -137,7 +137,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 && record.claim_token.as_ref() == Some(claim_token)
                 && record
                     .claim_expires_at
-                    .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                    .is_some_and(|claim_expires_at| claim_expires_at > now)
         }) else {
             return Ok(None);
         };
@@ -167,23 +167,32 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
         if !matches!(
             task.status,
-            VerificationTaskStatus::Completed
+            VerificationTaskStatus::PublishingEntitlement
+                | VerificationTaskStatus::Completed
                 | VerificationTaskStatus::Failed
                 | VerificationTaskStatus::Expired
         ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "claimed task transition must be terminal".to_owned(),
+                message: "claimed task transition must publish or terminalize".to_owned(),
             });
         }
+        let expected_status = match task.status {
+            VerificationTaskStatus::PublishingEntitlement => VerificationTaskStatus::InProgress,
+            VerificationTaskStatus::Completed => VerificationTaskStatus::PublishingEntitlement,
+            VerificationTaskStatus::Failed | VerificationTaskStatus::Expired => {
+                VerificationTaskStatus::InProgress
+            }
+            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress => unreachable!(),
+        };
         let mut records = self.records.write().await;
         let Some(record) = records.iter_mut().find(|record| {
             record.task.task_id == task.task_id
-                && record.task.status == VerificationTaskStatus::InProgress
+                && record.task.status == expected_status
                 && record.claimed_by.as_deref() == Some(worker_id)
                 && record.claim_token.as_ref() == Some(claim_token)
                 && record
                     .claim_expires_at
-                    .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                    .is_some_and(|claim_expires_at| claim_expires_at > now)
         }) else {
             return Ok(None);
         };
@@ -193,10 +202,12 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 .await?;
         }
         record.task = task;
-        record.claimed_by = None;
-        record.claim_token = None;
-        record.claim_expires_at = None;
-        record.next_attempt_at = None;
+        if record.task.status != VerificationTaskStatus::PublishingEntitlement {
+            record.claimed_by = None;
+            record.claim_token = None;
+            record.claim_expires_at = None;
+            record.next_attempt_at = None;
+        }
         Ok(Some(record.task.clone()))
     }
 }
@@ -209,7 +220,10 @@ impl ClaimableVerificationTask {
                 .is_none_or(|next_attempt_at| next_attempt_at <= now),
             VerificationTaskStatus::InProgress => self
                 .claim_expires_at
-                .is_some_and(|claim_expires_at| claim_expires_at < now),
+                .is_some_and(|claim_expires_at| claim_expires_at <= now),
+            VerificationTaskStatus::PublishingEntitlement => self
+                .claim_expires_at
+                .is_some_and(|claim_expires_at| claim_expires_at <= now),
             VerificationTaskStatus::Completed
             | VerificationTaskStatus::Failed
             | VerificationTaskStatus::Expired => false,
@@ -226,10 +240,15 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+        VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+    };
 
     use super::InMemoryVerificationTaskClaimer;
-    use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
+    use crate::application::models::{
+        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+    };
     use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
     use crate::infrastructure::memory::verification_tasks::InMemoryVerificationTaskRepository;
 
@@ -415,14 +434,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let completed = second
+        let publishing = second
             .task
             .clone()
-            .transition_to(
-                VerificationTaskStatus::Completed,
-                reclaimed_at + time::Duration::seconds(1),
-                None,
-            )
+            .begin_entitlement_publication(entitlement_for(&second.task))
+            .unwrap();
+        let completed = publishing
+            .complete_entitlement_publication(reclaimed_at + time::Duration::seconds(1))
             .unwrap();
         let failed = second
             .task
@@ -433,12 +451,20 @@ mod tests {
                 Some("stale failure".to_owned()),
             )
             .unwrap();
+        let expired = second
+            .task
+            .clone()
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                reclaimed_at + time::Duration::seconds(1),
+            )
+            .unwrap();
 
-        for terminal in [completed.clone(), failed] {
+        for stale_transition in [publishing.clone(), completed.clone(), failed, expired] {
             assert_eq!(
                 claimer
                     .persist_claimed_verification_task_transition(
-                        terminal,
+                        stale_transition,
                         "worker-a",
                         &first.claim_token,
                         reclaimed_at,
@@ -448,6 +474,19 @@ mod tests {
                 None
             );
         }
+        assert_eq!(
+            claimer
+                .persist_claimed_verification_task_transition(
+                    publishing,
+                    "worker-a",
+                    &second.claim_token,
+                    reclaimed_at,
+                )
+                .await
+                .unwrap()
+                .map(|task| task.status),
+            Some(VerificationTaskStatus::PublishingEntitlement)
+        );
         assert_eq!(
             claimer
                 .persist_claimed_verification_task_transition(
@@ -544,19 +583,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_tasks_are_not_claimed() {
-        let completed = task(
+    async fn claim_expiry_instant_rejects_owner_retry_and_allows_reclaim() {
+        let pending = task(
             "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
             VerificationTaskStatus::Pending,
-        )
-        .transition_to(VerificationTaskStatus::InProgress, NOW, None)
-        .unwrap()
-        .transition_to(
-            VerificationTaskStatus::Completed,
-            datetime!(2026-05-29 12:11:00 UTC),
-            None,
-        )
-        .unwrap();
+        );
+        let task_id = pending.task_id;
+        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending]);
+        let first = claimer
+            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            claimer
+                .schedule_verification_task_retry(
+                    &task_id,
+                    "worker-a",
+                    &first.claim_token,
+                    CLAIM_EXPIRES_AT,
+                    CLAIM_EXPIRES_AT + time::Duration::seconds(10),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            claimer
+                .claim_next_verification_task(
+                    "worker-b",
+                    CLAIM_EXPIRES_AT,
+                    CLAIM_EXPIRES_AT + time::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_expiry_instant_rejects_owner_terminal_write() {
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
+            VerificationTaskStatus::Pending,
+        );
+        let claimer = InMemoryVerificationTaskClaimer::new(vec![pending]);
+        let claim = claimer
+            .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            .await
+            .unwrap()
+            .unwrap();
+        let expired = claim
+            .task
+            .clone()
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                CLAIM_EXPIRES_AT,
+            )
+            .unwrap();
+
+        assert_eq!(
+            claimer
+                .persist_claimed_verification_task_transition(
+                    expired,
+                    "worker-a",
+                    &claim.claim_token,
+                    CLAIM_EXPIRES_AT,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_tasks_are_not_claimed() {
+        let completed_source = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
+            VerificationTaskStatus::Pending,
+        );
+        let completed = completed_source
+            .transition_to(VerificationTaskStatus::InProgress, NOW, None)
+            .unwrap()
+            .begin_entitlement_publication(entitlement_for(&completed_source))
+            .unwrap()
+            .complete_entitlement_publication(datetime!(2026-05-29 12:11:00 UTC))
+            .unwrap();
         let failed = task(
             "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d11",
             VerificationTaskStatus::Pending,
@@ -573,7 +686,12 @@ mod tests {
             "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d12",
             VerificationTaskStatus::Pending,
         )
-        .transition_to(VerificationTaskStatus::Expired, NOW, None)
+        .transition_to(VerificationTaskStatus::InProgress, NOW, None)
+        .unwrap()
+        .expire(
+            VerificationTerminalReason::PaymentDeadlineExpired,
+            datetime!(2026-05-29 12:11:00 UTC),
+        )
         .unwrap();
         let claimer = InMemoryVerificationTaskClaimer::new(vec![completed, failed, expired]);
 
@@ -665,6 +783,18 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        }
+    }
+
+    fn entitlement_for(task: &VerificationTaskRecord) -> VerifiedProofBundle {
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            pubky_lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
         }
     }
 }

@@ -10,8 +10,8 @@ use locks_core::verification::{
 use crate::application::entitlement_evaluator::evaluate_entitlement;
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    ClaimedVerificationTask, CriterionVerificationRequest, VerificationTaskRecord,
-    VerificationTaskStatus,
+    ClaimedVerificationTask, CriterionVerificationOutcome, CriterionVerificationRequest,
+    VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
 };
 use crate::application::ports::{
     Clock, ContentLockRepository, CriterionVerifierRegistry, EntitlementRepository,
@@ -45,6 +45,12 @@ pub struct CompleteVerificationTaskUseCase<'a> {
     verifiers: &'a dyn CriterionVerifierRegistry,
     clock: &'a dyn Clock,
     verified_by: LockServerPubky,
+}
+
+enum VerificationDecision {
+    Pending,
+    Satisfied(VerificationResult),
+    TerminalUnsatisfied(VerificationTerminalReason),
 }
 
 struct ClaimFencedTaskRepository<'a> {
@@ -124,6 +130,17 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
                 record: "verification_task",
             })?;
 
+        if task.status == VerificationTaskStatus::PublishingEntitlement {
+            let entitlement = task.entitlement_to_publish.clone().ok_or_else(|| {
+                ApplicationError::InvalidVerificationTaskState {
+                    message: "publishing task is missing entitlement payload".to_owned(),
+                }
+            })?;
+            return self
+                .publish_entitlement_and_complete(request.task_id, task, entitlement)
+                .await;
+        }
+
         let submitted = task.submitted_proof_bundle.clone();
         let pubky_lock_resource = submitted.pubky_lock_resource.clone();
 
@@ -153,9 +170,41 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         }
 
         let verification_result = match self.verify_criteria(&task, &content_lock).await {
-            Ok(verification_result) => verification_result,
+            Ok(VerificationDecision::Satisfied(verification_result)) => verification_result,
+            Ok(VerificationDecision::Pending) => {
+                return Err(ApplicationError::VerificationPending);
+            }
+            Ok(VerificationDecision::TerminalUnsatisfied(reason)) => {
+                let in_progress = match task.status {
+                    VerificationTaskStatus::Pending => {
+                        let in_progress = task.transition_to(
+                            VerificationTaskStatus::InProgress,
+                            self.clock.now(),
+                            None,
+                        )?;
+                        self.tasks
+                            .update_verification_task(in_progress.clone())
+                            .await?;
+                        in_progress
+                    }
+                    VerificationTaskStatus::InProgress => task,
+                    _ => task,
+                };
+                let completed_at = self.clock.now();
+                let expired = in_progress.expire(reason, completed_at)?;
+                self.tasks.update_verification_task(expired).await?;
+                return Ok(CompletedVerificationTask {
+                    task_id: request.task_id,
+                    status: VerificationTaskStatus::Expired,
+                    completed_at,
+                });
+            }
             Err(error) => {
-                if matches!(error, ApplicationError::VerificationPending) {
+                if matches!(
+                    error,
+                    ApplicationError::VerificationPending
+                        | ApplicationError::PaykitPaymentStatusConflict
+                ) {
                     return Err(error);
                 }
                 self.persist_failed_task(task, viewer_safe_failure_message(&error).to_owned())
@@ -199,46 +248,10 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
             verification_result,
             entitlement_lifetime: EntitlementLifetime::Unbounded,
         };
-        if let Err(error) = self
-            .entitlements
-            .insert_verified_proof_bundle(entitlement.clone())
+        task = task.begin_entitlement_publication(entitlement.clone())?;
+        self.tasks.update_verification_task(task.clone()).await?;
+        self.publish_entitlement_and_complete(request.task_id, task, entitlement)
             .await
-        {
-            match self
-                .entitlements
-                .get_verified_proof_bundle(
-                    entitlement.pubky_lock_resource.creator(),
-                    &entitlement.bundle_id,
-                )
-                .await
-            {
-                Ok(Some(existing)) if same_entitlement_decision(&existing, &entitlement) => {}
-                Ok(_) => {
-                    self.persist_failed_task(task, viewer_safe_failure_message(&error).to_owned())
-                        .await?;
-                    return Err(error);
-                }
-                Err(lookup_error) => {
-                    self.persist_failed_task(
-                        task,
-                        viewer_safe_failure_message(&lookup_error).to_owned(),
-                    )
-                    .await?;
-                    return Err(lookup_error);
-                }
-            }
-        }
-
-        let completed_at = self.clock.now();
-        let completed =
-            task.transition_to(VerificationTaskStatus::Completed, completed_at, None)?;
-        self.tasks.update_verification_task(completed).await?;
-
-        Ok(CompletedVerificationTask {
-            task_id: request.task_id,
-            status: VerificationTaskStatus::Completed,
-            completed_at,
-        })
     }
 
     /// Runs verifier work for a worker-owned lease and fences every terminal write by its token.
@@ -250,10 +263,13 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         claimer: &dyn VerificationTaskClaimer,
     ) -> Result<CompletedVerificationTask, ApplicationError> {
         if claim.task.task_id != request.task_id
-            || claim.task.status != VerificationTaskStatus::InProgress
+            || !matches!(
+                claim.task.status,
+                VerificationTaskStatus::InProgress | VerificationTaskStatus::PublishingEntitlement
+            )
         {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "claimed completion requires the matching in-progress task".to_owned(),
+                message: "claimed completion requires the matching active task".to_owned(),
             });
         }
         let fenced_tasks = ClaimFencedTaskRepository {
@@ -274,11 +290,48 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
         .await
     }
 
+    async fn publish_entitlement_and_complete(
+        &self,
+        task_id: TaskId,
+        task: VerificationTaskRecord,
+        entitlement: VerifiedProofBundle,
+    ) -> Result<CompletedVerificationTask, ApplicationError> {
+        let write_error = self
+            .entitlements
+            .insert_verified_proof_bundle(entitlement.clone())
+            .await
+            .err();
+        let read_back = self
+            .entitlements
+            .get_verified_proof_bundle(
+                entitlement.pubky_lock_resource.creator(),
+                &entitlement.bundle_id,
+            )
+            .await?;
+        if !read_back
+            .as_ref()
+            .is_some_and(|existing| same_entitlement_decision(existing, &entitlement))
+        {
+            return Err(write_error.unwrap_or_else(|| ApplicationError::Storage {
+                message: "published entitlement was not equivalent on read-back".to_owned(),
+            }));
+        }
+
+        let completed_at = self.clock.now();
+        let completed = task.complete_entitlement_publication(completed_at)?;
+        self.tasks.update_verification_task(completed).await?;
+        Ok(CompletedVerificationTask {
+            task_id,
+            status: VerificationTaskStatus::Completed,
+            completed_at,
+        })
+    }
+
     async fn verify_criteria(
         &self,
         task: &VerificationTaskRecord,
         content_lock: &ContentLock,
-    ) -> Result<VerificationResult, ApplicationError> {
+    ) -> Result<VerificationDecision, ApplicationError> {
         let verified_at = self.clock.now();
         let submitted = &task.submitted_proof_bundle;
         let mut criteria = Vec::new();
@@ -295,22 +348,31 @@ impl<'a> CompleteVerificationTaskUseCase<'a> {
                     verifier_type: criterion.verifier_type,
                 },
             )?;
-            criteria.push(
-                verifier
-                    .verify(CriterionVerificationRequest {
-                        bundle_id: submitted.bundle_id.clone(),
-                        creator: submitted.pubky_lock_resource.creator().clone(),
-                        lock_id: submitted.pubky_lock_resource.lock_id().clone(),
-                        criterion: criterion.clone(),
-                        proof: proof.clone(),
-                        verified_by: self.verified_by.clone(),
-                        verified_at,
-                    })
-                    .await?,
-            );
+            match verifier
+                .verify(CriterionVerificationRequest {
+                    bundle_id: submitted.bundle_id.clone(),
+                    creator: submitted.pubky_lock_resource.creator().clone(),
+                    lock_id: submitted.pubky_lock_resource.lock_id().clone(),
+                    criterion: criterion.clone(),
+                    proof: proof.clone(),
+                    verified_by: self.verified_by.clone(),
+                    verified_at,
+                })
+                .await?
+            {
+                CriterionVerificationOutcome::Pending => {
+                    return Ok(VerificationDecision::Pending);
+                }
+                CriterionVerificationOutcome::TerminalUnsatisfied(reason) => {
+                    return Ok(VerificationDecision::TerminalUnsatisfied(reason));
+                }
+                CriterionVerificationOutcome::Satisfied(result) => criteria.push(result),
+            }
         }
 
-        Ok(VerificationResult { criteria })
+        Ok(VerificationDecision::Satisfied(VerificationResult {
+            criteria,
+        }))
     }
 
     async fn persist_failed_task(
@@ -343,9 +405,9 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
     match error {
         ApplicationError::ContentLockUnavailable => "content lock unavailable",
         ApplicationError::EntitlementNotSatisfied => "entitlement not satisfied",
-        ApplicationError::UnsupportedVerifierType { .. } | ApplicationError::Verifier { .. } => {
-            "verification failed"
-        }
+        ApplicationError::UnsupportedVerifierType { .. }
+        | ApplicationError::Verifier { .. }
+        | ApplicationError::PaykitPaymentStatusInvalidResponse => "verification failed",
         ApplicationError::ContentLockHashMismatch { .. }
         | ApplicationError::ContentLockCanonicalization { .. } => "content lock invalid",
         ApplicationError::EmptyContentLockCriteria
@@ -359,6 +421,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
+        | ApplicationError::PaykitPaymentStatusConflict
         | ApplicationError::InvalidVerificationTaskState { .. }
         | ApplicationError::VerificationTaskClaimLost
         | ApplicationError::InvalidVerificationTaskFailureMessage
@@ -390,20 +453,7 @@ fn same_entitlement_decision(
     existing: &VerifiedProofBundle,
     candidate: &VerifiedProofBundle,
 ) -> bool {
-    if existing.verification_result.criteria.len() != candidate.verification_result.criteria.len() {
-        return false;
-    }
-
-    let mut normalized_candidate = candidate.clone();
-    for (candidate_result, existing_result) in normalized_candidate
-        .verification_result
-        .criteria
-        .iter_mut()
-        .zip(&existing.verification_result.criteria)
-    {
-        candidate_result.verified_at = existing_result.verified_at;
-    }
-    existing == &normalized_candidate
+    existing == candidate
 }
 
 #[cfg(test)]
@@ -432,8 +482,8 @@ mod tests {
     use super::{CompleteVerificationTaskRequest, CompleteVerificationTaskUseCase};
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        ClaimedVerificationTask, CriterionVerificationRequest, VerificationTaskRecord,
-        VerificationTaskStatus,
+        ClaimedVerificationTask, CriterionVerificationOutcome, CriterionVerificationRequest,
+        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::ports::{
         Clock, ContentLockRepository, CriterionVerifier, CriterionVerifierRegistry,
@@ -445,7 +495,7 @@ mod tests {
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 
     #[tokio::test]
-    async fn claimed_completion_rejects_lost_lease_after_entitlement_publication() {
+    async fn lost_claim_cannot_publish_entitlement_before_durable_intent_wins() {
         let content_lock = content_lock_fixture(true);
         let in_progress = pending_task_for(&content_lock)
             .transition_to(
@@ -493,12 +543,69 @@ mod tests {
             .await;
 
         assert_eq!(result, Err(ApplicationError::VerificationTaskClaimLost));
-        assert_eq!(entitlements.stored().len(), 1);
+        assert!(entitlements.stored().is_empty());
         assert!(tasks.updates().is_empty());
     }
 
     #[tokio::test]
-    async fn complete_verification_task_accepts_equivalent_existing_entitlement() {
+    async fn claimed_terminal_unsatisfied_expires_with_reason_without_entitlement() {
+        let content_lock = content_lock_fixture(true);
+        let in_progress = pending_task_for(&content_lock)
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:00:30 UTC),
+                None,
+            )
+            .unwrap();
+        let claim = ClaimedVerificationTask {
+            task: in_progress,
+            claim_token: uuid::Uuid::new_v4(),
+        };
+        let tasks = FakeTasks::new(None);
+        let content_locks = FakeContentLocks::new(Some(content_lock));
+        let entitlements = FakeEntitlements::default();
+        let verifier = TerminalVerifier;
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let claimer = CapturingClaimClaimer::default();
+        let completed_at = datetime!(2026-05-29 12:01:00 UTC);
+        let clock = SequenceClock::new(vec![completed_at, completed_at, completed_at]);
+        let use_case = CompleteVerificationTaskUseCase::new(
+            &tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &clock,
+            lock_server(),
+        );
+
+        let completed = use_case
+            .execute_claimed(
+                CompleteVerificationTaskRequest { task_id: task_id() },
+                claim,
+                "worker-a",
+                &claimer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(completed.status, VerificationTaskStatus::Expired);
+        assert_eq!(completed.completed_at, completed_at);
+        let persisted = claimer.persisted().expect("terminal task persisted");
+        assert_eq!(persisted.status, VerificationTaskStatus::Expired);
+        assert_eq!(persisted.completed_at, Some(completed_at));
+        assert_eq!(persisted.failure_message, None);
+        assert_eq!(
+            persisted.terminal_reason,
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        );
+        assert!(entitlements.stored().is_empty());
+        assert!(tasks.updates().is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_verification_task_replays_exact_persisted_entitlement() {
         let content_lock = content_lock_fixture(true);
         let content_locks = FakeContentLocks::new(Some(content_lock.clone()));
         let entitlements = FakeEntitlements::default();
@@ -509,34 +616,49 @@ mod tests {
         let registry = FakeRegistry {
             verifier: Some(&verifier),
         };
+        let initial_tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let initial_clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+            datetime!(2026-05-29 12:03:00 UTC),
+        ]);
+        CompleteVerificationTaskUseCase::new(
+            &initial_tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &initial_clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await
+        .unwrap();
 
-        for attempt in 0..2 {
-            let tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
-            let verified_at = if attempt == 0 {
-                datetime!(2026-05-29 12:01:00 UTC)
-            } else {
-                datetime!(2026-05-29 12:04:00 UTC)
-            };
-            let clock = SequenceClock::new(vec![
-                verified_at,
-                datetime!(2026-05-29 12:02:00 UTC),
-                datetime!(2026-05-29 12:03:00 UTC),
-            ]);
-            let completed = CompleteVerificationTaskUseCase::new(
-                &tasks,
-                &content_locks,
-                &entitlements,
-                &registry,
-                &clock,
-                lock_server(),
+        let exact_entitlement = entitlements.stored().into_iter().next().unwrap();
+        let publishing = pending_task_for(&content_lock)
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:04:00 UTC),
+                None,
             )
-            .execute(CompleteVerificationTaskRequest { task_id: task_id() })
-            .await
-            .expect("equivalent existing entitlement is idempotent");
+            .unwrap()
+            .begin_entitlement_publication(exact_entitlement)
+            .unwrap();
+        let replay_tasks = FakeTasks::new(Some(publishing));
+        let replay_clock = SequenceClock::new(vec![datetime!(2026-05-29 12:05:00 UTC)]);
+        let completed = CompleteVerificationTaskUseCase::new(
+            &replay_tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &replay_clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await
+        .expect("exact persisted entitlement replay is idempotent");
 
-            assert_eq!(completed.status, VerificationTaskStatus::Completed);
-        }
-
+        assert_eq!(completed.status, VerificationTaskStatus::Completed);
         assert_eq!(entitlements.stored().len(), 1);
     }
 
@@ -581,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_claim_owner_completes_after_equivalent_entitlement_was_published() {
+    async fn current_claim_owner_completes_after_exact_entitlement_was_published() {
         let content_lock = content_lock_fixture(true);
         let content_locks = FakeContentLocks::new(Some(content_lock.clone()));
         let entitlements = FakeEntitlements::default();
@@ -610,8 +732,9 @@ mod tests {
         .await
         .unwrap();
 
+        let exact_entitlement = entitlements.stored().into_iter().next().unwrap();
         let claimer = InMemoryVerificationTaskClaimer::new(vec![pending_task_for(&content_lock)]);
-        let claim = claimer
+        let in_progress_claim = claimer
             .claim_next_verification_task(
                 "worker-a",
                 datetime!(2026-05-29 12:04:00 UTC),
@@ -620,11 +743,29 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let publishing = in_progress_claim
+            .task
+            .clone()
+            .begin_entitlement_publication(exact_entitlement)
+            .unwrap();
+        claimer
+            .persist_claimed_verification_task_transition(
+                publishing.clone(),
+                "worker-a",
+                &in_progress_claim.claim_token,
+                datetime!(2026-05-29 12:04:00 UTC),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = ClaimedVerificationTask {
+            task: publishing,
+            claim_token: in_progress_claim.claim_token,
+        };
         let tasks = FakeTasks::new(None);
         let retry_clock = SequenceClock::new(vec![
             datetime!(2026-05-29 12:05:00 UTC),
             datetime!(2026-05-29 12:06:00 UTC),
-            datetime!(2026-05-29 12:07:00 UTC),
         ]);
         let completed = CompleteVerificationTaskUseCase::new(
             &tasks,
@@ -649,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_verification_task_rejects_mismatched_existing_entitlement() {
+    async fn mismatched_existing_entitlement_retains_replayable_publication_intent() {
         let content_lock = content_lock_fixture(true);
         let content_locks = FakeContentLocks::new(Some(content_lock.clone()));
         let entitlements = FakeEntitlements::default();
@@ -706,7 +847,74 @@ mod tests {
         );
         assert_eq!(
             retry_tasks.updates().last().unwrap().status,
-            VerificationTaskStatus::Failed
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert!(
+            retry_tasks
+                .updates()
+                .last()
+                .unwrap()
+                .entitlement_to_publish
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn different_verified_at_is_not_an_exact_publication_replay() {
+        let content_lock = content_lock_fixture(true);
+        let content_locks = FakeContentLocks::new(Some(content_lock.clone()));
+        let entitlements = FakeEntitlements::default();
+        let verifier = FakeVerifier {
+            satisfied: true,
+            error: None,
+        };
+        let registry = FakeRegistry {
+            verifier: Some(&verifier),
+        };
+        let initial_tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let initial_clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:01:00 UTC),
+            datetime!(2026-05-29 12:02:00 UTC),
+            datetime!(2026-05-29 12:03:00 UTC),
+        ]);
+        CompleteVerificationTaskUseCase::new(
+            &initial_tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &initial_clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await
+        .unwrap();
+
+        let retry_tasks = FakeTasks::new(Some(pending_task_for(&content_lock)));
+        let retry_clock = SequenceClock::new(vec![
+            datetime!(2026-05-29 12:04:00 UTC),
+            datetime!(2026-05-29 12:05:00 UTC),
+            datetime!(2026-05-29 12:06:00 UTC),
+        ]);
+        let result = CompleteVerificationTaskUseCase::new(
+            &retry_tasks,
+            &content_locks,
+            &entitlements,
+            &registry,
+            &retry_clock,
+            lock_server(),
+        )
+        .execute(CompleteVerificationTaskRequest { task_id: task_id() })
+        .await;
+
+        assert_eq!(
+            result,
+            Err(ApplicationError::DuplicateRecord {
+                record: "verified_proof_bundle"
+            })
+        );
+        assert_eq!(
+            retry_tasks.updates().last().unwrap().status,
+            VerificationTaskStatus::PublishingEntitlement
         );
     }
 
@@ -746,15 +954,23 @@ mod tests {
         assert_eq!(completed.status, VerificationTaskStatus::Completed);
         assert_eq!(completed.completed_at, datetime!(2026-05-29 12:03:00 UTC));
         let updates = tasks.updates();
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
         assert_eq!(updates[0].status, VerificationTaskStatus::InProgress);
         assert_eq!(
             updates[0].started_at,
             Some(datetime!(2026-05-29 12:02:00 UTC))
         );
-        assert_eq!(updates[1].status, VerificationTaskStatus::Completed);
         assert_eq!(
-            updates[1].completed_at,
+            updates[1].status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(
+            updates[1].entitlement_to_publish.as_ref(),
+            entitlements.stored().first()
+        );
+        assert_eq!(updates[2].status, VerificationTaskStatus::Completed);
+        assert_eq!(
+            updates[2].completed_at,
             Some(datetime!(2026-05-29 12:03:00 UTC))
         );
         let stored = entitlements.stored();
@@ -1034,6 +1250,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 
@@ -1106,17 +1324,78 @@ mod tests {
         async fn verify(
             &self,
             request: CriterionVerificationRequest,
-        ) -> Result<CriterionVerificationResult, ApplicationError> {
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
-            Ok(CriterionVerificationResult {
-                criterion_id: request.criterion.criterion_id,
-                satisfied: self.satisfied,
-                verified_at: request.verified_at,
-                verified_by: request.verified_by,
-                verifier_type: request.criterion.verifier_type,
-            })
+            Ok(CriterionVerificationOutcome::Satisfied(
+                CriterionVerificationResult {
+                    criterion_id: request.criterion.criterion_id,
+                    satisfied: self.satisfied,
+                    verified_at: request.verified_at,
+                    verified_by: request.verified_by,
+                    verifier_type: request.criterion.verifier_type,
+                },
+            ))
+        }
+    }
+
+    struct TerminalVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for TerminalVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Ok(CriterionVerificationOutcome::TerminalUnsatisfied(
+                VerificationTerminalReason::PaymentRequestRejected,
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingClaimClaimer {
+        persisted: Mutex<Option<VerificationTaskRecord>>,
+    }
+
+    impl CapturingClaimClaimer {
+        fn persisted(&self) -> Option<VerificationTaskRecord> {
+            self.persisted.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl VerificationTaskClaimer for CapturingClaimClaimer {
+        async fn claim_next_verification_task(
+            &self,
+            _worker_id: &str,
+            _now: OffsetDateTime,
+            _claim_expires_at: OffsetDateTime,
+        ) -> Result<Option<ClaimedVerificationTask>, ApplicationError> {
+            unreachable!("completion must not claim tasks")
+        }
+
+        async fn schedule_verification_task_retry(
+            &self,
+            _task_id: &TaskId,
+            _worker_id: &str,
+            _claim_token: &uuid::Uuid,
+            _now: OffsetDateTime,
+            _next_attempt_at: OffsetDateTime,
+        ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
+            unreachable!("completion must not schedule retries")
+        }
+
+        async fn persist_claimed_verification_task_transition(
+            &self,
+            task: VerificationTaskRecord,
+            _worker_id: &str,
+            _claim_token: &uuid::Uuid,
+            _now: OffsetDateTime,
+        ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
+            *self.persisted.lock().unwrap() = Some(task.clone());
+            Ok(Some(task))
         }
     }
 

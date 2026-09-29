@@ -4,10 +4,12 @@ use async_trait::async_trait;
 use sqlx::{FromRow, PgPool};
 
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::verification::{SubmittedProofBundle, VerifiedProofBundle};
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
+use crate::application::models::{
+    VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+};
 use crate::application::ports::VerificationTaskRepository;
 
 /// Postgres-backed repository for Lock Server private verification task state.
@@ -27,6 +29,8 @@ pub(super) struct VerificationTaskRow {
     started_at: Option<time::OffsetDateTime>,
     completed_at: Option<time::OffsetDateTime>,
     failure_message: Option<String>,
+    terminal_reason: Option<String>,
+    entitlement_to_publish: Option<serde_json::Value>,
 }
 
 struct VerificationTaskWriteRow {
@@ -39,6 +43,8 @@ struct VerificationTaskWriteRow {
     started_at: Option<time::OffsetDateTime>,
     completed_at: Option<time::OffsetDateTime>,
     failure_message: Option<String>,
+    terminal_reason: Option<&'static str>,
+    entitlement_to_publish: Option<serde_json::Value>,
 }
 
 pub(super) const VERIFICATION_TASK_ROW_COLUMNS: &str = "
@@ -50,7 +56,9 @@ pub(super) const VERIFICATION_TASK_ROW_COLUMNS: &str = "
     submitted_at,
     started_at,
     completed_at,
-    failure_message";
+    failure_message,
+    terminal_reason,
+    entitlement_to_publish";
 
 impl PostgresVerificationTaskRepository {
     /// Creates a repository backed by the provided migrated Postgres pool.
@@ -76,9 +84,11 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 submitted_at,
                 started_at,
                 completed_at,
-                failure_message
+                failure_message,
+                terminal_reason,
+                entitlement_to_publish
             )
-            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT DO NOTHING",
         )
         .bind(row.task_id)
@@ -90,6 +100,8 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         .bind(row.started_at)
         .bind(row.completed_at)
         .bind(row.failure_message)
+        .bind(row.terminal_reason)
+        .bind(row.entitlement_to_publish)
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -118,6 +130,8 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 started_at = $7,
                 completed_at = $8,
                 failure_message = $9,
+                terminal_reason = $10,
+                entitlement_to_publish = $11,
                 updated_at = now()
             WHERE task_id = $1::uuid",
         )
@@ -130,6 +144,8 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         .bind(row.started_at)
         .bind(row.completed_at)
         .bind(row.failure_message)
+        .bind(row.terminal_reason)
+        .bind(row.entitlement_to_publish)
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -232,6 +248,15 @@ impl TryFrom<VerificationTaskRow> for VerificationTaskRecord {
             started_at: row.started_at,
             completed_at: row.completed_at,
             failure_message: row.failure_message,
+            terminal_reason: row
+                .terminal_reason
+                .as_deref()
+                .map(terminal_reason_from_database)
+                .transpose()?,
+            entitlement_to_publish: row
+                .entitlement_to_publish
+                .map(verified_proof_bundle_from_json)
+                .transpose()?,
         })
     }
 }
@@ -262,8 +287,22 @@ impl TryFrom<&VerificationTaskRecord> for VerificationTaskWriteRow {
             started_at: task.started_at,
             completed_at: task.completed_at,
             failure_message: task.failure_message.clone(),
+            terminal_reason: task.terminal_reason.map(VerificationTerminalReason::as_str),
+            entitlement_to_publish: task
+                .entitlement_to_publish
+                .as_ref()
+                .map(verified_proof_bundle_to_json)
+                .transpose()?,
         })
     }
+}
+
+fn terminal_reason_from_database(
+    value: &str,
+) -> Result<VerificationTerminalReason, ApplicationError> {
+    VerificationTerminalReason::from_storage_value(value).ok_or_else(|| ApplicationError::Storage {
+        message: format!("invalid verification task terminal_reason stored in Postgres: {value}"),
+    })
 }
 
 fn submitted_proof_bundle_to_json(
@@ -282,10 +321,27 @@ fn submitted_proof_bundle_from_json(
     })
 }
 
+pub(super) fn verified_proof_bundle_to_json(
+    entitlement: &VerifiedProofBundle,
+) -> Result<serde_json::Value, ApplicationError> {
+    serde_json::to_value(entitlement).map_err(|error| ApplicationError::Storage {
+        message: format!("serialize entitlement publication payload for Postgres: {error}"),
+    })
+}
+
+fn verified_proof_bundle_from_json(
+    value: serde_json::Value,
+) -> Result<VerifiedProofBundle, ApplicationError> {
+    serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
+        message: format!("deserialize entitlement publication payload from Postgres: {error}"),
+    })
+}
+
 pub(super) fn status_to_database(status: VerificationTaskStatus) -> &'static str {
     match status {
         VerificationTaskStatus::Pending => "pending",
         VerificationTaskStatus::InProgress => "in_progress",
+        VerificationTaskStatus::PublishingEntitlement => "publishing_entitlement",
         VerificationTaskStatus::Completed => "completed",
         VerificationTaskStatus::Failed => "failed",
         VerificationTaskStatus::Expired => "expired",
@@ -296,6 +352,7 @@ fn status_from_database(status: &str) -> Result<VerificationTaskStatus, Applicat
     match status {
         "pending" => Ok(VerificationTaskStatus::Pending),
         "in_progress" => Ok(VerificationTaskStatus::InProgress),
+        "publishing_entitlement" => Ok(VerificationTaskStatus::PublishingEntitlement),
         "completed" => Ok(VerificationTaskStatus::Completed),
         "failed" => Ok(VerificationTaskStatus::Failed),
         "expired" => Ok(VerificationTaskStatus::Expired),
@@ -324,7 +381,9 @@ mod tests {
 
     use super::PostgresVerificationTaskRepository;
     use crate::application::errors::ApplicationError;
-    use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
+    use crate::application::models::{
+        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+    };
     use crate::application::ports::VerificationTaskRepository;
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -451,6 +510,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_terminal_reason_survives_repository_wrapper_recreation() {
+        let database = TestDatabase::create().await;
+        let original_repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let recreated_repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let task_id = TaskId::from_str(TASK_ID).unwrap();
+        let expired = task(VerificationTaskStatus::Pending)
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .expire(
+                VerificationTerminalReason::PaymentRequestCanceled,
+                datetime!(2026-05-29 12:02:00 UTC),
+            )
+            .unwrap();
+
+        original_repo
+            .insert_verification_task(expired.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recreated_repo
+                .get_verification_task(&task_id)
+                .await
+                .unwrap(),
+            Some(expired)
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn insert_rejects_task_when_record_creator_diverges_from_submitted_bundle() {
         let database = TestDatabase::create().await;
         let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
@@ -537,6 +631,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 }

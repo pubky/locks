@@ -55,6 +55,13 @@ mod tests {
         assert_column_exists(&mut connection, "verification_tasks", "bundle_id").await;
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;
         assert_column_exists(&mut connection, "verification_tasks", "claim_token").await;
+        assert_column_exists(&mut connection, "verification_tasks", "terminal_reason").await;
+        assert_column_exists(
+            &mut connection,
+            "verification_tasks",
+            "entitlement_to_publish",
+        )
+        .await;
         assert_index_exists(
             &mut connection,
             "verification_tasks",
@@ -176,7 +183,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=10).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=12).collect::<Vec<_>>());
 
         sqlx::query(
             "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)
@@ -192,6 +199,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_count, 1, "restart repeated the destructive reset");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn verification_task_state_constraint_rejects_incomplete_terminal_and_publication_tuples()
+    {
+        let database = TestDatabase::create().await;
+
+        for (status, extra_columns, extra_values) in [
+            ("completed", "", ""),
+            ("failed", ", started_at, completed_at", ", NOW(), NOW()"),
+            ("expired", ", started_at, completed_at", ", NOW(), NOW()"),
+            ("publishing_entitlement", ", started_at", ", NOW()"),
+        ] {
+            let result = sqlx::query(&format!(
+                "INSERT INTO verification_tasks (
+                    task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id
+                    {extra_columns}
+                 ) VALUES ($1, $2, '{{}}'::jsonb, NOW(), $3, $4 {extra_values})"
+            ))
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(format!("creator-{status}"))
+            .bind(format!("bundle-{status}"))
+            .execute(database.pool())
+            .await;
+
+            assert!(result.is_err(), "incomplete {status} tuple was accepted");
+        }
 
         database.cleanup().await;
     }

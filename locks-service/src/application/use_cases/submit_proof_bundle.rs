@@ -83,6 +83,8 @@ impl<'a> SubmitProofBundleUseCase<'a> {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         };
 
         match self.tasks.insert_verification_task(task.clone()).await {
@@ -126,6 +128,7 @@ mod tests {
     use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 
     use super::*;
+    use crate::application::models::VerificationTerminalReason;
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
@@ -196,6 +199,52 @@ mod tests {
         assert_eq!(task_ids.generate_count(), 0);
         assert_eq!(tasks.insert_count(), 0);
         assert_eq!(tasks.update_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_attempt_requires_fresh_bundle_id_to_create_new_lifecycle() {
+        let existing = verification_task_with_bundle(submitted_proof_bundle())
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                datetime!(2026-05-29 12:02:00 UTC),
+            )
+            .unwrap();
+        let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+        let tasks = CapturingTaskRepository::with_existing(existing);
+        let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+        let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+
+        let same_attempt = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: submitted_proof_bundle(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(same_attempt.status, VerificationTaskStatus::Expired);
+        assert_eq!(task_ids.generate_count(), 0);
+        assert_eq!(tasks.insert_count(), 0);
+
+        let fresh_bundle_id = BundleId::from_bytes([1; 16]);
+        let mut fresh_submission = submitted_proof_bundle();
+        fresh_submission.bundle_id = fresh_bundle_id.clone();
+
+        let result = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: fresh_submission,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.bundle_id, fresh_bundle_id);
+        assert_eq!(result.status, VerificationTaskStatus::Pending);
+        assert_eq!(task_ids.generate_count(), 1);
+        assert_eq!(tasks.insert_count(), 1);
     }
 
     #[tokio::test]
@@ -308,6 +357,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 

@@ -18,19 +18,21 @@ import {
 import { resolveCreatorStaticPath } from './lib/creator-static-path.mjs';
 import { publishCreatorProfile } from './publish-creator-profile.mjs';
 import {
-  parsePaykitReleaseRevision,
   readBoundedResponseText,
   validatePaykitSetupStatusSources,
 } from './check-paykit-setup-contract.mjs';
+import {
+  DEFAULT_PAYKIT_SERVER_CONTEXT,
+  PAYKIT_SERVER_REVISION,
+} from './lib/paykit-server-source.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-const paykitReleaseRevision = '31c77c99bf73fe6e377c842b582632a832950022';
+assert.match(PAYKIT_SERVER_REVISION, /^[0-9a-f]{40}$/);
 assert.equal(
-  parsePaykitReleaseRevision(`${paykitReleaseRevision}\trefs/tags/v0.1.0-rc5\n`),
-  paykitReleaseRevision,
+  DEFAULT_PAYKIT_SERVER_CONTEXT,
+  `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REVISION}`,
 );
-assert.throws(() => parsePaykitReleaseRevision('not-a-revision\n'), /release revision/);
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
   connectionStatusSource: '.route("/connections/status", post(status))',
@@ -347,6 +349,7 @@ const bitcoinBootstrap = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap
 const resetScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/reset-paykit-demo.mjs'), 'utf8');
 const validateScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/validate-paykit-compose.mjs'), 'utf8');
 const accountScript = await readFile(join(repoRoot, 'examples/js-sdk/scripts/generate-paykit-account-tpub.mjs'), 'utf8');
+const paykitServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/lib/paykit-server-source.mjs'), 'utf8');
 const packageJson = JSON.parse(await readFile(join(repoRoot, 'examples/js-sdk/package.json'), 'utf8'));
 const bootstrapMode = (await stat(join(repoRoot, 'docker/bitcoin-bootstrap.sh'))).mode;
 assert.notEqual(bootstrapMode & 0o111, 0, 'Bitcoin bootstrap script must be executable');
@@ -385,9 +388,9 @@ for (const required of [
   'node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4',
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
-  'https://github.com/pubky/paykit-server.git#v0.1.0-rc5',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc48:paykit-sdk',
+  DEFAULT_PAYKIT_SERVER_CONTEXT,
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc56:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc56:paykit-sdk',
   'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
@@ -421,6 +424,11 @@ for (const required of [
 ]) {
   assert.ok(compose.includes(required), `Compose missing ${required}`);
 }
+assert.doesNotMatch(
+  paykitServerSource,
+  /[0-9a-f]{40}/,
+  'Paykit Server source helper must derive the revision from Compose instead of duplicating it',
+);
 assert.ok(!compose.includes('env_file:'), 'Compose must bootstrap before loading generated environments');
 assert.ok(!compose.includes('chown -R 1000:1000 .local\n'), 'bootstrap must not rewrite ownership of the complete local state tree');
 assert.equal(
@@ -531,8 +539,8 @@ assert.equal(
   'node scripts/check-paykit-setup-contract.mjs',
 );
 assert.ok(
-  validateScript.includes("PAYKIT_SERVER_REF = 'v0.1.0-rc5'"),
-  'Compose validation must enforce the Paykit Server release ref',
+  validateScript.includes('DEFAULT_PAYKIT_SERVER_CONTEXT'),
+  'Compose validation must enforce the centralized Paykit Server source',
 );
 assert.ok(
   validateScript.includes("additional_contexts?.locks\n    !== repoRoot"),

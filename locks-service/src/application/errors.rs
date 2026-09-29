@@ -33,6 +33,12 @@ pub enum ApplicationError {
     /// Criterion verifier is not terminal yet and should be retried later.
     #[error("verification pending")]
     VerificationPending,
+    /// Paykit reported a durable payment-status identity conflict requiring operator attention.
+    #[error("paykit payment status conflict")]
+    PaykitPaymentStatusConflict,
+    /// Paykit returned a malformed or unsupported payment-status response.
+    #[error("invalid paykit payment status response")]
+    PaykitPaymentStatusInvalidResponse,
     /// Submitted payment proof does not match its canonical content lock criterion.
     #[error("invalid paykit payment submission")]
     InvalidPaykitPaymentSubmission,

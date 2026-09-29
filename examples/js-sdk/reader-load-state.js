@@ -17,3 +17,13 @@ export function describeReaderLoadState({ loadingLock, loaded, resource, loadErr
   if (resource) return { message: 'Ready to load content lock.', className: 'muted' };
   return { message: 'Paste a content lock resource.', className: 'muted' };
 }
+
+export function paymentLifecycleTerminalError(lifecycle) {
+  const status = lifecycle?.status;
+  if (status !== 'failed' && status !== 'expired') return null;
+
+  const terminalReason = lifecycle?.terminal_reason;
+  return terminalReason
+    ? `payment verification ended with status ${status}: ${terminalReason}; retry with a new Bundle ID`
+    : `payment verification ended with status ${status}`;
+}

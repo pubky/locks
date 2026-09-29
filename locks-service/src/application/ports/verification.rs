@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use locks_core::lock_policy::VerifierType;
-use locks_core::verification::CriterionVerificationResult;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    ClaimedVerificationTask, CriterionVerificationRequest, VerificationTaskRecord,
+    ClaimedVerificationTask, CriterionVerificationOutcome, CriterionVerificationRequest,
+    VerificationTaskRecord,
 };
 
 /// Repository for asynchronous verification task state.
@@ -108,11 +108,11 @@ pub trait VerificationTaskIdGenerator: Send + Sync {
 /// Adapter boundary for criterion-specific verification logic.
 #[async_trait]
 pub trait CriterionVerifier: Send + Sync {
-    /// Verifies one criterion/proof pair and returns minimal criterion-level evidence.
+    /// Verifies one criterion/proof pair and returns a closed lifecycle decision.
     async fn verify(
         &self,
         request: CriterionVerificationRequest,
-    ) -> Result<CriterionVerificationResult, ApplicationError>;
+    ) -> Result<CriterionVerificationOutcome, ApplicationError>;
 }
 
 /// Registry that dispatches protocol verifier types to concrete verifier adapters.

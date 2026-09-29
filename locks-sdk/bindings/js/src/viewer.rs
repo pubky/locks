@@ -808,10 +808,24 @@ mod tests {
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": "2026-06-01T12:00:01Z",
             "completed_at": "2026-06-01T12:00:02Z",
-            "failure_message": null
+            "failure_message": null,
+            "terminal_reason": null
         }))
         .unwrap();
         assert_eq!(lifecycle["status"], "completed");
+
+        let expired = validate_lifecycle_response_for_tests(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "expired",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "terminal_reason": "payment_deadline_expired"
+        }))
+        .unwrap();
+        assert_eq!(expired["terminal_reason"], "payment_deadline_expired");
 
         let credential = validate_access_credential_response_for_tests(json!({
             "credential": "raw-access-credential",
@@ -830,7 +844,8 @@ mod tests {
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
             "completed_at": null,
-            "failure_message": null
+            "failure_message": null,
+            "terminal_reason": null
         });
         assert_eq!(
             validate_submit_proof_bundle_response_for_tests(response.clone()).unwrap(),

@@ -264,7 +264,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Submitted Proof Bundle, Paykit Payment Verifier, Content Viewer
 
 ### Paykit Server
-- **Definition**: Standalone payment service configured under Lock Server `[paykit]`; Locks calls `POST /invoices` and `POST /transactions/status` with Lock-Server-signed requests.
+- **Definition**: Standalone payment service configured under Lock Server `[paykit]`; Locks calls `POST /invoices`, `POST /payment-requests/status`, and `POST /connections/status` with Lock-Server-signed requests.
 - **NOT**: Lock Server private runtime state, Locks-owned access decision logic, or creator-owned Pubky data.
 - **Synonyms to AVOID**: payment backend, wallet server, invoice server
 - **Related terms**: Paykit Payment Verifier, Lock Server, Reader Public Key

@@ -2139,8 +2139,8 @@ dependencies = [
 
 [[package]]
 name = "paykit-lib"
-version = "0.1.0-rc48"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc48#9b56a0eacd6874137370fa79ec0f40b809140809"
+version = "0.1.0-rc56"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc56#24162ebbcc703251d8038f2e176d1f4cfb117c6a"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2148,6 +2148,7 @@ dependencies = [
  "chrono",
  "pubky",
  "pubky-noise",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -2428,9 +2429,9 @@ dependencies = [
 
 [[package]]
 name = "pubky-noise"
-version = "0.1.0-rc7"
+version = "0.1.0-rc8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a0fcffa2792342caf099107604fe1bd4c99a5f92fd3584306b678cc0ad744da"
+checksum = "d506939a2d151814267bc94a1e70f6406d98bda0322da33a014a249edd307eea"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
@@ -3544,7 +3545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

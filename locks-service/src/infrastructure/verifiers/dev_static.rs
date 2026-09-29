@@ -4,7 +4,7 @@ use locks_core::lock_policy::VerifierType;
 use locks_core::verification::CriterionVerificationResult;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::CriterionVerificationRequest;
+use crate::application::models::{CriterionVerificationOutcome, CriterionVerificationRequest};
 use crate::application::ports::CriterionVerifier;
 
 /// Development-only verifier controlled by `criterion.params.satisfied`.
@@ -16,7 +16,7 @@ impl CriterionVerifier for DevStaticVerifier {
     async fn verify(
         &self,
         request: CriterionVerificationRequest,
-    ) -> Result<CriterionVerificationResult, ApplicationError> {
+    ) -> Result<CriterionVerificationOutcome, ApplicationError> {
         let satisfied = request
             .criterion
             .params
@@ -26,13 +26,15 @@ impl CriterionVerifier for DevStaticVerifier {
                 message: "dev-static criterion params.satisfied must be a boolean".to_owned(),
             })?;
 
-        Ok(CriterionVerificationResult {
-            criterion_id: request.criterion.criterion_id,
-            satisfied,
-            verified_at: request.verified_at,
-            verified_by: request.verified_by,
-            verifier_type: VerifierType::DevStatic,
-        })
+        Ok(CriterionVerificationOutcome::Satisfied(
+            CriterionVerificationResult {
+                criterion_id: request.criterion.criterion_id,
+                satisfied,
+                verified_at: request.verified_at,
+                verified_by: request.verified_by,
+                verifier_type: VerifierType::DevStatic,
+            },
+        ))
     }
 }
 
@@ -49,17 +51,20 @@ mod tests {
 
     use super::DevStaticVerifier;
     use crate::application::errors::ApplicationError;
-    use crate::application::models::CriterionVerificationRequest;
+    use crate::application::models::{CriterionVerificationOutcome, CriterionVerificationRequest};
     use crate::application::ports::CriterionVerifier;
 
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
     #[tokio::test]
     async fn dev_static_returns_satisfied_result_when_param_is_true() {
-        let result = DevStaticVerifier
+        let CriterionVerificationOutcome::Satisfied(result) = DevStaticVerifier
             .verify(request(json!({ "satisfied": true })))
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("dev-static should return criterion evidence");
+        };
 
         assert_eq!(result.criterion_id, "criterion-1");
         assert!(result.satisfied);
@@ -70,10 +75,13 @@ mod tests {
 
     #[tokio::test]
     async fn dev_static_returns_unsatisfied_result_when_param_is_false() {
-        let result = DevStaticVerifier
+        let CriterionVerificationOutcome::Satisfied(result) = DevStaticVerifier
             .verify(request(json!({ "satisfied": false })))
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("dev-static should return criterion evidence");
+        };
 
         assert_eq!(result.criterion_id, "criterion-1");
         assert!(!result.satisfied);

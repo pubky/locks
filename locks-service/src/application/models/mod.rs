@@ -17,9 +17,13 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
 
-    use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
+        SubmittedProofBundle, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
+        VerifiedProofBundle,
+    };
 
     use super::{
         AccessCredential, AccessCredentialLookupKey, AccessCredentialPolicy,
@@ -27,7 +31,7 @@ mod tests {
         CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
         DEFAULT_ACCESS_CREDENTIAL_TTL_SECONDS, FrontendSessionCode, FrontendSessionCodeRecord,
         FrontendSessionRecord, FrontendSessionToken, PendingCreatorConnectFlowRecord,
-        VerificationTaskRecord, VerificationTaskStatus,
+        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::errors::ApplicationError;
 
@@ -251,18 +255,30 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_task_transitions_to_completed_and_sets_completed_at() {
+    fn entitlement_publication_intent_precedes_completion_and_preserves_exact_payload() {
         let task = in_progress_task();
         let completed_at = datetime!(2026-05-29 12:03:00 UTC);
+        let entitlement = entitlement();
 
-        let transitioned = task
-            .transition_to(VerificationTaskStatus::Completed, completed_at, None)
+        let publishing = task
+            .begin_entitlement_publication(entitlement.clone())
+            .unwrap();
+        assert_eq!(
+            publishing.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(publishing.entitlement_to_publish, Some(entitlement));
+        assert_eq!(publishing.completed_at, None);
+
+        let transitioned = publishing
+            .complete_entitlement_publication(completed_at)
             .unwrap();
 
         assert_eq!(transitioned.status, VerificationTaskStatus::Completed);
         assert_eq!(transitioned.started_at, task.started_at);
         assert_eq!(transitioned.completed_at, Some(completed_at));
         assert_eq!(transitioned.failure_message, None);
+        assert!(transitioned.entitlement_to_publish.is_some());
     }
 
     #[test]
@@ -287,25 +303,23 @@ mod tests {
     }
 
     #[test]
-    fn pending_or_in_progress_task_can_expire_without_failure_message() {
+    fn in_progress_task_expires_with_typed_reason_without_failure_message() {
         let expired_at = datetime!(2026-05-29 12:04:00 UTC);
-
-        let from_pending = pending_task()
-            .transition_to(VerificationTaskStatus::Expired, expired_at, None)
-            .unwrap();
         let from_in_progress = in_progress_task()
-            .transition_to(VerificationTaskStatus::Expired, expired_at, None)
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                expired_at,
+            )
             .unwrap();
-
-        assert_eq!(from_pending.status, VerificationTaskStatus::Expired);
-        assert_eq!(from_pending.started_at, None);
-        assert_eq!(from_pending.completed_at, Some(expired_at));
-        assert_eq!(from_pending.failure_message, None);
 
         assert_eq!(from_in_progress.status, VerificationTaskStatus::Expired);
         assert!(from_in_progress.started_at.is_some());
         assert_eq!(from_in_progress.completed_at, Some(expired_at));
         assert_eq!(from_in_progress.failure_message, None);
+        assert_eq!(
+            from_in_progress.terminal_reason,
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        );
     }
 
     #[test]
@@ -349,7 +363,9 @@ mod tests {
 
     #[test]
     fn non_failed_transitions_reject_failure_message() {
-        let task = in_progress_task();
+        let task = in_progress_task()
+            .begin_entitlement_publication(entitlement())
+            .unwrap();
 
         let error = task
             .transition_to(
@@ -397,6 +413,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 
@@ -413,6 +431,7 @@ mod tests {
             status: VerificationTaskStatus::Completed,
             started_at: Some(datetime!(2026-05-29 12:01:00 UTC)),
             completed_at: Some(datetime!(2026-05-29 12:03:00 UTC)),
+            entitlement_to_publish: Some(entitlement()),
             ..pending_task()
         }
     }
@@ -431,6 +450,28 @@ mod tests {
                 verifier_type: VerifierType::DevStatic,
                 payload: json!({}),
             }],
+        }
+    }
+
+    fn entitlement() -> VerifiedProofBundle {
+        let submitted = submitted_proof_bundle();
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: submitted.bundle_id,
+            pubky_lock_resource: submitted.pubky_lock_resource,
+            verification_result: VerificationResult {
+                criteria: vec![CriterionVerificationResult {
+                    criterion_id: "criterion-1".to_owned(),
+                    satisfied: true,
+                    verified_at: datetime!(2026-05-29 12:02:00 UTC),
+                    verified_by: LockServerPubky::from_str(
+                        "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                    )
+                    .unwrap(),
+                    verifier_type: VerifierType::DevStatic,
+                }],
+            },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
         }
     }
 }
