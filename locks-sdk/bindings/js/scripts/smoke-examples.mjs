@@ -11,6 +11,7 @@ const examplesDir = join(repoRoot, 'examples', 'js-sdk');
 const files = {
   rootReadme: join(repoRoot, 'README.md'),
   localOperatorDemo: join(repoRoot, 'docs', 'LOCAL_OPERATOR_DEMO.md'),
+  paykitViewerDocs: join(repoRoot, 'docs', 'SDK_PAYKIT_VIEWER.md'),
   readme: join(examplesDir, 'README.md'),
   packageJson: join(examplesDir, 'package.json'),
   app: join(examplesDir, 'app.js'),
@@ -26,6 +27,7 @@ const files = {
   readerApp: join(examplesDir, 'reader-app.js'),
   readerLoadState: join(examplesDir, 'reader-load-state.js'),
   readerFlow: join(examplesDir, 'reader-flow.js'),
+  paykitViewerFlow: join(examplesDir, 'paykit-viewer-flow.js'),
   readerPersistence: join(examplesDir, 'reader-persistence.js'),
   readerStagingPaykit: join(examplesDir, 'reader-staging-paykit.js'),
   initConfig: join(examplesDir, 'scripts', 'init-config.mjs'),
@@ -129,6 +131,21 @@ const required = {
     'Reader Pubky matches the current `content-viewer` identity',
     'top-level `reader_public_key`',
     'minimum_confirmations = 0',
+    'paykit-viewer-flow.js',
+    'SDK_PAYKIT_VIEWER.md',
+  ],
+  paykitViewerDocs: [
+    'adds no new `locks-sdk` or JS/WASM export',
+    '`pending`, `in_progress`',
+    '`failed`, `expired`',
+    '`none`',
+    '`handshake`',
+    '`connected`',
+    '`recovery_required`',
+    '`blocked`',
+    'must not delay or stop authoritative lifecycle polling',
+    'Authorization: Bearer <credential>',
+    'locks-sdk/tests/paykit_viewer_flow.rs',
   ],
   packageJson: [
     '"@synonymdev/pubky"',
@@ -340,6 +357,20 @@ const required = {
     'viewer.proxyReadGuardedResourceResponse(accessCredential, path)',
     'response.headers.get',
     'response.arrayBuffer()',
+  ],
+  paykitViewerFlow: [
+    "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
+    'Locks.forContentLockWithOptions',
+    'Locks.readContentLockWithOptions',
+    'BundleId.generate().toString()',
+    'new VerificationTaskHandleOptions(creator, bundleId)',
+    'viewer.submitProofBundle',
+    'viewer.lookupPaykitConnectionState',
+    'viewer.lookupVerificationTask',
+    'viewer.issueAccessCredential',
+    'viewer.proxyReadGuardedResourceResponse',
+    "status === 'pending' || status === 'in_progress'",
+    "status === 'failed' || status === 'expired'",
   ],
   readerStagingPaykit: ['validateExternalReaderPubky', 'checkExternalReaderPaykitData', 'distinct Bitkit identities', "state: 'present'", "state: 'absent'", "state: 'unavailable'"],
   readerPersistence: ['buildPersistedReaderState', 'restorePersistedReaderState', "'resource'", "'loaded'"],
@@ -1094,6 +1125,7 @@ const {
   selectCurrentPaykitPaymentRequest,
   workflowHandleMatches,
 } = await import(pathToFileURL(files.readerFlow).href);
+const { runPaykitViewerFlow } = await import(pathToFileURL(files.paykitViewerFlow).href);
 const paymentResource = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json';
 const paymentBundleId = '000G40R40M30E209185GR38E1W';
 const readerPublicKey = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
@@ -1119,6 +1151,114 @@ assert.equal(classifyPaymentLifecycle({ status: 'completed' }), 'completed');
 assert.equal(classifyPaymentLifecycle({ status: 'failed' }), 'failed');
 assert.equal(classifyPaymentLifecycle({ status: 'expired' }), 'failed');
 assert.throws(() => classifyPaymentLifecycle({ status: 'unknown' }), /unknown lifecycle status/);
+
+const documentedLifecycle = [
+  { status: 'in_progress' },
+  { status: 'pending' },
+  { status: 'in_progress' },
+  { status: 'pending' },
+  { status: 'completed' },
+];
+const documentedConnectionStates = ['none', 'handshake', 'connected', 'recovery_required', 'blocked'];
+const observedConnectionStates = [];
+const viewerCalls = [];
+const documentedViewer = {
+  submitProofBundle: async (proof) => {
+    viewerCalls.push(['submit', proof]);
+    return { status: 'pending' };
+  },
+  lookupVerificationTask: async (handle) => {
+    viewerCalls.push(['lookup', handle]);
+    return documentedLifecycle.shift();
+  },
+  lookupPaykitConnectionState: async (handle) => {
+    viewerCalls.push(['connection', handle]);
+    return { state: documentedConnectionStates.shift() };
+  },
+  issueAccessCredential: async (handle) => {
+    viewerCalls.push(['issue', handle]);
+    return { credential: 'secret-access-credential', expires_at: '2026-09-29T12:15:00Z' };
+  },
+  proxyReadGuardedResourceResponse: async (credential, path) => {
+    viewerCalls.push(['read', credential, path]);
+    return new Response('unlocked', { headers: { 'content-type': 'text/plain' } });
+  },
+};
+const documentedHandle = { creator: creatorPubky, bundleId: paymentBundleId };
+const documentedProof = buildPaykitPaymentProofBundle({
+  resource: paymentResource,
+  readerPublicKey,
+  criterionId: 'payment-criterion',
+  bundleId: paymentBundleId,
+});
+const documentedResult = await runPaykitViewerFlow({
+  viewer: documentedViewer,
+  handle: documentedHandle,
+  submittedProofBundle: documentedProof,
+  guardedPath: 'primary.txt',
+  wait: () => new Promise((resolve) => setImmediate(resolve)),
+  onConnectionState: (state) => observedConnectionStates.push(state),
+});
+await Promise.resolve();
+assert.deepEqual(observedConnectionStates, ['none', 'handshake', 'connected', 'recovery_required', 'blocked']);
+assert.equal(documentedResult.lifecycle.status, 'completed');
+assert.equal(documentedResult.credentialExpiresAt, '2026-09-29T12:15:00Z');
+assert.equal(await documentedResult.response.text(), 'unlocked');
+assert.deepEqual(viewerCalls.at(0), ['submit', documentedProof]);
+assert.deepEqual(viewerCalls.at(-2), ['issue', documentedHandle]);
+assert.deepEqual(viewerCalls.at(-1), ['read', 'secret-access-credential', 'primary.txt']);
+assert.equal(JSON.stringify(viewerCalls.slice(0, -1)).includes('secret-access-credential'), false);
+
+for (const status of ['failed', 'expired', 'future']) {
+  await assert.rejects(
+    runPaykitViewerFlow({
+      viewer: {
+        submitProofBundle: async () => ({ status }),
+        lookupPaykitConnectionState: async () => ({ state: 'none' }),
+      },
+      handle: documentedHandle,
+      submittedProofBundle: documentedProof,
+      guardedPath: 'primary.txt',
+    }),
+    status === 'future' ? /unknown verification status/ : new RegExp(`verification ${status}`),
+  );
+}
+
+let observedConnectionError;
+const connectionFailureResult = await runPaykitViewerFlow({
+  viewer: {
+    submitProofBundle: async () => ({ status: 'pending' }),
+    lookupVerificationTask: async () => ({ status: 'completed' }),
+    lookupPaykitConnectionState: async () => { throw new Error('connection lookup unavailable'); },
+    issueAccessCredential: async () => ({
+      credential: 'secret-access-credential',
+      expires_at: '2026-09-29T12:15:00Z',
+    }),
+    proxyReadGuardedResourceResponse: async () => new Response('unlocked'),
+  },
+  handle: documentedHandle,
+  submittedProofBundle: documentedProof,
+  guardedPath: 'primary.txt',
+  wait: () => new Promise((resolve) => setImmediate(resolve)),
+  onConnectionError: (error) => { observedConnectionError = error.message; },
+});
+await Promise.resolve();
+assert.equal(connectionFailureResult.lifecycle.status, 'completed');
+assert.equal(observedConnectionError, 'connection lookup unavailable');
+
+await assert.rejects(
+  runPaykitViewerFlow({
+    viewer: {
+      submitProofBundle: async () => ({ status: 'pending' }),
+      lookupPaykitConnectionState: async () => ({ state: 'none' }),
+    },
+    handle: documentedHandle,
+    submittedProofBundle: documentedProof,
+    guardedPath: 'primary.txt',
+    maxPollAttempts: 0,
+  }),
+  /polling exhausted/,
+);
 const workflowHandle = { incarnation: 7, resource: paymentResource, creator: creatorPubky, bundleId: paymentBundleId };
 const currentWorkflow = { ...workflowHandle };
 assert.equal(workflowHandleMatches(workflowHandle, currentWorkflow), true);
