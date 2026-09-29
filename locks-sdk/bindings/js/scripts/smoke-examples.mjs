@@ -135,16 +135,27 @@ const required = {
     'SDK_PAYKIT_VIEWER.md',
   ],
   paykitViewerDocs: [
-    'adds no new `locks-sdk` or JS/WASM export',
-    '`pending`, `in_progress`',
-    '`failed`, `expired`',
+    'public Rust `VerificationTerminalReason` enum',
+    'no new JS class export',
+    '`VerificationTaskLifecycleResponse.terminal_reason`',
+    '`VerificationTerminalReason`',
+    '`payment_request_rejected`',
+    '`payment_request_canceled`',
+    '`proposal_expired`',
+    '`payment_deadline_expired`',
+    'fresh Bundle ID and payment request',
+    'Migration note',
+    '| `pending` |',
+    '| `in_progress` |',
+    '| `failed` |',
+    '| `expired` |',
     '`none`',
     '`handshake`',
     '`connected`',
     '`recovery_required`',
     '`blocked`',
     'must not delay or stop authoritative lifecycle polling',
-    'Authorization: Bearer <credential>',
+    '`Authorization` bearer header',
     'locks-sdk/tests/paykit_viewer_flow.rs',
   ],
   packageJson: [
@@ -370,7 +381,13 @@ const required = {
     'viewer.issueAccessCredential',
     'viewer.proxyReadGuardedResourceResponse',
     "status === 'pending' || status === 'in_progress'",
-    "status === 'failed' || status === 'expired'",
+    "status === 'failed'",
+    "status === 'expired'",
+    'payment_request_rejected',
+    'payment_request_canceled',
+    'proposal_expired',
+    'payment_deadline_expired',
+    'fresh Bundle ID and payment request',
   ],
   readerStagingPaykit: ['validateExternalReaderPubky', 'checkExternalReaderPaykitData', 'distinct Bitkit identities', "state: 'present'", "state: 'absent'", "state: 'unavailable'"],
   readerPersistence: ['buildPersistedReaderState', 'restorePersistedReaderState', "'resource'", "'loaded'"],
@@ -1152,12 +1169,23 @@ assert.equal(classifyPaymentLifecycle({ status: 'failed' }), 'failed');
 assert.equal(classifyPaymentLifecycle({ status: 'expired' }), 'failed');
 assert.throws(() => classifyPaymentLifecycle({ status: 'unknown' }), /unknown lifecycle status/);
 
+const lifecycleResponse = (status, overrides = {}) => {
+  const terminal = ['completed', 'failed', 'expired'].includes(status);
+  return {
+    status,
+    started_at: status === 'pending' ? null : '2026-09-29T12:00:01Z',
+    completed_at: terminal ? '2026-09-29T12:00:02Z' : null,
+    failure_message: status === 'failed' ? 'verification failed' : null,
+    terminal_reason: status === 'expired' ? 'payment_request_rejected' : null,
+    ...overrides,
+  };
+};
 const documentedLifecycle = [
-  { status: 'in_progress' },
-  { status: 'pending' },
-  { status: 'in_progress' },
-  { status: 'pending' },
-  { status: 'completed' },
+  lifecycleResponse('in_progress'),
+  lifecycleResponse('pending'),
+  lifecycleResponse('in_progress'),
+  lifecycleResponse('pending'),
+  lifecycleResponse('completed'),
 ];
 const documentedConnectionStates = ['none', 'handshake', 'connected', 'recovery_required', 'blocked'];
 const observedConnectionStates = [];
@@ -1165,7 +1193,7 @@ const viewerCalls = [];
 const documentedViewer = {
   submitProofBundle: async (proof) => {
     viewerCalls.push(['submit', proof]);
-    return { status: 'pending' };
+    return lifecycleResponse('pending');
   },
   lookupVerificationTask: async (handle) => {
     viewerCalls.push(['lookup', handle]);
@@ -1202,6 +1230,8 @@ const documentedResult = await runPaykitViewerFlow({
 await Promise.resolve();
 assert.deepEqual(observedConnectionStates, ['none', 'handshake', 'connected', 'recovery_required', 'blocked']);
 assert.equal(documentedResult.lifecycle.status, 'completed');
+assert.equal(Object.hasOwn(documentedResult.lifecycle, 'credential'), false);
+assert.equal(Object.hasOwn(documentedResult.lifecycle, 'task_id'), false);
 assert.equal(documentedResult.credentialExpiresAt, '2026-09-29T12:15:00Z');
 assert.equal(await documentedResult.response.text(), 'unlocked');
 assert.deepEqual(viewerCalls.at(0), ['submit', documentedProof]);
@@ -1209,26 +1239,79 @@ assert.deepEqual(viewerCalls.at(-2), ['issue', documentedHandle]);
 assert.deepEqual(viewerCalls.at(-1), ['read', 'secret-access-credential', 'primary.txt']);
 assert.equal(JSON.stringify(viewerCalls.slice(0, -1)).includes('secret-access-credential'), false);
 
-for (const status of ['failed', 'expired', 'future']) {
+for (const terminalReason of [
+  'payment_request_rejected',
+  'payment_request_canceled',
+  'proposal_expired',
+  'payment_deadline_expired',
+]) {
+  const rejectionCalls = [];
+  const rejectionConnectionCalls = [];
   await assert.rejects(
     runPaykitViewerFlow({
       viewer: {
-        submitProofBundle: async () => ({ status }),
-        lookupPaykitConnectionState: async () => ({ state: 'none' }),
+        submitProofBundle: async () => {
+          rejectionCalls.push('submit');
+          return lifecycleResponse('pending');
+        },
+        lookupVerificationTask: async () => {
+          rejectionCalls.push('lookup');
+          return lifecycleResponse('expired', { terminal_reason: terminalReason });
+        },
+        lookupPaykitConnectionState: async () => {
+          rejectionConnectionCalls.push('connection');
+          return { state: 'none' };
+        },
+        issueAccessCredential: async () => { rejectionCalls.push('issue'); },
+        proxyReadGuardedResourceResponse: async () => { rejectionCalls.push('read'); },
+      },
+      handle: documentedHandle,
+      submittedProofBundle: documentedProof,
+      guardedPath: 'primary.txt',
+      wait: () => Promise.resolve(),
+    }),
+    new RegExp(`${terminalReason}.*fresh Bundle ID.*payment request`),
+  );
+  assert.deepEqual(rejectionCalls, ['submit', 'lookup']);
+  assert.deepEqual(rejectionConnectionCalls, ['connection']);
+}
+
+await assert.rejects(
+  runPaykitViewerFlow({
+    viewer: {
+      submitProofBundle: async () => lifecycleResponse('failed'),
+    },
+    handle: documentedHandle,
+    submittedProofBundle: documentedProof,
+    guardedPath: 'primary.txt',
+  }),
+  /verification failed.*fresh Bundle ID.*payment request/,
+);
+
+for (const invalidLifecycle of [
+  lifecycleResponse('expired', { terminal_reason: null }),
+  lifecycleResponse('failed', { terminal_reason: 'payment_request_rejected' }),
+  lifecycleResponse('expired', { terminal_reason: 'future_reason' }),
+  lifecycleResponse('future'),
+]) {
+  await assert.rejects(
+    runPaykitViewerFlow({
+      viewer: {
+        submitProofBundle: async () => invalidLifecycle,
       },
       handle: documentedHandle,
       submittedProofBundle: documentedProof,
       guardedPath: 'primary.txt',
     }),
-    status === 'future' ? /unknown verification status/ : new RegExp(`verification ${status}`),
+    /invalid verification lifecycle response|unknown verification status/,
   );
 }
 
 let observedConnectionError;
 const connectionFailureResult = await runPaykitViewerFlow({
   viewer: {
-    submitProofBundle: async () => ({ status: 'pending' }),
-    lookupVerificationTask: async () => ({ status: 'completed' }),
+    submitProofBundle: async () => lifecycleResponse('pending'),
+    lookupVerificationTask: async () => lifecycleResponse('completed'),
     lookupPaykitConnectionState: async () => { throw new Error('connection lookup unavailable'); },
     issueAccessCredential: async () => ({
       credential: 'secret-access-credential',
@@ -1249,7 +1332,7 @@ assert.equal(observedConnectionError, 'connection lookup unavailable');
 await assert.rejects(
   runPaykitViewerFlow({
     viewer: {
-      submitProofBundle: async () => ({ status: 'pending' }),
+      submitProofBundle: async () => lifecycleResponse('pending'),
       lookupPaykitConnectionState: async () => ({ state: 'none' }),
     },
     handle: documentedHandle,

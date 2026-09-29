@@ -5,7 +5,8 @@ use locks_core::{
     verification::SubmittedProofBundle,
 };
 use locks_sdk::{
-    PaykitConnectionState, VerificationTaskHandleRequest, VerificationTaskStatus, ViewerLocks,
+    PaykitConnectionState, VerificationTaskHandleRequest, VerificationTaskStatus,
+    VerificationTerminalReason, ViewerLocks,
 };
 use serde_json::{Value, json};
 
@@ -110,6 +111,104 @@ fn public_api_parses_every_documented_lifecycle_and_connection_state() {
 }
 
 #[test]
+fn public_api_parses_every_terminal_reason_and_valid_terminal_tuple() {
+    for (wire, expected) in [
+        (
+            "payment_request_rejected",
+            VerificationTerminalReason::PaymentRequestRejected,
+        ),
+        (
+            "payment_request_canceled",
+            VerificationTerminalReason::PaymentRequestCanceled,
+        ),
+        (
+            "proposal_expired",
+            VerificationTerminalReason::ProposalExpired,
+        ),
+        (
+            "payment_deadline_expired",
+            VerificationTerminalReason::PaymentDeadlineExpired,
+        ),
+    ] {
+        let response = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "expired",
+            "submitted_at": "2026-09-29T12:00:00Z",
+            "started_at": "2026-09-29T12:00:01Z",
+            "completed_at": "2026-09-29T12:00:02Z",
+            "failure_message": null,
+            "terminal_reason": wire
+        }))
+        .unwrap();
+        assert_eq!(response.terminal_reason, Some(expected));
+    }
+
+    let completed = ViewerLocks::parse_lifecycle_response(lifecycle_json("completed")).unwrap();
+    assert_eq!(completed.status, VerificationTaskStatus::Completed);
+    assert!(completed.failure_message.is_none());
+    assert!(completed.terminal_reason.is_none());
+
+    let failed = ViewerLocks::parse_lifecycle_response(lifecycle_json("failed")).unwrap();
+    assert_eq!(failed.status, VerificationTaskStatus::Failed);
+    assert_eq!(
+        failed.failure_message.as_deref(),
+        Some("verification failed")
+    );
+    assert!(failed.terminal_reason.is_none());
+}
+
+#[test]
+fn public_api_rejects_invalid_terminal_tuples_and_private_fields() {
+    for invalid in [
+        json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "expired",
+            "submitted_at": "2026-09-29T12:00:00Z",
+            "started_at": "2026-09-29T12:00:01Z",
+            "completed_at": "2026-09-29T12:00:02Z",
+            "failure_message": null,
+            "terminal_reason": null
+        }),
+        json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "failed",
+            "submitted_at": "2026-09-29T12:00:00Z",
+            "started_at": "2026-09-29T12:00:01Z",
+            "completed_at": "2026-09-29T12:00:02Z",
+            "failure_message": "verification failed",
+            "terminal_reason": "payment_request_rejected"
+        }),
+        json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "expired",
+            "submitted_at": "2026-09-29T12:00:00Z",
+            "started_at": "2026-09-29T12:00:01Z",
+            "completed_at": "2026-09-29T12:00:02Z",
+            "failure_message": null,
+            "terminal_reason": "future_reason"
+        }),
+        json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-09-29T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "terminal_reason": null,
+            "task_id": "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
+            "credential": "secret-access-credential"
+        }),
+    ] {
+        assert!(ViewerLocks::parse_lifecycle_response(invalid).is_err());
+    }
+}
+
+#[test]
 fn public_api_places_access_credential_only_in_bearer_header() {
     let viewer = ViewerLocks::new();
     let issued = ViewerLocks::parse_access_credential_response(json!({
@@ -138,13 +237,42 @@ fn handle() -> VerificationTaskHandleRequest {
 }
 
 fn lifecycle_json(status: &str) -> Value {
+    let (started_at, completed_at, failure_message, terminal_reason) = match status {
+        "pending" => (Value::Null, Value::Null, Value::Null, Value::Null),
+        "in_progress" => (
+            json!("2026-09-29T12:00:01Z"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+        "completed" => (
+            json!("2026-09-29T12:00:01Z"),
+            json!("2026-09-29T12:00:02Z"),
+            Value::Null,
+            Value::Null,
+        ),
+        "failed" => (
+            json!("2026-09-29T12:00:01Z"),
+            json!("2026-09-29T12:00:02Z"),
+            json!("verification failed"),
+            Value::Null,
+        ),
+        "expired" => (
+            json!("2026-09-29T12:00:01Z"),
+            json!("2026-09-29T12:00:02Z"),
+            Value::Null,
+            json!("payment_request_rejected"),
+        ),
+        _ => (Value::Null, Value::Null, Value::Null, Value::Null),
+    };
     json!({
         "creator": CREATOR,
         "bundle_id": BUNDLE_ID,
         "status": status,
         "submitted_at": "2026-09-29T12:00:00Z",
-        "started_at": null,
-        "completed_at": null,
-        "failure_message": null
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "failure_message": failure_message,
+        "terminal_reason": terminal_reason
     })
 }

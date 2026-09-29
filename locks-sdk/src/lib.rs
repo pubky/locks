@@ -23,5 +23,6 @@ pub use session::LocksSession;
 pub use viewer::{
     AccessCredentialResponse, PaykitConnectionState, PaykitConnectionStateResponse,
     ReadLockedResourceRequest, SdkViewerRequest, VerificationTaskHandleRequest,
-    VerificationTaskLifecycleResponse, VerificationTaskStatus, ViewerLocks,
+    VerificationTaskLifecycleResponse, VerificationTaskStatus, VerificationTerminalReason,
+    ViewerLocks,
 };

@@ -1,6 +1,6 @@
 # Paykit-backed viewer flow
 
-Locks' signed Paykit lifecycle integration adds no new `locks-sdk` or JS/WASM export. SDK consumers compose existing public viewer calls; Lock Server owns invoice creation, payment observation, and verification.
+Locks' signed Paykit lifecycle integration adds `VerificationTaskLifecycleResponse.terminal_reason` and the public Rust `VerificationTerminalReason` enum. JS/WASM consumers receive the wire string on the existing lifecycle object; no new JS class export is needed. Lock Server owns invoice creation, payment observation, and verification.
 
 Runnable browser example: [`examples/js-sdk/paykit-viewer-flow.js`](../examples/js-sdk/paykit-viewer-flow.js). Its smoke test executes lifecycle handling with public generated-package method names and verifies credential placement.
 
@@ -81,18 +81,64 @@ Lifecycle response:
   "submitted_at": "2026-09-29T12:00:00Z",
   "started_at": null,
   "completed_at": null,
-  "failure_message": null
+  "failure_message": null,
+  "terminal_reason": null
 }
 ```
 
 Handle lifecycle states as closed vocabulary:
 
-| Status | Consumer action |
+| Status | Required fields | Consumer action |
+| --- | --- | --- |
+| `pending` | `started_at`, `completed_at`, `failure_message`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
+| `in_progress` | `started_at` is set; `completed_at`, `failure_message`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
+| `completed` | `started_at` and `completed_at` are set; `failure_message` and `terminal_reason` are `null` | Call `issueAccessCredential`, then proxy-read an authorized relative path. |
+| `failed` | `started_at` and `completed_at` are set; `failure_message` is non-empty; `terminal_reason` is `null` | Stop polling. Do not issue a credential. |
+| `expired` | `started_at` and `completed_at` are set; `failure_message` is `null`; `terminal_reason` is set | Stop polling. Do not issue a credential. |
+| anything else or any invalid tuple | Fail closed; client and server contract are incompatible. |
+
+`expired` identifies a normal terminal payment-request outcome, unlike `failed`, which carries a safe verification failure message. Its exact `terminal_reason` wire values are:
+
+| Wire value | Meaning |
 | --- | --- |
-| `pending`, `in_progress` | Wait, then call `lookupVerificationTask` again. |
-| `completed` | Call `issueAccessCredential`, then proxy-read an authorized relative path. |
-| `failed`, `expired` | Terminal failure. Do not issue a credential. |
-| anything else | Fail closed; client and server contract are incompatible. |
+| `payment_request_rejected` | Reader rejected payment request. |
+| `payment_request_canceled` | Payment request was canceled. |
+| `proposal_expired` | Payment proposal expired before acceptance. |
+| `payment_deadline_expired` | Accepted payment request reached its payment deadline. |
+
+All four outcomes are terminal: stop browser/Rust polling, issue no access credential, and grant no entitlement. To retry, submit a new attempt with a fresh Bundle ID and payment request; replaying same Bundle ID returns same terminal lifecycle.
+
+JS/WASM methods reject unknown statuses, unknown terminal reasons, extra private fields, and invalid tuples. Keep application handling closed too:
+
+```js
+function nextAction(lifecycle) {
+  switch (lifecycle.status) {
+    case 'pending':
+    case 'in_progress':
+      return 'poll';
+    case 'completed':
+      return 'issue-credential';
+    case 'failed':
+      throw new Error(`verification failed: ${lifecycle.failure_message}`);
+    case 'expired':
+      switch (lifecycle.terminal_reason) {
+        case 'payment_request_rejected':
+        case 'payment_request_canceled':
+        case 'proposal_expired':
+        case 'payment_deadline_expired':
+          throw new Error(
+            `${lifecycle.terminal_reason}; retry with a fresh Bundle ID and payment request`,
+          );
+        default:
+          throw new Error('invalid verification terminal reason');
+      }
+    default:
+      throw new Error('invalid verification lifecycle status');
+  }
+}
+```
+
+Migration note: lifecycle JSON now includes `terminal_reason` on every response (`null` unless status is `expired`). Consumers with exact object comparisons, JSON schemas, TypeScript interfaces, or destructuring assumptions for older payloads must accept this nullable field before deploying against this server version.
 
 Connection state is independent from verification lifecycle:
 
@@ -106,7 +152,7 @@ Connection state is independent from verification lifecycle:
 
 A timeout or error from `lookupPaykitConnectionState` must not delay or stop authoritative lifecycle polling. Never replay `submitProofBundle` merely to refresh connection state.
 
-Access credential is returned exactly once. Keep it out of URLs, JSON bodies, logs, and durable analytics. Pass it only to `proxyReadGuardedResource` or `proxyReadGuardedResourceResponse`; SDK places it in `Authorization: Bearer <credential>`.
+Access credential is returned exactly once. Keep it out of URLs, JSON bodies, logs, and durable analytics. Pass it only to `proxyReadGuardedResource` or `proxyReadGuardedResourceResponse`; SDK places it in the `Authorization` bearer header.
 
 ## Rust request planner
 
@@ -116,14 +162,15 @@ Rust `locks-sdk` builds canonical requests and parses closed responses. It does 
 use locks_core::verification::SubmittedProofBundle;
 use locks_sdk::{
     Result, SdkViewerRequest, VerificationTaskHandleRequest,
-    VerificationTaskStatus, ViewerLocks,
+    VerificationTaskStatus, VerificationTerminalReason, ViewerLocks,
 };
 use serde_json::Value;
 
 enum NextRequest {
     Poll(SdkViewerRequest),
     IssueCredential(SdkViewerRequest),
-    Terminal,
+    Failed(String),
+    Expired(VerificationTerminalReason),
 }
 
 fn plan_after_submit(
@@ -145,14 +192,28 @@ fn plan_after_submit(
         VerificationTaskStatus::Completed => {
             NextRequest::IssueCredential(viewer.issue_access_credential(handle))
         }
-        VerificationTaskStatus::Failed | VerificationTaskStatus::Expired => {
-            NextRequest::Terminal
+        VerificationTaskStatus::Failed => {
+            NextRequest::Failed(lifecycle.failure_message.expect("validated failed response"))
+        }
+        VerificationTaskStatus::Expired => {
+            NextRequest::Expired(
+                lifecycle.terminal_reason.expect("validated expired response"),
+            )
         }
     };
     Ok((submit_request, next))
 }
+
+fn expired_message(reason: VerificationTerminalReason) -> &'static str {
+    match reason {
+        VerificationTerminalReason::PaymentRequestRejected => "payment request rejected",
+        VerificationTerminalReason::PaymentRequestCanceled => "payment request canceled",
+        VerificationTerminalReason::ProposalExpired => "proposal expired",
+        VerificationTerminalReason::PaymentDeadlineExpired => "payment deadline expired",
+    }
+}
 ```
 
-Send returned request through caller transport. Parse each later lifecycle response with `parse_lifecycle_response`; parse credential response with `parse_access_credential_response`, then pass only its `credential` field to `proxy_read_guarded_resource`.
+Send returned request through caller transport. Parse each later lifecycle response with `parse_lifecycle_response`; it rejects unknown/invalid response shapes. Parse credential response with `parse_access_credential_response`, then pass only its `credential` field to `proxy_read_guarded_resource`. `Failed` and `Expired` are terminal and must not issue a credential; a retry needs a fresh Bundle ID and payment request.
 
 Compile-enforced public consumer contract: [`locks-sdk/tests/paykit_viewer_flow.rs`](../locks-sdk/tests/paykit_viewer_flow.rs). It verifies exact request bodies/routes, every lifecycle and connection state, invalid-state rejection, and bearer-only credential placement.
