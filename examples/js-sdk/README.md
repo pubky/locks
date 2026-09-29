@@ -14,6 +14,7 @@ examples/js-sdk/creator-complete-flow.js
 examples/js-sdk/reader.html
 examples/js-sdk/reader-app.js
 examples/js-sdk/reader-flow.js
+examples/js-sdk/paykit-viewer-flow.js
 examples/js-sdk/scripts/init-config.mjs
 examples/js-sdk/scripts/homegate-bridge.mjs
 examples/js-sdk/scripts/create-user.mjs
@@ -455,6 +456,8 @@ After success, the page displays the **Viewer content lock resource**:
 ## Reader browser flow
 
 The browser remains unauthenticated. A `paykit-payment` proof carries the public key prepared by the native helper; the browser never receives the reader secret or encrypted Paykit state.
+
+For SDK consumers who do not need this demo's helper/server orchestration, [`paykit-viewer-flow.js`](paykit-viewer-flow.js) is the concise copyable browser flow. [`docs/SDK_PAYKIT_VIEWER.md`](../../docs/SDK_PAYKIT_VIEWER.md) documents its public exports, exact request/response shapes, lifecycle terminals, independent connection-state observation, and bearer-only credential use.
 
 1. Copy the creator demo's **Viewer content lock resource** and paste it into the reader demo.
 2. Click **Load lock**. The browser SDK validates the content lock and resolves the Lock Server.
