@@ -133,6 +133,8 @@ const required = {
   ],
   paykitViewerDocs: [
     'adds no new `locks-sdk` or JS/WASM export',
+    'const bundleId = BundleId.generate().toString();',
+    'await persistBundleId(bundleId);',
     '`pending`, `in_progress`',
     '`failed`, `expired`',
     '`none`',
@@ -359,7 +361,7 @@ const required = {
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
     'Locks.forContentLockWithOptions',
     'Locks.readContentLockWithOptions',
-    'BundleId.generate().toString()',
+    'bundleId,',
     'new VerificationTaskHandleOptions(creator, bundleId)',
     'viewer.submitProofBundle',
     'viewer.lookupPaykitConnectionState',
@@ -420,6 +422,24 @@ for (const [label, snippets] of Object.entries(required)) {
       throw new Error(`${label} missing expected snippet: ${snippet}`);
     }
   }
+}
+
+const documentedBundleGeneration = texts.paykitViewerDocs.indexOf(
+  'const bundleId = BundleId.generate().toString();',
+);
+const documentedBundlePersistence = texts.paykitViewerDocs.indexOf(
+  'await persistBundleId(bundleId);',
+);
+const documentedUnlockCall = texts.paykitViewerDocs.indexOf('await unlockPaykitContent({');
+if (
+  documentedBundleGeneration < 0
+  || documentedBundlePersistence < documentedBundleGeneration
+  || documentedUnlockCall < documentedBundlePersistence
+) {
+  throw new Error('caller must generate and persist Bundle ID before starting Paykit unlock');
+}
+if (texts.paykitViewerFlow.includes('BundleId.generate()')) {
+  throw new Error('Paykit unlock helper must use caller-supplied Bundle ID');
 }
 
 if (texts.startReaderServer.includes('8081')) {
@@ -1252,6 +1272,35 @@ await assert.rejects(
   }),
   /polling exhausted/,
 );
+const resumedCalls = [];
+const resumedAfterExhaustion = await runPaykitViewerFlow({
+  viewer: {
+    lookupVerificationTask: async (handle) => {
+      resumedCalls.push(['lookup', handle]);
+      return { status: 'completed' };
+    },
+    issueAccessCredential: async (handle) => {
+      resumedCalls.push(['issue', handle]);
+      return {
+        credential: 'resumed-access-credential',
+        expires_at: '2026-09-29T12:15:00Z',
+      };
+    },
+    proxyReadGuardedResourceResponse: async (credential, path) => {
+      resumedCalls.push(['read', credential, path]);
+      return new Response('resumed');
+    },
+  },
+  handle: documentedHandle,
+  submittedProofBundle: null,
+  guardedPath: 'primary.txt',
+});
+assert.equal(await resumedAfterExhaustion.response.text(), 'resumed');
+assert.deepEqual(resumedCalls, [
+  ['lookup', documentedHandle],
+  ['issue', documentedHandle],
+  ['read', 'resumed-access-credential', 'primary.txt'],
+]);
 const workflowHandle = { incarnation: 7, resource: paymentResource, creator: creatorPubky, bundleId: paymentBundleId };
 const currentWorkflow = { ...workflowHandle };
 assert.equal(workflowHandleMatches(workflowHandle, currentWorkflow), true);
