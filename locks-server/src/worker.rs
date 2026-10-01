@@ -138,7 +138,17 @@ impl<'a> VerificationWorker<'a> {
                 info!(%task_id, status = ?completed.status, "completed verification task");
                 Ok(WorkerTick::Completed(task_id))
             }
-            Err(ApplicationError::VerificationPending) => {
+            Err(
+                error @ (ApplicationError::VerificationPending
+                | ApplicationError::PaykitPaymentStatusConflict),
+            ) => {
+                if matches!(error, ApplicationError::PaykitPaymentStatusConflict) {
+                    error!(
+                        %task_id,
+                        worker_id = %self.worker_id,
+                        "paykit payment status conflict; scheduling retry"
+                    );
+                }
                 let retry_scheduled_at = self.clock.now();
                 let next_attempt_at = retry_scheduled_at + retry_delay();
                 let Some(_) = self
@@ -232,12 +242,11 @@ mod tests {
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
         LockServerConfig, VerifierType,
     };
-    use locks_core::verification::{
-        CriterionVerificationResult, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
-    };
+    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
     use locks_service::application::errors::ApplicationError;
     use locks_service::application::models::{
-        CriterionVerificationRequest, VerificationTaskRecord, VerificationTaskStatus,
+        CriterionVerificationOutcome, CriterionVerificationRequest, VerificationTaskRecord,
+        VerificationTaskStatus,
     };
     use locks_service::application::ports::{
         ContentLockRepository, CriterionVerifier, EntitlementRepository, VerificationTaskRepository,
@@ -332,6 +341,68 @@ mod tests {
         assert_eq!(stored.status, VerificationTaskStatus::Pending);
         assert_eq!(stored.failure_message, None);
         assert_eq!(worker.run_once().await.unwrap(), WorkerTick::Idle);
+    }
+
+    #[tokio::test]
+    async fn worker_schedules_operator_visible_paykit_conflict_without_terminalizing() {
+        let fixture = WorkerFixture::new(content_lock(true)).await;
+        fixture.seed_task().await;
+        let verifier = ConflictVerifier;
+        let worker = fixture.worker_with_verifier(&verifier);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::RetryScheduled(task_id())
+        );
+        let stored = fixture
+            .tasks
+            .get_verification_task(&task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::Pending);
+        assert_eq!(stored.completed_at, None);
+        assert_eq!(stored.failure_message, None);
+        assert!(
+            fixture
+                .entitlements
+                .get_verified_proof_bundle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_fails_closed_on_invalid_paykit_status_response() {
+        let fixture = WorkerFixture::new(content_lock(true)).await;
+        fixture.seed_task().await;
+        let verifier = InvalidPaykitStatusVerifier;
+        let worker = fixture.worker_with_verifier(&verifier);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::Failed(task_id())
+        );
+        let stored = fixture
+            .tasks
+            .get_verification_task(&task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::Failed);
+        assert_eq!(
+            stored.failure_message,
+            Some("verification failed".to_owned())
+        );
+        assert!(
+            fixture
+                .entitlements
+                .get_verified_proof_bundle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -534,11 +605,35 @@ mod tests {
         async fn verify(
             &self,
             request: CriterionVerificationRequest,
-        ) -> Result<CriterionVerificationResult, ApplicationError> {
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
             if !self.returned_pending.swap(true, Ordering::SeqCst) {
-                return Err(ApplicationError::VerificationPending);
+                return Ok(CriterionVerificationOutcome::Pending);
             }
             DevStaticVerifier.verify(request).await
+        }
+    }
+
+    struct ConflictVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for ConflictVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Err(ApplicationError::PaykitPaymentStatusConflict)
+        }
+    }
+
+    struct InvalidPaykitStatusVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for InvalidPaykitStatusVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Err(ApplicationError::PaykitPaymentStatusInvalidResponse)
         }
     }
 
@@ -552,6 +647,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 

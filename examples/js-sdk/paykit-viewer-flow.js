@@ -12,6 +12,13 @@ const CONNECTION_STATES = new Set([
   'blocked',
 ]);
 
+const TERMINAL_REASONS = new Set([
+  'payment_request_rejected',
+  'payment_request_canceled',
+  'proposal_expired',
+  'payment_deadline_expired',
+]);
+
 /**
  * Complete a Paykit-backed viewer flow using only public JS/WASM SDK exports.
  * Caller must generate and durably store bundleId before invoking this helper.
@@ -88,7 +95,7 @@ export async function runPaykitViewerFlow({
   let connectionLookupInFlight = false;
 
   while (true) {
-    const status = lifecycle?.status;
+    const status = validateLifecycle(lifecycle);
     if (status === 'pending' || status === 'in_progress') {
       if (observeConnection && !connectionLookupInFlight) {
         connectionLookupInFlight = true;
@@ -111,11 +118,15 @@ export async function runPaykitViewerFlow({
       lifecycle = await viewer.lookupVerificationTask(handle);
       continue;
     }
-    if (status === 'failed' || status === 'expired') {
-      throw new Error(`Paykit verification ${status}`);
+    if (status === 'failed') {
+      throw new Error(
+        `Paykit verification failed: ${lifecycle.failure_message}; no access credential was issued; start a new attempt with a fresh Bundle ID and payment request`,
+      );
     }
-    if (status !== 'completed') {
-      throw new Error(`unknown verification status: ${String(status)}`);
+    if (status === 'expired') {
+      throw new Error(
+        `Paykit verification expired: ${lifecycle.terminal_reason}; no access credential was issued; start a new attempt with a fresh Bundle ID and payment request`,
+      );
     }
 
     const issued = await viewer.issueAccessCredential(handle);
@@ -129,6 +140,31 @@ export async function runPaykitViewerFlow({
       response,
     };
   }
+}
+
+function validateLifecycle(lifecycle) {
+  const status = lifecycle?.status;
+  const started = lifecycle?.started_at != null;
+  const completed = lifecycle?.completed_at != null;
+  const failure = lifecycle?.failure_message;
+  const terminalReason = lifecycle?.terminal_reason;
+  const valid = (
+    (status === 'pending'
+      && !started && !completed && failure === null && terminalReason === null)
+    || (status === 'in_progress'
+      && started && !completed && failure === null && terminalReason === null)
+    || (status === 'completed'
+      && started && completed && failure === null && terminalReason === null)
+    || (status === 'failed'
+      && started && completed && typeof failure === 'string' && failure.trim() !== ''
+      && terminalReason === null)
+    || (status === 'expired'
+      && started && completed && failure === null && TERMINAL_REASONS.has(terminalReason))
+  );
+  if (!valid) {
+    throw new Error(`invalid verification lifecycle response: ${String(status)}`);
+  }
+  return status;
 }
 
 function parseConnectionState(response) {

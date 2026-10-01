@@ -225,6 +225,13 @@ impl From<ApplicationError> for ApiError {
                 ApiErrorCode::TaskStateConflict,
                 "verification task state conflict",
             ),
+            ApplicationError::PaykitPaymentStatusConflict => Self::new(
+                ApiErrorCode::TaskStateConflict,
+                "paykit payment status conflict",
+            ),
+            ApplicationError::PaykitPaymentStatusInvalidResponse => {
+                Self::new(ApiErrorCode::InternalError, "internal server error")
+            }
             ApplicationError::UnsupportedVerifierType { .. } => Self::new(
                 ApiErrorCode::UnsupportedVerifierType,
                 "unsupported verifier type",
@@ -576,5 +583,15 @@ mod tests {
 
         assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
         assert_eq!(api_error.error_response().error.code, "task_state_conflict");
+    }
+
+    #[test]
+    fn paykit_payment_status_conflict_remains_operator_visible() {
+        let api_error = ApiError::from(ApplicationError::PaykitPaymentStatusConflict);
+
+        assert_eq!(api_error.status_code(), StatusCode::CONFLICT);
+        let response = api_error.error_response();
+        assert_eq!(response.error.code, "task_state_conflict");
+        assert_eq!(response.error.message, "paykit payment status conflict");
     }
 }

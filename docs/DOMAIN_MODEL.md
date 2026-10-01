@@ -340,6 +340,7 @@ Fields:
 - `started_at: Option<OffsetDateTime>`
 - `completed_at: Option<OffsetDateTime>`
 - `failure_message: Option<String>`
+- `terminal_reason: Option<VerificationTerminalReason>`
 
 Invariants:
 
@@ -355,11 +356,11 @@ Invariants:
 - Task records store operational lifecycle state only; they do not store `VerificationResult` because successful verification evidence lives in `VerifiedProofBundle`.
 - Public lifecycle responses replace internal `task_id` with `creator` and `bundle_id`, keep status/timestamp/failure fields, and must not expose submitted proof material, raw credentials, entitlement evidence, or worker claim metadata.
 - `{ creator, bundle_id }` is a permanent one-attempt lifecycle identity. After current canonical preflight, re-submitting the exact same submitted proof bundle returns the existing lifecycle state without creating new work or another Paykit invoice; different proof material for the same identity is a conflict.
-- Paykit status lookup uses a signed `{ creator, bundle_id }` request. Any status-call transport, HTTP, authentication/authorization, protocol, or decoding failure returns the task to pending for durable retry; v1 has no terminal Paykit payment-failure status.
+- Paykit lifecycle lookup uses a signed `{ creator, bundle_id }` request to `/payment-requests/status`. Request and payment states remain separate. Rejection, cancellation, proposal expiry, and payment deadline expiry terminalize the current attempt as `expired` with a typed reason, no failure message, no entitlement, and no retry. Transport failures, timeouts, response-body read failures, and non-`200` responses remain no-entitlement and pending for durable retry; `409 Conflict` remains operator-visible. Malformed JSON, missing or unknown fields, unknown states, oversized bodies, and invalid or misordered timestamps in a `200` response are permanent contract failures that terminalize the attempt as `failed` with no entitlement.
 - Retrying after `failed` or `expired` requires a new Bundle ID.
-- Allowed transitions are `pending -> in_progress`, `pending -> expired`, `in_progress -> completed`, `in_progress -> failed`, and `in_progress -> expired`.
+- Allowed transitions are `pending -> in_progress`, `in_progress -> completed`, `in_progress -> failed`, and `in_progress -> expired`.
 - `completed`, `failed`, and `expired` are terminal states; retention cleanup deletes task records rather than transitioning terminal tasks.
-- `failed` tasks require a non-empty failure message; other statuses must not carry failure messages.
+- `failed` tasks require a non-empty viewer-safe failure message and no terminal reason. `expired` tasks require one closed terminal reason and no failure message. Other statuses carry neither.
 - Transition methods validate current-state timestamp/failure-message invariants before applying a transition.
 
 ### VerifiedProofBundle Aggregate

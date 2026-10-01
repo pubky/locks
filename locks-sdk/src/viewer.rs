@@ -46,6 +46,15 @@ pub enum VerificationTaskStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum VerificationTerminalReason {
+    PaymentRequestRejected,
+    PaymentRequestCanceled,
+    ProposalExpired,
+    PaymentDeadlineExpired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaykitConnectionState {
     Connected,
     Handshake,
@@ -67,6 +76,7 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<time::OffsetDateTime>,
     pub failure_message: Option<String>,
+    pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -152,13 +162,16 @@ impl ViewerLocks {
     }
 
     pub fn parse_lifecycle_response(value: Value) -> Result<VerificationTaskLifecycleResponse> {
-        serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
+        let response: VerificationTaskLifecycleResponse = serde_json::from_value(value)
+            .map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))?;
+        validate_lifecycle_response(&response)?;
+        Ok(response)
     }
 
     pub fn parse_submit_proof_bundle_response(
         value: Value,
     ) -> Result<VerificationTaskLifecycleResponse> {
-        serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
+        Self::parse_lifecycle_response(value)
     }
 
     pub fn parse_paykit_connection_state_response(
@@ -184,6 +197,51 @@ impl ViewerLocks {
 impl Default for ViewerLocks {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> Result<()> {
+    let valid = match response.status {
+        VerificationTaskStatus::Pending => {
+            response.started_at.is_none()
+                && response.completed_at.is_none()
+                && response.failure_message.is_none()
+                && response.terminal_reason.is_none()
+        }
+        VerificationTaskStatus::InProgress => {
+            response.started_at.is_some()
+                && response.completed_at.is_none()
+                && response.failure_message.is_none()
+                && response.terminal_reason.is_none()
+        }
+        VerificationTaskStatus::Completed => {
+            response.started_at.is_some()
+                && response.completed_at.is_some()
+                && response.failure_message.is_none()
+                && response.terminal_reason.is_none()
+        }
+        VerificationTaskStatus::Failed => {
+            response.started_at.is_some()
+                && response.completed_at.is_some()
+                && response
+                    .failure_message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+                && response.terminal_reason.is_none()
+        }
+        VerificationTaskStatus::Expired => {
+            response.started_at.is_some()
+                && response.completed_at.is_some()
+                && response.failure_message.is_none()
+                && response.terminal_reason.is_some()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(LocksSdkError::InvalidResponse(
+            "invalid verification task lifecycle field combination".to_owned(),
+        ))
     }
 }
 
@@ -318,7 +376,8 @@ mod tests {
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": "2026-06-01T12:00:01Z",
             "completed_at": "2026-06-01T12:00:02Z",
-            "failure_message": null
+            "failure_message": null,
+            "terminal_reason": null
         }))
         .unwrap();
 
@@ -326,6 +385,51 @@ mod tests {
         assert_eq!(response.bundle_id.to_string(), BUNDLE_ID);
         assert_eq!(response.status, VerificationTaskStatus::Completed);
         assert!(response.failure_message.is_none());
+    }
+
+    #[test]
+    fn lifecycle_response_parses_terminal_reason_and_rejects_invalid_status_tuple() {
+        let response = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "expired",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "terminal_reason": "payment_request_rejected"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response.terminal_reason,
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        );
+
+        for invalid in [
+            json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "expired",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": "2026-06-01T12:00:01Z",
+                "completed_at": "2026-06-01T12:00:02Z",
+                "failure_message": null,
+                "terminal_reason": null
+            }),
+            json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "failed",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": "2026-06-01T12:00:01Z",
+                "completed_at": "2026-06-01T12:00:02Z",
+                "failure_message": "verification failed",
+                "terminal_reason": "payment_request_rejected"
+            }),
+        ] {
+            assert!(ViewerLocks::parse_lifecycle_response(invalid).is_err());
+        }
     }
 
     #[test]
@@ -356,6 +460,7 @@ mod tests {
                 "started_at": null,
                 "completed_at": null,
                 "failure_message": null,
+                "terminal_reason": null,
                 "connection_state": "connected"
             }))
             .is_err()

@@ -3,11 +3,11 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { repoRoot } from './lib/paths.mjs';
+import { DEFAULT_PAYKIT_SERVER_CONTEXT } from './lib/paykit-server-source.mjs';
 
 const MAX_MODEL_BYTES = 2 * 1024 * 1024;
 const COMPOSE_FILE = 'compose.paykit-local-demo.yaml';
-const PAYKIT_SERVER_REF = 'v0.1.0-rc5';
-const DEFAULT_PAYKIT_SERVER_CONTEXT = `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REF}`;
+
 const REQUIRED_SERVICES = [
   'postgres',
   'paykit-postgres',

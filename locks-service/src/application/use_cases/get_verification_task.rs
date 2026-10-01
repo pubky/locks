@@ -3,7 +3,9 @@ use time::OffsetDateTime;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
+use crate::application::models::{
+    VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+};
 use crate::application::ports::VerificationTaskRepository;
 
 /// Request to read verification task state.
@@ -48,6 +50,8 @@ pub struct VerificationTaskLifecycleView {
     pub completed_at: Option<OffsetDateTime>,
     /// Viewer-safe failure detail for failed tasks.
     pub failure_message: Option<String>,
+    /// Typed no-entitlement reason for expired Paykit attempts.
+    pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
 impl From<VerificationTaskRecord> for VerificationTaskLifecycleView {
@@ -60,6 +64,7 @@ impl From<VerificationTaskRecord> for VerificationTaskLifecycleView {
             started_at: task.started_at,
             completed_at: task.completed_at,
             failure_message: task.failure_message,
+            terminal_reason: task.terminal_reason,
         }
     }
 }
@@ -79,6 +84,8 @@ pub struct VerificationTaskView {
     pub completed_at: Option<OffsetDateTime>,
     /// Persisted failure detail for failed tasks.
     pub failure_message: Option<String>,
+    /// Typed no-entitlement reason for expired Paykit attempts.
+    pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
 /// Read-only verification task polling use case.
@@ -112,6 +119,7 @@ impl<'a> GetVerificationTaskUseCase<'a> {
             started_at: task.started_at,
             completed_at: task.completed_at,
             failure_message: task.failure_message,
+            terminal_reason: task.terminal_reason,
         })
     }
 }
@@ -245,6 +253,30 @@ mod tests {
         assert!(!debug.contains("satisfied"));
     }
 
+    #[test]
+    fn public_lifecycle_view_exposes_typed_terminal_reason() {
+        let task = verification_task()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .expire(
+                crate::application::models::VerificationTerminalReason::PaymentRequestCanceled,
+                datetime!(2026-05-29 12:02:00 UTC),
+            )
+            .unwrap();
+
+        let view = VerificationTaskLifecycleView::from(task);
+
+        assert_eq!(
+            view.terminal_reason,
+            Some(crate::application::models::VerificationTerminalReason::PaymentRequestCanceled)
+        );
+        assert_eq!(view.failure_message, None);
+    }
+
     #[tokio::test]
     async fn get_verification_task_by_handle_returns_public_lifecycle_view() {
         let task = verification_task()
@@ -334,6 +366,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 

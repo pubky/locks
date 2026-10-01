@@ -24,7 +24,11 @@ import {
   createPaykitDataCheckController,
 } from './reader-staging-paykit.js';
 import { buildPersistedReaderState, restorePersistedReaderState } from './reader-persistence.js';
-import { describeReaderLoadState, validateContentLockResource } from './reader-load-state.js';
+import {
+  describeReaderLoadState,
+  paymentLifecycleTerminalError,
+  validateContentLockResource,
+} from './reader-load-state.js';
 
 const STATE_KEY = 'pubky-locks-reader-demo.state';
 
@@ -526,8 +530,9 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
         await delay(1_000);
         continue;
       }
-      if (status === 'failed' || status === 'expired' || classification === 'failed') {
-        throw new Error(`payment verification ended with status ${status}`);
+      const terminalError = paymentLifecycleTerminalError(lifecycle);
+      if (terminalError || classification === 'failed') {
+        throw new Error(terminalError ?? `payment verification ended with status ${status}`);
       }
       if (classification === 'completed') {
         await postClientLog('info', 'reader-payment-poll-completed', handleDetails(handle));
@@ -728,7 +733,10 @@ function render() {
     el.proofStatus.textContent = 'Submitting proof bundle...';
     el.proofStatus.className = 'muted';
   } else if (state.lifecycle) {
-    el.proofStatus.textContent = `Proof submitted. Status: ${state.lifecycle.status}`;
+    const terminalReason = state.lifecycle.terminal_reason;
+    el.proofStatus.textContent = terminalReason
+      ? `Proof submitted. Status: ${state.lifecycle.status} (${terminalReason}); retry with a new Bundle ID.`
+      : `Proof submitted. Status: ${state.lifecycle.status}`;
     el.proofStatus.className = ['failed', 'expired'].includes(state.lifecycle.status) ? 'error' : 'ok';
   } else {
     el.proofStatus.textContent = state.loaded ? 'Ready to submit proof bundle.' : 'Waiting for loaded lock.';

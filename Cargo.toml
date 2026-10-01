@@ -28,10 +28,10 @@ clap = { version = "4", features = ["derive"] }
 locks-core = { path = "locks-core" }
 locks-service = { path = "locks-service" }
 mime = "0.3"
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc48" }
+paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", tag = "v0.1.0-rc56" }
 pubky = { version = "0.11.0", git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03", features = ["json"] }
 pubky-common = { version = "0.11.0", git = "https://github.com/pubky/pubky-homeserver.git", rev = "99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03" }
-pubky-noise = "=0.1.0-rc7"
+pubky-noise = "=0.1.0-rc8"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 pkarr = "8.0.0"
 percent-encoding = "2"

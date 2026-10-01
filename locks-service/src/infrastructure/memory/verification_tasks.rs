@@ -281,6 +281,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 }

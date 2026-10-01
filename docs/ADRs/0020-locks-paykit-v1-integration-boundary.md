@@ -73,7 +73,7 @@ For connection observation, the Reader sends its existing `{ creator, bundle_id 
 
 ### Status request and access policy
 
-Locks sends RFC 8785 canonical JSON to `POST /transactions/status`:
+Locks sends RFC 8785 canonical JSON to `POST /payment-requests/status`:
 
 ```json
 {
@@ -82,15 +82,9 @@ Locks sends RFC 8785 canonical JSON to `POST /transactions/status`:
 }
 ```
 
-The status body uses the same `X-Paykit-Signature` authentication as invoice creation. The only v1 factual statuses are:
+The status body uses the same `X-Paykit-Signature` authentication as invoice creation. It is closed and keeps canonical axes separate: `request_state` is `proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, or `active_recurring`; `payment_state` is `undetected`, `detected`, `confirmed`, or `expired`. The response also contains non-negative `confirmations`, `amount_matched`, `invoice_created_at`, and `payment_deadline`. Paykit reports those facts; Locks alone applies `minimum_confirmations` and decides access.
 
-- `undetected`;
-- `detected`; and
-- `confirmed`.
-
-The response also contains non-negative `confirmations` and `amount_matched`. Paykit reports those facts; Locks alone applies `minimum_confirmations` and decides whether access is satisfied.
-
-V1 Payment Request terms have no separate proposal TTL. Paykit Server applies an application payment deadline and returns `invoice_created_at` plus `payment_deadline` from invoice creation; Locks validates that closed response but does not use those timestamps for verification policy. The transaction-status boundary above remains factual (`undetected`, `detected`, `confirmed`) and has no terminal payment-failure value. Paykit's separate Payment Request lifecycle may expose `expired`; that is distinct from proposal expiry and this transaction-observation contract. Every status-call transport, timeout, HTTP, authentication/authorization, protocol, and decoding failure leaves verification pending and schedules durable retry. This includes `404` and malformed successful responses.
+`rejected`, `canceled`, `proposal_expired`, and accepted plus payment `expired` terminalize the current Locks attempt as `expired` with the corresponding typed reason. They issue no entitlement and do not retry the same task, even when confirmed payment facts exist. Transport failures, timeouts, response-body read failures, and non-`200` responses remain no-entitlement and pending for durable retry; `409 Conflict` is operator-visible rather than reclassified as payment rejection. A `200` response with malformed JSON, missing or unknown fields, unknown states, an oversized body, or invalid or misordered timestamps is a permanent contract failure: Locks terminalizes the attempt as `failed` with a viewer-safe failure message and no entitlement. Both `failed` and `expired` require a new Bundle ID for another attempt. Locks validates timestamp syntax and requires `payment_deadline > invoice_created_at`, but does not compare either timestamp to its local clock.
 
 ### Runtime boundary
 
@@ -108,14 +102,14 @@ V1 Payment Request terms have no separate proposal TTL. Paykit Server applies an
 - Payment transport and asset policy remain inside Paykit.
 - Creator-scoped invoice identity supports tenant isolation and Bundle ID reuse across creators.
 - Durable idempotency makes ambiguous and concurrent invoice submission recoverable.
-- Status failures cannot incorrectly become permanent payment denials.
+- Retryable status availability failures cannot incorrectly become permanent payment denials.
 
 ### Negative and risks
 
 - Both services must implement the same canonical-body signing contract.
 - Paykit must parse the public Locks payment criterion and therefore depends on its versioned shape.
 - Exact submission replay intentionally performs current canonical lock and reader preflight before returning persisted lifecycle state.
-- Unpaid invoices and pending Locks tasks have no protocol expiry in v1 and therefore require operational retention policy outside the payment-status contract.
+- Terminal payment attempts require a fresh Bundle ID for retry; payment evidence remains owned and queryable by Paykit.
 
 ## Rejected alternatives
 
@@ -123,7 +117,8 @@ V1 Payment Request terms have no separate proposal TTL. Paykit Server applies an
 - **Use globally unique Bundle IDs:** rejected because the durable identity is creator-scoped.
 - **Trust caller-supplied payment terms:** rejected because terms come from the canonical Lock Resource.
 - **Use unsigned or bundle-only status lookup:** rejected because it is unauthenticated and ambiguous across creators.
-- **Terminalize status transport/protocol failures:** rejected because those failures are not payment facts.
+- **Terminalize status transport or availability failures:** rejected because those failures are not payment facts.
+- **Retry malformed or unsupported status contracts:** rejected because retrying the same invalid contract under the same Bundle ID cannot establish entitlement safely.
 - **Store wallet or xpub material in Locks:** rejected because Paykit owns payment transport and derivation.
 
 ## Related records

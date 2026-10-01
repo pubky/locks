@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   describeReaderLoadState,
+  paymentLifecycleTerminalError,
   validateContentLockResource,
 } from '../reader-load-state.js';
 
@@ -28,6 +29,18 @@ assert.deepEqual(
     loadError: 'Old namespace rejected.',
   }),
   { message: 'Old namespace rejected.', className: 'error' },
+);
+
+assert.equal(
+  paymentLifecycleTerminalError({
+    status: 'expired',
+    terminal_reason: 'payment_request_rejected',
+  }),
+  'payment verification ended with status expired: payment_request_rejected; retry with a new Bundle ID',
+);
+assert.equal(
+  paymentLifecycleTerminalError({ status: 'pending', terminal_reason: null }),
+  null,
 );
 
 console.log('reader load state tests passed');

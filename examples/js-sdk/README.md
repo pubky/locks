@@ -212,10 +212,14 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build uses release tag `v0.1.0-rc5`, the active Locks checkout,
-Paykit Rust `v0.1.0-rc48`, and Pubky Homeserver `v0.11.0`. This release provides the signed
-lifecycle, setup-status, and Noise connection-status APIs required by Locks. No sibling
-repository checkout is required.
+The local demo temporarily selects the reviewed Paykit Server development commit encoded
+once in `compose.paykit-local-demo.yaml`, the active Locks checkout, Paykit Rust
+`v0.1.0-rc56`, and Pubky Homeserver `v0.11.0`. Contract checks derive the provisional
+server revision from that canonical Compose build context pending an immutable release.
+That server commit does not yet compile against
+the current stacked Locks API, so this Compose path is not a runtime-green rejection
+demo until the upstream contract is updated and repinned. No sibling repository checkout
+is required for source resolution.
 
 For coordinated Paykit Server work, select an explicit absolute local worktree
 without changing the committed public default:
