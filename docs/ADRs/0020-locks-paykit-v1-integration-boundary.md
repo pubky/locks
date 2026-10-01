@@ -84,7 +84,7 @@ Locks sends RFC 8785 canonical JSON to `POST /payment-requests/status`:
 
 The status body uses the same `X-Paykit-Signature` authentication as invoice creation. It is closed and keeps canonical axes separate: `request_state` is `proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, or `active_recurring`; `payment_state` is `undetected`, `detected`, `confirmed`, or `expired`. The response also contains non-negative `confirmations`, `amount_matched`, `invoice_created_at`, and `payment_deadline`. Paykit reports those facts; Locks alone applies `minimum_confirmations` and decides access.
 
-`rejected`, `canceled`, `proposal_expired`, and accepted plus payment `expired` terminalize the current Locks attempt as `expired` with the corresponding typed reason. They issue no entitlement and do not retry the same task, even when confirmed payment facts exist. A new attempt requires a new Bundle ID. Locks validates timestamp syntax and requires `payment_deadline > invoice_created_at`, but does not compare either timestamp to its local clock. Transport, timeout, unavailable, conflict, authentication/authorization, protocol, unknown-field/state, oversized-body, and decoding failures remain no-entitlement and pending for durable retry; conflict is operator-visible rather than reclassified as payment rejection.
+`rejected`, `canceled`, `proposal_expired`, and accepted plus payment `expired` terminalize the current Locks attempt as `expired` with the corresponding typed reason. They issue no entitlement and do not retry the same task, even when confirmed payment facts exist. Transport failures, timeouts, response-body read failures, and non-`200` responses remain no-entitlement and pending for durable retry; `409 Conflict` is operator-visible rather than reclassified as payment rejection. A `200` response with malformed JSON, missing or unknown fields, unknown states, an oversized body, or invalid or misordered timestamps is a permanent contract failure: Locks terminalizes the attempt as `failed` with a viewer-safe failure message and no entitlement. Both `failed` and `expired` require a new Bundle ID for another attempt. Locks validates timestamp syntax and requires `payment_deadline > invoice_created_at`, but does not compare either timestamp to its local clock.
 
 ### Runtime boundary
 
@@ -102,7 +102,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 - Payment transport and asset policy remain inside Paykit.
 - Creator-scoped invoice identity supports tenant isolation and Bundle ID reuse across creators.
 - Durable idempotency makes ambiguous and concurrent invoice submission recoverable.
-- Status failures cannot incorrectly become permanent payment denials.
+- Retryable status availability failures cannot incorrectly become permanent payment denials.
 
 ### Negative and risks
 
@@ -117,7 +117,8 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 - **Use globally unique Bundle IDs:** rejected because the durable identity is creator-scoped.
 - **Trust caller-supplied payment terms:** rejected because terms come from the canonical Lock Resource.
 - **Use unsigned or bundle-only status lookup:** rejected because it is unauthenticated and ambiguous across creators.
-- **Terminalize status transport/protocol failures:** rejected because those failures are not payment facts.
+- **Terminalize status transport or availability failures:** rejected because those failures are not payment facts.
+- **Retry malformed or unsupported status contracts:** rejected because retrying the same invalid contract under the same Bundle ID cannot establish entitlement safely.
 - **Store wallet or xpub material in Locks:** rejected because Paykit owns payment transport and derivation.
 
 ## Related records
