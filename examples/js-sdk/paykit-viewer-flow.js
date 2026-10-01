@@ -1,5 +1,4 @@
 import init, {
-  BundleId,
   Locks,
   LocksOptions,
   VerificationTaskHandleOptions,
@@ -22,12 +21,13 @@ const TERMINAL_REASONS = new Set([
 
 /**
  * Complete a Paykit-backed viewer flow using only public JS/WASM SDK exports.
- * Store the returned bundleId durably. It is bearer-like recovery state.
+ * Caller must generate and durably store bundleId before invoking this helper.
  */
 export async function unlockPaykitContent({
   resource,
   readerPublicKey,
   guardedPath,
+  bundleId,
   pkarrRelays = [],
   pollIntervalMs = 1_000,
   maxPollAttempts = 120,
@@ -45,7 +45,6 @@ export async function unlockPaykitContent({
   ]);
   const viewer = locks.viewer;
   const creator = creatorFromResource(resource);
-  const bundleId = BundleId.generate().toString();
   const criterionId = paykitCriterionId(contentLock);
   const submittedProofBundle = {
     version: 1,

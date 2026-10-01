@@ -8,11 +8,16 @@ Runnable browser example: [`examples/js-sdk/paykit-viewer-flow.js`](../examples/
 
 ```js
 import { unlockPaykitContent } from './paykit-viewer-flow.js';
+import { BundleId } from '../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
 
-const { bundleId, credentialExpiresAt, response } = await unlockPaykitContent({
+const bundleId = BundleId.generate().toString();
+await persistBundleId(bundleId); // application-owned durable, secret-safe storage
+
+const { credentialExpiresAt, response } = await unlockPaykitContent({
   resource: 'pubky.../pub/app.locks/<lock_id>.json',
   readerPublicKey: 'pubky...',
   guardedPath: 'primary.txt',
+  bundleId,
   pkarrRelays: ['http://127.0.0.1:15411'], // omit on normal public network
   onConnectionState(state) {
     // none | handshake | connected | recovery_required | blocked
@@ -24,9 +29,16 @@ const { bundleId, credentialExpiresAt, response } = await unlockPaykitContent({
   },
 });
 
-// Persist bundleId as bearer-like recovery state. Consume body once.
+// Bundle ID was durable before invoice creation. Consume body once.
 console.log(bundleId, credentialExpiresAt, await response.arrayBuffer());
 ```
+
+`bundleId` is bearer-like recovery state. Generate and persist it before calling
+`unlockPaykitContent`; the helper validates it before submission. If submission,
+polling, credential issuance, or proxy-read fails, reuse that same Bundle ID with
+the same resource, reader, and proof. Exact proof-bundle replay is idempotent and
+returns the existing verification lifecycle, so it does not create another invoice.
+Generate a new Bundle ID only for a new verification attempt.
 
 Copy `unlockPaykitContent` and `runPaykitViewerFlow` from the linked example into an application module. They use only generated public exports:
 
