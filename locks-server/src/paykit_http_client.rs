@@ -480,8 +480,10 @@ impl PaykitPaymentStatusClient for PaykitHttpClient {
             PaykitClientError::InvalidStatusResponse(_) => {
                 PaykitPaymentStatusError::InvalidResponse
             }
-            PaykitClientError::InvalidPaymentStatusResponse(_)
-            | PaykitClientError::InvalidPaymentStatusJson(_)
+            PaykitClientError::InvalidPaymentStatusResponse(_) => {
+                PaykitPaymentStatusError::Unavailable
+            }
+            PaykitClientError::InvalidPaymentStatusJson(_)
             | PaykitClientError::StatusBodyTooLarge
             | PaykitClientError::InvalidStatusTimestamps => {
                 PaykitPaymentStatusError::InvalidResponse
@@ -983,6 +985,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_request_status_response_body_timeout_is_retryable() {
+        let server_url = spawn_stalled_payment_status_body().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_secs(1), Duration::from_millis(500)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            PaykitPaymentStatusClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await,
+            Err(PaykitPaymentStatusError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn status_not_found_is_retryable_but_invalid_success_bodies_fail_closed() {
         let server_url = spawn_configured_status_server(StatusCode::NOT_FOUND, "not found").await;
         let client = PaykitHttpClient::from_parts(
@@ -1156,6 +1179,22 @@ mod tests {
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 24\r\n\r\n{\"state\":",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_stalled_payment_status_body() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\r\n{\"request_state\":\"accepted\",",
                 )
                 .await
                 .unwrap();

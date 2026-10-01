@@ -1367,7 +1367,7 @@ const resumedAfterExhaustion = await runPaykitViewerFlow({
   viewer: {
     lookupVerificationTask: async (handle) => {
       resumedCalls.push(['lookup', handle]);
-      return { status: 'completed' };
+      return lifecycleResponse('completed');
     },
     issueAccessCredential: async (handle) => {
       resumedCalls.push(['issue', handle]);
