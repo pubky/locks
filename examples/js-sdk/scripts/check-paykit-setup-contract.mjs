@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { fileURLToPath } from 'node:url';
 
-import { PAYKIT_SERVER_REVISION } from './lib/paykit-server-source.mjs';
+import { PAYKIT_SERVER_REF } from './lib/paykit-server-source.mjs';
 
 const MAX_SOURCE_BYTES = 256 * 1024;
 const TIMEOUT_MS = 30_000;
@@ -28,14 +28,14 @@ export function validatePaykitSetupStatusSources({
 export async function checkPaykitSetupContract({
   fetchSource = fetchBoundedText,
 } = {}) {
-  const sourceBase = `https://raw.githubusercontent.com/pubky/paykit-server/${PAYKIT_SERVER_REVISION}`;
+  const sourceBase = `https://raw.githubusercontent.com/pubky/paykit-server/${PAYKIT_SERVER_REF}`;
   const [setupStatusSource, connectionStatusSource, serverSource] = await Promise.all([
     fetchSource(`${sourceBase}/paykit-server/src/http/setup_status.rs`),
     fetchSource(`${sourceBase}/paykit-server/src/http/connection_status.rs`),
     fetchSource(`${sourceBase}/paykit-server/src/server.rs`),
   ]);
   validatePaykitSetupStatusSources({ setupStatusSource, connectionStatusSource, serverSource });
-  return PAYKIT_SERVER_REVISION;
+  return PAYKIT_SERVER_REF;
 }
 
 async function fetchBoundedText(url) {

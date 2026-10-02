@@ -63,24 +63,26 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'Paykit Server development commit encoded once in `compose.paykit-local-demo.yaml`',
-    'Paykit Rust release tag `v0.1.0-rc56`',
-    'does not yet compile against the current stacked Locks API',
+    'immutable Paykit Server release tag `0.1.0-rc7`',
+    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc59`',
+    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
     'An absolute local `PAYKIT_SERVER_CONTEXT` override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Rust release `v0.1.0-rc56`',
-    'does not yet compile against the current stacked Locks API',
-    'must not be presented as a working rejection demo',
+    'Paykit Server release `0.1.0-rc7`',
+    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc59`',
+    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'reviewed Paykit Server development commit encoded',
-    'canonical Compose build context',
-    '`v0.1.0-rc56`, and Pubky Homeserver',
+    'immutable Paykit Server release tag `0.1.0-rc7`',
+    'Paykit Server local-demo build uses Paykit Rust',
+    '`v0.1.0-rc59`',
+    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
+    'Pubky Homeserver `v0.11.0`',
     'For coordinated Paykit Server work',
     'npm --prefix examples/js-sdk install',
     'npm --prefix examples/js-sdk run init-config',
@@ -445,6 +447,18 @@ for (const [label, snippets] of Object.entries(required)) {
   for (const snippet of snippets) {
     if (!texts[label].includes(snippet)) {
       throw new Error(`${label} missing expected snippet: ${snippet}`);
+    }
+  }
+}
+
+for (const retired of [
+  '44ed37886122a201b2d5f73c9578ecabb48f72bd',
+  'provisional server revision',
+  'does not yet compile against the current stacked Locks API',
+]) {
+  for (const label of ['rootReadme', 'localOperatorDemo', 'readme']) {
+    if (texts[label].includes(retired)) {
+      throw new Error(`${label} retains retired Paykit Server source wording: ${retired}`);
     }
   }
 }

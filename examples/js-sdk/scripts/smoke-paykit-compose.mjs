@@ -23,15 +23,16 @@ import {
 } from './check-paykit-setup-contract.mjs';
 import {
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  PAYKIT_SERVER_REVISION,
+  PAYKIT_SERVER_REF,
 } from './lib/paykit-server-source.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-assert.match(PAYKIT_SERVER_REVISION, /^[0-9a-f]{40}$/);
+const locksReleaseVersion = '0.1.0-rc8';
+assert.equal(PAYKIT_SERVER_REF, '0.1.0-rc7');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  `https://github.com/pubky/paykit-server.git#${PAYKIT_SERVER_REVISION}`,
+  'https://github.com/pubky/paykit-server.git#0.1.0-rc7',
 );
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
@@ -75,6 +76,9 @@ await assert.rejects(
 assert.equal(oversizedSourceCancelled, true);
 const composeSource = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
 const defaultComposeSource = await readFile(join(repoRoot, 'docker-compose.yml'), 'utf8');
+const cargoManifestSource = await readFile(join(repoRoot, 'Cargo.toml'), 'utf8');
+const cargoLockSource = await readFile(join(repoRoot, 'Cargo.lock'), 'utf8');
+const jsPackage = JSON.parse(await readFile(join(repoRoot, 'locks-sdk/bindings/js/package.json'), 'utf8'));
 const bitcoinBootstrapSource = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap.sh'), 'utf8');
 const creatorAppSource = await readFile(join(repoRoot, 'examples/js-sdk/app-iframe.js'), 'utf8');
 const creatorServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/start-demo-server.mjs'), 'utf8');
@@ -83,6 +87,22 @@ const paykitHttpClientSource = await readFile(join(repoRoot, 'locks-server/src/p
 const checkWorkflowSource = await readFile(join(repoRoot, '.github/workflows/check.yml'), 'utf8');
 assert.match(composeSource, /^# Local development and demonstration only;/);
 assert.match(composeSource, /^name: pubky-locks-paykit-demo$/m);
+assert.match(cargoManifestSource, new RegExp(`^version = "${locksReleaseVersion}"$`, 'm'));
+assert.equal(jsPackage.version, locksReleaseVersion);
+for (const packageName of [
+  'locks-core',
+  'locks-e2e',
+  'locks-sdk',
+  'locks-sdk-wasm',
+  'locks-server',
+  'locks-service',
+]) {
+  assert.match(
+    cargoLockSource,
+    new RegExp(`name = "${packageName}"\\nversion = "${locksReleaseVersion}"`),
+    `${packageName} Cargo.lock version must match the release candidate`,
+  );
+}
 assert.match(creatorAppSource, /hasExactKeys\(event\.data, \['type', 'state', 'code'\]\)/);
 assert.match(creatorAppSource, /body: JSON\.stringify\(\{ level \}\)/);
 assert.match(creatorAppSource, /\[result\.authorizationUrl, result\.command\]\.filter\(Boolean\)/);
@@ -389,8 +409,8 @@ for (const required of [
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc56:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc56:paykit-sdk',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-sdk',
   'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',
