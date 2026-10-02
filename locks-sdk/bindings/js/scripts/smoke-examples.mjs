@@ -11,6 +11,7 @@ const examplesDir = join(repoRoot, 'examples', 'js-sdk');
 const files = {
   rootReadme: join(repoRoot, 'README.md'),
   localOperatorDemo: join(repoRoot, 'docs', 'LOCAL_OPERATOR_DEMO.md'),
+  sdkDocs: join(repoRoot, 'docs', 'SDK.md'),
   paykitViewerDocs: join(repoRoot, 'docs', 'SDK_PAYKIT_VIEWER.md'),
   readme: join(examplesDir, 'README.md'),
   packageJson: join(examplesDir, 'package.json'),
@@ -448,6 +449,10 @@ for (const [label, snippets] of Object.entries(required)) {
   }
 }
 
+const documentedWasmImport = texts.paykitViewerDocs.indexOf(
+  "import init, { BundleId } from '../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';",
+);
+const documentedWasmInitialization = texts.paykitViewerDocs.indexOf('await init();');
 const documentedBundleGeneration = texts.paykitViewerDocs.indexOf(
   'const bundleId = BundleId.generate().toString();',
 );
@@ -456,14 +461,38 @@ const documentedBundlePersistence = texts.paykitViewerDocs.indexOf(
 );
 const documentedUnlockCall = texts.paykitViewerDocs.indexOf('await unlockPaykitContent({');
 if (
-  documentedBundleGeneration < 0
+  documentedWasmImport < 0
+  || documentedWasmInitialization < documentedWasmImport
+  || documentedBundleGeneration < documentedWasmInitialization
   || documentedBundlePersistence < documentedBundleGeneration
   || documentedUnlockCall < documentedBundlePersistence
 ) {
-  throw new Error('caller must generate and persist Bundle ID before starting Paykit unlock');
+  throw new Error('caller must initialize WASM, then generate and persist Bundle ID before starting Paykit unlock');
 }
 if (texts.paykitViewerFlow.includes('BundleId.generate()')) {
   throw new Error('Paykit unlock helper must use caller-supplied Bundle ID');
+}
+
+const sdkWasmImport = texts.sdkDocs.indexOf(
+  'import init, { BundleId, VerificationTaskHandleOptions } from "@synonymdev/locks-sdk";',
+);
+const sdkWasmInitialization = texts.sdkDocs.indexOf('await init();', sdkWasmImport);
+const sdkViewerAccess = texts.sdkDocs.indexOf('const viewer = locks.viewer;', sdkWasmImport);
+const sdkBundleGeneration = texts.sdkDocs.indexOf(
+  'const bundleId = BundleId.generate().toString();',
+  sdkWasmImport,
+);
+const sdkBundlePersistence = texts.sdkDocs.indexOf('await persistBundleId(bundleId);', sdkWasmImport);
+const sdkSubmission = texts.sdkDocs.indexOf('await viewer.submitProofBundle({', sdkWasmImport);
+if (
+  sdkWasmImport < 0
+  || sdkWasmInitialization < sdkWasmImport
+  || sdkViewerAccess < sdkWasmInitialization
+  || sdkBundleGeneration < sdkViewerAccess
+  || sdkBundlePersistence < sdkBundleGeneration
+  || sdkSubmission < sdkBundlePersistence
+) {
+  throw new Error('SDK proof example must initialize WASM and persist its Bundle ID before submission');
 }
 
 if (texts.startReaderServer.includes('8081')) {

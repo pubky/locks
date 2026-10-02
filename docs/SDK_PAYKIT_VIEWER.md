@@ -8,8 +8,9 @@ Runnable browser example: [`examples/js-sdk/paykit-viewer-flow.js`](../examples/
 
 ```js
 import { unlockPaykitContent } from './paykit-viewer-flow.js';
-import { BundleId } from '../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
+import init, { BundleId } from '../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js';
 
+await init();
 const bundleId = BundleId.generate().toString();
 await persistBundleId(bundleId); // application-owned durable, secret-safe storage
 
@@ -33,7 +34,10 @@ const { credentialExpiresAt, response } = await unlockPaykitContent({
 console.log(bundleId, credentialExpiresAt, await response.arrayBuffer());
 ```
 
-`bundleId` is bearer-like recovery state. Generate and persist it before calling
+Await the generated package's default `init` export before using any wasm-backed
+export. Later `init()` calls return the already initialized module, so the helper's
+defensive initialization is safe. `bundleId` is bearer-like recovery state.
+Generate and persist it before calling
 `unlockPaykitContent`; the helper validates it before submission. If submission,
 polling, credential issuance, or proxy-read fails, reuse that same Bundle ID with
 the same resource, reader, and proof. Exact proof-bundle replay is idempotent and

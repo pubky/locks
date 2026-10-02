@@ -404,10 +404,12 @@ const locksForContent = await Locks.forContentLock(
 ### Submit proof bundle
 
 ```ts
-import { BundleId, VerificationTaskHandleOptions } from "locks-sdk-wasm";
+import init, { BundleId, VerificationTaskHandleOptions } from "@synonymdev/locks-sdk";
 
+await init();
 const viewer = locks.viewer;
-const bundleId = BundleId.generate().toString(); // caller must store durably; bearer-like recovery handle
+const bundleId = BundleId.generate().toString();
+await persistBundleId(bundleId); // application-owned durable, secret-safe storage
 const creator = "pubky...";
 
 const lifecycle = await viewer.submitProofBundle({
