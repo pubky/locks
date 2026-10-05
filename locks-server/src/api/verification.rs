@@ -161,13 +161,35 @@ async fn maybe_prepare_paykit_submission(
 
 fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
     match &error {
-        PaykitClientError::NonSuccess { operation, status } => {
-            tracing::warn!(operation, %status, "Paykit request returned non-success status");
-        }
-        PaykitClientError::Http(source) => {
+        PaykitClientError::InvoiceNonSuccess {
+            request_id,
+            elapsed_ms,
+            status,
+            error_code,
+            retry_after_seconds,
+        } => {
             tracing::warn!(
-                timeout = source.is_timeout(),
-                connect = source.is_connect(),
+                operation = "invoice creation",
+                %request_id,
+                status = status.as_u16(),
+                error_code,
+                retry_after_seconds,
+                elapsed_ms,
+                "Paykit request returned non-success status"
+            );
+        }
+        PaykitClientError::InvoiceTransport {
+            request_id,
+            elapsed_ms,
+            timeout,
+            connect,
+        } => {
+            tracing::warn!(
+                operation = "invoice creation",
+                %request_id,
+                elapsed_ms,
+                timeout,
+                connect,
                 "Paykit request transport failed"
             );
         }
@@ -175,7 +197,7 @@ fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
     }
     if matches!(
         error,
-        PaykitClientError::NonSuccess {
+        PaykitClientError::InvoiceNonSuccess {
             status: StatusCode::CONFLICT,
             ..
         }
@@ -357,9 +379,12 @@ mod tests {
 
     #[test]
     fn paykit_invoice_conflict_maps_to_existing_task_conflict() {
-        let error = map_paykit_invoice_error(PaykitClientError::NonSuccess {
-            operation: "invoice creation",
+        let error = map_paykit_invoice_error(PaykitClientError::InvoiceNonSuccess {
+            request_id: uuid::Uuid::nil(),
+            elapsed_ms: 1,
             status: StatusCode::CONFLICT,
+            error_code: Some("invoice_conflict"),
+            retry_after_seconds: None,
         });
 
         assert_eq!(error.status_code(), StatusCode::CONFLICT);
@@ -376,9 +401,12 @@ mod tests {
 
     #[test]
     fn other_paykit_invoice_failures_remain_generic_bad_gateway() {
-        let error = map_paykit_invoice_error(PaykitClientError::NonSuccess {
-            operation: "invoice creation",
+        let error = map_paykit_invoice_error(PaykitClientError::InvoiceNonSuccess {
+            request_id: uuid::Uuid::nil(),
+            elapsed_ms: 1,
             status: StatusCode::BAD_REQUEST,
+            error_code: Some("invalid_request"),
+            retry_after_seconds: None,
         });
 
         assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);

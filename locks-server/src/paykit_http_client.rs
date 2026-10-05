@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -14,6 +14,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::{
     LockServerCredentialsConfig, LockServerSigningKeyError, PAYKIT_CONNECT_TIMEOUT_SECONDS,
@@ -21,8 +22,11 @@ use crate::config::{
 };
 
 const SIGNATURE_HEADER: &str = "X-Paykit-Signature";
+const REQUEST_ID_HEADER: &str = "X-Request-ID";
 const SIGNATURE_DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
 const INVOICE_BODY_LIMIT: usize = 1_024;
+const INVOICE_ERROR_BODY_LIMIT: usize = 1_024;
+const MAX_RETRY_AFTER_SECONDS: u64 = 86_400;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 const PAYMENT_STATUS_BODY_LIMIT: usize = 2_048;
 
@@ -40,6 +44,13 @@ pub enum PaykitClientError {
     Serialize(serde_json::Error),
     #[error("Paykit request failed: {0}")]
     Http(reqwest::Error),
+    #[error("Paykit invoice request transport failed")]
+    InvoiceTransport {
+        request_id: Uuid,
+        elapsed_ms: u64,
+        timeout: bool,
+        connect: bool,
+    },
     #[error("Paykit invoice response was invalid: {0}")]
     InvalidInvoiceResponse(reqwest::Error),
     #[error("Paykit invoice response JSON was invalid: {0}")]
@@ -52,6 +63,14 @@ pub enum PaykitClientError {
     NonSuccess {
         operation: &'static str,
         status: StatusCode,
+    },
+    #[error("Paykit invoice creation returned non-success status {status}")]
+    InvoiceNonSuccess {
+        request_id: Uuid,
+        elapsed_ms: u64,
+        status: StatusCode,
+        error_code: Option<&'static str>,
+        retry_after_seconds: Option<u64>,
     },
     #[error("Paykit connection-status response was invalid: {0}")]
     InvalidConnectionStatusResponse(reqwest::Error),
@@ -79,6 +98,7 @@ impl PaykitClientError {
             | Self::InvalidConnectionStatusResponse(source)
             | Self::InvalidPaymentStatusResponse(source)
             | Self::InvalidStatusResponse(source) => source.is_timeout(),
+            Self::InvoiceTransport { timeout, .. } => *timeout,
             Self::InvalidServerUrl
             | Self::SigningSeedRead(_)
             | Self::InvalidSigningSeed
@@ -92,7 +112,8 @@ impl PaykitClientError {
             | Self::InvalidPaymentStatusJson(_)
             | Self::StatusBodyTooLarge
             | Self::InvalidStatusTimestamps
-            | Self::NonSuccess { .. } => false,
+            | Self::NonSuccess { .. }
+            | Self::InvoiceNonSuccess { .. } => false,
         }
     }
 }
@@ -268,12 +289,35 @@ impl PaykitHttpClient {
         &self,
         request: &PaykitInvoiceRequest,
     ) -> Result<(), PaykitClientError> {
-        let response = self.signed_post("invoices", request).await?;
+        let request_id = Uuid::new_v4();
+        let started = Instant::now();
+        let response = match self
+            .signed_post_with_request_id("invoices", request, Some(request_id))
+            .await
+        {
+            Ok(response) => response,
+            Err(PaykitClientError::Http(source)) => {
+                return Err(PaykitClientError::InvoiceTransport {
+                    request_id,
+                    elapsed_ms: elapsed_millis(started),
+                    timeout: source.is_timeout(),
+                    connect: source.is_connect(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         if response.status() != StatusCode::OK {
-            return Err(PaykitClientError::NonSuccess {
-                operation: "invoice creation",
-                status: response.status(),
+            let status = response.status();
+            let retry_after_seconds =
+                safe_retry_after_seconds(response.headers().get(reqwest::header::RETRY_AFTER));
+            let error_code = read_invoice_error_code(response).await;
+            return Err(PaykitClientError::InvoiceNonSuccess {
+                request_id,
+                elapsed_ms: elapsed_millis(started),
+                status,
+                error_code,
+                retry_after_seconds,
             });
         }
 
@@ -301,6 +345,13 @@ impl PaykitHttpClient {
             .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
         OffsetDateTime::parse(&response.payment_deadline, &Rfc3339)
             .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        tracing::info!(
+            operation = "invoice creation",
+            %request_id,
+            status = StatusCode::OK.as_u16(),
+            elapsed_ms = elapsed_millis(started),
+            "Paykit request completed"
+        );
         Ok(())
     }
 
@@ -376,17 +427,82 @@ impl PaykitHttpClient {
         path: &str,
         request: &T,
     ) -> Result<reqwest::Response, PaykitClientError> {
+        self.signed_post_with_request_id(path, request, None).await
+    }
+
+    async fn signed_post_with_request_id<T: Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+        request_id: Option<Uuid>,
+    ) -> Result<reqwest::Response, PaykitClientError> {
         let body = canonical_body_bytes(request)?;
         let endpoint = self.endpoint(path);
         let signature = sign_request(&self.signing_keypair, "POST", endpoint.path(), &body);
-        self.http
+        let mut request_builder = self
+            .http
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(SIGNATURE_HEADER, signature)
-            .body(body)
+            .body(body);
+        if let Some(request_id) = request_id {
+            request_builder = request_builder.header(REQUEST_ID_HEADER, request_id.to_string());
+        }
+        request_builder
             .send()
             .await
             .map_err(PaykitClientError::Http)
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn safe_retry_after_seconds(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    value?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= MAX_RETRY_AFTER_SECONDS)
+}
+
+async fn read_invoice_error_code(mut response: reqwest::Response) -> Option<&'static str> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > INVOICE_ERROR_BODY_LIMIT as u64)
+    {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > INVOICE_ERROR_BODY_LIMIT {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    invoice_error_code(&body)
+}
+
+fn invoice_error_code(body: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.get("code")?.as_str()?;
+    match code {
+        "invalid_request" => Some("invalid_request"),
+        "invalid_signature" => Some("invalid_signature"),
+        "payload_too_large" => Some("payload_too_large"),
+        "rate_limited" => Some("rate_limited"),
+        "creator_session_invalid" => Some("creator_session_invalid"),
+        "creator_session_unavailable" => Some("creator_session_unavailable"),
+        "dependency_unavailable" => Some("dependency_unavailable"),
+        "dependency_timeout" => Some("dependency_timeout"),
+        "invoice_conflict" => Some("invoice_conflict"),
+        "internal_error" => Some("internal_error"),
+        "lock_not_found" => Some("lock_not_found"),
+        "lock_resource_unavailable" => Some("lock_resource_unavailable"),
+        _ => None,
     }
 }
 
@@ -734,6 +850,75 @@ mod tests {
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
         assert_eq!(request.signature, Some(expected_signature));
+        assert!(Uuid::parse_str(request.request_id.as_deref().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn invoice_error_code_parser_allows_only_known_codes() {
+        for code in [
+            "invalid_request",
+            "invalid_signature",
+            "payload_too_large",
+            "rate_limited",
+            "creator_session_invalid",
+            "creator_session_unavailable",
+            "dependency_unavailable",
+            "dependency_timeout",
+            "invoice_conflict",
+            "internal_error",
+            "lock_not_found",
+            "lock_resource_unavailable",
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"secret"}}}}"#);
+            assert_eq!(invoice_error_code(body.as_bytes()), Some(code));
+        }
+
+        for body in [
+            br#"{"error":{"code":"attacker-controlled"}}"#.as_slice(),
+            br#"{"error":{"code":42}}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+            br#"{}"#.as_slice(),
+        ] {
+            assert_eq!(invoice_error_code(body), None);
+        }
+        let bounded = reqwest::header::HeaderValue::from_static("60");
+        let unbounded = reqwest::header::HeaderValue::from_static("86401");
+        let arbitrary = reqwest::header::HeaderValue::from_static("secret-value");
+        assert_eq!(safe_retry_after_seconds(Some(&bounded)), Some(60));
+        assert_eq!(safe_retry_after_seconds(Some(&unbounded)), None);
+        assert_eq!(safe_retry_after_seconds(Some(&arbitrary)), None);
+    }
+
+    #[tokio::test]
+    async fn invoice_non_success_diagnostics_are_bounded_and_redacted() {
+        let secret = "do-not-log-payment-payload";
+        let body = Box::leak(
+            format!(
+                r#"{{"error":{{"code":"attacker-{secret}","message":"{secret}"}},"padding":"{}"}}"#,
+                "x".repeat(INVOICE_ERROR_BODY_LIMIT)
+            )
+            .into_boxed_str(),
+        );
+        let server_url = spawn_configured_invoice_server(StatusCode::BAD_GATEWAY, body).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        let rendered = format!("{error:?} {error}");
+
+        assert!(matches!(
+            error,
+            PaykitClientError::InvoiceNonSuccess {
+                status: StatusCode::BAD_GATEWAY,
+                error_code: None,
+                ..
+            }
+        ));
+        assert!(!rendered.contains(secret));
     }
 
     #[tokio::test]
@@ -960,7 +1145,14 @@ mod tests {
 
         let error = client.create_invoice(&invoice_request()).await.unwrap_err();
 
-        assert!(matches!(error, PaykitClientError::Http(error) if error.is_timeout()));
+        assert!(matches!(
+            error,
+            PaykitClientError::InvoiceTransport {
+                timeout: true,
+                connect: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1127,6 +1319,7 @@ mod tests {
     struct CapturedRequest {
         path: String,
         signature: Option<String>,
+        request_id: Option<String>,
         body: Vec<u8>,
     }
 
@@ -1368,6 +1561,9 @@ mod tests {
             signature: headers
                 .get(SIGNATURE_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
         Json(json!({
@@ -1402,6 +1598,9 @@ mod tests {
             signature: headers
                 .get(SIGNATURE_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
         Json(json!({ "state": state.state }))
@@ -1416,6 +1615,9 @@ mod tests {
             path: "/payment-requests/status".to_owned(),
             signature: headers
                 .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
