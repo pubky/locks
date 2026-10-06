@@ -1,8 +1,13 @@
 use locks_core::verification::SubmittedProofBundle;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
-use crate::application::ports::{Clock, VerificationTaskIdGenerator, VerificationTaskRepository};
+use crate::application::models::{
+    INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, VerificationTaskRecord,
+    VerificationTaskStatus,
+};
+use crate::application::ports::{
+    Clock, InvoiceAdmissionRepository, VerificationTaskIdGenerator, VerificationTaskRepository,
+};
 use crate::application::use_cases::get_verification_task::VerificationTaskLifecycleView;
 
 /// Request to create a server-owned verification task from submitted proof material.
@@ -110,6 +115,48 @@ impl<'a> SubmitProofBundleUseCase<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Creates or finds a durable Paykit invoice-admission task.
+    pub async fn execute_invoice_pending(
+        &self,
+        request: SubmitProofBundleRequest,
+        admissions: &dyn InvoiceAdmissionRepository,
+    ) -> Result<SubmittedVerificationTask, ApplicationError> {
+        let submitted_proof_bundle = request.submitted_proof_bundle;
+        if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
+            return Ok(existing);
+        }
+        let creator = submitted_proof_bundle.pubky_lock_resource.creator().clone();
+        let reader = submitted_proof_bundle
+            .reader_public_key
+            .clone()
+            .ok_or(ApplicationError::InvalidPaykitPaymentSubmission)?;
+        let task = VerificationTaskRecord {
+            task_id: self.task_ids.generate_task_id().await?,
+            creator: creator.clone(),
+            submitted_at: self.clock.now(),
+            submitted_proof_bundle: submitted_proof_bundle.clone(),
+            status: VerificationTaskStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        };
+        let admission = admissions
+            .insert_invoice_pending_task(
+                task,
+                InvoiceAdmissionIntentV1 {
+                    version: INVOICE_ADMISSION_INTENT_VERSION,
+                    creator,
+                    bundle_id: submitted_proof_bundle.bundle_id,
+                    lock_resource: submitted_proof_bundle.pubky_lock_resource,
+                    reader,
+                },
+            )
+            .await?;
+        Ok(VerificationTaskLifecycleView::from(admission.task))
     }
 }
 

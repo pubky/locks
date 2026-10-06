@@ -59,7 +59,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
-| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` tasks require `[paykit]`; exact persisted replay returns lifecycle without calling Paykit. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
+| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` submissions durably persist one pending invoice-admission task before any Reader/Paykit I/O; exact persisted replay returns same lifecycle. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `429 rate_limited` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
 | `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `429 rate_limited`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
@@ -108,10 +108,8 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
 | `not_paykit_payment` | 422 | Connection state was requested for a verification task that is not Paykit-backed. |
-| `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
 | `rate_limited` | 429 | Submission or Paykit connection-state lookup exceeded configured admission limits. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
-| `paykit_invoice_creation_failed` | 502 | Lock Server could not create the Paykit invoice; no verification task is created. |
 | `paykit_connection_state_unavailable` | 502 | Paykit connection-state lookup failed or returned an invalid response. |
 | `paykit_connection_state_timeout` | 504 | Paykit connection-state lookup exceeded its whole-request deadline. |
 | `internal_error` | 500 | Unexpected server-side failure. |
@@ -570,7 +568,9 @@ Success response returns lifecycle metadata only. It does not return connection 
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting, validates proof shape, loads the current canonical content lock referenced by `pubky_lock_resource`, verifies its lock identity and payment policy (including recipient/creator equality), and resolves `reader_public_key` through Pubky/PKARR/homeserver discovery. It then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`. Exact persisted replays return the existing lifecycle without calling Paykit. New submissions call Paykit `POST /invoices`; task insertion retains race reconciliation after invoice creation. Signed Paykit invoice body is exactly:
+Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
+
+A claimed background worker sends the persisted body below to Paykit `POST /invoices`, using the task UUID as stable `X-Request-ID` for exact Paykit replay after an ambiguous response or process restart:
 
 ```json
 {
@@ -580,7 +580,9 @@ Submission processing applies rate limiting, validates proof shape, loads the cu
 }
 ```
 
-Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks currently discards those response fields after confirming success. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; no new verification task is created unless invoice creation was accepted.
+Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks validates the response, marks invoice admission ready with the exact live claim token, then leaves existing payment-status/outbox processing unchanged. No entitlement can be issued before admission is ready.
+
+Transport errors, typed Reader setup/registry failures (including malformed or oversized registry data), and generic proxy `502`/`503` responses schedule durable full-jitter retry (2-second initial cap, then exponential caps through 60 seconds) without extending the DB-owned 10-minute admission deadline. Numeric `Retry-After` is clamped to 60 seconds. `409 reader_not_payable` and `409 invoice_conflict` are terminal only when both status and typed code match; status-only `409` is never interpreted as either typed condition. Deadline expiry terminalizes the task without entitlement.
 
 ### `POST /paykit-connection-state-lookups`
 
@@ -605,6 +607,8 @@ Rate limiting, when enabled, returns `429 rate_limited` with the stable error en
 ### `POST /verification-task-lookups`
 
 Looks up lifecycle metadata by public handle `{ creator, bundle_id }` using a JSON body. Bundle ID is bearer-secret-like, so it is not placed in URL paths or query strings.
+
+Lifecycle responses include nullable `status_message`. While invoice admission is durably retrying `reader_setup_pending` or malformed/oversized Reader registry data, it is `"Reader wallet setup needed"`; clients should show that safe message and continue polling the existing task. Other states use `null`. This projection does not imply entitlement or invoice readiness.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
 

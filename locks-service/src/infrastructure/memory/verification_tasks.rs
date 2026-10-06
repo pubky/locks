@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{RwLock as SyncRwLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -8,15 +9,18 @@ use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedInvoiceAdmission, INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1,
-    InvoiceAdmissionPhase, InvoiceAdmissionRecord, VerificationTaskRecord, VerificationTaskStatus,
+    InvoiceAdmissionPhase, InvoiceAdmissionRecord, InvoiceAdmissionRetryReason,
+    VerificationTaskRecord, VerificationTaskStatus,
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
+use crate::infrastructure::memory::verification_task_claims::InMemoryVerificationTaskClaimer;
 
 /// In-memory verification task repository.
 #[derive(Debug, Default)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
     invoice_admissions: RwLock<HashMap<TaskId, MemoryInvoiceAdmission>>,
+    verification_task_claimer: SyncRwLock<Option<Weak<InMemoryVerificationTaskClaimer>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +35,19 @@ impl InMemoryVerificationTaskRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Connects tasks created here to the paired in-memory verification claimer.
+    pub fn attach_verification_task_claimer(&self, claimer: Weak<InMemoryVerificationTaskClaimer>) {
+        *self.verification_task_claimer.write().unwrap() = Some(claimer);
+    }
+
+    fn verification_task_claimer(&self) -> Option<std::sync::Arc<InMemoryVerificationTaskClaimer>> {
+        self.verification_task_claimer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
     }
 }
 
@@ -52,7 +69,13 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 record: "verification_task",
             });
         }
-        records.insert(task.task_id, task);
+        records.insert(task.task_id, task.clone());
+        drop(records);
+        if let Some(claimer) = self.verification_task_claimer() {
+            claimer
+                .register_task(task, InvoiceAdmissionPhase::Ready)
+                .await;
+        }
         Ok(())
     }
 
@@ -96,6 +119,9 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
         self.records.write().await.remove(task_id);
         self.invoice_admissions.write().await.remove(task_id);
+        if let Some(claimer) = self.verification_task_claimer() {
+            claimer.remove_task(task_id).await;
+        }
         Ok(())
     }
 }
@@ -138,6 +164,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             admission_deadline_at: task.submitted_at + time::Duration::minutes(10),
             next_attempt_at: Some(task.submitted_at),
             attempt_count: 0,
+            retry_reason: None,
         };
         self.invoice_admissions.write().await.insert(
             task.task_id,
@@ -148,7 +175,13 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 claim_expires_at: None,
             },
         );
-        records.insert(task.task_id, task);
+        records.insert(task.task_id, task.clone());
+        drop(records);
+        if let Some(claimer) = self.verification_task_claimer() {
+            claimer
+                .register_task(task, InvoiceAdmissionPhase::InvoicePending)
+                .await;
+        }
         Ok(admission)
     }
 
@@ -178,14 +211,15 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                     && state
                         .record
                         .next_attempt_at
-                        .is_some_and(|next_attempt_at| next_attempt_at <= now)
+                        .or(state.claim_expires_at)
+                        .is_some_and(|claimable_at| claimable_at <= now)
                     && state
                         .claim_expires_at
                         .is_none_or(|claim_expires_at| claim_expires_at <= now)
             })
             .min_by_key(|(_, state)| {
                 (
-                    state.record.next_attempt_at,
+                    state.record.next_attempt_at.or(state.claim_expires_at),
                     state.record.task.submitted_at,
                     state.record.task.task_id.to_string(),
                 )
@@ -227,10 +261,16 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         };
         state.record.phase = InvoiceAdmissionPhase::Ready;
         state.record.next_attempt_at = None;
+        state.record.retry_reason = None;
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
-        Ok(Some(state.record.clone()))
+        let record = state.record.clone();
+        drop(admissions);
+        if let Some(claimer) = self.verification_task_claimer() {
+            claimer.mark_invoice_admission_ready(task_id).await;
+        }
+        Ok(Some(record))
     }
 
     async fn schedule_invoice_admission_retry(
@@ -240,6 +280,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
         retry_after: time::Duration,
+        retry_reason: Option<InvoiceAdmissionRetryReason>,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
@@ -253,6 +294,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         };
         state.record.next_attempt_at =
             Some((now + retry_after).min(state.record.admission_deadline_at));
+        state.record.retry_reason = retry_reason;
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
@@ -287,6 +329,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.record.task.completed_at = Some(now);
         state.record.task.failure_message = Some(message.to_owned());
         state.record.next_attempt_at = None;
+        state.record.retry_reason = None;
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
@@ -570,6 +613,7 @@ mod tests {
                 &uuid::Uuid::new_v4(),
                 task.submitted_at,
                 time::Duration::seconds(5),
+                None,
             )
             .await
             .unwrap(),
@@ -603,6 +647,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoice_admission_reclaims_expired_lease_with_fresh_token() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let mut task = task(VerificationTaskStatus::Pending);
+        task.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        repo.insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let lease = time::Duration::seconds(5);
+        let first = repo
+            .claim_next_invoice_admission("worker-a", task.submitted_at, lease)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            repo.claim_next_invoice_admission(
+                "worker-b",
+                task.submitted_at + lease - time::Duration::nanoseconds(1),
+                lease,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let second = repo
+            .claim_next_invoice_admission("worker-b", task.submitted_at + lease, lease)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(second.claim_token, first.claim_token);
+        assert_eq!(second.admission.attempt_count, 2);
+    }
+
+    #[tokio::test]
     async fn invoice_admission_retry_is_due_gated_and_failure_is_fenced() {
         let repo = InMemoryVerificationTaskRepository::new();
         let mut task = task(VerificationTaskStatus::Pending);
@@ -626,6 +708,7 @@ mod tests {
                 &first.claim_token,
                 task.submitted_at,
                 time::Duration::seconds(5),
+                None,
             )
             .await
             .unwrap()
@@ -707,6 +790,7 @@ mod tests {
                 &claim.claim_token,
                 retry_started_at,
                 retry_after,
+                None,
             )
             .await
             .unwrap()

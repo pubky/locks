@@ -64,6 +64,26 @@ pub enum InvoiceAdmissionPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceAdmissionRetryReason {
+    ReaderWalletSetupNeeded,
+}
+
+impl InvoiceAdmissionRetryReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReaderWalletSetupNeeded => "reader_wallet_setup_needed",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "reader_wallet_setup_needed" => Some(Self::ReaderWalletSetupNeeded),
+            _ => None,
+        }
+    }
+}
+
 /// Durable invoice-admission state stored with one verification task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceAdmissionRecord {
@@ -73,6 +93,7 @@ pub struct InvoiceAdmissionRecord {
     pub admission_deadline_at: OffsetDateTime,
     pub next_attempt_at: Option<OffsetDateTime>,
     pub attempt_count: u32,
+    pub retry_reason: Option<InvoiceAdmissionRetryReason>,
 }
 
 /// Claimed invoice admission carrying exact lease-incarnation fencing token.

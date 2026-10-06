@@ -20,8 +20,8 @@ use locks_service::{
             AccessCredentialStore, Clock, ContentLockRepository, CreatorAuthorityManager,
             CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
             FrontendSessionCodeStore, FrontendSessionStore, GuardedResourceRepository,
-            LegacyCreatorConnectFlowClient, LockServicePointerRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
+            LockServicePointerRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
     },
     infrastructure::{
@@ -162,6 +162,7 @@ pub struct AppState {
     content_locks: Arc<dyn ContentLockRepository>,
     guarded_resources: Arc<dyn GuardedResourceRepository>,
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
+    invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     entitlements: Arc<dyn EntitlementRepository>,
@@ -227,6 +228,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -243,6 +246,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -276,6 +280,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -291,6 +297,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -324,6 +331,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -356,6 +365,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -410,6 +420,7 @@ impl AppState {
             };
 
         let private_runtime = PrivateRuntimeAdapters {
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -471,6 +482,7 @@ impl AppState {
             entitlements,
         );
         let private_runtime = PrivateRuntimeAdapters {
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -543,6 +555,7 @@ impl AppState {
             content_locks: creator_repositories.content_locks,
             guarded_resources: creator_repositories.guarded_resources,
             lock_service_pointers: creator_repositories.lock_service_pointers,
+            invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
             entitlements: creator_repositories.entitlements,
@@ -597,6 +610,10 @@ impl AppState {
 
     pub fn verification_tasks(&self) -> &Arc<dyn VerificationTaskRepository> {
         &self.verification_tasks
+    }
+
+    pub fn invoice_admissions(&self) -> &Arc<dyn InvoiceAdmissionRepository> {
+        &self.invoice_admissions
     }
 
     pub fn verification_task_claimer(&self) -> &Arc<dyn VerificationTaskClaimer> {

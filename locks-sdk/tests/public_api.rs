@@ -60,10 +60,15 @@ fn crate_root_exports_foundation_sdk_types() {
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
             "completed_at": null,
-            "failure_message": null
+            "failure_message": null,
+            "status_message": "Reader wallet setup needed"
         }))
         .unwrap();
     assert_eq!(lifecycle.status, VerificationTaskStatus::Pending);
+    assert_eq!(
+        lifecycle.status_message.as_deref(),
+        Some("Reader wallet setup needed")
+    );
 
     let issued: AccessCredentialResponse =
         ViewerLocks::parse_access_credential_response(serde_json::json!({

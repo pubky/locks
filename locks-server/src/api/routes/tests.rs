@@ -23,8 +23,8 @@ use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
-    FrontendSessionToken, GuardedResourceRecord, LegacyCreatorConnectFlowApproval,
-    PendingCreatorConnectFlowRecord,
+    FrontendSessionToken, GuardedResourceRecord, InvoiceAdmissionRetryReason,
+    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
 use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
 use pubky_common::crypto::Keypair;
@@ -435,7 +435,7 @@ async fn post_proof_bundles_rejects_paykit_payment_when_paykit_is_not_configured
 }
 
 #[tokio::test]
-async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_invoice() {
+async fn post_proof_bundles_persists_pending_without_inline_paykit_invoice() {
     let calls = Arc::new(AtomicUsize::new(0));
     let paykit_url = spawn_counting_paykit_invoice(Arc::clone(&calls)).await;
     let paykit = Arc::new(
@@ -455,8 +455,8 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
     let state = test_state()
         .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
         .with_paykit_http_client(Some(paykit));
-    seed_content_lock(&state, content_lock).await;
-    let app = router(state);
+    seed_content_lock(&state, content_lock.clone()).await;
+    let app = router(state.clone());
 
     let first = app
         .clone()
@@ -469,6 +469,24 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert!(response_json(first).await.get("connection_state").is_none());
+
+    let premature_completion = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-completions",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(premature_completion.status(), StatusCode::CONFLICT);
+
+    let mut changed_content_lock = content_lock;
+    changed_content_lock.created_at += time::Duration::seconds(1);
+    seed_content_lock(&state, changed_content_lock).await;
 
     let replay = app
         .oneshot(json_request(
@@ -485,7 +503,151 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
             .get("connection_state")
             .is_none()
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn in_memory_invoice_ready_task_becomes_claimable_for_verification() {
+    let paykit_url = spawn_counting_paykit_invoice(Arc::new(AtomicUsize::new(0))).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = state.clock().now();
+    let admission_claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("invoice-worker", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .invoice_admissions()
+        .mark_invoice_admission_ready(
+            &task.task_id,
+            "invoice-worker",
+            &admission_claim.claim_token,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let verification_claim = state
+        .verification_task_claimer()
+        .claim_next_verification_task("verification-worker", now, now + time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .expect("ready invoice task must enter verification worker queue");
+    assert_eq!(verification_claim.task.task_id, task.task_id);
+}
+
+#[tokio::test]
+async fn verification_task_lookup_projects_reader_wallet_setup_needed_without_entitlement() {
+    let paykit_url = spawn_counting_paykit_invoice(Arc::new(AtomicUsize::new(0))).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let mut content_lock = content_lock(true);
+    content_lock.criteria[0].verifier_type = VerifierType::PaykitPayment;
+    content_lock.criteria[0].params = json!({
+        "recipient_pubky": creator().to_string(),
+        "amount": "50000",
+        "asset": "BTC"
+    });
+    let mut bundle = submitted_proof_bundle_for(&content_lock);
+    bundle.reader_public_key = Some(other_creator());
+    bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+    bundle.proofs[0].payload = json!({});
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = state.clock().now();
+    let claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("worker-a", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .invoice_admissions()
+        .schedule_invoice_admission_retry(
+            &task.task_id,
+            "worker-a",
+            &claim.claim_token,
+            now,
+            time::Duration::seconds(2),
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(replay).await["status_message"],
+        "Reader wallet setup needed"
+    );
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["status_message"], "Reader wallet setup needed");
+    assert!(body.get("entitlement_to_publish").is_none());
 }
 
 #[tokio::test]
@@ -758,7 +920,7 @@ async fn paykit_connection_state_lookup_maps_invalid_paykit_response_to_bad_gate
 
 #[tokio::test]
 async fn paykit_connection_state_lookup_maps_response_body_timeout_to_gateway_timeout() {
-    let paykit_url = spawn_invoice_then_stalled_connection_status_body().await;
+    let paykit_url = spawn_stalled_connection_status_body().await;
     let paykit = Arc::new(
         PaykitHttpClient::new_for_test_with_timeout(
             &paykit_url,
@@ -3613,19 +3775,10 @@ async fn spawn_blocking_paykit_connection_status(
     format!("http://{address}")
 }
 
-async fn spawn_invoice_then_stalled_connection_status_body() -> String {
+async fn spawn_stalled_connection_status_body() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut invoice_socket, _) = listener.accept().await.unwrap();
-        invoice_socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"invoice_created_at\":\"2026-09-25T11:00:00Z\",\"payment_deadline\":\"2026-09-25T12:00:00Z\"}",
-            )
-            .await
-            .unwrap();
-        drop(invoice_socket);
-
         let (mut connection_status_socket, _) = listener.accept().await.unwrap();
         connection_status_socket
             .write_all(

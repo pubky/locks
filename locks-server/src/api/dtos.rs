@@ -89,6 +89,7 @@ pub struct VerificationTaskLifecycleHttpResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
     pub failure_message: Option<String>,
+    pub status_message: Option<String>,
     #[serde(serialize_with = "serialize_optional_terminal_reason")]
     pub terminal_reason: Option<VerificationTerminalReason>,
 }
@@ -103,6 +104,7 @@ impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpRespon
             started_at: view.started_at,
             completed_at: view.completed_at,
             failure_message: view.failure_message,
+            status_message: None,
             terminal_reason: view.terminal_reason,
         }
     }

@@ -9,8 +9,8 @@ use locks_core::verification::{SubmittedProofBundle, VerifiedProofBundle};
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedInvoiceAdmission, INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1,
-    InvoiceAdmissionPhase, InvoiceAdmissionRecord, VerificationTaskRecord, VerificationTaskStatus,
-    VerificationTerminalReason,
+    InvoiceAdmissionPhase, InvoiceAdmissionRecord, InvoiceAdmissionRetryReason,
+    VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
 
@@ -56,6 +56,7 @@ struct InvoiceAdmissionMetadataRow {
     admission_deadline_at: Option<time::OffsetDateTime>,
     next_attempt_at: Option<time::OffsetDateTime>,
     attempt_count: i32,
+    invoice_admission_retry_reason: Option<String>,
 }
 
 pub(super) const VERIFICATION_TASK_ROW_COLUMNS: &str = "
@@ -285,7 +286,8 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
         let metadata = sqlx::query_as::<_, InvoiceAdmissionMetadataRow>(
             "SELECT invoice_admission_phase, invoice_admission_intent,
-                    admission_deadline_at, next_attempt_at, attempt_count
+                    admission_deadline_at, next_attempt_at, attempt_count,
+                    invoice_admission_retry_reason
              FROM verification_tasks
              WHERE task_id = $1::uuid AND invoice_admission_intent IS NOT NULL",
         )
@@ -327,6 +329,18 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             u32::try_from(metadata.attempt_count).map_err(|_| ApplicationError::Storage {
                 message: "invoice admission attempt_count is negative".to_owned(),
             })?;
+        let retry_reason = metadata
+            .invoice_admission_retry_reason
+            .map(|value| {
+                InvoiceAdmissionRetryReason::from_storage_value(&value).ok_or_else(|| {
+                    ApplicationError::Storage {
+                        message: format!(
+                            "invalid invoice_admission_retry_reason stored in Postgres: {value}"
+                        ),
+                    }
+                })
+            })
+            .transpose()?;
         Ok(Some(InvoiceAdmissionRecord {
             task,
             phase,
@@ -334,6 +348,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             admission_deadline_at,
             next_attempt_at: metadata.next_attempt_at,
             attempt_count,
+            retry_reason,
         }))
     }
 
@@ -351,9 +366,9 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
                  FROM verification_tasks
                  WHERE invoice_admission_phase = 'invoice_pending'
                    AND status = 'pending'
-                   AND next_attempt_at <= clock_timestamp()
+                   AND COALESCE(next_attempt_at, claim_expires_at) <= clock_timestamp()
                    AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
-                 ORDER BY next_attempt_at, submitted_at, task_id
+                 ORDER BY COALESCE(next_attempt_at, claim_expires_at), submitted_at, task_id
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
              ),
@@ -371,7 +386,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              WHERE task.task_id = candidate.task_id
                AND task.invoice_admission_phase = 'invoice_pending'
                AND task.status = 'pending'
-               AND task.next_attempt_at <= timing.winner_time
+               AND COALESCE(task.next_attempt_at, task.claim_expires_at) <= timing.winner_time
                AND (task.claim_expires_at IS NULL OR task.claim_expires_at <= timing.winner_time)
              RETURNING task.task_id::text,
                        task.admission_deadline_at <= timing.winner_time AS deadline_expired",
@@ -419,6 +434,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              )
              UPDATE verification_tasks AS task
              SET invoice_admission_phase = 'ready',
+                 invoice_admission_retry_reason = NULL,
                  claimed_by = NULL,
                  claim_token = NULL,
                  claim_expires_at = NULL,
@@ -453,6 +469,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         claim_token: &uuid::Uuid,
         _now: time::OffsetDateTime,
         retry_after: time::Duration,
+        retry_reason: Option<InvoiceAdmissionRetryReason>,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
         let retry_after_microseconds = duration_microseconds(retry_after, "retry delay")?;
         let updated: Option<String> = sqlx::query_scalar(
@@ -466,6 +483,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              )
              UPDATE verification_tasks AS task
              SET claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 invoice_admission_retry_reason = $5,
                  next_attempt_at = LEAST(
                      timing.winner_time + ($4 * INTERVAL '1 microsecond'),
                      task.admission_deadline_at
@@ -484,6 +502,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         .bind(worker_id)
         .bind(claim_token)
         .bind(retry_after_microseconds)
+        .bind(retry_reason.map(InvoiceAdmissionRetryReason::as_str))
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -516,6 +535,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              )
              UPDATE verification_tasks AS task
              SET invoice_admission_phase = 'failed', status = 'failed',
+                 invoice_admission_retry_reason = NULL,
                  started_at = COALESCE(task.started_at, timing.winner_time),
                  completed_at = timing.winner_time, failure_message = $4,
                  claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
@@ -745,7 +765,8 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, InvoiceAdmissionPhase,
-        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+        InvoiceAdmissionRetryReason, VerificationTaskRecord, VerificationTaskStatus,
+        VerificationTerminalReason,
     };
     use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
     use crate::infrastructure::postgres::testing::TestDatabase;
@@ -973,6 +994,7 @@ mod tests {
                 &uuid::Uuid::new_v4(),
                 task.submitted_at,
                 time::Duration::seconds(5),
+                None,
             )
             .await
             .unwrap(),
@@ -1004,6 +1026,53 @@ mod tests {
         assert_eq!(ready.task.status, VerificationTaskStatus::Pending);
         assert_eq!(ready.next_attempt_at, None);
 
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invoice_admission_postgres_reclaims_expired_lease_with_fresh_token() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let mut task = task(VerificationTaskStatus::Pending);
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+        repo.insert_invoice_pending_task(
+            task.clone(),
+            InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: task.creator.clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader,
+            },
+        )
+        .await
+        .unwrap();
+        let first = repo
+            .claim_next_invoice_admission("worker-a", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET claim_expires_at = clock_timestamp() - INTERVAL '1 microsecond'
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let second = repo
+            .claim_next_invoice_admission("worker-b", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(second.claim_token, first.claim_token);
+        assert_eq!(second.admission.attempt_count, 2);
         database.cleanup().await;
     }
 
@@ -1062,6 +1131,7 @@ mod tests {
                 &claim.claim_token,
                 task.submitted_at,
                 time::Duration::milliseconds(1_250),
+                None,
             )
             .await
             .unwrap()
@@ -1173,6 +1243,7 @@ mod tests {
                 &first.claim_token,
                 task.submitted_at,
                 time::Duration::seconds(5),
+                Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded),
             )
             .await
             .unwrap()
@@ -1180,6 +1251,15 @@ mod tests {
         assert_eq!(retry.phase, InvoiceAdmissionPhase::InvoicePending);
         assert_eq!(retry.attempt_count, 1);
         assert!(retry.next_attempt_at.is_some());
+        assert_eq!(
+            recreated_repo
+                .get_invoice_admission(&task.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .retry_reason,
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
+        );
 
         sqlx::query(
             "UPDATE verification_tasks

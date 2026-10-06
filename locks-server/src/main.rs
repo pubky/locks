@@ -6,7 +6,7 @@ use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initial
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{home_dir_from_env, parse_config_arg};
 use locks_server::storage::build_runtime_state;
-use locks_server::worker::VerificationWorker;
+use locks_server::worker::{InvoiceAdmissionWorker, OsFullJitter, VerificationWorker};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
@@ -36,14 +36,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = build_runtime_state(config).await?;
     let worker_enabled = state.config().worker.enabled;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let worker_handle = if worker_enabled {
+    let verification_worker_handle = if worker_enabled {
         let worker_state = state.clone();
+        let worker_shutdown = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             let worker = VerificationWorker::from_state(&worker_state);
-            if let Err(error) = worker.run_until_shutdown(shutdown_rx).await {
+            if let Err(error) = worker.run_until_shutdown(worker_shutdown).await {
                 error!(%error, "verification worker stopped with error");
             }
         }))
+    } else {
+        None
+    };
+    let invoice_worker_handle = if worker_enabled {
+        state.paykit_http_client().cloned().map(|paykit| {
+            let worker_state = state.clone();
+            tokio::spawn(async move {
+                let jitter = OsFullJitter;
+                let worker =
+                    InvoiceAdmissionWorker::from_state(&worker_state, paykit.as_ref(), &jitter);
+                if let Err(error) = worker.run_until_shutdown(shutdown_rx).await {
+                    error!(%error, "invoice admission worker stopped with error");
+                }
+            })
+        })
     } else {
         None
     };
@@ -58,7 +74,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     let _ = shutdown_tx.send(true);
-    if let Some(worker_handle) = worker_handle {
+    if let Some(worker_handle) = verification_worker_handle {
+        worker_handle.await?;
+    }
+    if let Some(worker_handle) = invoice_worker_handle {
         worker_handle.await?;
     }
     Ok(())

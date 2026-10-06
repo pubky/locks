@@ -26,7 +26,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-ID";
 const SIGNATURE_DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
 const INVOICE_BODY_LIMIT: usize = 1_024;
 const INVOICE_ERROR_BODY_LIMIT: usize = 1_024;
-const MAX_RETRY_AFTER_SECONDS: u64 = 86_400;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 const PAYMENT_STATUS_BODY_LIMIT: usize = 2_048;
 
@@ -59,6 +59,8 @@ pub enum PaykitClientError {
     InvoiceBodyTooLarge,
     #[error("Paykit invoice response timestamp was invalid: {0}")]
     InvalidInvoiceTimestamp(time::error::Parse),
+    #[error("Paykit invoice response timestamps were invalid")]
+    InvalidInvoiceTimestamps,
     #[error("Paykit {operation} returned non-success status {status}")]
     NonSuccess {
         operation: &'static str,
@@ -106,6 +108,7 @@ impl PaykitClientError {
             | Self::Serialize(_)
             | Self::InvalidInvoiceJson(_)
             | Self::InvalidInvoiceTimestamp(_)
+            | Self::InvalidInvoiceTimestamps
             | Self::InvoiceBodyTooLarge
             | Self::InvalidConnectionStatusJson(_)
             | Self::ConnectionStatusBodyTooLarge
@@ -130,6 +133,15 @@ pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
     pub reader: String,
+}
+
+#[async_trait]
+pub trait PaykitInvoiceCreator: Send + Sync {
+    async fn create_invoice(
+        &self,
+        request_id: Uuid,
+        request: &PaykitInvoiceRequest,
+    ) -> Result<(), PaykitClientError>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,9 +299,9 @@ impl PaykitHttpClient {
 
     pub async fn create_invoice(
         &self,
+        request_id: Uuid,
         request: &PaykitInvoiceRequest,
     ) -> Result<(), PaykitClientError> {
-        let request_id = Uuid::new_v4();
         let started = Instant::now();
         let response = match self
             .signed_post_with_request_id("invoices", request, Some(request_id))
@@ -341,10 +353,13 @@ impl PaykitHttpClient {
         }
         let response: PaykitInvoiceResponse =
             serde_json::from_slice(&body).map_err(PaykitClientError::InvalidInvoiceJson)?;
-        OffsetDateTime::parse(&response.invoice_created_at, &Rfc3339)
+        let invoice_created_at = OffsetDateTime::parse(&response.invoice_created_at, &Rfc3339)
             .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
-        OffsetDateTime::parse(&response.payment_deadline, &Rfc3339)
+        let payment_deadline = OffsetDateTime::parse(&response.payment_deadline, &Rfc3339)
             .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        if payment_deadline <= invoice_created_at {
+            return Err(PaykitClientError::InvalidInvoiceTimestamps);
+        }
         tracing::info!(
             operation = "invoice creation",
             %request_id,
@@ -455,6 +470,17 @@ impl PaykitHttpClient {
     }
 }
 
+#[async_trait]
+impl PaykitInvoiceCreator for PaykitHttpClient {
+    async fn create_invoice(
+        &self,
+        request_id: Uuid,
+        request: &PaykitInvoiceRequest,
+    ) -> Result<(), PaykitClientError> {
+        PaykitHttpClient::create_invoice(self, request_id, request).await
+    }
+}
+
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -465,7 +491,7 @@ fn safe_retry_after_seconds(value: Option<&reqwest::header::HeaderValue>) -> Opt
         .ok()?
         .parse::<u64>()
         .ok()
-        .filter(|seconds| *seconds <= MAX_RETRY_AFTER_SECONDS)
+        .map(|seconds| seconds.min(MAX_RETRY_AFTER_SECONDS))
 }
 
 async fn read_invoice_error_code(mut response: reqwest::Response) -> Option<&'static str> {
@@ -499,6 +525,10 @@ fn invoice_error_code(body: &[u8]) -> Option<&'static str> {
         "dependency_unavailable" => Some("dependency_unavailable"),
         "dependency_timeout" => Some("dependency_timeout"),
         "invoice_conflict" => Some("invoice_conflict"),
+        "reader_setup_pending" => Some("reader_setup_pending"),
+        "reader_registry_unavailable" => Some("reader_registry_unavailable"),
+        "reader_registry_malformed" => Some("reader_registry_malformed"),
+        "reader_not_payable" => Some("reader_not_payable"),
         "internal_error" => Some("internal_error"),
         "lock_not_found" => Some("lock_not_found"),
         "lock_resource_unavailable" => Some("lock_resource_unavailable"),
@@ -844,13 +874,20 @@ mod tests {
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
         let expected_signature = sign_request(&keypair, "POST", "/invoices", &expected_body);
 
-        client.create_invoice(&invoice_request()).await.unwrap();
+        let request_id = Uuid::parse_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap();
+        client
+            .create_invoice(request_id, &invoice_request())
+            .await
+            .unwrap();
 
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
         assert_eq!(request.signature, Some(expected_signature));
-        assert!(Uuid::parse_str(request.request_id.as_deref().unwrap()).is_ok());
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some(request_id.to_string().as_str())
+        );
     }
 
     #[test]
@@ -865,6 +902,10 @@ mod tests {
             "dependency_unavailable",
             "dependency_timeout",
             "invoice_conflict",
+            "reader_setup_pending",
+            "reader_registry_unavailable",
+            "reader_registry_malformed",
+            "reader_not_payable",
             "internal_error",
             "lock_not_found",
             "lock_resource_unavailable",
@@ -882,10 +923,10 @@ mod tests {
             assert_eq!(invoice_error_code(body), None);
         }
         let bounded = reqwest::header::HeaderValue::from_static("60");
-        let unbounded = reqwest::header::HeaderValue::from_static("86401");
+        let clamped = reqwest::header::HeaderValue::from_static("61");
         let arbitrary = reqwest::header::HeaderValue::from_static("secret-value");
         assert_eq!(safe_retry_after_seconds(Some(&bounded)), Some(60));
-        assert_eq!(safe_retry_after_seconds(Some(&unbounded)), None);
+        assert_eq!(safe_retry_after_seconds(Some(&clamped)), Some(60));
         assert_eq!(safe_retry_after_seconds(Some(&arbitrary)), None);
     }
 
@@ -907,7 +948,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
         let rendered = format!("{error:?} {error}");
 
         assert!(matches!(
@@ -943,7 +987,38 @@ mod tests {
             )
             .unwrap();
 
-            assert!(client.create_invoice(&invoice_request()).await.is_err());
+            assert!(
+                client
+                    .create_invoice(Uuid::new_v4(), &invoice_request())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_equal_or_reversed_timestamps() {
+        for payment_deadline in ["2026-09-25T11:00:00Z", "2026-09-25T10:59:59Z"] {
+            let body = Box::leak(
+                format!(
+                    "{{\"invoice_created_at\":\"2026-09-25T11:00:00Z\",\"payment_deadline\":\"{payment_deadline}\"}}"
+                )
+                .into_boxed_str(),
+            );
+            let server_url = spawn_configured_invoice_server(StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                client
+                    .create_invoice(Uuid::new_v4(), &invoice_request())
+                    .await,
+                Err(PaykitClientError::InvalidInvoiceTimestamps)
+            ));
         }
     }
 
@@ -1143,7 +1218,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1427,7 +1505,10 @@ mod tests {
             Keypair::from_secret(&[9_u8; 32]),
         )
         .unwrap();
-        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
         assert!(matches!(error, PaykitClientError::InvoiceBodyTooLarge));
     }
 

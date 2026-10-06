@@ -101,6 +101,50 @@ impl InMemoryVerificationTaskClaimer {
             task_repository: None,
         }
     }
+
+    /// Registers a task created after this in-memory claimer was constructed.
+    pub async fn register_task(
+        &self,
+        task: VerificationTaskRecord,
+        invoice_admission_phase: InvoiceAdmissionPhase,
+    ) {
+        let mut records = self.records.write().await;
+        if records
+            .iter()
+            .any(|record| record.task.task_id == task.task_id)
+        {
+            return;
+        }
+        records.push(ClaimableVerificationTask {
+            task,
+            invoice_admission_phase,
+            claimed_by: None,
+            claim_token: None,
+            claim_expires_at: None,
+            next_attempt_at: None,
+        });
+    }
+
+    /// Releases an admitted invoice task into the verification worker queue.
+    pub async fn mark_invoice_admission_ready(&self, task_id: &TaskId) {
+        if let Some(record) = self
+            .records
+            .write()
+            .await
+            .iter_mut()
+            .find(|record| record.task.task_id == *task_id)
+        {
+            record.invoice_admission_phase = InvoiceAdmissionPhase::Ready;
+        }
+    }
+
+    /// Removes task state deleted from the paired in-memory repository.
+    pub async fn remove_task(&self, task_id: &TaskId) {
+        self.records
+            .write()
+            .await
+            .retain(|record| record.task.task_id != *task_id);
+    }
 }
 
 #[async_trait]

@@ -6,7 +6,7 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedInvoiceAdmission, ClaimedVerificationTask, CriterionVerificationOutcome,
     CriterionVerificationRequest, InvoiceAdmissionIntentV1, InvoiceAdmissionRecord,
-    VerificationTaskRecord,
+    InvoiceAdmissionRetryReason, VerificationTaskRecord,
 };
 
 /// Persistence boundary for durable work that must exist before Paykit invoice creation.
@@ -52,6 +52,7 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
         retry_after: time::Duration,
+        retry_reason: Option<InvoiceAdmissionRetryReason>,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
 
     /// Terminalizes admission only for exact live lease incarnation.

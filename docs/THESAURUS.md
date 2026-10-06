@@ -252,13 +252,13 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Criterion Verification Result, Lock Type
 
 ### Paykit Payment Verifier
-- **Definition**: Production-shaped payment verifier with public wire value `paykit-payment`; in v1 it must be the content lock's sole criterion and the sole lock-logic reference, creates invoices through configured Paykit Server during proof submission, and verifies payment status through worker-owned status checks.
+- **Definition**: Production-shaped payment verifier with public wire value `paykit-payment`; in v1 it must be the content lock's sole criterion and the sole lock-logic reference. Submission first persists a durable invoice-admission task; workers create the invoice through configured Paykit Server, then verify payment status after admission is ready.
 - **NOT**: The Paykit Server itself, wallet/xpub custody, a generic `payment` verifier, or the stale `paykit` verifier value.
 - **Synonyms to AVOID**: paykit verifier, payment verifier, paid lock verifier
 - **Related terms**: Verifier Type, Submitted Proof Bundle, Reader Public Key, Paykit Server
 
 ### Reader Public Key
-- **Definition**: Top-level `SubmittedProofBundle.reader_public_key` Pubky identity required for `paykit-payment` submissions; it must resolve through Pubky/PKARR/homeserver discovery before invoice creation.
+- **Definition**: Top-level `SubmittedProofBundle.reader_public_key` Pubky identity required for `paykit-payment` submissions and persisted in immutable invoice-admission intent. Paykit performs Reader wallet registry discovery when the durable worker requests invoice creation; setup and bounded malformed/oversized registry failures remain retryable until the original 10-minute admission deadline.
 - **NOT**: A proof payload field, content creator identity, access credential binding, or final non-transferability guarantee.
 - **Synonyms to AVOID**: reader, viewer key, payer key
 - **Related terms**: Submitted Proof Bundle, Paykit Payment Verifier, Content Viewer

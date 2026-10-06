@@ -76,6 +76,7 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<time::OffsetDateTime>,
     pub failure_message: Option<String>,
+    pub status_message: Option<String>,
     pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
@@ -206,18 +207,24 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
             response.started_at.is_none()
                 && response.completed_at.is_none()
                 && response.failure_message.is_none()
+                && matches!(
+                    response.status_message.as_deref(),
+                    None | Some("Reader wallet setup needed")
+                )
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::InProgress => {
             response.started_at.is_some()
                 && response.completed_at.is_none()
                 && response.failure_message.is_none()
+                && response.status_message.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Completed => {
             response.started_at.is_some()
                 && response.completed_at.is_some()
                 && response.failure_message.is_none()
+                && response.status_message.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Failed => {
@@ -227,12 +234,14 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                     .failure_message
                     .as_deref()
                     .is_some_and(|message| !message.trim().is_empty())
+                && response.status_message.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Expired => {
             response.started_at.is_some()
                 && response.completed_at.is_some()
                 && response.failure_message.is_none()
+                && response.status_message.is_none()
                 && response.terminal_reason.is_some()
         }
     };
@@ -430,6 +439,35 @@ mod tests {
         ] {
             assert!(ViewerLocks::parse_lifecycle_response(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn lifecycle_response_rejects_unknown_or_non_pending_status_message() {
+        let base = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "status_message": "future progress text",
+            "terminal_reason": null
+        });
+        assert!(ViewerLocks::parse_lifecycle_response(base).is_err());
+
+        let completed = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "status_message": "Reader wallet setup needed",
+            "terminal_reason": null
+        });
+        assert!(ViewerLocks::parse_lifecycle_response(completed).is_err());
     }
 
     #[test]

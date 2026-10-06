@@ -13,6 +13,9 @@ use tracing::{debug, error, info};
 
 use crate::app_state::AppState;
 
+mod invoice;
+pub use invoice::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, OsFullJitter};
+
 const PENDING_VERIFICATION_RETRY_DELAY_SECONDS: i64 = 30;
 
 /// Result of one worker polling attempt.
@@ -227,6 +230,9 @@ fn claim_timeout(seconds: u64) -> time::Duration {
 fn retry_delay() -> time::Duration {
     time::Duration::seconds(PENDING_VERIFICATION_RETRY_DELAY_SECONDS)
 }
+
+#[cfg(test)]
+mod invoice_tests;
 
 #[cfg(test)]
 mod tests {

@@ -98,6 +98,7 @@ Lifecycle response:
   "started_at": null,
   "completed_at": null,
   "failure_message": null,
+  "status_message": "Reader wallet setup needed",
   "terminal_reason": null
 }
 ```
@@ -106,12 +107,14 @@ Handle lifecycle states as closed vocabulary:
 
 | Status | Required fields | Consumer action |
 | --- | --- | --- |
-| `pending` | `started_at`, `completed_at`, `failure_message`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
+| `pending` | `started_at`, `completed_at`, `failure_message`, and `terminal_reason` are `null`; `status_message` is nullable | If `status_message` is `Reader wallet setup needed`, show it. Keep polling same task; do not resubmit. |
 | `in_progress` | `started_at` is set; `completed_at`, `failure_message`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
 | `completed` | `started_at` and `completed_at` are set; `failure_message` and `terminal_reason` are `null` | Call `issueAccessCredential`, then proxy-read an authorized relative path. |
 | `failed` | `started_at` and `completed_at` are set; `failure_message` is non-empty; `terminal_reason` is `null` | Stop polling. Do not issue a credential. |
 | `expired` | `started_at` and `completed_at` are set; `failure_message` is `null`; `terminal_reason` is set | Stop polling. Do not issue a credential. |
 | anything else or any invalid tuple | Fail closed; client and server contract are incompatible. |
+
+`status_message` is viewer-safe progress text, not proof of invoice readiness or entitlement. Current non-null value is exactly `Reader wallet setup needed`, projected while backend retries missing or malformed/oversized Reader wallet registry state inside original 10-minute admission deadline. All other lifecycle states currently use `null`.
 
 `expired` identifies a normal terminal payment-request outcome, unlike `failed`, which carries a safe verification failure message. Its exact `terminal_reason` wire values are:
 
@@ -154,7 +157,7 @@ function nextAction(lifecycle) {
 }
 ```
 
-Migration note: lifecycle JSON now includes `terminal_reason` on every response (`null` unless status is `expired`). Consumers with exact object comparisons, JSON schemas, TypeScript interfaces, or destructuring assumptions for older payloads must accept this nullable field before deploying against this server version.
+Migration note: lifecycle JSON includes `terminal_reason` on every response (`null` unless status is `expired`) and nullable `status_message`. Consumers with exact object comparisons, JSON schemas, TypeScript interfaces, or destructuring assumptions for older payloads must accept these fields before deploying against this server version.
 
 Connection state is independent from verification lifecycle:
 
