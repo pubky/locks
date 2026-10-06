@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    ClaimedVerificationTask, VerificationTaskRecord, VerificationTaskStatus,
+    ClaimedVerificationTask, InvoiceAdmissionPhase, VerificationTaskRecord, VerificationTaskStatus,
 };
 use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
 
@@ -20,6 +20,7 @@ pub struct InMemoryVerificationTaskClaimer {
 #[derive(Debug, Clone)]
 struct ClaimableVerificationTask {
     task: VerificationTaskRecord,
+    invoice_admission_phase: InvoiceAdmissionPhase,
     claimed_by: Option<String>,
     claim_token: Option<uuid::Uuid>,
     claim_expires_at: Option<time::OffsetDateTime>,
@@ -35,6 +36,7 @@ impl InMemoryVerificationTaskClaimer {
                     .into_iter()
                     .map(|task| ClaimableVerificationTask {
                         task,
+                        invoice_admission_phase: InvoiceAdmissionPhase::Ready,
                         claimed_by: None,
                         claim_token: None,
                         claim_expires_at: None,
@@ -56,6 +58,26 @@ impl InMemoryVerificationTaskClaimer {
         claimer
     }
 
+    /// Creates a claimer seeded with tasks still waiting for invoice admission.
+    pub fn with_invoice_pending_tasks(records: Vec<VerificationTaskRecord>) -> Self {
+        Self {
+            records: RwLock::new(
+                records
+                    .into_iter()
+                    .map(|task| ClaimableVerificationTask {
+                        task,
+                        invoice_admission_phase: InvoiceAdmissionPhase::InvoicePending,
+                        claimed_by: None,
+                        claim_token: None,
+                        claim_expires_at: None,
+                        next_attempt_at: None,
+                    })
+                    .collect(),
+            ),
+            task_repository: None,
+        }
+    }
+
     /// Creates a claimer seeded with already-claimed task records.
     pub fn with_claimed_tasks(
         records: Vec<(VerificationTaskRecord, String, time::OffsetDateTime)>,
@@ -67,6 +89,7 @@ impl InMemoryVerificationTaskClaimer {
                     .map(
                         |(task, claimed_by, claim_expires_at)| ClaimableVerificationTask {
                             task,
+                            invoice_admission_phase: InvoiceAdmissionPhase::Ready,
                             claimed_by: Some(claimed_by),
                             claim_token: Some(uuid::Uuid::new_v4()),
                             claim_expires_at: Some(claim_expires_at),
@@ -214,6 +237,9 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
 
 impl ClaimableVerificationTask {
     fn is_claimable_at(&self, now: time::OffsetDateTime) -> bool {
+        if self.invoice_admission_phase != InvoiceAdmissionPhase::Ready {
+            return false;
+        }
         match self.task.status {
             VerificationTaskStatus::Pending => self
                 .next_attempt_at
@@ -291,6 +317,23 @@ mod tests {
         assert_eq!(
             claimer
                 .claim_next_verification_task("worker-b", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn invoice_pending_task_is_not_eligible_for_verification_claim() {
+        let pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
+            VerificationTaskStatus::Pending,
+        );
+        let claimer = InMemoryVerificationTaskClaimer::with_invoice_pending_tasks(vec![pending]);
+
+        assert_eq!(
+            claimer
+                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
                 .await
                 .unwrap(),
             None

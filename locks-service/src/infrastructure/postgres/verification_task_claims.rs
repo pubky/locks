@@ -55,6 +55,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                            AND claim_expires_at <= clock_timestamp()))
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
+                  AND invoice_admission_phase = 'ready'
                 ORDER BY submitted_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -210,9 +211,12 @@ mod tests {
 
     use super::PostgresVerificationTaskClaimer;
     use crate::application::models::{
-        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+        INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, VerificationTaskRecord,
+        VerificationTaskStatus, VerificationTerminalReason,
     };
-    use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
+    use crate::application::ports::{
+        InvoiceAdmissionRepository, VerificationTaskClaimer, VerificationTaskRepository,
+    };
     use crate::infrastructure::postgres::testing::TestDatabase;
     use crate::infrastructure::postgres::verification_tasks::PostgresVerificationTaskRepository;
 
@@ -253,6 +257,49 @@ mod tests {
         assert_eq!(claimed.task.task_id, older.task_id);
         assert_eq!(claimed.task.status, VerificationTaskStatus::InProgress);
         assert_eq!(claimed.task.started_at, Some(NOW));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invoice_pending_task_is_claimable_only_for_invoice_admission() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let verification_claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        let mut pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
+            VerificationTaskStatus::Pending,
+            datetime!(2026-05-29 12:00:00 UTC),
+        );
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        pending.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+        let intent = InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: pending.creator.clone(),
+            bundle_id: pending.submitted_proof_bundle.bundle_id.clone(),
+            lock_resource: pending.submitted_proof_bundle.pubky_lock_resource.clone(),
+            reader,
+        };
+        repository
+            .insert_invoice_pending_task(pending.clone(), intent)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verification_claimer
+                .claim_next_verification_task("verification-worker", NOW, CLAIM_EXPIRES_AT)
+                .await
+                .unwrap(),
+            None
+        );
+        let admission = repository
+            .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .expect("invoice-pending task is eligible for admission work");
+        assert_eq!(admission.admission.task.task_id, pending.task_id);
 
         database.cleanup().await;
     }

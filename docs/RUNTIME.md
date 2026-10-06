@@ -186,6 +186,8 @@ Migration `0010_reset_prototype_runtime_state` performs the approved one-time de
 
 Migration `0011_verification_terminal_reason` performs the approved staging-only reset of `verification_tasks`, then adds the closed terminal-reason column and lifecycle constraint. Scope is limited to incompatible Locks verification-task rows; access credentials, creator authority, frontend sessions, unrelated Locks tables, the Paykit database, and Pubky-hosted data are untouched. Existing staging attempts must be resubmitted with fresh Bundle IDs after the coordinated cutover.
 
+Migration `0013_invoice_admission_foundation` adds Lock-Server-private, versioned invoice-admission intent, `invoice_pending`/`ready`/`failed` phase, database-time ten-minute deadline, due/attempt fields, and claim-token lease fencing to existing verification tasks. Existing tasks are marked `ready` because tasks created before this migration were already admitted. Verification claims exclude `invoice_pending` tasks. This migration is persistence foundation only: current HTTP submission ordering and worker network behavior remain unchanged until a later runtime slice wires durable admission to Paykit invoice calls.
+
 Creator-granted session material is encrypted before storage. The server-side encryption key comes from an env var named by config:
 
 ```toml

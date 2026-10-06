@@ -30,7 +30,8 @@ mod tests {
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
         CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
         DEFAULT_ACCESS_CREDENTIAL_TTL_SECONDS, FrontendSessionCode, FrontendSessionCodeRecord,
-        FrontendSessionRecord, FrontendSessionToken, PendingCreatorConnectFlowRecord,
+        FrontendSessionRecord, FrontendSessionToken, INVOICE_ADMISSION_INTENT_VERSION,
+        InvoiceAdmissionIntentV1, InvoiceAdmissionPhase, PendingCreatorConnectFlowRecord,
         VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::errors::ApplicationError;
@@ -38,6 +39,61 @@ mod tests {
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
     const TASK_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn invoice_admission_intent_v1_has_closed_canonical_json_shape() {
+        let intent = InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            lock_resource: PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+            ))
+            .unwrap(),
+            reader: CreatorPubky::from_str(
+                "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            )
+            .unwrap(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&intent).unwrap(),
+            json!({
+                "version": 1,
+                "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                "bundle_id": BUNDLE_ID,
+                "lock_resource": format!(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+                ),
+                "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<InvoiceAdmissionIntentV1>(
+                serde_json::to_value(&intent).unwrap()
+            )
+            .unwrap(),
+            intent
+        );
+        assert!(serde_json::from_value::<InvoiceAdmissionIntentV1>(json!({
+            "version": 2,
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "bundle_id": BUNDLE_ID,
+            "lock_resource": format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+            ),
+            "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+        })).is_err());
+        assert_eq!(
+            InvoiceAdmissionPhase::InvoicePending.as_str(),
+            "invoice_pending"
+        );
+        assert_eq!(InvoiceAdmissionPhase::Ready.as_str(), "ready");
+        assert_eq!(InvoiceAdmissionPhase::Failed.as_str(), "failed");
+    }
 
     #[test]
     fn access_credential_debug_output_redacts_bearer_value() {

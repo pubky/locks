@@ -1,10 +1,107 @@
 use time::OffsetDateTime;
 
-use locks_core::ids::{BundleId, CreatorPubky, LockId, LockServerPubky, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId, LockServerPubky, PubkyLockResource, TaskId};
 use locks_core::lock_policy::Criterion;
 use locks_core::verification::{Proof, SubmittedProofBundle, VerifiedProofBundle};
 
 use crate::application::errors::ApplicationError;
+
+/// Only supported persisted invoice-admission intent version.
+pub const INVOICE_ADMISSION_INTENT_VERSION: u8 = 1;
+
+/// Immutable public Paykit invoice inputs retained before first outbound attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InvoiceAdmissionIntentV1 {
+    pub version: u8,
+    pub creator: CreatorPubky,
+    pub bundle_id: BundleId,
+    pub lock_resource: PubkyLockResource,
+    pub reader: CreatorPubky,
+}
+
+impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredIntent {
+            version: u8,
+            creator: CreatorPubky,
+            bundle_id: BundleId,
+            lock_resource: PubkyLockResource,
+            reader: CreatorPubky,
+        }
+
+        let stored = StoredIntent::deserialize(deserializer)?;
+        if stored.version != INVOICE_ADMISSION_INTENT_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported invoice admission intent version: {}",
+                stored.version
+            )));
+        }
+        if stored.lock_resource.creator() != &stored.creator {
+            return Err(serde::de::Error::custom(
+                "invoice admission creator does not match lock resource",
+            ));
+        }
+        Ok(Self {
+            version: stored.version,
+            creator: stored.creator,
+            bundle_id: stored.bundle_id,
+            lock_resource: stored.lock_resource,
+            reader: stored.reader,
+        })
+    }
+}
+
+/// Internal invoice admission phase. Public task lifecycle remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceAdmissionPhase {
+    InvoicePending,
+    Ready,
+    Failed,
+}
+
+/// Durable invoice-admission state stored with one verification task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceAdmissionRecord {
+    pub task: VerificationTaskRecord,
+    pub phase: InvoiceAdmissionPhase,
+    pub intent: InvoiceAdmissionIntentV1,
+    pub admission_deadline_at: OffsetDateTime,
+    pub next_attempt_at: Option<OffsetDateTime>,
+    pub attempt_count: u32,
+}
+
+/// Claimed invoice admission carrying exact lease-incarnation fencing token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedInvoiceAdmission {
+    pub admission: InvoiceAdmissionRecord,
+    pub claim_token: uuid::Uuid,
+    /// Storage-authoritative deadline result sampled after claim serialization.
+    pub deadline_expired: bool,
+}
+
+impl InvoiceAdmissionPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvoicePending => "invoice_pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "invoice_pending" => Some(Self::InvoicePending),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
 
 /// Verification task status used by the service layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,6 +3,7 @@ use sqlx::migrate::Migrator;
 
 use super::PostgresError;
 
+// Embed ordered migrations so production and isolated test schemas execute identical SQL.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// Runs managed Postgres migrations for Lock Server runtime-owned tables.
@@ -56,6 +57,24 @@ mod tests {
         assert_column_exists(&mut connection, "verification_tasks", "next_attempt_at").await;
         assert_column_exists(&mut connection, "verification_tasks", "claim_token").await;
         assert_column_exists(&mut connection, "verification_tasks", "terminal_reason").await;
+        assert_column_exists(
+            &mut connection,
+            "verification_tasks",
+            "invoice_admission_phase",
+        )
+        .await;
+        assert_column_exists(
+            &mut connection,
+            "verification_tasks",
+            "invoice_admission_intent",
+        )
+        .await;
+        assert_column_exists(
+            &mut connection,
+            "verification_tasks",
+            "admission_deadline_at",
+        )
+        .await;
         assert_column_exists(
             &mut connection,
             "verification_tasks",
@@ -183,7 +202,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=12).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=13).collect::<Vec<_>>());
 
         sqlx::query(
             "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)
@@ -229,6 +248,47 @@ mod tests {
 
             assert!(result.is_err(), "incomplete {status} tuple was accepted");
         }
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invoice_admission_migration_marks_existing_accepted_tasks_ready() {
+        let database = TestDatabase::create_unmigrated().await;
+        let baseline = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(12).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        baseline.run(database.pool()).await.unwrap();
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO verification_tasks (
+                task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id
+             ) VALUES ($1, 'pending', '{}'::jsonb, clock_timestamp(), 'creator', 'bundle')",
+        )
+        .bind(task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        let row: (
+            String,
+            Option<serde_json::Value>,
+            Option<time::OffsetDateTime>,
+        ) = sqlx::query_as(
+            "SELECT invoice_admission_phase, invoice_admission_intent,
+                        admission_deadline_at
+                 FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(task_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(row, ("ready".to_owned(), None, None));
 
         database.cleanup().await;
     }
