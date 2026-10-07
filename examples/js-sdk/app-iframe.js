@@ -76,7 +76,9 @@ const el = {
   lockType: document.querySelector('#lock-type'),
   devStaticFields: document.querySelector('#dev-static-fields'),
   paykitPaymentFields: document.querySelector('#paykit-payment-fields'),
-  paykitAmountSats: document.querySelector('#paykit-amount-sats'),
+  paykitAmount: document.querySelector('#paykit-amount'),
+  paykitAsset: document.querySelector('#paykit-asset'),
+  paykitAmountLabel: document.querySelector('#paykit-amount-label'),
   paykitSetupStatus: document.querySelector('#paykit-setup-status'),
   retryPaykitSetup: document.querySelector('#retry-paykit-setup'),
   criterionId: document.querySelector('#criterion-id'),
@@ -435,6 +437,16 @@ el.primaryContentFile.addEventListener('change', () => {
 el.secondaryContentFiles.addEventListener('change', renderSelectedResources);
 el.resourceFilename.addEventListener('input', renderSelectedResources);
 el.lockType.addEventListener('change', () => refreshLockTypeFields());
+el.paykitAsset.addEventListener('change', () => {
+  // A denomination change must not reinterpret a previously entered price.
+  el.paykitAmount.value = '';
+  el.paykitAmountLabel.textContent = el.paykitAsset.value === 'BTC'
+    ? 'Bitcoin Amount' : 'USD Amount';
+  state.paykitSetupComplete = false;
+  state.paykitSetupStatusRequestId += 1;
+  closePaykitSetupIframe();
+  refreshLockTypeFields();
+});
 el.retryPaykitSetup.addEventListener('click', () => {
   if (el.lockType.value === 'paykit-payment') refreshPaykitSetupReadiness();
 });
@@ -457,7 +469,8 @@ el.lockedContentForm.addEventListener('submit', async (event) => {
       lockType: el.lockType.value,
       criterionId: el.criterionId.value,
       devStaticSatisfied: el.criterionSatisfied.value === 'true',
-      amountSats: el.paykitAmountSats.value,
+      amount: el.paykitAmount.value,
+      asset: el.paykitAsset.value,
       recipientPubky: operation.creatorPubky,
       paykitSetupComplete: state.paykitSetupComplete,
     });
@@ -533,10 +546,13 @@ async function refreshDemoAuthStatus() {
 }
 
 async function refreshLockTypeFields() {
+  for (const option of el.paykitAsset.options) {
+    option.disabled = state.config?.mode !== 'staging' && option.value !== 'BTC';
+  }
   const paymentSelected = el.lockType.value === 'paykit-payment';
   el.devStaticFields.hidden = paymentSelected;
   el.paykitPaymentFields.hidden = !paymentSelected;
-  el.paykitAmountSats.required = paymentSelected;
+  el.paykitAmount.required = paymentSelected;
 
   if (!paymentSelected) {
     state.paykitSetupStatusRequestId += 1;
@@ -577,12 +593,15 @@ async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}
   const requestId = ++state.paykitSetupStatusRequestId;
   const creatorPubky = state.creatorPubky;
   const sessionSecret = state.feLockSessionToken;
+  const asset = el.paykitAsset.value;
+  state.paykitSetupComplete = false;
   el.retryPaykitSetup.hidden = true;
   el.paykitSetupStatus.textContent = 'Checking Paykit setup status.';
   el.paykitSetupStatus.className = 'muted';
 
   try {
     const result = await queryPaykitSetupStatus({
+      asset,
       lockServer: state.config.lockServer.pubky,
       sessionSecret,
       pkarrRelays: pkarrRelaysForDemoConfig(state.config),
@@ -591,6 +610,7 @@ async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}
       requestId !== state.paykitSetupStatusRequestId
       || creatorPubky !== state.creatorPubky
       || sessionSecret !== state.feLockSessionToken
+      || asset !== el.paykitAsset.value
       || el.lockType.value !== 'paykit-payment'
     ) return;
 
@@ -619,6 +639,7 @@ async function refreshPaykitSetupReadiness({ openSetupWhenRequired = true } = {}
       requestId !== state.paykitSetupStatusRequestId
       || creatorPubky !== state.creatorPubky
       || sessionSecret !== state.feLockSessionToken
+      || asset !== el.paykitAsset.value
       || el.lockType.value !== 'paykit-payment'
     ) return;
     state.paykitSetupComplete = false;

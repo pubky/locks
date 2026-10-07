@@ -1,3 +1,4 @@
+import { formatPaymentAmount } from './payment-amount.js';
 import {
   classifyPaymentLifecycle,
   connectionStateIndicator,
@@ -80,6 +81,7 @@ const el = {
   load: document.querySelector('#load-content-lock'),
   loadStatus: document.querySelector('#load-status'),
   loadedOutput: document.querySelector('#loaded-lock-output'),
+  paymentPrice: document.querySelector('#payment-price'),
   verifierType: document.querySelector('#verifier-type'),
   proofSatisfied: document.querySelector('#proof-satisfied'),
   paykitReaderCommands: document.querySelector('#paykit-reader-commands'),
@@ -707,7 +709,7 @@ function render() {
     el.paykitReaderStatus.className = 'muted';
   }
   el.paykitReaderPayment.textContent = stagingMode
-    ? (state.bundleId ? 'Complete the Payment Request in the external reader Bitkit, then resume payment verification polling.' : '')
+    ? (state.bundleId ? 'Pay the request in Bitkit using one of its accepted payment methods, then resume payment verification polling.' : '')
     : state.paykitPaymentRequest
     ? format({
       payment_request_id: state.paykitPaymentRequest.payment_request_id,
@@ -723,6 +725,15 @@ function render() {
   el.loadStatus.textContent = loadStatus.message;
   el.loadStatus.className = loadStatus.className;
   el.loadedOutput.textContent = format(state.loaded);
+  const payment = state.loaded?.contentLock?.criteria?.find((criterion) => criterion.verifier_type === 'paykit-payment');
+  el.paymentPrice.hidden = !payment;
+  if (payment) {
+    try {
+      el.paymentPrice.textContent = `Price: ${formatPaymentAmount(payment.params.amount, payment.params.asset)}`;
+    } catch {
+      el.paymentPrice.textContent = 'See the Payment Request in Bitkit for the price.';
+    }
+  }
   renderLockResources();
 
   el.submitProof.disabled = state.loadingLock

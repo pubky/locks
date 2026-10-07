@@ -114,12 +114,12 @@ export async function configureLockServicePointer({ lockServer, sessionSecret, p
 /**
  * Queries Paykit setup readiness through the current authenticated Locks session.
  */
-export async function queryPaykitSetupStatus({ lockServer, sessionSecret, pkarrRelays = [] }) {
+export async function queryPaykitSetupStatus({ lockServer, sessionSecret, asset, pkarrRelays = [] }) {
   await init();
 
   const locks = Locks.forServerWithOptions(lockServer, buildLocksOptions({ pkarrRelays }));
   const session = locks.restoreSession(sessionSecret);
-  return session.creator.paykitSetupStatus();
+  return session.creator.paykitSetupStatus(asset);
 }
 
 /**

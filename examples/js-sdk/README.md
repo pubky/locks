@@ -212,9 +212,9 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The local demo selects immutable Paykit Server release tag `0.1.0-rc7`, the active Locks
+The local demo selects immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`, the active Locks
 checkout, and Pubky Homeserver `v0.11.0`. Paykit Server local-demo build uses Paykit Rust
-`v0.1.0-rc59`; Locks workspace retains Paykit Rust `v0.1.0-rc56`. Contract checks derive
+`v0.1.0-rc71`; Locks workspace retains Paykit Rust `v0.1.0-rc56`. Contract checks derive
 server release ref from canonical Compose build context. No sibling repository checkout
 is required for source resolution.
 
@@ -504,3 +504,11 @@ This does not run live browser flows. It verifies that the examples keep the agr
 - Compose generates closed Locks and Paykit TOML from actual local identities; trusted-key placeholders are never runnable configuration.
 - The second auth flow must use Lock Server `/connect`, not a demo-origin rendering of the raw `authorization_url`.
 - The examples do not use a gateway/base URL fallback. SDK calls resolve through browser PKARR/domain paths using the configured local PKARR relay.
+
+### Price currencies and checkout
+
+Creators price content in BTC (entered in sats) or USD (up to two decimal places). USDT is a payment method, not a price-currency choice. The public lock stores the amount as an integer string in that denomination's smallest unit. Changing currency clears the price and checks setup readiness again. The default Paykit Server configuration omits `[usdt]`: setup requests only the Bitcoin account, and both price currencies are payable in Bitcoin. USDT receiving requires explicitly enabling that server configuration and compatible wallets.
+
+Paykit Server creates the immutable request and fixed conversion rates, using its configured BTC/USD source and USD/USDT parity. The default converted-payment window is one hour (configured on Paykit Server). Readers pay one of the accepted methods in Bitkit; fees are additional. Locks never performs conversion or accepts cross-chain bridge receipts. Full on-time USDT payment unlocks after verified Arbitrum inclusion.
+
+The local regtest reader helper remains Bitcoin-only. For a USDT flow use staging mode with real Bitkit and the matching Paykit Server USDT configuration. The local HTTP tests use server status fixtures; they do not execute blockchain payments. Deploy the SDK, Locks, and the per-rail Paykit Server contract together.

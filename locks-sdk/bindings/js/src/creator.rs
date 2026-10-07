@@ -376,11 +376,15 @@ impl Creator {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = paykitSetupStatus)]
-    pub async fn paykit_setup_status(&self) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+    pub async fn paykit_setup_status(
+        &self,
+        asset: String,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
         let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
         let request = self
-            .build_paykit_setup_status_request()
+            .build_paykit_setup_status_request(&asset)
+            .map_err(crate::js_error::invalid_input)?
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
@@ -447,8 +451,13 @@ impl Creator {
 
     #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(crate) fn build_paykit_setup_status_request(&self) -> JsAuthorizedRequestPlan {
-        self.authorized_request_plan(self.session.inner().creator().paykit_setup_status())
+    pub(crate) fn build_paykit_setup_status_request(
+        &self,
+        asset: &str,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
+        let asset = serde_json::from_value(serde_json::Value::String(asset.to_owned()))
+            .map_err(|_| "payment asset must be BTC, USD, or USDT".to_owned())?;
+        Ok(self.authorized_request_plan(self.session.inner().creator().paykit_setup_status(asset)))
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -735,13 +744,21 @@ mod tests {
     fn paykit_setup_status_request_uses_current_session_without_creator_argument() {
         let creator = Creator::new(test_session());
 
-        let request = creator.build_paykit_setup_status_request();
+        let request = creator.build_paykit_setup_status_request("USDT").unwrap();
 
         assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/creator/paykit/setup-status");
+        assert_eq!(request.path, "/creator/paykit/setup-status?asset=USDT");
         assert_eq!(request.authorization, "Bearer frontend-session-secret");
         assert_eq!(request.content_type, None);
         assert_eq!(request.body, JsRequestBody::Empty);
+    }
+
+    #[test]
+    fn paykit_setup_status_rejects_unsupported_denominations() {
+        let creator = Creator::new(test_session());
+        for asset in ["", "btc", "ETH", "USDT&creator=other"] {
+            assert!(creator.build_paykit_setup_status_request(asset).is_err());
+        }
     }
 
     #[test]

@@ -92,10 +92,17 @@
         </div>
         <div id="paykit-payment-fields" hidden>
           <label>
-            Amount (sats)
-            <input id="paykit-amount-sats" type="text" inputmode="numeric" pattern="[0-9]+" autocomplete="off" />
+            Price currency
+            <select id="paykit-asset">
+              <option value="BTC">Bitcoin</option>
+              <option value="USD">USD</option>
+            </select>
           </label>
-          <p class="muted">Asset is fixed to BTC. Recipient is the authenticated content creator.</p>
+          <label>
+            <span id="paykit-amount-label">Bitcoin Amount</span>
+            <input id="paykit-amount" type="text" inputmode="decimal" autocomplete="off" />
+          </label>
+          <p class="muted">Recipient is the authenticated content creator. Available payment methods and the exact quote appear in Bitkit.</p>
           <p id="paykit-setup-status" class="muted">Paykit setup is required for this creator.</p>
           <button id="retry-paykit-setup" type="button" hidden>Retry Paykit setup</button>
         </div>

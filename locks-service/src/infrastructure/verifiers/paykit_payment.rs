@@ -32,8 +32,16 @@ pub enum PaykitPaymentState {
 pub struct PaykitPaymentStatus {
     pub request_state: PaykitPaymentRequestState,
     pub payment_state: PaykitPaymentState,
+    pub bitcoin: Option<PaykitPaymentObservation>,
+    pub usdt_arbitrum: Option<PaykitPaymentObservation>,
+}
+
+/// Current payment evidence verified by the Paykit server for one payment rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaykitPaymentObservation {
     pub confirmations: u32,
     pub amount_matched: bool,
+    pub paid_on_time: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,12 +150,27 @@ fn payment_status_decision(
     if let Some(reason) = terminal_reason {
         return CriterionVerificationOutcome::TerminalUnsatisfied(reason);
     }
-    let satisfied = status.amount_matched
-        && match (minimum_confirmations, status.payment_state) {
-            (0, PaykitPaymentState::Detected | PaykitPaymentState::Confirmed) => true,
-            (required, PaykitPaymentState::Confirmed) => status.confirmations >= required,
-            _ => false,
-        }
+    // Each rail must independently cover the full invoice within its payment window.
+    // Arbitrum inclusion is sufficient; Bitcoin keeps the operator's confirmation policy.
+    let bitcoin_paid = status.bitcoin.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations >= minimum_confirmations
+            && matches!(
+                (minimum_confirmations, status.payment_state),
+                (
+                    0,
+                    PaykitPaymentState::Detected | PaykitPaymentState::Confirmed
+                ) | (_, PaykitPaymentState::Confirmed)
+            )
+    });
+    let usdt_paid = status.usdt_arbitrum.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations > 0
+            && status.payment_state == PaykitPaymentState::Confirmed
+    });
+    let satisfied = (bitcoin_paid || usdt_paid)
         && matches!(
             status.request_state,
             PaykitPaymentRequestState::Accepted
@@ -183,8 +206,9 @@ mod tests {
     use locks_core::verification::Proof;
 
     use super::{
-        PaykitPaymentRequestState, PaykitPaymentState, PaykitPaymentStatus,
-        PaykitPaymentStatusClient, PaykitPaymentStatusError, PaykitPaymentVerifier,
+        PaykitPaymentObservation, PaykitPaymentRequestState, PaykitPaymentState,
+        PaykitPaymentStatus, PaykitPaymentStatusClient, PaykitPaymentStatusError,
+        PaykitPaymentVerifier,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -215,8 +239,16 @@ mod tests {
                 PaykitPaymentStatus {
                     request_state,
                     payment_state: PaykitPaymentState::Confirmed,
-                    confirmations: 6,
-                    amount_matched: true,
+                    bitcoin: Some(PaykitPaymentObservation {
+                        confirmations: 6,
+                        amount_matched: true,
+                        paid_on_time: true,
+                    }),
+                    usdt_arbitrum: Some(PaykitPaymentObservation {
+                        confirmations: 1,
+                        amount_matched: true,
+                        paid_on_time: true,
+                    }),
                 },
                 1,
             );
@@ -234,8 +266,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Expired,
-                confirmations: 6,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 6,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
@@ -254,8 +290,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Detected,
-                confirmations: 0,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             0,
         );
@@ -281,8 +321,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Undetected,
-                confirmations: 0,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             0,
         );
@@ -299,8 +343,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Detected,
-                confirmations: 3,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 3,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
@@ -317,8 +365,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Confirmed,
-                confirmations: 0,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
@@ -335,8 +387,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Confirmed,
-                confirmations: 1,
-                amount_matched: true,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 1,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
@@ -353,8 +409,12 @@ mod tests {
             PaykitPaymentStatus {
                 request_state: PaykitPaymentRequestState::Accepted,
                 payment_state: PaykitPaymentState::Confirmed,
-                confirmations: 6,
-                amount_matched: false,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 6,
+                    amount_matched: false,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
@@ -363,6 +423,56 @@ mod tests {
             verifier.verify(request()).await,
             Ok(CriterionVerificationOutcome::Pending)
         );
+    }
+
+    #[tokio::test]
+    async fn each_rail_requires_its_own_full_on_time_payment() {
+        let full = PaykitPaymentObservation {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: true,
+        };
+        let partial = PaykitPaymentObservation {
+            amount_matched: false,
+            ..full
+        };
+        let late = PaykitPaymentObservation {
+            paid_on_time: false,
+            ..full
+        };
+        let unmined = PaykitPaymentObservation {
+            confirmations: 0,
+            ..full
+        };
+        for (bitcoin, usdt_arbitrum, satisfied) in [
+            (None, Some(full), true),
+            (Some(late), Some(full), true),
+            (Some(partial), Some(full), true),
+            (Some(full), None, false), // one BTC confirmation is below this operator's threshold
+            (None, Some(unmined), false),
+            (None, Some(late), false),
+            (Some(partial), Some(partial), false),
+            (Some(late), Some(late), false),
+            (None, None, false), // missing/reorged observations cannot grant access
+        ] {
+            let outcome = verifier(
+                PaykitPaymentStatus {
+                    request_state: PaykitPaymentRequestState::ProofSubmitted,
+                    payment_state: PaykitPaymentState::Confirmed,
+                    bitcoin,
+                    usdt_arbitrum,
+                },
+                6,
+            )
+            .verify(request())
+            .await
+            .unwrap();
+            assert_eq!(
+                matches!(outcome, CriterionVerificationOutcome::Satisfied(_)),
+                satisfied,
+                "bitcoin={bitcoin:?}, usdt_arbitrum={usdt_arbitrum:?}"
+            );
+        }
     }
 
     #[tokio::test]

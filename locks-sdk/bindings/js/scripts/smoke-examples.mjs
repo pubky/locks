@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 
 const repoRoot = resolve(new URL('../../../..', import.meta.url).pathname);
 const examplesDir = join(repoRoot, 'examples', 'js-sdk');
+await import(pathToFileURL(join(examplesDir, 'scripts/test-payment-amount.mjs')).href);
 const files = {
   rootReadme: join(repoRoot, 'README.md'),
   localOperatorDemo: join(repoRoot, 'docs', 'LOCAL_OPERATOR_DEMO.md'),
@@ -63,24 +64,24 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'immutable Paykit Server release tag `0.1.0-rc7`',
-    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc59`',
+    'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
+    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
     'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
     'An absolute local `PAYKIT_SERVER_CONTEXT` override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server release `0.1.0-rc7`',
-    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc59`',
+    'Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
+    'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
     'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'immutable Paykit Server release tag `0.1.0-rc7`',
+    'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
     'Paykit Server local-demo build uses Paykit Rust',
-    '`v0.1.0-rc59`',
+    '`v0.1.0-rc71`',
     'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
     'Pubky Homeserver `v0.11.0`',
     'For coordinated Paykit Server work',
@@ -233,7 +234,7 @@ const required = {
     "const paymentSelected = el.lockType.value === 'paykit-payment'",
     'el.devStaticFields.hidden = paymentSelected',
     'el.paykitPaymentFields.hidden = !paymentSelected',
-    'el.paykitAmountSats.required = paymentSelected',
+    'el.paykitAmount.required = paymentSelected',
     'openPaykitSetupIframe',
     'npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator',
     'acceptPaykitSetupEvent',
@@ -256,8 +257,8 @@ const required = {
     'Authenticate to the Lock Server before checking Paykit setup.',
     'el.retryPaykitSetup.hidden = false',
   ],
-  index: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app.js', 'Select primary file', 'id="primary-content-file"', 'Select secondary files', 'id="secondary-content-files"', 'multiple', 'id="selected-resources"', 'id="selected-resource-list"', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
-  iframe: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app-iframe.js', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount-sats"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
+  index: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app.js', 'Select primary file', 'id="primary-content-file"', 'Select secondary files', 'id="secondary-content-files"', 'multiple', 'id="selected-resources"', 'id="selected-resource-list"', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
+  iframe: ['iframe modal', 'id="demo-auth"', 'id="creator-publishing"', '/examples/js-sdk/app-iframe.js', 'id="lock-type"', '<option value="dev-static">dev-static</option>', '<option value="paykit-payment">paykit-payment</option>', 'id="dev-static-fields"', 'id="paykit-payment-fields" hidden', 'id="paykit-amount"', 'id="paykit-setup-status"', 'id="retry-paykit-setup"'],
   flows: ['Both creator pages use iframe auth', '/examples/js-sdk/', '/examples/js-sdk/iframe.html'],
   readerHtml: ['id="content-lock-resource"', 'id="lock-resources"', 'id="primary-resource-list"', 'id="secondary-resource-list"', 'id="reset-reader-state"', 'id="read-content"', 'id="reader-public-key" type="text"', 'id="refresh-paykit-reader"', 'id="paykit-reader-status"', 'id="paykit-reader-payment"', 'id="paykit-reader-commands"', 'id="paykit-reader-guidance"', 'id="poll-payment"', 'paykit-payment', 'prepared automatically by the local demo', '/reader-app.js'],
   initConfig: ['~/.pubky-lock/config.toml', './.local/demo-config/config.json', 'lock_server_public_key', 'http://127.0.0.1:15411', 'http://127.0.0.1:15412', '127.0.0.1:6881'],
@@ -337,12 +338,12 @@ const required = {
     'normalizeResources',
     'new SetLockServicePointerOptions(lockServer)',
     'queryPaykitSetupStatus',
-    'session.creator.paykitSetupStatus()',
+    'session.creator.paykitSetupStatus(asset)',
     'session.signout()',
     '.lockLogic(lockLogic)',
   ],
   creatorIdentity: ['enforceCreatorIdentityMatch', 'invalidateIdentityScopedCreatorState', 'session.signout()', 'does not match the demo creator'],
-  creatorPolicy: ['buildCreatorLockPolicy', 'paykit-payment', 'recipient_pubky', "asset: 'BTC'"],
+  creatorPolicy: ['buildCreatorLockPolicy', 'paykit-payment', 'recipient_pubky', 'paymentAmountToAtomic(amount, asset)'],
   paykitSetup: ['buildPaykitSetupRequest', 'acceptPaykitSetupEvent', 'decidePaykitSetupReadiness', 'paykit-setup-callback'],
   readerFlow: [
     "from '../../locks-sdk/bindings/js/pkg/locks_sdk_wasm.js'",
@@ -818,7 +819,8 @@ assert.deepEqual(
   buildCreatorLockPolicy({
     lockType: 'paykit-payment',
     criterionId: 'payment-1',
-    amountSats: '00018446744073709551616',
+    amount: '00018446744073709551615',
+    asset: 'BTC',
     recipientPubky: creatorPubky,
     paykitSetupComplete: true,
   }),
@@ -828,7 +830,7 @@ assert.deepEqual(
       verifier_type: 'paykit-payment',
       params: {
         recipient_pubky: creatorPubky,
-        amount: '00018446744073709551616',
+        amount: '18446744073709551615',
         asset: 'BTC',
       },
     }],
@@ -836,35 +838,38 @@ assert.deepEqual(
   },
 );
 
-for (const amountSats of ['', '0', '000', '-1', '1.5', '1e3', ' 1', '1 ']) {
+for (const amount of ['', '0', '000', '-1', '1.5', '1e3', ' 1', '1 ', '18446744073709551616']) {
   assert.throws(
     () => buildCreatorLockPolicy({
       lockType: 'paykit-payment',
       criterionId: 'payment-1',
-      amountSats,
+      amount,
+      asset: 'BTC',
       recipientPubky: creatorPubky,
       paykitSetupComplete: true,
     }),
-    /positive decimal integer string/,
+    /payment amount/,
   );
 }
-for (const amountSats of [1, null, undefined]) {
+for (const amount of [1, null, undefined]) {
   assert.throws(
     () => buildCreatorLockPolicy({
       lockType: 'paykit-payment',
       criterionId: 'payment-1',
-      amountSats,
+      amount,
+      asset: 'BTC',
       recipientPubky: creatorPubky,
       paykitSetupComplete: true,
     }),
-    /positive decimal integer string/,
+    /payment amount/,
   );
 }
 assert.throws(
   () => buildCreatorLockPolicy({
     lockType: 'paykit-payment',
     criterionId: 'payment-1',
-    amountSats: '1',
+    amount: '1',
+    asset: 'BTC',
     recipientPubky: creatorPubky,
     paykitSetupComplete: false,
   }),
@@ -874,7 +879,8 @@ assert.throws(
   () => buildCreatorLockPolicy({
     lockType: 'paykit-payment',
     criterionId: 'payment-1',
-    amountSats: '1',
+    amount: '1',
+    asset: 'BTC',
     recipientPubky: '',
     paykitSetupComplete: true,
   }),
@@ -1014,8 +1020,8 @@ for (const label of ['index', 'iframe']) {
   if (selectIndex < 0 || devStaticIndex < selectIndex || paymentIndex < devStaticIndex) {
     throw new Error(`${label} must default the lock-type selector to dev-static`);
   }
-  if (/<(?:input|select|textarea)[^>]*(?:recipient|asset)/i.test(texts[label])) {
-    throw new Error(`${label} must not expose editable payment recipient or asset controls`);
+  if (/<(?:input|select|textarea)[^>]*recipient/i.test(texts[label])) {
+    throw new Error(`${label} must not expose an editable payment recipient`);
   }
 }
 
@@ -1161,8 +1167,8 @@ for (const [label, snippets] of Object.entries({
   app: ['window.location.assign', 'completeCreatorConnect'],
   appIframe: ['state.lastReceivedCode', 'feLockSessionToken: ${state.feLockSessionToken}', "'lock-auth-iframe-complete', { code }", 'xpub', 'account_xpub'],
   readme: ['redirect to the Lock-Server-hosted `/connect` shell', 'stores the Locks frontend session in `localStorage`', 'verifier dropdown has one option'],
-  index: ['full-page redirect', 'Switch to iframe flow', 'id="paykit-recipient', 'id="paykit-asset', 'xpub', 'account_xpub'],
-  iframe: ['full-page redirect', 'Switch to redirect flow', 'id="paykit-recipient', 'id="paykit-asset', 'xpub', 'account_xpub'],
+  index: ['full-page redirect', 'Switch to iframe flow', 'id="paykit-recipient', 'xpub', 'account_xpub'],
+  iframe: ['full-page redirect', 'Switch to redirect flow', 'id="paykit-recipient', 'xpub', 'account_xpub'],
   flows: ['Redirect flow', 'full-page redirect', 'localStorage'],
 })) {
   for (const snippet of snippets) {
