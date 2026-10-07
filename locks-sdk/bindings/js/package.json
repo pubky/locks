@@ -1,6 +1,6 @@
 {
   "name": "@synonymdev/locks-sdk",
-  "version": "0.1.0-rc8",
+  "version": "0.1.0-rc9",
   "description": "Browser JS/WASM bindings for the Pubky Locks Creator SDK",
   "type": "module",
   "license": "MIT",
