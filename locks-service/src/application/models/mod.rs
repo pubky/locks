@@ -1,10 +1,12 @@
 mod access;
+mod content_lock_ownership;
 mod creator_authority;
 mod frontend_session;
 mod guarded_resource;
 mod verification;
 
 pub use access::*;
+pub use content_lock_ownership::*;
 pub use creator_authority::*;
 pub use frontend_session::*;
 pub use guarded_resource::*;

@@ -264,7 +264,8 @@ mod tests {
                 params: json!({
                     "recipient_pubky": CREATOR,
                     "amount": "50000",
-                    "asset": "BTC"
+                    "asset": "BTC",
+                    "payment_in": 24
                 }),
             }],
             lock_logic: LockLogic::All {
