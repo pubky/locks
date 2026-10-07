@@ -936,8 +936,12 @@ async fn fake_status_handler(
         "payment_state": "detected",
         "invoice_created_at": "2026-09-25T11:00:00Z",
         "payment_deadline": "2026-09-25T12:00:00Z",
-        "confirmations": 0,
-        "amount_matched": true,
+        "bitcoin": {
+            "confirmations": 0,
+            "amount_matched": true,
+            "paid_on_time": true,
+        },
+        "usdt_arbitrum": null,
     }))
 }
 
