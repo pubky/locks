@@ -1,0 +1,1 @@
+{"request_state":"proof_submitted","payment_state":"confirmed","invoice_created_at":"2026-08-11T09:00:00Z","payment_deadline":"2026-08-12T09:00:00Z","bitcoin":{"confirmations":6,"amount_matched":true,"paid_on_time":true},"usdt_arbitrum":{"confirmations":200,"amount_matched":true,"paid_on_time":false,"finalized":false}}

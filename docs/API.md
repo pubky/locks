@@ -268,11 +268,11 @@ Returns whether the authenticated Creator already has usable authority configure
 Server. Creator identity comes only from the Locks frontend session.
 
 ```http
-GET /creator/paykit/setup-status
+GET /creator/paykit/setup-status?asset=USD
 Authorization: Bearer <frontend_session_token>
 ```
 
-The request has no query parameters and no body. Success is always a closed one-field object:
+The required `asset` query parameter is `BTC`, `USD`, or `USDT`, matching the invoice denomination. Other query fields and a request body are rejected. Readiness covers authority and a receiving method usable for that denomination; USDT address sharing remains optional for Bitcoin-only creators. Success is always a closed one-field object:
 
 ```json
 {"status":"ready"}
@@ -598,7 +598,7 @@ This lookup is independent from verification lifecycle. `connected` does not mea
 
 Locks limits this public outbound proxy independently from proof submission. Default admission is 60 requests per 60 seconds for each `(client IP, creator, bundle_id)` plus 16 concurrent outbound Paykit status requests process-wide. Fixed-window rejection includes `Retry-After`; either limit returns `429 rate_limited` before another Paykit request is sent.
 
-Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /payment-requests/status`. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body`; body-only signatures are unsupported. The closed response keeps `request_state` (`proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, `active_recurring`) separate from `payment_state` (`undetected`, `detected`, `confirmed`, `expired`) and includes `invoice_created_at`, `payment_deadline`, and optional `bitcoin` and `usdt_arbitrum` observations. Locks derives detection, confirmations, and amount/deadline matching from `bitcoin` only; `usdt_arbitrum` is opaque and cannot satisfy payment criteria. Bitcoin must have both `amount_matched` and `paid_on_time` before the existing confirmation threshold can grant access. Aggregate `expired` remains terminal. Locks validates timestamp syntax and strict ordering but never infers expiry from its local clock.
+Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /payment-requests/status`. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body`; body-only signatures are unsupported. The closed response keeps `request_state` (`proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, `active_recurring`) separate from `payment_state` (`undetected`, `detected`, `confirmed`, `expired`) and includes `invoice_created_at`, `payment_deadline`, and nullable `bitcoin` and `usdt_arbitrum` observations. Each observation contains `confirmations`, `amount_matched`, and `paid_on_time`; USDT also reports `finalized`. Amount and timing must qualify on the same rail. Bitcoin uses the configured confirmation threshold; USDT unlocks after verified successful Arbitrum inclusion, without waiting for `finalized`. No raw transaction hash or payer claim can grant access. Locks validates timestamp syntax and strict ordering but never infers expiry from its local clock.
 
 Rejected, canceled, proposal-expired, and payment-expired attempts return lifecycle `status: "expired"` with `terminal_reason` equal to `payment_request_rejected`, `payment_request_canceled`, `proposal_expired`, or `payment_deadline_expired`. Such responses have `failure_message: null`, issue no entitlement, and are not retried. Transport failures, timeouts, response-body read failures, and every non-`200` response remain no-entitlement and retryable; `409 Conflict` is preserved as an operator-visible conflict. A `200` response with malformed JSON, missing or unknown fields, an unknown state, an oversized body, or invalid or misordered timestamps is a permanent contract failure: the worker transitions the attempt to `failed` with a viewer-safe `failure_message` and no entitlement. `failed` remains distinct from payment-lifecycle `expired`, but both are terminal for that Bundle ID; another attempt requires a new Bundle ID.
 

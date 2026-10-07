@@ -5,7 +5,7 @@ const compose = readFileSync(
   'utf8',
 );
 const source = compose.match(
-  /context: "\$\{PAYKIT_SERVER_CONTEXT:-(https:\/\/github\.com\/pubky\/paykit-server\.git#([0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+))\}"/,
+  /context: "\$\{PAYKIT_SERVER_CONTEXT:-(https:\/\/github\.com\/pubky\/paykit-server\.git#([0-9a-f]{40}))\}"/,
 );
 if (!source) throw new Error('Compose is missing the canonical Paykit Server source');
 

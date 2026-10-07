@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky};
+use locks_core::lock_policy::PaykitPaymentAsset;
 use locks_service::infrastructure::verifiers::paykit_payment::{
-    PaykitPaymentRequestState as ServicePaymentRequestState,
+    PaykitPaymentObservation, PaykitPaymentRequestState as ServicePaymentRequestState,
     PaykitPaymentState as ServicePaymentState, PaykitPaymentStatus, PaykitPaymentStatusClient,
     PaykitPaymentStatusError,
 };
@@ -182,6 +183,7 @@ pub struct PaykitStatusRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaykitSetupStatusRequest {
     pub creator: CreatorPubky,
+    pub asset: PaykitPaymentAsset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +213,7 @@ pub trait PaykitSetupStatusProvider: Send + Sync {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>;
 }
 
@@ -245,8 +248,7 @@ pub struct PaykitPaymentRequestStatus {
     #[serde(with = "time::serde::rfc3339")]
     pub payment_deadline: OffsetDateTime,
     pub bitcoin: Option<PaykitBitcoinPaymentStatus>,
-    #[serde(rename = "usdt_arbitrum")]
-    _usdt_arbitrum: Option<serde_json::Value>,
+    pub usdt_arbitrum: Option<PaykitUsdtPaymentStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -255,6 +257,15 @@ pub struct PaykitBitcoinPaymentStatus {
     pub confirmations: u32,
     pub amount_matched: bool,
     pub paid_on_time: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitUsdtPaymentStatus {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+    pub finalized: bool,
 }
 
 impl PaykitHttpClient {
@@ -662,20 +673,24 @@ impl PaykitPaymentStatusClient for PaykitHttpClient {
                     ServicePaymentRequestState::ActiveRecurring
                 }
             },
-            // The aggregate state may describe USDT; only Bitcoin can satisfy Locks payments.
-            payment_state: match (status.payment_state, &status.bitcoin) {
-                (PaykitPaymentState::Expired, _) => ServicePaymentState::Expired,
-                (_, None) => ServicePaymentState::Undetected,
-                (_, Some(bitcoin)) if bitcoin.confirmations == 0 => ServicePaymentState::Detected,
-                (_, Some(_)) => ServicePaymentState::Confirmed,
+            payment_state: match status.payment_state {
+                PaykitPaymentState::Undetected => ServicePaymentState::Undetected,
+                PaykitPaymentState::Detected => ServicePaymentState::Detected,
+                PaykitPaymentState::Confirmed => ServicePaymentState::Confirmed,
+                PaykitPaymentState::Expired => ServicePaymentState::Expired,
             },
-            confirmations: status
-                .bitcoin
-                .as_ref()
-                .map_or(0, |bitcoin| bitcoin.confirmations),
-            amount_matched: status
-                .bitcoin
-                .is_some_and(|bitcoin| bitcoin.amount_matched && bitcoin.paid_on_time),
+            bitcoin: status.bitcoin.map(|payment| PaykitPaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
+            usdt_arbitrum: status
+                .usdt_arbitrum
+                .map(|payment| PaykitPaymentObservation {
+                    confirmations: payment.confirmations,
+                    amount_matched: payment.amount_matched,
+                    paid_on_time: payment.paid_on_time,
+                }),
         })
     }
 }
@@ -685,11 +700,13 @@ impl PaykitSetupStatusProvider for PaykitHttpClient {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
         PaykitHttpClient::setup_status(
             self,
             &PaykitSetupStatusRequest {
                 creator: creator.clone(),
+                asset,
             },
         )
         .await
@@ -1215,7 +1232,7 @@ mod tests {
                     amount_matched: true,
                     paid_on_time: true,
                 }),
-                _usdt_arbitrum: None,
+                usdt_arbitrum: None,
             }
         );
         let request = captured.single();
@@ -1228,81 +1245,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payment_request_status_uses_only_timely_bitcoin_observations() {
-        let bitcoin = |confirmations, amount_matched, paid_on_time| json!({ "confirmations": confirmations, "amount_matched": amount_matched, "paid_on_time": paid_on_time });
-        let usdt = json!({ "confirmations": 200, "amount_matched": true, "paid_on_time": true, "finalized": true });
-        for (name, aggregate, bitcoin, usdt, state, confirmations, amount_matched) in [
-            (
-                "bitcoin mempool",
-                "detected",
-                bitcoin(0, true, true),
-                json!(null),
-                ServicePaymentState::Detected,
-                0,
-                true,
-            ),
-            (
-                "bitcoin confirmed",
-                "confirmed",
-                bitcoin(6, true, true),
-                json!(null),
-                ServicePaymentState::Confirmed,
-                6,
-                true,
-            ),
-            (
-                "usdt only",
-                "confirmed",
-                json!(null),
-                usdt.clone(),
-                ServicePaymentState::Undetected,
-                0,
-                false,
-            ),
-            (
-                "bitcoin underpaid",
-                "confirmed",
-                bitcoin(3, false, false),
-                usdt.clone(),
-                ServicePaymentState::Confirmed,
-                3,
-                false,
-            ),
-            (
-                "bitcoin late",
-                "confirmed",
-                bitcoin(3, true, false),
-                usdt.clone(),
-                ServicePaymentState::Confirmed,
-                3,
-                false,
-            ),
-            (
-                "bitcoin confirmations independent",
-                "confirmed",
-                bitcoin(0, true, true),
-                usdt,
-                ServicePaymentState::Detected,
-                0,
-                true,
-            ),
-            (
-                "payment expired",
-                "expired",
-                bitcoin(3, true, false),
-                json!(null),
-                ServicePaymentState::Expired,
-                3,
-                false,
-            ),
-        ] {
+    async fn payment_request_status_preserves_independent_rail_observations() {
+        for aggregate in ["detected", "confirmed", "expired"] {
             let body = json!({
                 "request_state": "accepted",
                 "payment_state": aggregate,
                 "invoice_created_at": "2026-09-25T11:00:00Z",
                 "payment_deadline": "2026-09-25T12:00:00Z",
-                "bitcoin": bitcoin,
-                "usdt_arbitrum": usdt,
+                "bitcoin": {"confirmations": 0, "amount_matched": true, "paid_on_time": false},
+                "usdt_arbitrum": {"confirmations": 1, "amount_matched": false, "paid_on_time": true, "finalized": false},
             });
             let server_url = spawn_configured_status_server(
                 StatusCode::OK,
@@ -1322,16 +1273,29 @@ mod tests {
             )
             .await
             .unwrap();
-
             assert_eq!(
-                status,
-                PaykitPaymentStatus {
-                    request_state: ServicePaymentRequestState::Accepted,
-                    payment_state: state,
-                    confirmations,
-                    amount_matched,
-                },
-                "{name}"
+                status.bitcoin,
+                Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: false,
+                })
+            );
+            assert_eq!(
+                status.usdt_arbitrum,
+                Some(PaykitPaymentObservation {
+                    confirmations: 1,
+                    amount_matched: false,
+                    paid_on_time: true,
+                })
+            );
+            assert_eq!(
+                status.payment_state,
+                match aggregate {
+                    "detected" => ServicePaymentState::Detected,
+                    "confirmed" => ServicePaymentState::Confirmed,
+                    _ => ServicePaymentState::Expired,
+                }
             );
         }
     }
@@ -1379,6 +1343,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn payment_status_accepts_server_contract_and_rejects_incomplete_observations() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/payment-request-status/dual-asset-confirmed.json"
+        ))
+        .unwrap();
+        let status: PaykitPaymentRequestStatus = serde_json::from_value(value.clone()).unwrap();
+        assert!(status.bitcoin.unwrap().paid_on_time);
+        assert!(!status.usdt_arbitrum.unwrap().paid_on_time);
+        for rail in ["bitcoin", "usdt_arbitrum"] {
+            for field in ["confirmations", "amount_matched", "paid_on_time"] {
+                let mut incomplete = value.clone();
+                incomplete[rail].as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<PaykitPaymentRequestStatus>(incomplete).is_err(),
+                    "{rail}.{field} must be explicit"
+                );
+            }
+        }
+        for source in [
+            include_str!("../tests/fixtures/payment-request-status/canceled-confirmed.json"),
+            include_str!("../tests/fixtures/payment-request-status/rejected-confirmed.json"),
+            include_str!("../tests/fixtures/payment-request-status/proposal-expired.json"),
+            include_str!("../tests/fixtures/payment-request-status/payment-deadline-expired.json"),
+        ] {
+            serde_json::from_str::<PaykitPaymentRequestStatus>(source).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1855,11 +1848,7 @@ mod tests {
             "payment_state": "detected",
             "invoice_created_at": "2026-09-25T11:00:00Z",
             "payment_deadline": "2026-09-25T12:00:00Z",
-            "bitcoin": {
-                "confirmations": 0,
-                "amount_matched": true,
-                "paid_on_time": true,
-            },
+            "bitcoin": {"confirmations": 0, "amount_matched": true, "paid_on_time": true},
             "usdt_arbitrum": null,
         }))
     }
@@ -1892,7 +1881,7 @@ mod setup_status_tests {
 
         assert_eq!(
             String::from_utf8(body.clone()).unwrap(),
-            format!("{{\"creator\":\"{CREATOR}\"}}")
+            format!("{{\"asset\":\"USDT\",\"creator\":\"{CREATOR}\"}}")
         );
         assert_eq!(
             signature,
@@ -2047,6 +2036,7 @@ mod setup_status_tests {
 
     fn setup_status_request() -> PaykitSetupStatusRequest {
         PaykitSetupStatusRequest {
+            asset: PaykitPaymentAsset::Usdt,
             creator: CreatorPubky::from_str(CREATOR).unwrap(),
         }
     }

@@ -11,6 +11,25 @@ use crate::ids::{
     BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockHash, LockId, LockServerPubky,
 };
 
+/// Invoice denominations supported by the Paykit server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PaykitPaymentAsset {
+    Btc,
+    Usd,
+    Usdt,
+}
+
+impl PaykitPaymentAsset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usd => "USD",
+            Self::Usdt => "USDT",
+        }
+    }
+}
+
 /// Supported v0 content lock payload version.
 pub const CONTENT_LOCK_VERSION: u16 = 1;
 

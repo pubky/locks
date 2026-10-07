@@ -29,10 +29,10 @@ import {
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const locksReleaseVersion = '0.1.0-rc9';
-assert.equal(PAYKIT_SERVER_REF, '0.1.0-rc7');
+assert.equal(PAYKIT_SERVER_REF, '4cc8e7b836dba28446a8d821f593ee40bb4acbeb');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  'https://github.com/pubky/paykit-server.git#0.1.0-rc7',
+  'https://github.com/pubky/paykit-server.git#4cc8e7b836dba28446a8d821f593ee40bb4acbeb',
 );
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',
@@ -409,8 +409,8 @@ for (const required of [
   'additional_contexts:',
   'PUBKY_HOMESERVER_REF: v0.11.0',
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-lib',
-  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-sdk',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-lib',
+  'https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-sdk',
   'locks: .',
   '127.0.0.1:${LOCKS_PAYKIT_PORT:-3001}:3001',
   '127.0.0.1:${LOCKS_READER_DEMO_PORT:-8088}:8088',

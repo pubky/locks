@@ -1,4 +1,5 @@
 pub use locks_core::creator_publishing::{CreateContentLockRequest, SetLockServicePointerRequest};
+pub use locks_core::lock_policy::PaykitPaymentAsset;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,18 +135,18 @@ impl CreatorLocks {
         self.set_lock_service_pointer_request(request)
     }
 
-    pub fn paykit_setup_status_request(&self) -> SdkRequest {
+    pub fn paykit_setup_status_request(&self, asset: PaykitPaymentAsset) -> SdkRequest {
         SdkRequest {
             method: "GET",
-            path: "/creator/paykit/setup-status".to_owned(),
+            path: format!("/creator/paykit/setup-status?asset={}", asset.as_str()),
             authorization: self.session.authorization_header_value(),
             content_type: String::new(),
             body: SdkRequestBody::Empty,
         }
     }
 
-    pub fn paykit_setup_status(&self) -> SdkRequest {
-        self.paykit_setup_status_request()
+    pub fn paykit_setup_status(&self, asset: PaykitPaymentAsset) -> SdkRequest {
+        self.paykit_setup_status_request(asset)
     }
 
     pub fn parse_paykit_setup_status_response(value: Value) -> crate::Result<PaykitSetupStatus> {
@@ -324,10 +325,10 @@ mod tests {
     fn paykit_setup_status_request_uses_authenticated_get_without_creator_input() {
         let creator = LocksSession::new("frontend-session-secret").creator();
 
-        let request = creator.paykit_setup_status_request();
+        let request = creator.paykit_setup_status_request(super::PaykitPaymentAsset::Usd);
 
         assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/creator/paykit/setup-status");
+        assert_eq!(request.path, "/creator/paykit/setup-status?asset=USD");
         assert_eq!(request.authorization, "Bearer frontend-session-secret");
         assert_eq!(request.content_type, "");
         assert_eq!(request.body, SdkRequestBody::Empty);

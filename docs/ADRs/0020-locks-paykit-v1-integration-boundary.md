@@ -38,6 +38,25 @@ The v1 content-lock criterion has verifier wire value `paykit-payment` and param
 - The submitted payment proof payload is `{}`. `reader_public_key` is top-level submission data.
 - Content-lock authoring does not require runtime Paykit configuration or availability.
 
+### Price denomination and payment methods
+
+The criterion's `asset` and `amount` describe the requested value, not the required
+payment method. Creator UIs offer BTC prices in satoshis or USD prices in cents.
+Locks preserves that criterion unchanged. Paykit Server reads it from the canonical
+Lock Resource and builds the request from the creator's enabled receiving methods:
+
+| Price | Bitcoin enabled | Arbitrum USDT enabled |
+| --- | --- | --- |
+| BTC | Exact BTC amount, no conversion | Fixed BTC-to-USDT quote |
+| USD | Fixed USD-to-BTC quote | Fixed 1:1 USD-to-USDT quote |
+
+Without Paykit Server's optional `[usdt]` configuration, setup requests only the Bitcoin account and invoices offer only Bitcoin. Choosing a USD price does not request a USDT address.
+
+A disabled receiving method is omitted from the request. Paykit owns rate selection,
+quote expiry and exact amount verification. Locks does not fetch exchange rates or
+compare a payment asset to the criterion's denomination; it requires a full on-time
+payment on one accepted method using Paykit's authenticated invoice status.
+
 ### Locks submission lifecycle
 
 `{ creator, bundle_id }` is a permanent, one-attempt Locks lifecycle identity. Submission processing occurs in this order:
@@ -82,7 +101,7 @@ Locks sends RFC 8785 canonical JSON to `POST /payment-requests/status`:
 }
 ```
 
-The status body uses the same `X-Paykit-Signature` authentication as invoice creation. It is closed and keeps canonical axes separate: `request_state` is `proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, or `active_recurring`; `payment_state` is `undetected`, `detected`, `confirmed`, or `expired`. The response also contains `invoice_created_at`, `payment_deadline`, and optional `bitcoin` and `usdt_arbitrum` observations. Locks uses only `bitcoin.confirmations`, `bitcoin.amount_matched`, and `bitcoin.paid_on_time`: Bitcoin must meet the amount and deadline before the existing `minimum_confirmations` policy can grant access. Bitcoin detection and confirmation state come from that observation, not the aggregate state, which may describe another asset. Aggregate `expired` still terminalizes the attempt. `usdt_arbitrum` is accepted as opaque JSON and is not used for access decisions; USDT payments do not satisfy Locks payment criteria.
+The status body uses the same `X-Paykit-Signature` authentication as invoice creation. It is closed and keeps canonical axes separate: `request_state` is `proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, or `active_recurring`; `payment_state` is `undetected`, `detected`, `confirmed`, or `expired`. The response also contains `invoice_created_at`, `payment_deadline`, and nullable `bitcoin` / `usdt_arbitrum` observations, each with `confirmations`, `amount_matched`, and `paid_on_time` (USDT additionally has `finalized`). Locks requires a full on-time payment on one rail, applies `minimum_confirmations` only to Bitcoin, and accepts USDT after verified Arbitrum inclusion. Paykit verifies the payment; Locks decides access.
 
 `rejected`, `canceled`, `proposal_expired`, and accepted plus payment `expired` terminalize the current Locks attempt as `expired` with the corresponding typed reason. They issue no entitlement and do not retry the same task, even when confirmed payment facts exist. Transport failures, timeouts, response-body read failures, and non-`200` responses remain no-entitlement and pending for durable retry; `409 Conflict` is operator-visible rather than reclassified as payment rejection. A `200` response with malformed JSON, missing required or unknown fields, unknown states, an oversized body, or invalid or misordered timestamps is a permanent contract failure: Locks terminalizes the attempt as `failed` with a viewer-safe failure message and no entitlement. Both `failed` and `expired` require a new Bundle ID for another attempt. Locks validates timestamp syntax and requires `payment_deadline > invoice_created_at`, but does not compare either timestamp to its local clock.
 
