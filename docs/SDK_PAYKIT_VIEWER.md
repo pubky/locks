@@ -99,6 +99,7 @@ Lifecycle response:
   "completed_at": null,
   "failure_message": null,
   "status_message": "Reader wallet setup needed",
+  "admission_deadline_at": "2026-09-29T12:10:00Z",
   "terminal_reason": null
 }
 ```
@@ -107,14 +108,14 @@ Handle lifecycle states as closed vocabulary:
 
 | Status | Required fields | Consumer action |
 | --- | --- | --- |
-| `pending` | `started_at`, `completed_at`, `failure_message`, and `terminal_reason` are `null`; `status_message` is nullable | If `status_message` is `Reader wallet setup needed`, show it. Keep polling same task; do not resubmit. |
-| `in_progress` | `started_at` is set; `completed_at`, `failure_message`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
-| `completed` | `started_at` and `completed_at` are set; `failure_message` and `terminal_reason` are `null` | Call `issueAccessCredential`, then proxy-read an authorized relative path. |
-| `failed` | `started_at` and `completed_at` are set; `failure_message` is non-empty; `terminal_reason` is `null` | Stop polling. Do not issue a credential. |
-| `expired` | `started_at` and `completed_at` are set; `failure_message` is `null`; `terminal_reason` is set | Stop polling. Do not issue a credential. |
+| `pending` | `started_at`, `completed_at`, `failure_message`, and `terminal_reason` are `null`; `status_message` and `admission_deadline_at` are nullable | If `status_message` is `Reader wallet setup needed`, show it. Use deadline as DB-owned progress cutoff, not synthetic failure. Keep polling same task; do not resubmit. |
+| `in_progress` | `started_at` is set; `completed_at`, `failure_message`, `admission_deadline_at`, and `terminal_reason` are `null` | Wait, then call `lookupVerificationTask` again. |
+| `completed` | `started_at` and `completed_at` are set; `failure_message`, `admission_deadline_at`, and `terminal_reason` are `null` | Call `issueAccessCredential`, then proxy-read an authorized relative path. |
+| `failed` | `started_at` and `completed_at` are set; `failure_message` is non-empty; `admission_deadline_at` and `terminal_reason` are `null` | Stop polling. Do not issue a credential. |
+| `expired` | `started_at` and `completed_at` are set; `failure_message` and `admission_deadline_at` are `null`; `terminal_reason` is set | Stop polling. Do not issue a credential. |
 | anything else or any invalid tuple | Fail closed; client and server contract are incompatible. |
 
-`status_message` is viewer-safe progress text, not proof of invoice readiness or entitlement. Current non-null value is exactly `Reader wallet setup needed`, projected while backend retries missing or malformed/oversized Reader wallet registry state inside original 10-minute admission deadline. All other lifecycle states currently use `null`.
+`status_message` is viewer-safe progress text, not proof of invoice readiness or entitlement. Current non-null value is exactly `Reader wallet setup needed`, projected while backend retries missing or malformed/oversized Reader wallet registry state inside original 10-minute admission deadline. Once observed it remains sticky across unrelated transient retries until ready or failed. `admission_deadline_at` is persisted DB-owned time exposed only while invoice admission is pending; an overdue value can indicate a stalled worker but does not mean worker ran or task failed. Keep polling. Browser/host clock skew makes local countdowns approximate.
 
 `expired` identifies a normal terminal payment-request outcome, unlike `failed`, which carries a safe verification failure message. Its exact `terminal_reason` wire values are:
 
@@ -157,7 +158,7 @@ function nextAction(lifecycle) {
 }
 ```
 
-Migration note: lifecycle JSON includes `terminal_reason` on every response (`null` unless status is `expired`) and nullable `status_message`. Consumers with exact object comparisons, JSON schemas, TypeScript interfaces, or destructuring assumptions for older payloads must accept these fields before deploying against this server version.
+Migration note: lifecycle JSON includes `terminal_reason` on every response (`null` unless status is `expired`), nullable `status_message`, and nullable `admission_deadline_at`. Consumers with exact object comparisons, JSON schemas, TypeScript interfaces, or destructuring assumptions for older payloads must accept these fields before deploying against this server version.
 
 Connection state is independent from verification lifecycle:
 

@@ -55,6 +55,7 @@ use crate::paykit_http_client::{
     PaykitHttpClient, PaykitSetupStatusKind, PaykitSetupStatusProvider,
     PaykitSetupStatusProviderError,
 };
+use crate::worker::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick};
 
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
@@ -610,8 +611,27 @@ async fn verification_task_lookup_projects_reader_wallet_setup_needed_without_en
             "worker-a",
             &claim.claim_token,
             now,
-            time::Duration::seconds(2),
+            time::Duration::ZERO,
             Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let second_claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("worker-b", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = state
+        .invoice_admissions()
+        .schedule_invoice_admission_retry(
+            &task.task_id,
+            "worker-b",
+            &second_claim.claim_token,
+            now,
+            time::Duration::seconds(2),
+            None,
         )
         .await
         .unwrap()
@@ -647,7 +667,64 @@ async fn verification_task_lookup_projects_reader_wallet_setup_needed_without_en
     let body = response_json(response).await;
     assert_eq!(body["status"], "pending");
     assert_eq!(body["status_message"], "Reader wallet setup needed");
+    assert_eq!(
+        body["admission_deadline_at"],
+        admission
+            .admission_deadline_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
     assert!(body.get("entitlement_to_publish").is_none());
+}
+
+#[tokio::test]
+async fn reader_not_payable_worker_failure_is_visible_through_http_lookup() {
+    let paykit_url = spawn_paykit_invoice_error(
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "reader_not_payable", "message": "not payable"}}),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state().with_paykit_http_client(Some(paykit.clone()));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+
+    let jitter = ZeroInvoiceJitter;
+    let worker = InvoiceAdmissionWorker::from_state(&state, paykit.as_ref(), &jitter);
+    assert!(matches!(
+        worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Failed(_)
+    ));
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["failure_message"], "reader is not payable");
+    assert_eq!(body["admission_deadline_at"], Value::Null);
 }
 
 #[tokio::test]
@@ -3688,6 +3765,24 @@ async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
     format!("http://{address}")
 }
 
+async fn spawn_paykit_invoice_error(status: StatusCode, body: Value) -> String {
+    async fn invoice(
+        State((status, body)): State<(StatusCode, Value)>,
+    ) -> impl axum::response::IntoResponse {
+        (status, Json(body))
+    }
+
+    let app = Router::new()
+        .route("/invoices", post(invoice))
+        .with_state((status, body));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}")
+}
+
 async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
     async fn invoice() -> impl axum::response::IntoResponse {
         invoice_created_response()
@@ -4085,6 +4180,14 @@ struct FixedClock(time::OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> time::OffsetDateTime {
         self.0
+    }
+}
+
+struct ZeroInvoiceJitter;
+
+impl InvoiceRetryJitter for ZeroInvoiceJitter {
+    fn delay(&self, _attempt_count: u32) -> time::Duration {
+        time::Duration::ZERO
     }
 }
 

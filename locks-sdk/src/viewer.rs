@@ -77,6 +77,8 @@ pub struct VerificationTaskLifecycleResponse {
     pub completed_at: Option<time::OffsetDateTime>,
     pub failure_message: Option<String>,
     pub status_message: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub admission_deadline_at: Option<time::OffsetDateTime>,
     pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
@@ -218,6 +220,7 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                 && response.completed_at.is_none()
                 && response.failure_message.is_none()
                 && response.status_message.is_none()
+                && response.admission_deadline_at.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Completed => {
@@ -225,6 +228,7 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                 && response.completed_at.is_some()
                 && response.failure_message.is_none()
                 && response.status_message.is_none()
+                && response.admission_deadline_at.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Failed => {
@@ -235,6 +239,7 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                     .as_deref()
                     .is_some_and(|message| !message.trim().is_empty())
                 && response.status_message.is_none()
+                && response.admission_deadline_at.is_none()
                 && response.terminal_reason.is_none()
         }
         VerificationTaskStatus::Expired => {
@@ -242,6 +247,7 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                 && response.completed_at.is_some()
                 && response.failure_message.is_none()
                 && response.status_message.is_none()
+                && response.admission_deadline_at.is_none()
                 && response.terminal_reason.is_some()
         }
     };
@@ -468,6 +474,34 @@ mod tests {
             "terminal_reason": null
         });
         assert!(ViewerLocks::parse_lifecycle_response(completed).is_err());
+    }
+
+    #[test]
+    fn pending_lifecycle_response_exposes_optional_invoice_admission_deadline() {
+        let response = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "status_message": "Reader wallet setup needed",
+            "admission_deadline_at": "2026-06-01T12:10:00Z",
+            "terminal_reason": null
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response.admission_deadline_at,
+            Some(
+                time::OffsetDateTime::parse(
+                    "2026-06-01T12:10:00Z",
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap()
+            )
+        );
     }
 
     #[test]

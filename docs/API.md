@@ -582,7 +582,7 @@ A claimed background worker sends the persisted body below to Paykit `POST /invo
 
 Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks validates the response, marks invoice admission ready with the exact live claim token, then leaves existing payment-status/outbox processing unchanged. No entitlement can be issued before admission is ready.
 
-Transport errors, typed Reader setup/registry failures (including malformed or oversized registry data), and generic proxy `502`/`503` responses schedule durable full-jitter retry (2-second initial cap, then exponential caps through 60 seconds) without extending the DB-owned 10-minute admission deadline. Numeric `Retry-After` is clamped to 60 seconds. `409 reader_not_payable` and `409 invoice_conflict` are terminal only when both status and typed code match; status-only `409` is never interpreted as either typed condition. Deadline expiry terminalizes the task without entitlement.
+Transport errors, typed Reader setup/registry failures (including malformed or oversized registry data), `429`, and every `5xx` response schedule durable full-jitter retry (2-second initial cap, then exponential caps through 60 seconds) without extending the DB-owned 10-minute admission deadline. Numeric `Retry-After` is clamped to 60 seconds. `409 reader_not_payable` maps to `reader is not payable`; `409 invoice_conflict` maps to `paykit invoice conflict`; any other `409` and other terminal Paykit admission errors map to `paykit invoice admission failed`. `400` remains terminal. Deadline expiry maps to `invoice admission deadline exceeded`. These four messages are the closed invoice-admission failure vocabulary; every failure is worker-owned and issues no entitlement.
 
 ### `POST /paykit-connection-state-lookups`
 
@@ -608,7 +608,9 @@ Rate limiting, when enabled, returns `429 rate_limited` with the stable error en
 
 Looks up lifecycle metadata by public handle `{ creator, bundle_id }` using a JSON body. Bundle ID is bearer-secret-like, so it is not placed in URL paths or query strings.
 
-Lifecycle responses include nullable `status_message`. While invoice admission is durably retrying `reader_setup_pending` or malformed/oversized Reader registry data, it is `"Reader wallet setup needed"`; clients should show that safe message and continue polling the existing task. Other states use `null`. This projection does not imply entitlement or invoice readiness.
+Lifecycle responses include nullable `status_message` and `admission_deadline_at`. While invoice admission is pending, `admission_deadline_at` exposes the persisted DB-owned RFC 3339 cutoff; clients may use it to distinguish ordinary progress from an overdue/stalled worker, but must keep polling because only the worker may persist terminal failure. It becomes `null` after admission reaches ready or failed. Compare against a server-synchronized clock: DB time owns enforcement, so host/browser clock skew can make a local countdown approximate.
+
+While invoice admission is durably retrying `reader_setup_pending` or malformed/oversized Reader registry data, `status_message` is `"Reader wallet setup needed"`; clients should show that safe message and continue polling the existing task. Once observed, this reason remains sticky across unrelated transient retries until admission becomes ready or failed. Other states use `null`. Neither projection implies entitlement, invoice readiness, worker execution, or synthetic failure.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
 

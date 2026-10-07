@@ -483,7 +483,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              )
              UPDATE verification_tasks AS task
              SET claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
-                 invoice_admission_retry_reason = $5,
+                 invoice_admission_retry_reason = COALESCE($5, task.invoice_admission_retry_reason),
                  next_attempt_at = LEAST(
                      timing.winner_time + ($4 * INTERVAL '1 microsecond'),
                      task.admission_deadline_at
@@ -1077,6 +1077,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_invoice_admission_claims_return_one_lease_for_one_task() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let mut task = task(VerificationTaskStatus::Pending);
+        task.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        repo.insert_invoice_pending_task(
+            task.clone(),
+            InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: task.creator.clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader: task
+                    .submitted_proof_bundle
+                    .reader_public_key
+                    .clone()
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let repo_a = repo.clone();
+        let repo_b = repo.clone();
+        let (claim_a, claim_b) = tokio::join!(
+            repo_a.claim_next_invoice_admission(
+                "worker-a",
+                task.submitted_at,
+                time::Duration::minutes(1),
+            ),
+            repo_b.claim_next_invoice_admission(
+                "worker-b",
+                task.submitted_at,
+                time::Duration::minutes(1),
+            ),
+        );
+        let claims = [claim_a.unwrap(), claim_b.unwrap()];
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn invoice_admission_fractional_claim_and_retry_durations_keep_precision() {
         let database = TestDatabase::create().await;
         let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
@@ -1258,6 +1304,35 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .retry_reason,
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
+        );
+
+        sqlx::query(
+            "UPDATE verification_tasks SET next_attempt_at = clock_timestamp() WHERE task_id = $1::uuid",
+        )
+        .bind(task.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let transient_claim = recreated_repo
+            .claim_next_invoice_admission("worker-b", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let transient_retry = recreated_repo
+            .schedule_invoice_admission_retry(
+                &task.task_id,
+                "worker-b",
+                &transient_claim.claim_token,
+                task.submitted_at,
+                time::Duration::seconds(1),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            transient_retry.retry_reason,
             Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
         );
 

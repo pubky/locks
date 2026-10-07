@@ -294,7 +294,9 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         };
         state.record.next_attempt_at =
             Some((now + retry_after).min(state.record.admission_deadline_at));
-        state.record.retry_reason = retry_reason;
+        if retry_reason.is_some() {
+            state.record.retry_reason = retry_reason;
+        }
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
@@ -751,6 +753,57 @@ mod tests {
         );
         assert_eq!(failed.task.entitlement_to_publish, None);
         assert_eq!(failed.next_attempt_at, None);
+    }
+
+    #[tokio::test]
+    async fn invoice_admission_retry_keeps_reader_setup_reason_across_other_transient_errors() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let mut task = task(VerificationTaskStatus::Pending);
+        task.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        repo.insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let first = repo
+            .claim_next_invoice_admission("worker-a", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        repo.schedule_invoice_admission_retry(
+            &task.task_id,
+            "worker-a",
+            &first.claim_token,
+            task.submitted_at,
+            time::Duration::ZERO,
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second = repo
+            .claim_next_invoice_admission("worker-b", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = repo
+            .schedule_invoice_admission_retry(
+                &task.task_id,
+                "worker-b",
+                &second.claim_token,
+                task.submitted_at,
+                time::Duration::seconds(1),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            retry.retry_reason,
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
+        );
     }
 
     #[tokio::test]

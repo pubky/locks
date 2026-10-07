@@ -17,7 +17,10 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use uuid::Uuid;
 
-use super::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick};
+use super::invoice::{
+    InvoiceAdmissionWorker, InvoiceErrorAction, InvoiceRetryJitter, InvoiceWorkerTick,
+    invoice_error_action,
+};
 use crate::paykit_http_client::{PaykitClientError, PaykitInvoiceCreator, PaykitInvoiceRequest};
 
 #[tokio::test]
@@ -123,6 +126,36 @@ async fn invoice_worker_retries_typed_pending_and_generic_proxy_without_losing_t
             None,
         ),
         (
+            PaykitClientError::InvoiceNonSuccess {
+                request_id: Uuid::new_v4(),
+                elapsed_ms: 1,
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_code: Some("rate_limited"),
+                retry_after_seconds: Some(60),
+            },
+            None,
+        ),
+        (
+            PaykitClientError::InvoiceNonSuccess {
+                request_id: Uuid::new_v4(),
+                elapsed_ms: 1,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_code: Some("internal_error"),
+                retry_after_seconds: None,
+            },
+            None,
+        ),
+        (
+            PaykitClientError::InvoiceNonSuccess {
+                request_id: Uuid::new_v4(),
+                elapsed_ms: 1,
+                status: StatusCode::GATEWAY_TIMEOUT,
+                error_code: None,
+                retry_after_seconds: None,
+            },
+            None,
+        ),
+        (
             PaykitClientError::InvoiceTransport {
                 request_id: Uuid::new_v4(),
                 elapsed_ms: 1,
@@ -183,7 +216,7 @@ async fn invoice_worker_retries_typed_pending_and_generic_proxy_without_losing_t
 }
 
 #[tokio::test]
-async fn invoice_worker_retries_status_only_conflict_but_fails_expired_deadline() {
+async fn invoice_worker_fails_status_only_conflict() {
     let repo = InMemoryVerificationTaskRepository::new();
     let task = invoice_task();
     repo.insert_invoice_pending_task(task.clone(), invoice_intent(&task))
@@ -210,15 +243,17 @@ async fn invoice_worker_retries_status_only_conflict_but_fails_expired_deadline(
 
     assert_eq!(
         worker.run_once().await.unwrap(),
-        InvoiceWorkerTick::RetryScheduled(task.task_id)
+        InvoiceWorkerTick::Failed(task.task_id)
     );
     assert_eq!(
         repo.get_invoice_admission(&task.task_id)
             .await
             .unwrap()
             .unwrap()
-            .phase,
-        InvoiceAdmissionPhase::InvoicePending
+            .task
+            .failure_message
+            .as_deref(),
+        Some("paykit invoice admission failed")
     );
 
     let expired_repo = InMemoryVerificationTaskRepository::new();
@@ -289,6 +324,39 @@ async fn invoice_worker_terminalizes_only_typed_conflict_meanings_with_specific_
             Some(expected_message)
         );
         assert_eq!(admission.task.entitlement_to_publish, None);
+    }
+}
+
+#[test]
+fn invoice_error_classification_retries_only_429_and_all_5xx_statuses() {
+    for status in std::iter::once(StatusCode::TOO_MANY_REQUESTS)
+        .chain((500..=599).map(|status| StatusCode::from_u16(status).unwrap()))
+    {
+        let error = PaykitClientError::InvoiceNonSuccess {
+            request_id: Uuid::new_v4(),
+            elapsed_ms: 1,
+            status,
+            error_code: None,
+            retry_after_seconds: None,
+        };
+        assert!(matches!(
+            invoice_error_action(&error),
+            InvoiceErrorAction::Retry(_)
+        ));
+    }
+
+    for status in [StatusCode::BAD_REQUEST, StatusCode::CONFLICT] {
+        let error = PaykitClientError::InvoiceNonSuccess {
+            request_id: Uuid::new_v4(),
+            elapsed_ms: 1,
+            status,
+            error_code: None,
+            retry_after_seconds: None,
+        };
+        assert!(matches!(
+            invoice_error_action(&error),
+            InvoiceErrorAction::Fail("paykit invoice admission failed")
+        ));
     }
 }
 

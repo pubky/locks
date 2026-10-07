@@ -202,6 +202,13 @@ fn project_lifecycle_response(
     }) {
         response.status_message = Some("Reader wallet setup needed".to_owned());
     }
+    if let Some(admission) = admission.filter(|value| {
+        value.phase == InvoiceAdmissionPhase::InvoicePending
+            && response.status
+                == locks_service::application::models::VerificationTaskStatus::Pending
+    }) {
+        response.admission_deadline_at = Some(admission.admission_deadline_at);
+    }
     response
 }
 

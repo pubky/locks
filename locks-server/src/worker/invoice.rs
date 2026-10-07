@@ -217,12 +217,12 @@ impl<'a> InvoiceAdmissionWorker<'a> {
     }
 }
 
-enum InvoiceErrorAction {
+pub(super) enum InvoiceErrorAction {
     Retry(Option<time::Duration>),
     Fail(&'static str),
 }
 
-fn invoice_error_action(error: &PaykitClientError) -> InvoiceErrorAction {
+pub(super) fn invoice_error_action(error: &PaykitClientError) -> InvoiceErrorAction {
     match error {
         PaykitClientError::InvoiceTransport { .. }
         | PaykitClientError::InvalidInvoiceResponse(_)
@@ -234,11 +234,7 @@ fn invoice_error_action(error: &PaykitClientError) -> InvoiceErrorAction {
             status,
             retry_after_seconds,
             ..
-        } if matches!(
-            *status,
-            reqwest::StatusCode::BAD_GATEWAY | reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ) =>
-        {
+        } if *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
             InvoiceErrorAction::Retry(retry_after_seconds.map(|seconds| {
                 time::Duration::seconds(i64::try_from(seconds).unwrap_or(60).min(60))
             }))
@@ -256,7 +252,7 @@ fn invoice_error_action(error: &PaykitClientError) -> InvoiceErrorAction {
         PaykitClientError::InvoiceNonSuccess {
             status: reqwest::StatusCode::CONFLICT,
             ..
-        } => InvoiceErrorAction::Retry(None),
+        } => InvoiceErrorAction::Fail("paykit invoice admission failed"),
         _ => InvoiceErrorAction::Fail("paykit invoice admission failed"),
     }
 }
