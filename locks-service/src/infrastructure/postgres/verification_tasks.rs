@@ -1331,6 +1331,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(transient_retry.attempt_count, 2);
         assert_eq!(
             transient_retry.retry_reason,
             Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
@@ -1346,19 +1347,19 @@ mod tests {
         .execute(database.pool())
         .await
         .unwrap();
-        let second = recreated_repo
+        let expired_claim = recreated_repo
             .claim_next_invoice_admission("worker-b", task.submitted_at, time::Duration::minutes(1))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.admission.attempt_count, 2);
-        assert!(second.deadline_expired);
+        assert_eq!(expired_claim.admission.attempt_count, 3);
+        assert!(expired_claim.deadline_expired);
         assert_eq!(
             recreated_repo
                 .mark_invoice_admission_ready(
                     &task.task_id,
                     "worker-b",
-                    &second.claim_token,
+                    &expired_claim.claim_token,
                     task.submitted_at,
                 )
                 .await
@@ -1369,7 +1370,7 @@ mod tests {
             .mark_invoice_admission_failed(
                 &task.task_id,
                 "worker-b",
-                &second.claim_token,
+                &expired_claim.claim_token,
                 task.submitted_at,
                 "invoice admission failed",
             )
