@@ -554,6 +554,17 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
 
     let submit_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(submit_json["status"], "pending");
+    let submitted_at = time::OffsetDateTime::parse(
+        submit_json["submitted_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let admission_deadline_at = time::OffsetDateTime::parse(
+        submit_json["admission_deadline_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(admission_deadline_at, submitted_at + Duration::minutes(10));
     assert!(submit_json.get("connection_state").is_none());
     assert!(submit_json.get("task_id").is_none());
     let jitter = OsFullJitter;
@@ -581,7 +592,9 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     fake_paykit.assert_connection_status_checked().await;
 
     let replay_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
-    assert_eq!(replay_json, submit_json);
+    let mut expected_replay_json = submit_json;
+    expected_replay_json["admission_deadline_at"] = serde_json::Value::Null;
+    assert_eq!(replay_json, expected_replay_json);
     fake_paykit.assert_invoice_count(1).await;
 
     let mut conflicting = submitted;
