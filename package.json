@@ -1,0 +1,28 @@
+{
+  "name": "@synonymdev/locks-sdk",
+  "version": "0.1.0-rc9+git.c692fb70522c",
+  "description": "Browser JS/WASM bindings for the Pubky Locks Creator SDK",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pubky/locks.git"
+  },
+  "homepage": "https://github.com/pubky/locks#readme",
+  "bugs": "https://github.com/pubky/locks/issues",
+  "main": "./pkg/locks_sdk_wasm.js",
+  "types": "./pkg/locks_sdk_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/locks_sdk_wasm.d.ts",
+      "import": "./pkg/locks_sdk_wasm.js"
+    }
+  },
+  "files": [
+    "pkg/locks_sdk_wasm.js",
+    "pkg/locks_sdk_wasm_bg.wasm",
+    "pkg/locks_sdk_wasm.d.ts",
+    "pkg/locks_sdk_wasm_bg.wasm.d.ts"
+  ],
+  "locksSourceCommit": "c692fb70522cf75025b86ad72a3b98fa7ef84e72"
+}
