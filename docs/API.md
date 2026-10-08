@@ -147,7 +147,7 @@ The hosted browser routes are mounted when `[creator_authority_acquisition].enab
 - `POST /frontend-sessions`
 - `DELETE /frontend-sessions/current`
 
-In grant mode, the Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, requested capability coverage, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and required scopes, including after a Postgres-backed restart. The persisted authorization URL identifies whether each pending flow is `signin` or `signin_grant`; changing acquisition method while a flow is pending therefore fails closed instead of completing it through the other mechanism. Legacy records fail closed in grant mode and require creator reconnection. Both methods preserve the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
+In grant mode, the Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, exact requested capability set, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and exact required scopes, including after a Postgres-backed restart. Restore uses the homeserver stored at approval time, so a creator who moves homeserver must reconnect. The persisted authorization URL identifies whether each pending flow is `signin` or `signin_grant`; changing acquisition method while a flow is pending therefore fails closed instead of completing it through the other mechanism. Legacy records fail closed in grant mode and require creator reconnection. Both methods preserve the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
 
 ### `GET /connect`
 
@@ -157,9 +157,9 @@ Starts the human-facing Lock-Server-hosted connect shell using the selected acqu
 GET /connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state
 ```
 
-`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition.grant_connect].allowed_return_origins` in grant mode or `[creator_authority_acquisition.legacy_connect].allowed_return_origins` in legacy mode. Outside production, an explicit wildcard may admit the concrete `return_to` origin. The Lock Server validates this before starting Pubky auth.
+`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition.grant_connect].allowed_return_origins` in grant mode or `[creator_authority_acquisition.legacy_connect].allowed_return_origins` in legacy mode. Grant mode requires at least one grant-specific origin and does not fall back to legacy or top-level origins. Outside production, an explicit wildcard may admit the concrete `return_to` origin. The Lock Server validates this before starting Pubky auth.
 
-Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG, deeplink, and raw fallback text on the Lock Server origin. In grant mode its URL host is `signin_grant`; no cookie-auth URL is generated.
+Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and a touch-device deeplink button on the Lock Server origin. In grant mode its URL host is `signin_grant`; no cookie-auth URL is generated.
 
 The HTML form posts back to:
 

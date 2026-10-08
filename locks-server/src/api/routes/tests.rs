@@ -3416,6 +3416,69 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
     assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
 }
 
+#[tokio::test]
+async fn grant_connect_shell_rejects_origin_allowed_only_for_legacy_connect() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config
+        .creator_authority_acquisition
+        .legacy_connect
+        .allowed_return_origins = vec!["https://legacy.example".to_owned()];
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Flegacy.example%2Fcallback&state=opaque-state",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+}
+
+#[tokio::test]
+async fn grant_connect_postmessage_completion_returns_only_state_and_code() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    seed_pending_grant_creator_connect_flow(
+        &state,
+        "grant-flow-postmessage",
+        "https://pubky.app/locks/connected",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "POST",
+            "/connect/grant-flow-postmessage/complete?delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["state"], "opaque-state");
+    assert!(body["code"].as_str().is_some_and(|code| !code.is_empty()));
+    assert_eq!(body.as_object().unwrap().len(), 2);
+}
+
 #[test]
 fn connect_shell_escape_html_escapes_interpolated_text() {
     assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#x27;");
@@ -4384,6 +4447,33 @@ async fn seed_pending_creator_connect_flow(
         .unwrap();
 }
 
+async fn seed_pending_grant_creator_connect_flow(
+    state: &AppState,
+    flow_id: &str,
+    return_to: &str,
+    opaque_state: &str,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    state
+        .creator_connect_flows()
+        .insert_pending_creator_connect_flow(PendingCreatorConnectFlowRecord {
+            flow_id: CreatorConnectFlowId::new(flow_id),
+            return_to: return_to.to_owned(),
+            state: opaque_state.to_owned(),
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=fake-grant",
+            ),
+            requested_scopes: vec![
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
+            ],
+            created_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        })
+        .await
+        .unwrap();
+}
+
 struct FixedClock(time::OffsetDateTime);
 
 impl Clock for FixedClock {
@@ -4471,9 +4561,14 @@ impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
         &self,
         _authorization_url: &CreatorConnectAuthorizationUrl,
         _pop_key_id: &GrantPopKeyId,
-        _requested_scopes: &[String],
+        requested_scopes: &[String],
     ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
-        unreachable!("start route must not await approval")
+        Ok(GrantCreatorConnectFlowApproval {
+            creator: creator(),
+            grant_state: CreatorAuthoritySecret::new("delegated-grant-state"),
+            granted_scopes: requested_scopes.to_vec(),
+            grant_expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        })
     }
 }
 

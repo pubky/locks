@@ -651,6 +651,31 @@ fn grant_connect_requires_grant_configuration() {
 }
 
 #[test]
+fn grant_connect_requires_nonempty_allowed_return_origins() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        .replace(
+            "frontend_session_code_ttl_seconds = 120",
+            "frontend_session_code_ttl_seconds = 120\nallowed_return_origins = [\"https://legacy.example\"]",
+        )
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = []
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::EmptyGrantConnectAllowedReturnOrigins
+    ));
+}
+
+#[test]
 fn grant_connect_rejects_malformed_client_ids() {
     for client_id in [
         "https://locks.example",

@@ -663,6 +663,13 @@ impl RawCreatorAuthorityAcquisitionConfig {
                 },
             )
             .transpose()?;
+        if self.method == CreatorAuthorityAcquisitionMethod::GrantConnect
+            && grant_connect
+                .as_ref()
+                .is_some_and(|grant| grant.allowed_return_origins.is_empty())
+        {
+            return Err(ConfigError::EmptyGrantConnectAllowedReturnOrigins);
+        }
         if environment == RuntimeEnvironment::Production
             && grant_connect.as_ref().is_some_and(|grant| {
                 grant

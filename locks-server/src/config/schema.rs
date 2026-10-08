@@ -386,6 +386,10 @@ pub enum ConfigError {
     )]
     MissingGrantConnectConfig,
     #[error(
+        "creator_authority_acquisition.method = grant-connect requires creator_authority_acquisition.grant_connect.allowed_return_origins to contain at least one origin"
+    )]
+    EmptyGrantConnectAllowedReturnOrigins,
+    #[error(
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
