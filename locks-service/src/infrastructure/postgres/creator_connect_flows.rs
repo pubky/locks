@@ -95,6 +95,25 @@ impl CreatorConnectFlowStore for PostgresCreatorConnectFlowStore {
             .map_err(storage_error)?;
         Ok(())
     }
+
+    async fn consume_pending_creator_connect_flow(
+        &self,
+        flow_id: &CreatorConnectFlowId,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<PendingCreatorConnectFlowRecord>, ApplicationError> {
+        let row = sqlx::query(
+            "DELETE FROM pending_creator_connect_flows
+             WHERE flow_id = $1 AND expires_at > clock_timestamp()
+             RETURNING flow_id, return_to, state, authorization_url,
+                       requested_scopes, created_at, expires_at",
+        )
+        .bind(flow_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+
+        row.map(row_to_record).transpose()
+    }
 }
 
 fn row_to_record(
@@ -189,7 +208,7 @@ mod tests {
         let original_store = PostgresCreatorConnectFlowStore::new(database.pool().clone());
         let recreated_store = PostgresCreatorConnectFlowStore::new(database.pool().clone());
         let flow_id = CreatorConnectFlowId::new("flow-123");
-        let authorization_url = "pubkyauth://secret-flow-token";
+        let authorization_url = "pubkyauth://signin_grant?secret=secret-flow-token";
         let record = PendingCreatorConnectFlowRecord {
             authorization_url: CreatorConnectAuthorizationUrl::new(authorization_url),
             ..pending_flow_record(flow_id.clone())
@@ -207,7 +226,84 @@ mod tests {
             .expect("stored pending flow");
         assert_eq!(loaded, record);
         assert_eq!(loaded.authorization_url.expose_url(), authorization_url);
+        assert_eq!(
+            loaded.authorization_url.auth_kind().unwrap(),
+            crate::application::models::CreatorAuthorityAuthKind::Grant
+        );
         assert!(!format!("{loaded:?}").contains(authorization_url));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_consume_has_exactly_one_winner() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorConnectFlowStore::new(database.pool().clone());
+        let flow_id = CreatorConnectFlowId::new("flow-concurrent");
+        store
+            .insert_pending_creator_connect_flow(pending_flow_record(flow_id.clone()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE pending_creator_connect_flows
+             SET expires_at = clock_timestamp() + INTERVAL '1 minute'
+             WHERE flow_id = $1",
+        )
+        .bind(flow_id.as_str())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            store
+                .consume_pending_creator_connect_flow(&flow_id, datetime!(2026-05-29 12:00:00 UTC)),
+            store
+                .consume_pending_creator_connect_flow(&flow_id, datetime!(2026-05-29 12:00:00 UTC))
+        );
+        assert_eq!(
+            [first.unwrap(), second.unwrap()]
+                .into_iter()
+                .filter(Option::is_some)
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_pending_creator_connect_flow(&flow_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_flow_at_expiry_boundary() {
+        let database = TestDatabase::create().await;
+        let store = PostgresCreatorConnectFlowStore::new(database.pool().clone());
+        let flow_id = CreatorConnectFlowId::new("flow-expired");
+        store
+            .insert_pending_creator_connect_flow(pending_flow_record(flow_id.clone()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE pending_creator_connect_flows
+             SET expires_at = clock_timestamp()
+             WHERE flow_id = $1",
+        )
+        .bind(flow_id.as_str())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .consume_pending_creator_connect_flow(&flow_id, datetime!(2026-05-29 12:00:00 UTC))
+                .await
+                .unwrap(),
+            None
+        );
 
         database.cleanup().await;
     }

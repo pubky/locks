@@ -4,7 +4,7 @@ use locks_core::ids::CreatorPubky;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, FrontendSessionToken};
-use crate::application::ports::{Clock, CreatorAuthorityStore, FrontendSessionStore};
+use crate::application::ports::{Clock, CreatorAuthorityManager, FrontendSessionStore};
 
 /// Request for secret-free creator authority status from authenticated frontend context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub struct CreatorAuthorityStatusView {
 /// Returns secret-free creator authority status for an authenticated frontend session.
 pub async fn get_creator_authority_status(
     frontend_sessions: &dyn FrontendSessionStore,
-    creator_authorities: &dyn CreatorAuthorityStore,
+    creator_authority_manager: &dyn CreatorAuthorityManager,
     clock: &dyn Clock,
     request: GetCreatorAuthorityStatusRequest,
 ) -> Result<CreatorAuthorityStatusView, ApplicationError> {
@@ -48,14 +48,21 @@ pub async fn get_creator_authority_status(
     }
 
     let creator = frontend_session.creator;
-    let Some(authority) = creator_authorities.get_creator_authority(&creator).await? else {
-        return Ok(CreatorAuthorityStatusView {
-            creator,
-            authorized: false,
-            auth_kind: None,
-            granted_scopes: Vec::new(),
-            session_expires_at: None,
-        });
+    let authority = match creator_authority_manager
+        .revalidate_creator_authority(&creator)
+        .await
+    {
+        Ok(authority) => authority,
+        Err(ApplicationError::CreatorAuthorityUnavailable) => {
+            return Ok(CreatorAuthorityStatusView {
+                creator,
+                authorized: false,
+                auth_kind: None,
+                granted_scopes: Vec::new(),
+                session_expires_at: None,
+            });
+        }
+        Err(error) => return Err(error),
     };
 
     Ok(CreatorAuthorityStatusView {
@@ -82,7 +89,10 @@ mod tests {
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
         FrontendSessionRecord, FrontendSessionToken,
     };
-    use crate::application::ports::{Clock, CreatorAuthorityStore, FrontendSessionStore};
+    use crate::application::ports::{
+        Clock, CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
+        FrontendSessionStore,
+    };
 
     #[tokio::test]
     async fn get_creator_authority_status_returns_unauthorized_when_frontend_session_is_missing_or_expired()
@@ -185,6 +195,25 @@ mod tests {
         assert!(!debug.contains("frontend-session-token"));
     }
 
+    #[tokio::test]
+    async fn get_creator_authority_status_reports_runtime_rejected_authority_as_unauthorized() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let status = get_creator_authority_status(
+            &SessionStore::with_record(session_record(now)),
+            &RejectingAuthorityManager,
+            &FixedClock(now),
+            GetCreatorAuthorityStatusRequest {
+                session_token: FrontendSessionToken::new("frontend-session-token"),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!status.authorized);
+        assert_eq!(status.auth_kind, None);
+        assert!(status.granted_scopes.is_empty());
+    }
+
     fn session_record(now: OffsetDateTime) -> FrontendSessionRecord {
         FrontendSessionRecord {
             token: FrontendSessionToken::new("frontend-session-token"),
@@ -273,6 +302,52 @@ mod tests {
         ) -> Result<(), ApplicationError> {
             *self.record.lock().unwrap() = None;
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CreatorAuthorityManager for AuthorityStore {
+        async fn revalidate_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            let record = self
+                .get_creator_authority(creator)
+                .await?
+                .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+            Ok(CreatorAuthorityStatus {
+                creator: record.creator,
+                auth_kind: record.auth_kind,
+                authorized: true,
+                granted_scopes: record.granted_scopes,
+                session_expires_at: record.session_expires_at,
+            })
+        }
+
+        async fn require_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            self.revalidate_creator_authority(creator).await
+        }
+    }
+
+    struct RejectingAuthorityManager;
+
+    #[async_trait]
+    impl CreatorAuthorityManager for RejectingAuthorityManager {
+        async fn revalidate_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+
+        async fn require_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            self.revalidate_creator_authority(creator).await
         }
     }
 

@@ -352,7 +352,7 @@ That command signs up/registers the local `content-creator`, approves the auth s
 
 Click **Authenticate to Lock Server**.
 
-Both creator pages open the Lock Server `/connect` shell in an iframe modal. The raw legacy-connect authorization URL stays on the Lock Server origin.
+Both creator pages open the Lock Server `/connect` shell in an iframe modal. In grant mode the shell exposes one `signin_grant` QR/deeplink, never a cookie fallback; raw authorization state stays on Lock Server origin.
 
 The shell returns `{ state, code }` directly to the parent with `postMessage`. The parent accepts the result only from the exact Lock Server origin and iframe window, then validates the state before exchanging the one-time code. The configured callback URL supplies the parent target origin; the browser does not navigate to it:
 

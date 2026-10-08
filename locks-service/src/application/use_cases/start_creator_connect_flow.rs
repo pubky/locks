@@ -2,10 +2,12 @@ use time::{Duration, OffsetDateTime};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, PendingCreatorConnectFlowRecord,
+    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, GrantPopKeyId,
+    PendingCreatorConnectFlowRecord,
 };
 use crate::application::ports::{
-    Clock, CreatorConnectFlowIdGenerator, CreatorConnectFlowStore, LegacyCreatorConnectFlowClient,
+    Clock, CreatorConnectFlowIdGenerator, CreatorConnectFlowStore, GrantCreatorConnectFlowClient,
+    LegacyCreatorConnectFlowClient,
 };
 
 const CREATOR_CONNECT_FLOW_TTL: Duration = Duration::minutes(5);
@@ -37,6 +39,7 @@ pub struct StartCreatorConnectFlowResponse {
 pub async fn start_creator_connect_flow(
     store: &dyn CreatorConnectFlowStore,
     client: &dyn LegacyCreatorConnectFlowClient,
+    grant_client: Option<&dyn GrantCreatorConnectFlowClient>,
     flow_id_generator: &dyn CreatorConnectFlowIdGenerator,
     clock: &dyn Clock,
     request: StartCreatorConnectFlowRequest,
@@ -46,9 +49,21 @@ pub async fn start_creator_connect_flow(
     let expires_at = now + CREATOR_CONNECT_FLOW_TTL;
     let flow_id = flow_id_generator.generate_creator_connect_flow_id();
     let requested_scopes = default_requested_scopes();
-    let authorization_url = client
-        .start_legacy_creator_connect_flow(&requested_scopes)
-        .await?;
+    let authorization_url = match grant_client {
+        Some(grant_client) => {
+            grant_client
+                .start_grant_creator_connect_flow(
+                    &requested_scopes,
+                    &GrantPopKeyId::for_connect_flow(&flow_id),
+                )
+                .await?
+        }
+        None => {
+            client
+                .start_legacy_creator_connect_flow(&requested_scopes)
+                .await?
+        }
+    };
 
     store
         .insert_pending_creator_connect_flow(PendingCreatorConnectFlowRecord {
@@ -70,7 +85,7 @@ pub async fn start_creator_connect_flow(
     })
 }
 
-fn default_requested_scopes() -> Vec<String> {
+pub fn default_requested_scopes() -> Vec<String> {
     DEFAULT_REQUESTED_SCOPES
         .iter()
         .map(|scope| (*scope).to_owned())
@@ -101,13 +116,44 @@ mod tests {
     use super::{StartCreatorConnectFlowRequest, start_creator_connect_flow};
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        CreatorConnectAuthorizationUrl, CreatorConnectFlowId, LegacyCreatorConnectFlowApproval,
-        PendingCreatorConnectFlowRecord,
+        CreatorConnectAuthorizationUrl, CreatorConnectFlowId, GrantCreatorConnectFlowApproval,
+        GrantPopKeyId, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
     };
     use crate::application::ports::{
         Clock, CreatorConnectFlowIdGenerator, CreatorConnectFlowStore,
-        LegacyCreatorConnectFlowClient,
+        GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
     };
+
+    #[tokio::test]
+    async fn configured_grant_connect_starts_only_grant_flow() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let store = RecordingFlowStore::default();
+        let grant = RecordingGrantConnectFlowClient::default();
+
+        let response = start_creator_connect_flow(
+            &store,
+            &PanicLegacyConnectFlowClient,
+            Some(&grant),
+            &FixedFlowIdGenerator,
+            &FixedClock(now),
+            StartCreatorConnectFlowRequest {
+                return_to: "https://pubky.app/locks/connected".to_owned(),
+                state: "opaque-state".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.authorization_url.expose_url(),
+            "pubkyauth://signin_grant?secret=grant"
+        );
+        assert_eq!(grant.started.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.record().unwrap().authorization_url,
+            response.authorization_url
+        );
+    }
 
     #[tokio::test]
     async fn start_creator_connect_flow_stores_pending_flow_and_returns_safe_response() {
@@ -120,6 +166,7 @@ mod tests {
         let response = start_creator_connect_flow(
             &store,
             &client,
+            None,
             &generator,
             &clock,
             StartCreatorConnectFlowRequest {
@@ -133,7 +180,7 @@ mod tests {
         assert_eq!(response.flow_id, CreatorConnectFlowId::new("flow-123"));
         assert_eq!(
             response.authorization_url.expose_url(),
-            "pubkyauth://secret-flow-url"
+            "pubkyauth://signin?secret=secret-flow-url"
         );
         assert_eq!(response.state, "opaque-state");
         assert!(response.expires_at <= now + Duration::minutes(5));
@@ -145,7 +192,7 @@ mod tests {
         assert_eq!(stored.state, "opaque-state");
         assert_eq!(
             stored.authorization_url.expose_url(),
-            "pubkyauth://secret-flow-url"
+            "pubkyauth://signin?secret=secret-flow-url"
         );
         assert_eq!(stored.created_at, now);
         assert_eq!(stored.expires_at, response.expires_at);
@@ -174,9 +221,10 @@ mod tests {
                 state: "".to_owned(),
             },
         ] {
-            let error = start_creator_connect_flow(&store, &client, &generator, &clock, request)
-                .await
-                .unwrap_err();
+            let error =
+                start_creator_connect_flow(&store, &client, None, &generator, &clock, request)
+                    .await
+                    .unwrap_err();
             assert!(matches!(error, ApplicationError::Storage { .. }));
         }
 
@@ -245,7 +293,7 @@ mod tests {
             _requested_scopes: &[String],
         ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
             Ok(CreatorConnectAuthorizationUrl::new(
-                "pubkyauth://secret-flow-url",
+                "pubkyauth://signin?secret=secret-flow-url",
             ))
         }
 
@@ -254,6 +302,53 @@ mod tests {
             _authorization_url: &CreatorConnectAuthorizationUrl,
         ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
             unreachable!("start use case must not await approval")
+        }
+    }
+
+    struct PanicLegacyConnectFlowClient;
+
+    #[async_trait]
+    impl LegacyCreatorConnectFlowClient for PanicLegacyConnectFlowClient {
+        async fn start_legacy_creator_connect_flow(
+            &self,
+            _requested_scopes: &[String],
+        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+            panic!("grant-only mode must not start legacy cookie flow")
+        }
+
+        async fn await_legacy_creator_connect_flow_approval(
+            &self,
+            _authorization_url: &CreatorConnectAuthorizationUrl,
+        ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingGrantConnectFlowClient {
+        started: std::sync::Mutex<Vec<GrantPopKeyId>>,
+    }
+
+    #[async_trait]
+    impl GrantCreatorConnectFlowClient for RecordingGrantConnectFlowClient {
+        async fn start_grant_creator_connect_flow(
+            &self,
+            _requested_scopes: &[String],
+            pop_key_id: &GrantPopKeyId,
+        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+            self.started.lock().unwrap().push(pop_key_id.clone());
+            Ok(CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=grant",
+            ))
+        }
+
+        async fn await_grant_creator_connect_flow_approval(
+            &self,
+            _authorization_url: &CreatorConnectAuthorizationUrl,
+            _pop_key_id: &GrantPopKeyId,
+            _requested_scopes: &[String],
+        ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+            unreachable!()
         }
     }
 }

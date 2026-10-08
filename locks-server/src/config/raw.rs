@@ -10,11 +10,12 @@ use url::Url;
 use super::defaults::{DEFAULT_CREATOR_AUTHORITY_KEY_ENV, PUBLIC_KEY_PLACEHOLDER};
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LegacyConnectAcquisitionConfig,
-    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, MAX_TRUSTED_PROXY_HOPS,
-    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
-    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, GrantConnectAcquisitionConfig,
+    LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
+    LoggingConfig, MAX_TRUSTED_PROXY_HOPS, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
+    PaykitConnectionStateLookupRateLimitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
+    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -289,11 +290,21 @@ struct RawCreatorAuthorityAcquisitionConfig {
     frontend_session_code_ttl_seconds: u64,
     #[serde(default)]
     legacy_connect: RawLegacyConnectAcquisitionConfig,
+    #[serde(default)]
+    grant_connect: Option<RawGrantConnectAcquisitionConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawLegacyConnectAcquisitionConfig {
+    #[serde(default)]
+    allowed_return_origins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGrantConnectAcquisitionConfig {
+    client_id: String,
     #[serde(default)]
     allowed_return_origins: Vec<String>,
 }
@@ -307,6 +318,7 @@ impl Default for RawCreatorAuthorityAcquisitionConfig {
             frontend_session_ttl_seconds: default_frontend_session_ttl_seconds(),
             frontend_session_code_ttl_seconds: default_frontend_session_code_ttl_seconds(),
             legacy_connect: RawLegacyConnectAcquisitionConfig::default(),
+            grant_connect: None,
         }
     }
 }
@@ -325,6 +337,23 @@ fn default_frontend_session_ttl_seconds() -> u64 {
 
 fn default_frontend_session_code_ttl_seconds() -> u64 {
     120
+}
+
+fn validate_grant_connect_client_id(value: String) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidGrantConnectClientId(value.clone());
+    if value.is_empty() || value.len() > 253 || value.chars().any(|ch| !ch.is_ascii_graphic()) {
+        return Err(invalid());
+    }
+    let url = Url::parse(&format!("https://{value}/")).map_err(|_| invalid())?;
+    let host = url.host_str().ok_or_else(invalid)?;
+    if host != value
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(value)
 }
 
 fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
@@ -604,6 +633,11 @@ impl RawCreatorAuthorityAcquisitionConfig {
         self,
         environment: RuntimeEnvironment,
     ) -> Result<CreatorAuthorityAcquisitionConfig, ConfigError> {
+        if self.method == CreatorAuthorityAcquisitionMethod::GrantConnect
+            && self.grant_connect.is_none()
+        {
+            return Err(ConfigError::MissingGrantConnectConfig);
+        }
         let mut allowed_return_origin_values = self.legacy_connect.allowed_return_origins;
         if allowed_return_origin_values.is_empty() {
             allowed_return_origin_values = self.allowed_return_origins;
@@ -616,6 +650,36 @@ impl RawCreatorAuthorityAcquisitionConfig {
         {
             return Err(ConfigError::WildcardReturnOriginInProduction);
         }
+        let grant_connect = self
+            .grant_connect
+            .map(
+                |grant| -> Result<GrantConnectAcquisitionConfig, ConfigError> {
+                    Ok(GrantConnectAcquisitionConfig {
+                        client_id: validate_grant_connect_client_id(grant.client_id)?,
+                        allowed_return_origins: validate_allowed_return_origins(
+                            grant.allowed_return_origins,
+                        )?,
+                    })
+                },
+            )
+            .transpose()?;
+        if self.method == CreatorAuthorityAcquisitionMethod::GrantConnect
+            && grant_connect
+                .as_ref()
+                .is_some_and(|grant| grant.allowed_return_origins.is_empty())
+        {
+            return Err(ConfigError::EmptyGrantConnectAllowedReturnOrigins);
+        }
+        if environment == RuntimeEnvironment::Production
+            && grant_connect.as_ref().is_some_and(|grant| {
+                grant
+                    .allowed_return_origins
+                    .iter()
+                    .any(|origin| origin == "*")
+            })
+        {
+            return Err(ConfigError::WildcardReturnOriginInProduction);
+        }
         Ok(CreatorAuthorityAcquisitionConfig {
             enabled: self.enabled,
             method: self.method,
@@ -624,6 +688,7 @@ impl RawCreatorAuthorityAcquisitionConfig {
             legacy_connect: LegacyConnectAcquisitionConfig {
                 allowed_return_origins,
             },
+            grant_connect,
         })
     }
 }

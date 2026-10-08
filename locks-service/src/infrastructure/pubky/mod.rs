@@ -1,5 +1,6 @@
 pub mod content_locks;
 pub mod entitlements;
+pub mod grant_connect_flow;
 pub mod legacy_connect_flow;
 pub mod legacy_creator_authority;
 pub mod lock_service_pointers;
@@ -8,11 +9,13 @@ pub mod storage_client;
 
 pub use content_locks::PubkyContentLockRepository;
 pub use entitlements::PubkyEntitlementRepository;
+pub use grant_connect_flow::{LockServerGrantPopKeys, PubkyGrantCreatorConnectFlowClient};
 pub use legacy_connect_flow::{
     PubkyLegacyCreatorConnectFlowClient, legacy_locks_connect_capabilities,
 };
 pub use legacy_creator_authority::{
-    LegacyCookieCreatorAuthorityManager, LegacyCookieSessionRevalidator,
+    GrantCreatorAuthorityManager, GrantCredentialRevalidator, LegacyCookieCreatorAuthorityManager,
+    LegacyCookieSessionRevalidator, PubkyGrantCredentialRevalidator,
     PubkyLegacyCookieSessionRevalidator,
 };
 pub use lock_service_pointers::PubkyLockServicePointerRepository;

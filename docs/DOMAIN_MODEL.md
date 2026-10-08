@@ -236,10 +236,10 @@ Responsibilities:
 - Resolve Pubky resources and Lock Server addresses.
 - Use one creator-granted Locks app session per creator per Lock Server, reused across that creator's locks.
 - Require creator-granted capability scope for `/pub/app.locks/:rw` and `/priv/app.locks/:rw` in the production Pubky-backed flow.
-- Persist native session secrets for the Lock Server; current expected session lifetime is 6 months.
+- Persist encrypted delegated grant restore state for the Lock Server; never persist the derived PoP private key.
 - Own Creator Authority Acquisition: the process by which the Lock Server obtains or refreshes creator-granted homeserver authority for Locks public and private namespaces.
-- Treat redirect, popup, iframe, and native pubky.app rendering as presentation shells over the same acquisition state machine, not as domain/application concepts. ADR 0019 chooses Lock-Server-hosted redirect/popup for legacy-connect because the legacy Pubky authorization URL is secret-bearing; iframe and pubky.app-native rendering are deferred shells.
-- Implement the existing Pubky QR/deeplink auth flow as the legacy/cookie creator authorization path first, then migrate to the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the durable production auth primitive.
+- Treat redirect, popup, iframe, and native pubky.app rendering as presentation shells over the same acquisition state machine, not as domain/application concepts. ADR 0019's Lock-Server-hosted redirect/popup preserves the one-time callback boundary.
+- Use the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the production primitive. Derive one PoP key per flow from Lock Server signing seed; verify issuer/session identity, client id, key binding, scope coverage, and expiry. Keep legacy/cookie auth only as an explicitly selected compatibility mode, never a grant fallback.
 - Reject manual operator provisioning and direct raw-session submission as production paths for creator-granted session acquisition.
 - Treat creator authority status-check UX/API semantics as part of the authenticated `pubky.app/browser -> Lock Server` relationship; if exposed, derive creator from that authenticated context rather than accepting an arbitrary public key query parameter.
 - Read and write public Locks app resources under `/pub/app.locks/`.
@@ -606,11 +606,11 @@ Local dev/test creator publishing use case that stores or replaces the creator's
 
 ### CreatorAuthorityAcquisition
 
-Lock-Server-owned protocol that starts a legacy-connect Pubky auth flow, completes it after creator approval, stores creator-granted homeserver authority as encrypted private runtime state, returns a short-lived one-time frontend session code, and exchanges that code plus state for a Locks-local frontend session token. Redirect, popup, iframe, and native pubky.app rendering are presentation shells over this protocol, not separate domain concepts. For legacy-connect, ADR 0019 requires a Lock-Server-hosted redirect/popup shell because the Pubky authorization URL is secret-bearing. The implemented production gate is `[creator_authority_acquisition].enabled = true` with `method = "legacy-connect"`; live Pubky/testnet smoke remains deferred.
+Lock-Server-owned protocol that starts the explicitly selected Pubky auth flow, completes it after creator approval, stores creator-granted homeserver authority as encrypted private runtime state, returns a short-lived one-time frontend session code, and exchanges that code plus state for a Locks-local frontend session token. Production uses `method = "grant-connect"`: one grant URL, no cookie race/fallback, per-flow PoP, closed delegated restore state, and exact grant validation. `legacy-connect` remains explicit compatibility mode; grant mode rejects legacy records. Redirect, popup, iframe, and native rendering remain presentation shells, not separate domain concepts. Live Ring/Bitkit and Postgres restart smoke remains deferred.
 
 ### GetCreatorAuthorityStatus
 
-Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, reads the stored creator-authority record, and returns a secret-free missing/present status. Missing stored authority is represented as `authorized = false`, not as an operational error. The read model does not revalidate Pubky I/O; Pubky-backed repository operations revalidate authority before actual homeserver reads/writes.
+Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, and asks the runtime-selected authority manager to revalidate the current authority before returning a secret-free status. Missing, revoked, expired, wrong-kind, or otherwise unavailable authority is represented as `authorized = false`; grant mode therefore cannot report a retained legacy record as connected after a configuration change.
 
 ### FrontendSessionExchange
 

@@ -3,11 +3,11 @@ use time::{Duration, OffsetDateTime};
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorConnectFlowId, FrontendSessionCode,
-    FrontendSessionCodeRecord,
+    FrontendSessionCodeRecord, GrantPopKeyId,
 };
 use crate::application::ports::{
     Clock, CreatorAuthorityStore, CreatorConnectFlowStore, FrontendSessionCodeGenerator,
-    FrontendSessionCodeStore, LegacyCreatorConnectFlowClient,
+    FrontendSessionCodeStore, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
 };
 
 const FRONTEND_SESSION_CODE_TTL: Duration = Duration::minutes(5);
@@ -34,22 +34,27 @@ pub struct CompleteCreatorConnectFlowResponse {
     pub code_expires_at: OffsetDateTime,
 }
 
-/// Completes a legacy Pubky creator connect flow and issues a frontend session code.
+pub enum SelectedCreatorConnectFlowClient<'a> {
+    Legacy(&'a dyn LegacyCreatorConnectFlowClient),
+    Grant(&'a dyn GrantCreatorConnectFlowClient),
+}
+
+/// Completes the selected Pubky creator connect flow and issues a frontend session code.
 pub async fn complete_creator_connect_flow(
     flow_store: &dyn CreatorConnectFlowStore,
     authority_store: &dyn CreatorAuthorityStore,
     code_store: &dyn FrontendSessionCodeStore,
-    client: &dyn LegacyCreatorConnectFlowClient,
+    client: SelectedCreatorConnectFlowClient<'_>,
     code_generator: &dyn FrontendSessionCodeGenerator,
     clock: &dyn Clock,
     request: CompleteCreatorConnectFlowRequest,
 ) -> Result<CompleteCreatorConnectFlowResponse, ApplicationError> {
-    let now = clock.now();
     let pending = flow_store
         .get_pending_creator_connect_flow(&request.flow_id)
         .await?
         .ok_or(ApplicationError::CreatorConnectFlowUnavailable)?;
 
+    let now = clock.now();
     if pending.is_expired_at(now) {
         flow_store
             .delete_pending_creator_connect_flow(&request.flow_id)
@@ -57,41 +62,95 @@ pub async fn complete_creator_connect_flow(
         return Err(ApplicationError::CreatorConnectFlowExpired);
     }
 
-    let approval = client
-        .await_legacy_creator_connect_flow_approval(&pending.authorization_url)
-        .await?;
+    let selected_auth_kind = match client {
+        SelectedCreatorConnectFlowClient::Legacy(_) => CreatorAuthorityAuthKind::LegacyCookie,
+        SelectedCreatorConnectFlowClient::Grant(_) => CreatorAuthorityAuthKind::Grant,
+    };
+    if pending.authorization_url.auth_kind()? != selected_auth_kind {
+        return Err(ApplicationError::CreatorAuthorityUnavailable);
+    }
+
+    let (creator, authority) = match client {
+        SelectedCreatorConnectFlowClient::Grant(grant_client) => {
+            let approval = grant_client
+                .await_grant_creator_connect_flow_approval(
+                    &pending.authorization_url,
+                    &GrantPopKeyId::for_connect_flow(&pending.flow_id),
+                    &pending.requested_scopes,
+                )
+                .await?;
+            let creator = approval.creator.clone();
+            let authority = CreatorAuthorityRecord {
+                creator: creator.clone(),
+                auth_kind: CreatorAuthorityAuthKind::Grant,
+                granted_scopes: approval.granted_scopes,
+                secret: approval.grant_state,
+                session_expires_at: Some(approval.grant_expires_at),
+                last_revalidated_at: Some(now),
+            };
+            (creator, authority)
+        }
+        SelectedCreatorConnectFlowClient::Legacy(client) => {
+            let approval = client
+                .await_legacy_creator_connect_flow_approval(&pending.authorization_url)
+                .await?;
+            let creator = approval.creator.clone();
+            let authority = CreatorAuthorityRecord {
+                creator: creator.clone(),
+                auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+                granted_scopes: pending.requested_scopes.clone(),
+                secret: approval.session_secret,
+                session_expires_at: None,
+                last_revalidated_at: Some(now),
+            };
+            (creator, authority)
+        }
+    };
+    let completed_at = clock.now();
+    if pending.is_expired_at(completed_at)
+        || authority
+            .session_expires_at
+            .is_some_and(|expires_at| expires_at <= completed_at)
+    {
+        return Err(ApplicationError::CreatorConnectFlowExpired);
+    }
+    let consumed = flow_store
+        .consume_pending_creator_connect_flow(&request.flow_id, completed_at)
+        .await?
+        .filter(|consumed| consumed == &pending)
+        .ok_or(ApplicationError::CreatorConnectFlowUnavailable)?;
+    let committed_at = clock.now();
+    if consumed.is_expired_at(committed_at)
+        || authority
+            .session_expires_at
+            .is_some_and(|expires_at| expires_at <= committed_at)
+    {
+        return Err(ApplicationError::CreatorConnectFlowExpired);
+    }
     let authority = CreatorAuthorityRecord {
-        creator: approval.creator.clone(),
-        auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
-        granted_scopes: pending.requested_scopes.clone(),
-        secret: approval.session_secret,
-        session_expires_at: None,
-        last_revalidated_at: Some(now),
+        last_revalidated_at: Some(committed_at),
+        ..authority
     };
     authority_store.upsert_creator_authority(authority).await?;
 
     let code = code_generator.generate_frontend_session_code();
-    let code_expires_at = now + FRONTEND_SESSION_CODE_TTL;
+    let code_expires_at = committed_at + FRONTEND_SESSION_CODE_TTL;
     code_store
         .insert_frontend_session_code(FrontendSessionCodeRecord {
             code: code.clone(),
-            creator: approval.creator.clone(),
-            state: pending.state.clone(),
-            return_to: pending.return_to.clone(),
-            created_at: now,
+            creator: creator.clone(),
+            state: consumed.state.clone(),
+            return_to: consumed.return_to.clone(),
+            created_at: committed_at,
             expires_at: code_expires_at,
             consumed_at: None,
         })
         .await?;
 
-    flow_store
-        .delete_pending_creator_connect_flow(&request.flow_id)
-        .await?;
-
     Ok(CompleteCreatorConnectFlowResponse {
-        creator: approval.creator,
-        state: pending.state,
-        return_to: pending.return_to,
+        creator,
+        state: consumed.state,
+        return_to: consumed.return_to,
         code,
         code_expires_at,
     })
@@ -99,27 +158,58 @@ pub async fn complete_creator_connect_flow(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
     use time::{Duration, OffsetDateTime};
+    use tokio::sync::Semaphore;
 
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
         CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionCode,
-        FrontendSessionCodeRecord, LegacyCreatorConnectFlowApproval,
-        PendingCreatorConnectFlowRecord,
+        FrontendSessionCodeRecord, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+        LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
     };
     use crate::application::ports::{
         Clock, CreatorAuthorityStore, CreatorConnectFlowStore, FrontendSessionCodeGenerator,
-        FrontendSessionCodeStore, LegacyCreatorConnectFlowClient,
+        FrontendSessionCodeStore, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
     };
     use crate::application::use_cases::complete_creator_connect_flow::{
-        CompleteCreatorConnectFlowRequest, complete_creator_connect_flow,
+        CompleteCreatorConnectFlowRequest, SelectedCreatorConnectFlowClient,
+        complete_creator_connect_flow,
     };
+
+    #[tokio::test]
+    async fn configured_grant_connect_stores_only_validated_grant_authority() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let flow_store = FlowStore::with_record(grant_pending_flow(now));
+        let authority_store = AuthorityStore::default();
+
+        complete_creator_connect_flow(
+            &flow_store,
+            &authority_store,
+            &CodeStore::default(),
+            SelectedCreatorConnectFlowClient::Grant(&ApprovedGrantConnectFlowClient(
+                now + Duration::days(30),
+            )),
+            &FixedCodeGenerator,
+            &FixedClock(now),
+            CompleteCreatorConnectFlowRequest {
+                flow_id: CreatorConnectFlowId::new("flow-123"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let authority = authority_store.record().unwrap();
+        assert_eq!(authority.auth_kind, CreatorAuthorityAuthKind::Grant);
+        assert_eq!(authority.secret.expose_secret(), "delegated-grant-state");
+        assert_eq!(authority.session_expires_at, Some(now + Duration::days(30)));
+    }
 
     #[tokio::test]
     async fn complete_creator_connect_flow_stores_authority_issues_code_and_deletes_pending_flow() {
@@ -135,7 +225,7 @@ mod tests {
             &flow_store,
             &authority_store,
             &code_store,
-            &client,
+            SelectedCreatorConnectFlowClient::Legacy(&client),
             &code_generator,
             &clock,
             CompleteCreatorConnectFlowRequest {
@@ -186,7 +276,7 @@ mod tests {
             &FlowStore::default(),
             &AuthorityStore::default(),
             &CodeStore::default(),
-            &FakeConnectFlowClient,
+            SelectedCreatorConnectFlowClient::Legacy(&FakeConnectFlowClient),
             &FixedCodeGenerator,
             &FixedClock(now),
             CompleteCreatorConnectFlowRequest {
@@ -206,7 +296,7 @@ mod tests {
             &expired_store,
             &AuthorityStore::default(),
             &CodeStore::default(),
-            &FakeConnectFlowClient,
+            SelectedCreatorConnectFlowClient::Legacy(&FakeConnectFlowClient),
             &FixedCodeGenerator,
             &FixedClock(now),
             CompleteCreatorConnectFlowRequest {
@@ -219,18 +309,184 @@ mod tests {
         assert!(expired_store.record().is_none(), "expired flow cleaned up");
     }
 
+    #[tokio::test]
+    async fn concurrent_completion_issues_exactly_one_code_after_approval() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let flow_store = Arc::new(FlowStore::with_record(grant_pending_flow(now)));
+        let authority_store = Arc::new(AuthorityStore::default());
+        let code_store = Arc::new(CodeStore::default());
+        let client = Arc::new(BlockingGrantConnectFlowClient::new(now));
+
+        let first = {
+            let flow_store = Arc::clone(&flow_store);
+            let authority_store = Arc::clone(&authority_store);
+            let code_store = Arc::clone(&code_store);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                complete_creator_connect_flow(
+                    flow_store.as_ref(),
+                    authority_store.as_ref(),
+                    code_store.as_ref(),
+                    SelectedCreatorConnectFlowClient::Grant(client.as_ref()),
+                    &FixedCodeGenerator,
+                    &FixedClock(now),
+                    CompleteCreatorConnectFlowRequest {
+                        flow_id: CreatorConnectFlowId::new("flow-123"),
+                    },
+                )
+                .await
+            })
+        };
+
+        client
+            .entered
+            .acquire()
+            .await
+            .expect("approval-entry semaphore remains open")
+            .forget();
+
+        let second = {
+            let flow_store = Arc::clone(&flow_store);
+            let authority_store = Arc::clone(&authority_store);
+            let code_store = Arc::clone(&code_store);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                complete_creator_connect_flow(
+                    flow_store.as_ref(),
+                    authority_store.as_ref(),
+                    code_store.as_ref(),
+                    SelectedCreatorConnectFlowClient::Grant(client.as_ref()),
+                    &FixedCodeGenerator,
+                    &FixedClock(now),
+                    CompleteCreatorConnectFlowRequest {
+                        flow_id: CreatorConnectFlowId::new("flow-123"),
+                    },
+                )
+                .await
+            })
+        };
+        client
+            .entered
+            .acquire()
+            .await
+            .expect("approval-entry semaphore remains open")
+            .forget();
+
+        client.release.add_permits(2);
+        let first = first.await.expect("first completion task joins");
+        let second = second.await.expect("second completion task joins");
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!([first, second].contains(&Err(ApplicationError::CreatorConnectFlowUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn failed_approval_keeps_pending_flow_retryable() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let flow_store = FlowStore::with_record(grant_pending_flow(now));
+
+        let error = complete_creator_connect_flow(
+            &flow_store,
+            &AuthorityStore::default(),
+            &CodeStore::default(),
+            SelectedCreatorConnectFlowClient::Grant(&RejectedGrantConnectFlowClient),
+            &FixedCodeGenerator,
+            &FixedClock(now),
+            CompleteCreatorConnectFlowRequest {
+                flow_id: CreatorConnectFlowId::new("flow-123"),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+        assert_eq!(flow_store.record(), Some(grant_pending_flow(now)));
+    }
+
+    #[tokio::test]
+    async fn pending_grant_flow_cannot_be_completed_by_legacy_client_after_config_change() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let flow_store = FlowStore::with_record(PendingCreatorConnectFlowRecord {
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=grant",
+            ),
+            ..pending_flow(now)
+        });
+
+        let error = complete_creator_connect_flow(
+            &flow_store,
+            &AuthorityStore::default(),
+            &CodeStore::default(),
+            SelectedCreatorConnectFlowClient::Legacy(&FakeConnectFlowClient),
+            &FixedCodeGenerator,
+            &FixedClock(now),
+            CompleteCreatorConnectFlowRequest {
+                flow_id: CreatorConnectFlowId::new("flow-123"),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+        assert!(flow_store.record().is_some());
+    }
+
+    #[tokio::test]
+    async fn grant_expiring_at_commit_boundary_issues_no_authority_or_code() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let flow_store = FlowStore::with_record(grant_pending_flow(now));
+        let authority_store = AuthorityStore::default();
+        let code_store = CodeStore::default();
+        let clock = AdvancingClock(Mutex::new(VecDeque::from([
+            now,
+            now,
+            now + Duration::seconds(2),
+        ])));
+
+        let error = complete_creator_connect_flow(
+            &flow_store,
+            &authority_store,
+            &code_store,
+            SelectedCreatorConnectFlowClient::Grant(&ApprovedGrantConnectFlowClient(
+                now + Duration::seconds(1),
+            )),
+            &FixedCodeGenerator,
+            &clock,
+            CompleteCreatorConnectFlowRequest {
+                flow_id: CreatorConnectFlowId::new("flow-123"),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, ApplicationError::CreatorConnectFlowExpired);
+        assert!(authority_store.record().is_none());
+        assert!(code_store.record().is_none());
+    }
+
     fn pending_flow(now: OffsetDateTime) -> PendingCreatorConnectFlowRecord {
         PendingCreatorConnectFlowRecord {
             flow_id: CreatorConnectFlowId::new("flow-123"),
             return_to: "https://pubky.app/locks/connected".to_owned(),
             state: "opaque-state".to_owned(),
-            authorization_url: CreatorConnectAuthorizationUrl::new("pubkyauth://secret-flow-url"),
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin?secret=secret-flow-url",
+            ),
             requested_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: now,
             expires_at: now + Duration::minutes(5),
+        }
+    }
+
+    fn grant_pending_flow(now: OffsetDateTime) -> PendingCreatorConnectFlowRecord {
+        PendingCreatorConnectFlowRecord {
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=grant",
+            ),
+            ..pending_flow(now)
         }
     }
 
@@ -278,6 +534,21 @@ mod tests {
         ) -> Result<(), ApplicationError> {
             *self.record.lock().unwrap() = None;
             Ok(())
+        }
+
+        async fn consume_pending_creator_connect_flow(
+            &self,
+            _flow_id: &CreatorConnectFlowId,
+            now: OffsetDateTime,
+        ) -> Result<Option<PendingCreatorConnectFlowRecord>, ApplicationError> {
+            let mut record = self.record.lock().unwrap();
+            if record
+                .as_ref()
+                .is_none_or(|record| record.is_expired_at(now))
+            {
+                return Ok(None);
+            }
+            Ok(record.take())
         }
     }
 
@@ -370,6 +641,107 @@ mod tests {
         }
     }
 
+    struct ApprovedGrantConnectFlowClient(OffsetDateTime);
+
+    #[async_trait]
+    impl GrantCreatorConnectFlowClient for ApprovedGrantConnectFlowClient {
+        async fn start_grant_creator_connect_flow(
+            &self,
+            _requested_scopes: &[String],
+            _pop_key_id: &GrantPopKeyId,
+        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+            unreachable!()
+        }
+
+        async fn await_grant_creator_connect_flow_approval(
+            &self,
+            _authorization_url: &CreatorConnectAuthorizationUrl,
+            pop_key_id: &GrantPopKeyId,
+            _requested_scopes: &[String],
+        ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+            assert_eq!(pop_key_id.as_str(), "locks-connect-v1.flow-123");
+            Ok(GrantCreatorConnectFlowApproval {
+                creator: creator(),
+                grant_state: CreatorAuthoritySecret::new("delegated-grant-state"),
+                granted_scopes: vec![
+                    "/pub/app.locks/:rw".to_owned(),
+                    "/priv/app.locks/:rw".to_owned(),
+                ],
+                grant_expires_at: self.0,
+            })
+        }
+    }
+
+    struct BlockingGrantConnectFlowClient {
+        now: OffsetDateTime,
+        entered: Semaphore,
+        release: Semaphore,
+    }
+
+    impl BlockingGrantConnectFlowClient {
+        fn new(now: OffsetDateTime) -> Self {
+            Self {
+                now,
+                entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GrantCreatorConnectFlowClient for BlockingGrantConnectFlowClient {
+        async fn start_grant_creator_connect_flow(
+            &self,
+            _requested_scopes: &[String],
+            _pop_key_id: &GrantPopKeyId,
+        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+            unreachable!()
+        }
+
+        async fn await_grant_creator_connect_flow_approval(
+            &self,
+            authorization_url: &CreatorConnectAuthorizationUrl,
+            pop_key_id: &GrantPopKeyId,
+            requested_scopes: &[String],
+        ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("approval-release semaphore remains open")
+                .forget();
+            ApprovedGrantConnectFlowClient(self.now + Duration::days(30))
+                .await_grant_creator_connect_flow_approval(
+                    authorization_url,
+                    pop_key_id,
+                    requested_scopes,
+                )
+                .await
+        }
+    }
+
+    struct RejectedGrantConnectFlowClient;
+
+    #[async_trait]
+    impl GrantCreatorConnectFlowClient for RejectedGrantConnectFlowClient {
+        async fn start_grant_creator_connect_flow(
+            &self,
+            _requested_scopes: &[String],
+            _pop_key_id: &GrantPopKeyId,
+        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+            unreachable!()
+        }
+
+        async fn await_grant_creator_connect_flow_approval(
+            &self,
+            _authorization_url: &CreatorConnectAuthorizationUrl,
+            _pop_key_id: &GrantPopKeyId,
+            _requested_scopes: &[String],
+        ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+    }
+
     struct FixedCodeGenerator;
 
     impl FrontendSessionCodeGenerator for FixedCodeGenerator {
@@ -383,6 +755,14 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             self.0
+        }
+    }
+
+    struct AdvancingClock(Mutex<VecDeque<OffsetDateTime>>);
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> OffsetDateTime {
+            self.0.lock().unwrap().pop_front().expect("clock sample")
         }
     }
 }

@@ -308,7 +308,7 @@ pub fn creator_z32_from_creator_pubky(creator: &CreatorPubky) -> Result<String, 
         })
 }
 
-fn requested_scopes_to_capabilities(
+pub(crate) fn requested_scopes_to_capabilities(
     requested_scopes: &[String],
 ) -> Result<Capabilities, ApplicationError> {
     if requested_scopes.is_empty() {

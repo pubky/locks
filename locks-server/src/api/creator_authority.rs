@@ -4,7 +4,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use locks_service::application::use_cases::complete_creator_connect_flow::{
-    CompleteCreatorConnectFlowRequest, complete_creator_connect_flow,
+    CompleteCreatorConnectFlowRequest, SelectedCreatorConnectFlowClient,
+    complete_creator_connect_flow,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::exchange_frontend_session_code;
 use locks_service::application::use_cases::get_creator_authority_status::{
@@ -28,6 +29,23 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
+use crate::config::CreatorAuthorityAcquisitionMethod;
+
+fn connect_allowed_return_origins(state: &AppState) -> &[String] {
+    let acquisition = &state.config().creator_authority_acquisition;
+    match acquisition.method {
+        CreatorAuthorityAcquisitionMethod::LegacyConnect => {
+            &acquisition.legacy_connect.allowed_return_origins
+        }
+        CreatorAuthorityAcquisitionMethod::GrantConnect => {
+            &acquisition
+                .grant_connect
+                .as_ref()
+                .expect("validated grant-connect config")
+                .allowed_return_origins
+        }
+    }
+}
 
 pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
@@ -36,7 +54,7 @@ pub(super) async fn creator_authority_status_route(
     let session_token = parse_frontend_session_token(&headers)?;
     let status = get_creator_authority_status(
         state.frontend_sessions().as_ref(),
-        state.creator_authorities().as_ref(),
+        state.creator_authority_manager().as_ref(),
         state.clock().as_ref(),
         GetCreatorAuthorityStatusRequest { session_token },
     )
@@ -84,11 +102,7 @@ pub(super) async fn connect_shell_start(
 ) -> Result<Response, ApiError> {
     let Query(query) =
         query.map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
-    let allowed_origins = &state
-        .config()
-        .creator_authority_acquisition
-        .legacy_connect
-        .allowed_return_origins;
+    let allowed_origins = connect_allowed_return_origins(&state);
     let return_to = validate_return_to_url(&query.return_to, allowed_origins)?;
     let delivery = ConnectDeliveryMode::from_query(query.delivery.as_deref());
     let callback_state = query.state.clone();
@@ -98,6 +112,9 @@ pub(super) async fn connect_shell_start(
     let response = start_creator_connect_flow(
         state.creator_connect_flows().as_ref(),
         state.legacy_creator_connect_flow_client().as_ref(),
+        state
+            .grant_creator_connect_flow_client()
+            .map(|client| client.as_ref()),
         state.creator_connect_flow_id_generator().as_ref(),
         state.clock().as_ref(),
         StartCreatorConnectFlowRequest {
@@ -396,11 +413,17 @@ pub(super) async fn connect_shell_complete(
     let Query(query) =
         query.map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
     let delivery = ConnectDeliveryMode::from_query(query.delivery.as_deref());
+    let connect_client = match state.grant_creator_connect_flow_client() {
+        Some(client) => SelectedCreatorConnectFlowClient::Grant(client.as_ref()),
+        None => SelectedCreatorConnectFlowClient::Legacy(
+            state.legacy_creator_connect_flow_client().as_ref(),
+        ),
+    };
     let response = complete_creator_connect_flow(
         state.creator_connect_flows().as_ref(),
         state.creator_authorities().as_ref(),
         state.frontend_session_codes().as_ref(),
-        state.legacy_creator_connect_flow_client().as_ref(),
+        connect_client,
         state.frontend_session_code_generator().as_ref(),
         state.clock().as_ref(),
         CompleteCreatorConnectFlowRequest {
@@ -410,14 +433,8 @@ pub(super) async fn connect_shell_complete(
     .await?;
     // Validate even in postmessage mode: the shell already targets this origin, but re-checking
     // keeps the allowlist the single source of truth for both delivery paths.
-    let return_to = validate_return_to_url(
-        &response.return_to,
-        &state
-            .config()
-            .creator_authority_acquisition
-            .legacy_connect
-            .allowed_return_origins,
-    )?;
+    let return_to =
+        validate_return_to_url(&response.return_to, connect_allowed_return_origins(&state))?;
 
     if delivery == ConnectDeliveryMode::PostMessage {
         return Ok(Json(ConnectCompletePostMessageResponse {

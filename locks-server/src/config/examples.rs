@@ -5,8 +5,9 @@ use locks_core::ids::LockServerPubky;
 use tempfile::tempdir;
 
 use crate::config::{
-    ConfigError, MAX_TRUSTED_PROXY_HOPS, PaykitConnectionStateLookupRateLimitConfig, PubkyNetwork,
-    RateLimitsConfig, RuntimeEnvironment, load_existing_config_from_path,
+    ConfigError, CreatorAuthorityAcquisitionMethod, MAX_TRUSTED_PROXY_HOPS,
+    PaykitConnectionStateLookupRateLimitConfig, PubkyNetwork, RateLimitsConfig, RuntimeEnvironment,
+    load_existing_config_from_path,
 };
 
 #[test]
@@ -605,6 +606,125 @@ fn allows_wildcard_return_origin_outside_production() {
             .allowed_return_origins,
         vec!["*".to_owned()]
     );
+}
+
+#[test]
+fn parses_grant_connect_configuration() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "production")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["https://pubky.app"]
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+    let grant = config.creator_authority_acquisition.grant_connect.unwrap();
+
+    assert_eq!(
+        config.creator_authority_acquisition.method,
+        CreatorAuthorityAcquisitionMethod::GrantConnect
+    );
+    assert_eq!(grant.client_id, "locks.example");
+    assert_eq!(grant.allowed_return_origins, ["https://pubky.app"]);
+}
+
+#[test]
+fn grant_connect_requires_grant_configuration() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"");
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::MissingGrantConnectConfig
+    ));
+}
+
+#[test]
+fn grant_connect_requires_nonempty_allowed_return_origins() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        .replace(
+            "frontend_session_code_ttl_seconds = 120",
+            "frontend_session_code_ttl_seconds = 120\nallowed_return_origins = [\"https://legacy.example\"]",
+        )
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = []
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::EmptyGrantConnectAllowedReturnOrigins
+    ));
+}
+
+#[test]
+fn grant_connect_rejects_malformed_client_ids() {
+    for client_id in [
+        "https://locks.example",
+        "locks.example/path",
+        "locks.example:8443",
+        "user@locks.example",
+        "locks example",
+    ] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config(&secret_path, &public_key, "development")
+            .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+            + &format!(
+                r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "{client_id}"
+allowed_return_origins = ["https://pubky.app"]
+"#,
+            );
+        std::fs::write(&config_path, config).unwrap();
+
+        assert!(matches!(
+            load_existing_config_from_path(&config_path).unwrap_err(),
+            ConfigError::InvalidGrantConnectClientId(value) if value == client_id
+        ));
+    }
+}
+
+#[test]
+fn grant_connect_rejects_wildcard_return_origin_in_production() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "production")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["*"]
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::WildcardReturnOriginInProduction
+    ));
 }
 
 fn test_identity(secret_path: &std::path::Path) -> LockServerPubky {

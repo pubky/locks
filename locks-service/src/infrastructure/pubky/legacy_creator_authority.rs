@@ -9,6 +9,9 @@ use crate::application::models::{
 use crate::application::ports::{
     CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
 };
+use crate::infrastructure::pubky::grant_connect_flow::{
+    LockServerGrantPopKeys, restore_grant_session_for_creator,
+};
 
 /// Revalidates a stored legacy Pubky cookie-session secret.
 #[async_trait]
@@ -49,6 +52,104 @@ impl LegacyCookieSessionRevalidator for PubkyLegacyCookieSessionRevalidator {
             .map_err(|_| ApplicationError::CreatorAuthoritySecret {
                 message: "failed to restore legacy creator authority secret".to_owned(),
             })
+    }
+}
+
+#[async_trait]
+pub trait GrantCredentialRevalidator: Send + Sync {
+    async fn revalidate_grant_credential(
+        &self,
+        creator: &CreatorPubky,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct PubkyGrantCredentialRevalidator {
+    client: pubky::PubkyHttpClient,
+    pop_keys: LockServerGrantPopKeys,
+    client_id: pubky::ClientId,
+    required_scopes: Vec<String>,
+}
+
+impl PubkyGrantCredentialRevalidator {
+    pub fn new(
+        client: pubky::PubkyHttpClient,
+        pop_keys: LockServerGrantPopKeys,
+        client_id: pubky::ClientId,
+        required_scopes: Vec<String>,
+    ) -> Self {
+        Self {
+            client,
+            pop_keys,
+            client_id,
+            required_scopes,
+        }
+    }
+}
+
+#[async_trait]
+impl GrantCredentialRevalidator for PubkyGrantCredentialRevalidator {
+    async fn revalidate_grant_credential(
+        &self,
+        creator: &CreatorPubky,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError> {
+        restore_grant_session_for_creator(
+            &self.client,
+            &self.pop_keys,
+            &self.client_id,
+            &self.required_scopes,
+            creator,
+            secret,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// Grant-only authority manager. Legacy records fail closed in grant-connect mode.
+#[derive(Debug)]
+pub struct GrantCreatorAuthorityManager<S, G> {
+    store: S,
+    revalidator: G,
+}
+
+impl<S, G> GrantCreatorAuthorityManager<S, G> {
+    pub fn new(store: S, revalidator: G) -> Self {
+        Self { store, revalidator }
+    }
+}
+
+#[async_trait]
+impl<S, G> CreatorAuthorityManager for GrantCreatorAuthorityManager<S, G>
+where
+    S: CreatorAuthorityStore,
+    G: GrantCredentialRevalidator,
+{
+    async fn revalidate_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+        let record = self
+            .store
+            .get_creator_authority(creator)
+            .await?
+            .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+        if record.auth_kind != CreatorAuthorityAuthKind::Grant {
+            return Err(ApplicationError::CreatorAuthorityUnavailable);
+        }
+        self.revalidator
+            .revalidate_grant_credential(creator, &record.secret)
+            .await?;
+        Ok(record_to_authorized_status(record))
+    }
+
+    async fn require_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+        self.revalidate_creator_authority(creator).await
     }
 }
 
@@ -125,7 +226,11 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use time::macros::datetime;
 
-    use super::{LegacyCookieCreatorAuthorityManager, LegacyCookieSessionRevalidator};
+    use super::{
+        GrantCreatorAuthorityManager, GrantCredentialRevalidator,
+        LegacyCookieCreatorAuthorityManager, LegacyCookieSessionRevalidator,
+        PubkyGrantCredentialRevalidator,
+    };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
@@ -211,6 +316,59 @@ mod tests {
         assert!(!format!("{error:?}").contains("legacy-cookie-session-secret"));
     }
 
+    #[tokio::test]
+    async fn grant_manager_accepts_only_revalidated_grant_records() {
+        let grant_record = CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            ..creator_authority_record("delegated-grant-state")
+        };
+        let manager = GrantCreatorAuthorityManager::new(
+            FakeCreatorAuthorityStore::new(Some(grant_record)),
+            FakeGrantCredentialRevalidator(Ok(())),
+        );
+
+        let status = manager.require_creator_authority(&creator()).await.unwrap();
+        assert_eq!(status.auth_kind, CreatorAuthorityAuthKind::Grant);
+        assert!(status.authorized);
+
+        let legacy_manager = GrantCreatorAuthorityManager::new(
+            FakeCreatorAuthorityStore::new(Some(creator_authority_record(
+                "legacy-cookie-session-secret",
+            ))),
+            FakeGrantCredentialRevalidator(Ok(())),
+        );
+        assert_eq!(
+            legacy_manager.require_creator_authority(&creator()).await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_manager_maps_malformed_stored_grant_to_unavailable() {
+        let grant_record = CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            ..creator_authority_record("malformed-delegated-grant-state")
+        };
+        let revalidator = PubkyGrantCredentialRevalidator::new(
+            pubky::PubkyHttpClient::testnet().unwrap(),
+            crate::infrastructure::pubky::LockServerGrantPopKeys::from_lock_server_seed([42; 32]),
+            pubky::ClientId::new("locks.example").unwrap(),
+            vec![
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
+            ],
+        );
+        let manager = GrantCreatorAuthorityManager::new(
+            FakeCreatorAuthorityStore::new(Some(grant_record)),
+            revalidator,
+        );
+
+        assert_eq!(
+            manager.revalidate_creator_authority(&creator()).await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+    }
+
     #[derive(Debug)]
     struct FakeCreatorAuthorityStore {
         record: Option<CreatorAuthorityRecord>,
@@ -280,6 +438,20 @@ mod tests {
                 .unwrap()
                 .push(secret.expose_secret().to_owned());
             self.result.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeGrantCredentialRevalidator(Result<(), ApplicationError>);
+
+    #[async_trait]
+    impl GrantCredentialRevalidator for FakeGrantCredentialRevalidator {
+        async fn revalidate_grant_credential(
+            &self,
+            _creator: &CreatorPubky,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<(), ApplicationError> {
+            self.0.clone()
         }
     }
 

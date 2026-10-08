@@ -34,10 +34,10 @@ The Lock Server has one non-production route family and one authenticated creato
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.
   - Returns only `ready`, `setup_required`, or `unavailable`.
-- Hosted legacy creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
+- Hosted creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
   - Mount when explicit `[creator_authority_acquisition].enabled = true`.
   - `DELETE /frontend-sessions/current` requires `Authorization: Bearer <frontend_session_token>` and revokes the current frontend session.
-  - `GET /connect` validates `return_to` against `[creator_authority_acquisition].allowed_return_origins` before starting a legacy flow.
+  - `GET /connect` validates `return_to` against the selected method's `allowed_return_origins` before starting a flow.
   - `POST /connect/{flow_id}/complete` completes the Lock-Server-owned flow, revalidates the stored `return_to`, and redirects with only `state` and one-time `code`.
 
 When gated routes are disabled, they are not mounted and return `404 Not Found`.
@@ -136,30 +136,30 @@ The SDK should verify all three fields:
 
 The endpoint is public, always mounted, CORS-enabled, and must not return secrets or runtime storage details.
 
-## Legacy creator connect/session routes
+## Creator connect/session routes
 
-These routes are the current legacy-connect implementation of the Creator Authority Acquisition protocol.
+These routes implement Creator Authority Acquisition using the explicitly configured method. Production deployments should use `method = "grant-connect"`; this emits exactly one `signin_grant` QR/deeplink and never starts or falls back to cookie auth. `method = "legacy-connect"` remains an explicit compatibility mode.
 
-The hosted browser routes are mounted when `[creator_authority_acquisition].enabled = true` and `method = "legacy-connect"`:
+The hosted browser routes are mounted when `[creator_authority_acquisition].enabled = true`:
 
 - `GET /connect`
 - `POST /connect/{flow_id}/complete`
 - `POST /frontend-sessions`
 - `DELETE /frontend-sessions/current`
 
-The protocol proves the backend flow: the Lock Server owns the legacy Pubky auth flow, stores creator-granted homeserver authority as private runtime state, returns a one-time frontend code through the hosted shell callback, and exchanges that code for a Locks-local frontend session token. Authenticated Pubky-backed creator publishing routes consume those Locks-local frontend session tokens. ADR 0019 chooses a Lock-Server-hosted redirect/popup page as the human-facing legacy-connect shell. pubky.app-native QR/deeplink rendering is not allowed for legacy-connect because the legacy Pubky authorization URL is secret-bearing and must stay on the Lock Server origin.
+In grant mode, the Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, exact requested capability set, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and exact required scopes, including after a Postgres-backed restart. Restore uses the homeserver stored at approval time, so a creator who moves homeserver must reconnect. The persisted authorization URL identifies whether each pending flow is `signin` or `signin_grant`; changing acquisition method while a flow is pending therefore fails closed instead of completing it through the other mechanism. Legacy records fail closed in grant mode and require creator reconnection. Both methods preserve the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
 
 ### `GET /connect`
 
-Starts the human-facing Lock-Server-hosted legacy-connect shell.
+Starts the human-facing Lock-Server-hosted connect shell using the selected acquisition method.
 
 ```http
 GET /connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state
 ```
 
-`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition].allowed_return_origins`, unless the operator explicitly configured wildcard mode with `allowed_return_origins = ["*"]`. The Lock Server validates this before starting the Pubky auth flow.
+`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition.grant_connect].allowed_return_origins` in grant mode or `[creator_authority_acquisition.legacy_connect].allowed_return_origins` in legacy mode. Grant mode requires at least one grant-specific origin and does not fall back to legacy or top-level origins. Outside production, an explicit wildcard may admit the concrete `return_to` origin. The Lock Server validates this before starting Pubky auth.
 
-Success returns `200 text/html; charset=utf-8`. The HTML intentionally contains the secret-bearing Pubky authorization QR SVG, deeplink, and raw fallback text, but only on the Lock Server origin.
+Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and a touch-device deeplink button on the Lock Server origin. In grant mode its URL host is `signin_grant`; no cookie-auth URL is generated.
 
 The HTML form posts back to:
 
@@ -169,12 +169,14 @@ POST /connect/{flow_id}/complete
 
 ### `POST /connect/{flow_id}/complete`
 
-Completes the pending Lock-Server-owned legacy auth flow, stores creator authority, issues a one-time frontend-session code, revalidates the stored `return_to`, and redirects back to pubky.app:
+Completes the pending Lock-Server-owned auth flow, stores creator authority, issues a one-time frontend-session code, revalidates the stored `return_to`, and redirects back to pubky.app:
 
 ```http
 303 See Other
 Location: https://pubky.app/locks/callback?state=opaque-state&code=<one-time-code>
 ```
+
+Approval/retrieval errors leave the pending flow available for bounded client retry. After approval succeeds, completion atomically consumes the pending flow before the creator-authority and one-time-code stores are updated, preventing concurrent completion from issuing two codes. Those final two writes are not one cross-store transaction: a storage failure after flow consumption can require a new connect flow and can leave already-validated creator authority stored without a frontend code. It cannot make unvalidated authority usable.
 
 The callback URL carries only `state` and `code`. It must not contain `authorization_url`, `pubkyauth`, creator-authority session material, or frontend session tokens. pubky.app then calls `POST /frontend-sessions` with the code and state.
 

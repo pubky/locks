@@ -69,7 +69,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
         .unwrap();
     assert_eq!(shell_response.status(), StatusCode::OK);
     let shell_html = response_text(shell_response).await;
-    assert!(shell_html.contains("pubkyauth://fake-secret-flow-url"));
+    assert!(shell_html.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert_no_secret_text_material(&shell_html);
     let flow_id = extract_flow_id_from_shell(&shell_html);
 
@@ -195,7 +195,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
             ["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
         Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://fake-secret-flow-url",
+            "pubkyauth://signin?secret=fake-secret-flow-url",
         ))
     }
 
@@ -205,7 +205,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
         assert_eq!(
             authorization_url.expose_url(),
-            "pubkyauth://fake-secret-flow-url"
+            "pubkyauth://signin?secret=fake-secret-flow-url"
         );
         Ok(LegacyCreatorConnectFlowApproval {
             creator: creator(),
