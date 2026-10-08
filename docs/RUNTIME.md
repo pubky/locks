@@ -100,19 +100,22 @@ Creator repositories are not operator-selectable. Server runtime always uses Pub
 ```toml
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["http://localhost:3000"]
 ```
 
-`legacy-connect` is the only accepted method. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` entries are exact `http`/`https` origins with scheme and authority only. Paths, query strings, and fragments are rejected. A single wildcard entry is accepted only outside production and must not be mixed with concrete origins.
 
-When enabled, the Lock Server starts and completes legacy Pubky auth, stores encrypted creator authority, then issues a short-lived code that pubky.app/browser clients exchange for a Locks-local frontend session token.
+When enabled, the Lock Server derives a distinct PoP key for each pending flow from the Lock Server signing seed, starts grant auth, validates exact issuer/session identity, `client_id`, PoP key, requested capability coverage, and expiry, then stores only encrypted delegated restore state. PoP private keys, grant bearers, authorization URLs, and frontend session tokens are not stored in creator authority. The short-lived callback code and Locks-local frontend session protocol remain unchanged.
 
-`legacy_connect.allowed_return_origins` entries are exact `http`/`https` origins with scheme and authority only. Paths, query strings, and fragments are rejected. A single wildcard entry, `allowed_return_origins = ["*"]`, is accepted and means `/connect` may use the origin from `return_to`; wildcard must not be mixed with concrete origins.
+`legacy-connect` remains an explicit compatibility mode for older operator/test flows. It uses `[creator_authority_acquisition.legacy_connect]`. Grant mode rejects stored `LegacyCookie` authority instead of silently using it; creators must reconnect with a grant after switching modes. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+
+Grant PoP keys depend on both the configured Lock Server signing seed and a fixed derivation context. Rotating that seed or changing the context makes stored grants unrestorable; reconnect creators before such a rotation. The delegated callback signs only a syntactically closed Pubky PoP JWS input (`EdDSA`, `pubky-pop`, exact `aud`/`gid`/`iat`/`nonce` claims); grant ID and homeserver audience validation remain inside the pinned SDK credential exchange because its callback does not expose expected context separately. Grant composition currently uses pinned Pubky SDK delegated-flow APIs that are `#[doc(hidden)]`; upgrading `pubky` requires explicit compatibility and signing-boundary review or an upstream public server-held delegated signer API.
 
 ## PKARR and browser SDK reachability
 
@@ -247,7 +250,7 @@ enabled = true
 method = "legacy-connect"
 ```
 
-This mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route.
+This legacy development shape mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route. Use the grant-connect configuration above for Ring 2.0 / Bitkit grant testing.
 
 ## Staging/production shape
 
@@ -262,13 +265,14 @@ environment = "staging" # or "production"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 ```
 
-This mounts authenticated Pubky-backed creator publishing routes and hosted legacy-connect/session routes. It does not mount the dev completion route.
+This mounts authenticated Pubky-backed creator publishing routes and grant-only hosted connect/session routes. It does not mount the dev completion route.
 
 ## Worker
 

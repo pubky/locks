@@ -50,7 +50,7 @@ Open:
 http://127.0.0.1:8080/demo/
 ```
 
-The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working `legacy-connect` creator acquisition.
+The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working creator acquisition.
 
 `smoke:demo` is a static alignment check, not a live browser integration test:
 
@@ -86,9 +86,10 @@ environment = "production"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 
 [pubky]
@@ -187,7 +188,7 @@ const locksFromCreator = await Locks.forCreator("pubky...");
 
 ## Connect flow
 
-The first browser auth surface is the Lock-Server-hosted `legacy-connect` shell. pubky.app or another creator UI never receives the secret-bearing legacy Pubky `authorization_url`; it only receives a short-lived `code` and caller-managed `state` on the configured callback URL.
+The browser auth surface is the Lock-Server-hosted connect shell. In grant mode it renders exactly one `signin_grant` QR/deeplink and no cookie fallback. Creator UI receives only a short-lived `code` and caller-managed `state` on the configured callback URL; PoP keys, delegated restore state, and authorization URLs remain server-owned.
 
 ```ts
 import { Locks, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions } from "locks-sdk-wasm";

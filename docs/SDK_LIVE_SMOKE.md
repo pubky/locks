@@ -20,7 +20,7 @@ The command is informational and exits 0. It reports whether the following envir
 | `LOCKS_LIVE_PKARR_RELAY` | PKARR relay URL. Local `pubky-testnet` uses `http://127.0.0.1:15411` |
 | `LOCKS_LIVE_CREATOR` | Creator Pubky publishing `/pub/app.locks/config.json` |
 | `LOCKS_LIVE_CONTENT_LOCK_RESOURCE` | Canonical `pubky.../pub/app.locks/<lock_id>.json` resource |
-| `LOCKS_LIVE_DEMO_ORIGIN` | Browser origin allowed by `creator_authority_acquisition.legacy_connect.allowed_return_origins` |
+| `LOCKS_LIVE_DEMO_ORIGIN` | Browser origin allowed by selected creator-acquisition method's `allowed_return_origins` |
 
 ## Manual smoke sequence
 
@@ -47,7 +47,7 @@ Then verify:
    ```
 
 2. `Locks.forServerWithOptions(lockServer, options)` displays the configured Lock Server Pubky.
-3. `createConnectUrl` generates a Lock-Server-hosted `legacy-connect` URL without exposing a raw legacy Pubky `authorization_url` to the app.
+3. `createConnectUrl` generates a Lock-Server-hosted connect URL without exposing raw Pubky authorization state to the app; grant mode renders one `signin_grant` URL and no cookie fallback.
 4. The connect callback path can parse `code` and `state`, validate caller-managed state, and exchange the code for a frontend session.
 5. `session.exportSecret()` and `locks.restoreSession(secret)` round-trip the session and retain Lock Server context.
 6. `session.signout()` revokes the current frontend session.

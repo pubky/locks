@@ -8,6 +8,9 @@ use locks_core::lock_policy::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, CreatorAuthoritySecret};
 use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStore};
+use crate::infrastructure::pubky::grant_connect_flow::{
+    LockServerGrantPopKeys, restore_grant_session,
+};
 use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
 
 /// Bytes fetched from a creator-owned Pubky homeserver resource.
@@ -208,6 +211,11 @@ pub trait PubkySessionImporter: Send + Sync {
         &self,
         secret: &CreatorAuthoritySecret,
     ) -> Result<Self::Session, ApplicationError>;
+
+    async fn import_grant_session(
+        &self,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<Self::Session, ApplicationError>;
 }
 
 /// Creator-scoped storage provider backed by persisted legacy cookie creator authority.
@@ -215,11 +223,24 @@ pub trait PubkySessionImporter: Send + Sync {
 pub struct LegacyCookieCreatorScopedPubkyStorageProvider<S, I> {
     store: S,
     importer: I,
+    accepted_auth_kind: CreatorAuthorityAuthKind,
 }
 
 impl<S, I> LegacyCookieCreatorScopedPubkyStorageProvider<S, I> {
     pub fn new(store: S, importer: I) -> Self {
-        Self { store, importer }
+        Self {
+            store,
+            importer,
+            accepted_auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+        }
+    }
+
+    pub fn new_grant(store: S, importer: I) -> Self {
+        Self {
+            store,
+            importer,
+            accepted_auth_kind: CreatorAuthorityAuthKind::Grant,
+        }
     }
 
     pub fn importer(&self) -> &I {
@@ -243,14 +264,20 @@ where
             .await?
             .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
 
-        if record.auth_kind != CreatorAuthorityAuthKind::LegacyCookie {
+        if record.auth_kind != self.accepted_auth_kind {
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
 
-        let session = self
-            .importer
-            .import_legacy_cookie_session(&record.secret)
-            .await?;
+        let session = match record.auth_kind {
+            CreatorAuthorityAuthKind::LegacyCookie => {
+                self.importer
+                    .import_legacy_cookie_session(&record.secret)
+                    .await?
+            }
+            CreatorAuthorityAuthKind::Grant => {
+                self.importer.import_grant_session(&record.secret).await?
+            }
+        };
         let restored_creator = creator_from_pubky_public_key_z32(&session.public_key_z32())?;
         if &restored_creator != creator {
             return Err(ApplicationError::CreatorAuthorityUnavailable);
@@ -264,11 +291,31 @@ where
 #[derive(Debug, Clone)]
 pub struct PubkyLegacyCookieSessionImporter {
     client: pubky::PubkyHttpClient,
+    grant_pop_keys: Option<LockServerGrantPopKeys>,
+    grant_client_id: Option<pubky::ClientId>,
+    grant_required_scopes: Vec<String>,
 }
 
 impl PubkyLegacyCookieSessionImporter {
     pub fn new(client: pubky::PubkyHttpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            grant_pop_keys: None,
+            grant_client_id: None,
+            grant_required_scopes: Vec::new(),
+        }
+    }
+
+    pub fn with_grant_policy(
+        mut self,
+        grant_pop_keys: LockServerGrantPopKeys,
+        client_id: pubky::ClientId,
+        required_scopes: Vec<String>,
+    ) -> Self {
+        self.grant_pop_keys = Some(grant_pop_keys);
+        self.grant_client_id = Some(client_id);
+        self.grant_required_scopes = required_scopes;
+        self
     }
 }
 
@@ -290,6 +337,29 @@ impl PubkySessionImporter for PubkyLegacyCookieSessionImporter {
             .map_err(|_| ApplicationError::CreatorAuthoritySecret {
                 message: "failed to restore legacy creator authority secret".to_owned(),
             })
+    }
+
+    async fn import_grant_session(
+        &self,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<Self::Session, ApplicationError> {
+        let keys = self
+            .grant_pop_keys
+            .as_ref()
+            .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+        let client_id = self
+            .grant_client_id
+            .as_ref()
+            .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+        restore_grant_session(
+            &self.client,
+            keys,
+            client_id,
+            &self.grant_required_scopes,
+            secret,
+        )
+        .await
+        .map(PubkyImportedSession)
     }
 }
 
@@ -856,6 +926,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grant_provider_accepts_grants_and_rejects_legacy_records() {
+        let grant_record = CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            ..creator_authority_record("delegated-grant-state")
+        };
+        let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new_grant(
+            FakeCreatorAuthorityStore::new(Some(grant_record)),
+            FakePubkySessionImporter::new(Ok(FakeImportedPubkySession::for_creator(creator_z32()))),
+        );
+
+        provider.storage_for_creator(&creator()).await.unwrap();
+        assert_eq!(
+            provider.importer().seen_secrets(),
+            vec!["delegated-grant-state".to_owned()]
+        );
+
+        let legacy_provider = LegacyCookieCreatorScopedPubkyStorageProvider::new_grant(
+            FakeCreatorAuthorityStore::new(Some(creator_authority_record(
+                "legacy-cookie-session-secret",
+            ))),
+            FakePubkySessionImporter::new(Ok(FakeImportedPubkySession::for_creator(creator_z32()))),
+        );
+        assert_storage_error(
+            legacy_provider.storage_for_creator(&creator()).await,
+            ApplicationError::CreatorAuthorityUnavailable,
+        );
+        assert!(legacy_provider.importer().seen_secrets().is_empty());
+    }
+
     #[derive(Debug)]
     struct FakeCreatorAuthorityManager {
         result: Result<CreatorAuthorityStatus, ApplicationError>,
@@ -1207,6 +1307,17 @@ mod tests {
         type Session = FakeImportedPubkySession;
 
         async fn import_legacy_cookie_session(
+            &self,
+            secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            self.seen_secrets
+                .lock()
+                .unwrap()
+                .push(secret.expose_secret().to_owned());
+            self.result.clone()
+        }
+
+        async fn import_grant_session(
             &self,
             secret: &CreatorAuthoritySecret,
         ) -> Result<Self::Session, ApplicationError> {

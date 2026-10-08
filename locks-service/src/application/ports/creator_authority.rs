@@ -5,7 +5,8 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorConnectAuthorizationUrl,
     CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord, FrontendSessionRecord,
-    FrontendSessionToken, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
 
 /// Secret-free status view for creator-granted homeserver authority.
@@ -85,6 +86,23 @@ pub trait CreatorConnectFlowStore: Send + Sync {
         &self,
         flow_id: &CreatorConnectFlowId,
     ) -> Result<(), ApplicationError>;
+
+    /// Atomically removes and returns a pending flow exactly once.
+    async fn consume_pending_creator_connect_flow(
+        &self,
+        flow_id: &CreatorConnectFlowId,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<PendingCreatorConnectFlowRecord>, ApplicationError> {
+        let record = self.get_pending_creator_connect_flow(flow_id).await?;
+        if record
+            .as_ref()
+            .is_some_and(|record| !record.is_expired_at(now))
+        {
+            self.delete_pending_creator_connect_flow(flow_id).await?;
+            return Ok(record);
+        }
+        Ok(None)
+    }
 }
 
 /// Store for short-lived one-time frontend session exchange codes.
@@ -163,6 +181,23 @@ pub trait LegacyCreatorConnectFlowClient: Send + Sync {
         &self,
         authorization_url: &CreatorConnectAuthorizationUrl,
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError>;
+}
+
+/// Object-safe seam for delegated grant creator connect flows.
+#[async_trait]
+pub trait GrantCreatorConnectFlowClient: Send + Sync {
+    async fn start_grant_creator_connect_flow(
+        &self,
+        requested_scopes: &[String],
+        pop_key_id: &GrantPopKeyId,
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError>;
+
+    async fn await_grant_creator_connect_flow_approval(
+        &self,
+        authorization_url: &CreatorConnectAuthorizationUrl,
+        pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError>;
 }
 
 #[cfg(test)]

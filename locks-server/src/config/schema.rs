@@ -124,10 +124,17 @@ pub struct CreatorAuthorityAcquisitionConfig {
     pub frontend_session_ttl_seconds: u64,
     pub frontend_session_code_ttl_seconds: u64,
     pub legacy_connect: LegacyConnectAcquisitionConfig,
+    pub grant_connect: Option<GrantConnectAcquisitionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyConnectAcquisitionConfig {
+    pub allowed_return_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantConnectAcquisitionConfig {
+    pub client_id: String,
     pub allowed_return_origins: Vec<String>,
 }
 
@@ -141,6 +148,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
             legacy_connect: LegacyConnectAcquisitionConfig {
                 allowed_return_origins: Vec::new(),
             },
+            grant_connect: None,
         }
     }
 }
@@ -149,6 +157,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum CreatorAuthorityAcquisitionMethod {
     LegacyConnect,
+    GrantConnect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +378,14 @@ pub enum ConfigError {
     )]
     InvalidCreatorAuthorityAllowedReturnOrigin(String),
     #[error(
+        "grant-connect requires a hostname client_id without scheme, path, query, or fragment: {0}"
+    )]
+    InvalidGrantConnectClientId(String),
+    #[error(
+        "creator_authority_acquisition.method = grant-connect requires [creator_authority_acquisition.grant_connect]"
+    )]
+    MissingGrantConnectConfig,
+    #[error(
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
@@ -384,6 +401,10 @@ pub enum ConfigError {
         "paykit requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
     )]
     InvalidPaykitSigningSeed,
+    #[error(
+        "grant-connect requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
+    )]
+    InvalidGrantSigningSeed,
     #[error(
         "worker.claim_timeout_seconds must exceed the {request_timeout_seconds}-second Paykit request timeout when Paykit and the in-process worker are enabled"
     )]

@@ -44,7 +44,7 @@ async fn legacy_connect_shell_http_flow_starts_completes_redirects_and_exchanges
     );
     let shell_html = String::from_utf8(response_bytes(shell_response).await).unwrap();
     assert!(shell_html.contains("Enable Locks"));
-    assert!(shell_html.contains("pubkyauth://fake-secret-flow-url"));
+    assert!(shell_html.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert!(shell_html.contains("data-testid=\"pubky-auth-qr\""));
     assert!(shell_html.contains("<svg"));
     assert!(shell_html.contains("aria-label=\"Pubky authorization QR code\""));
@@ -239,7 +239,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
             ["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
         Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://fake-secret-flow-url",
+            "pubkyauth://signin?secret=fake-secret-flow-url",
         ))
     }
 
@@ -249,7 +249,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
         assert_eq!(
             authorization_url.expose_url(),
-            "pubkyauth://fake-secret-flow-url"
+            "pubkyauth://signin?secret=fake-secret-flow-url"
         );
         Ok(LegacyCreatorConnectFlowApproval {
             creator: creator(),

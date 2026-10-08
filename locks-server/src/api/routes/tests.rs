@@ -23,10 +23,12 @@ use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
-    FrontendSessionToken, GuardedResourceRecord, InvoiceAdmissionRetryReason,
-    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
+    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
-use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
+use locks_service::application::ports::{
+    Clock, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
+};
 use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -47,9 +49,10 @@ use crate::api::dtos::{
 use crate::app_state::{AppState, ReaderPubkyResolver};
 use crate::config::{
     ContentLocksConfig, CreatorAuthorityAcquisitionConfig, CreatorAuthorityAcquisitionMethod,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PaykitConnectionStateLookupRateLimitConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    DatabaseConfig, GrantConnectAcquisitionConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 use crate::paykit_http_client::{
     PaykitHttpClient, PaykitSetupStatusKind, PaykitSetupStatusProvider,
@@ -3368,7 +3371,7 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
     );
     let body = String::from_utf8(response_bytes(response).await).unwrap();
     assert!(body.contains("Enable Locks"));
-    assert!(body.contains("pubkyauth://fake-secret-flow-url"));
+    assert!(body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert!(body.contains("data-testid=\"pubky-auth-qr\""));
     assert!(body.contains("<svg"));
     assert!(body.contains("aria-label=\"Pubky authorization QR code\""));
@@ -3382,6 +3385,35 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
     assert!(!body.contains("frontend_session_token"));
     assert!(!body.contains("one-time-code"));
     assert_eq!(client.start_call_count(), 1);
+}
+
+#[tokio::test]
+async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow() {
+    let grant = Arc::new(FakeGrantConnectFlowClient);
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(grant);
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains("pubkyauth://signin_grant?secret=fake-grant"));
+    assert!(!body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
 }
 
 #[test]
@@ -3516,8 +3548,9 @@ async fn raw_creator_connect_flow_routes_are_never_mounted() {
         frontend_session_ttl_seconds: 86_400,
         frontend_session_code_ttl_seconds: 120,
         legacy_connect: crate::config::LegacyConnectAcquisitionConfig {
-            allowed_return_origins: Vec::new(),
+            allowed_return_origins: vec!["https://pubky.app".to_owned()],
         },
+        grant_connect: None,
     };
     let app = router(AppState::new_empty_in_memory(config));
 
@@ -4338,7 +4371,7 @@ async fn seed_pending_creator_connect_flow(
             return_to: return_to.to_owned(),
             state: opaque_state.to_owned(),
             authorization_url: CreatorConnectAuthorizationUrl::new(
-                "pubkyauth://fake-secret-flow-url",
+                "pubkyauth://signin?secret=fake-secret-flow-url",
             ),
             requested_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
@@ -4386,7 +4419,7 @@ impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
         Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://fake-secret-flow-url",
+            "pubkyauth://signin?secret=fake-secret-flow-url",
         ))
     }
 
@@ -4398,6 +4431,49 @@ impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
             creator: creator(),
             session_secret: CreatorAuthoritySecret::new("session-secret"),
         })
+    }
+}
+
+struct PanicLegacyConnectFlowClient;
+
+#[async_trait]
+impl LegacyCreatorConnectFlowClient for PanicLegacyConnectFlowClient {
+    async fn start_legacy_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        panic!("grant-connect mode must not start legacy cookie flow")
+    }
+
+    async fn await_legacy_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
+        panic!("grant-connect mode must not await legacy cookie flow")
+    }
+}
+
+struct FakeGrantConnectFlowClient;
+
+#[async_trait]
+impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
+    async fn start_grant_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+        _pop_key_id: &GrantPopKeyId,
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        Ok(CreatorConnectAuthorizationUrl::new(
+            "pubkyauth://signin_grant?secret=fake-grant",
+        ))
+    }
+
+    async fn await_grant_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+        _pop_key_id: &GrantPopKeyId,
+        _requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+        unreachable!("start route must not await approval")
     }
 }
 

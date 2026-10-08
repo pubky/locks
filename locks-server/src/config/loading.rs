@@ -4,9 +4,9 @@ use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_
 use super::raw::RawConfig;
 use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PaykitConfig, PkdnsConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-    SecretsConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
 
@@ -91,6 +91,11 @@ fn validate_existing_config_secret(
     if config.paykit.is_some() {
         validate_paykit_signing_seed(secret_path)?;
     }
+    if config.creator_authority_acquisition.method
+        == CreatorAuthorityAcquisitionMethod::GrantConnect
+    {
+        validate_grant_signing_seed(secret_path)?;
+    }
 
     Ok(())
 }
@@ -104,6 +109,17 @@ fn validate_paykit_signing_seed(secret_path: &Path) -> Result<(), ConfigError> {
     parse_lock_server_keypair_seed(&secret)
         .map(|_| ())
         .map_err(|_| ConfigError::InvalidPaykitSigningSeed)
+}
+
+fn validate_grant_signing_seed(secret_path: &Path) -> Result<(), ConfigError> {
+    let secret =
+        std::fs::read_to_string(secret_path).map_err(|source| ConfigError::DerivePublicKey {
+            path: secret_path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+    parse_lock_server_keypair_seed(&secret)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidGrantSigningSeed)
 }
 
 fn initialize_default_config(
@@ -182,7 +198,7 @@ minimum_confirmations = {} # Global confirmation threshold for payment satisfact
 
 [creator_authority_acquisition]
 enabled = {} # true mounts hosted creator connect/session routes; false disables browser acquisition of creator authority.
-method = "legacy-connect" # Currently only legacy-connect is supported. It uses Pubky auth via Ring/signer and stores creator authority server-side.
+method = "legacy-connect" # One of: legacy-connect, grant-connect. Grant mode requires a grant_connect table with client_id and allowed_return_origins.
 frontend_session_ttl_seconds = {} # Locks-local browser session lifetime after connect. Higher values reduce reauth; lower values reduce stolen-token lifetime.
 frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep short; browser must exchange it quickly for a frontend session.
 
@@ -307,7 +323,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FilesystemLockServerIdentityProvider;
+    use crate::config::{FilesystemLockServerIdentityProvider, GrantConnectAcquisitionConfig};
     use tempfile::tempdir;
 
     #[test]
@@ -372,5 +388,42 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(error, ConfigError::InvalidPaykitSigningSeed));
+    }
+
+    #[test]
+    fn grant_connect_requires_signing_seed_secret_on_startup() {
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(
+                "PUBKY_LOCK_DATABASE_URL",
+                "postgres://locks:***@localhost/locks_test",
+            );
+        }
+        let mut generated =
+            load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
+                .unwrap();
+        generated.paykit = None;
+        generated.creator_authority_acquisition.method =
+            CreatorAuthorityAcquisitionMethod::GrantConnect;
+        generated.creator_authority_acquisition.grant_connect =
+            Some(GrantConnectAcquisitionConfig {
+                client_id: "locks.example".to_owned(),
+                allowed_return_origins: vec!["https://pubky.app".to_owned()],
+            });
+        let secret_path = home.path().join(".pubky-lock/secret.sess");
+        std::fs::write(
+            &secret_path,
+            format!(
+                "{}:legacy-session-secret",
+                generated.credentials.lock_server_public_key
+            ),
+        )
+        .unwrap();
+
+        let error =
+            validate_existing_config_secret(&generated, &FilesystemLockServerIdentityProvider)
+                .unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidGrantSigningSeed));
     }
 }
