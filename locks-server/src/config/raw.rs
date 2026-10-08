@@ -346,11 +346,11 @@ fn validate_grant_connect_client_id(value: String) -> Result<String, ConfigError
     }
     let url = Url::parse(&format!("https://{value}/")).map_err(|_| invalid())?;
     let host = url.host_str().ok_or_else(invalid)?;
-    let authority = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    };
-    if authority != value || !url.username().is_empty() || url.password().is_some() {
+    if host != value
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(invalid());
     }
     Ok(value)

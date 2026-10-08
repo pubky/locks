@@ -229,6 +229,7 @@ mod tests {
     use super::{
         GrantCreatorAuthorityManager, GrantCredentialRevalidator,
         LegacyCookieCreatorAuthorityManager, LegacyCookieSessionRevalidator,
+        PubkyGrantCredentialRevalidator,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -338,6 +339,32 @@ mod tests {
         );
         assert_eq!(
             legacy_manager.require_creator_authority(&creator()).await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_manager_maps_malformed_stored_grant_to_unavailable() {
+        let grant_record = CreatorAuthorityRecord {
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            ..creator_authority_record("malformed-delegated-grant-state")
+        };
+        let revalidator = PubkyGrantCredentialRevalidator::new(
+            pubky::PubkyHttpClient::testnet().unwrap(),
+            crate::infrastructure::pubky::LockServerGrantPopKeys::from_lock_server_seed([42; 32]),
+            pubky::ClientId::new("locks.example").unwrap(),
+            vec![
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
+            ],
+        );
+        let manager = GrantCreatorAuthorityManager::new(
+            FakeCreatorAuthorityStore::new(Some(grant_record)),
+            revalidator,
+        );
+
+        assert_eq!(
+            manager.revalidate_creator_authority(&creator()).await,
             Err(ApplicationError::CreatorAuthorityUnavailable)
         );
     }

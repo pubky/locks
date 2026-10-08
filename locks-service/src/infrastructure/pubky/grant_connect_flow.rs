@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -228,11 +229,10 @@ fn grant_approval_from_parts(
         return Err(grant_error("grant is not bound to the Lock Server key"));
     }
     let requested = requested_scopes_to_capabilities(requested_scopes)?;
-    if !requested
-        .iter()
-        .all(|required| grant_covers(&claims.caps, required))
-    {
-        return Err(grant_error("grant does not cover the requested scopes"));
+    if !capability_sets_match(claims.caps.as_slice(), requested.as_slice()) {
+        return Err(grant_error(
+            "grant capabilities do not exactly match the requested scopes",
+        ));
     }
     let creator = creator_from_pubky_public_key_z32(&claims.iss.z32())?;
     let grant_expires_at = i64::try_from(claims.exp)
@@ -246,19 +246,19 @@ fn grant_approval_from_parts(
     Ok(GrantCreatorConnectFlowApproval {
         creator,
         grant_state: encode_grant_state(&state),
-        granted_scopes: claims.caps.iter().map(ToString::to_string).collect(),
+        granted_scopes: requested.iter().map(ToString::to_string).collect(),
         grant_expires_at,
     })
 }
 
-fn grant_covers(granted: &[Capability], required: &Capability) -> bool {
-    granted.iter().any(|capability| {
-        capability.scope_covers_path(required.scope())
-            && required
-                .actions()
-                .iter()
-                .all(|action| capability.actions().contains(action))
-    })
+fn capability_sets_match(granted: &[Capability], requested: &[Capability]) -> bool {
+    let canonical = |capabilities: &[Capability]| {
+        capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+    canonical(granted) == canonical(requested)
 }
 
 pub fn encode_grant_state(state: &DelegatedGrantCredentialState) -> CreatorAuthoritySecret {
@@ -310,29 +310,29 @@ pub async fn restore_grant_session(
     required_scopes: &[String],
     secret: &CreatorAuthoritySecret,
 ) -> Result<PubkySession, ApplicationError> {
-    let state = decode_grant_state(secret)?;
+    let state =
+        decode_grant_state(secret).map_err(|_| ApplicationError::CreatorAuthorityUnavailable)?;
     let key_id = GrantPopKeyId::new(state.key_id.clone());
     let expected_client_pk = pop_keys.public_key(&key_id);
-    let claims = GrantClaims::decode(&state.grant_jws).map_err(|_| grant_restore_error())?;
+    let claims = GrantClaims::decode(&state.grant_jws)
+        .map_err(|_| ApplicationError::CreatorAuthorityUnavailable)?;
     let required =
         requested_scopes_to_capabilities(required_scopes).map_err(|_| grant_restore_error())?;
     if state.client_pk != expected_client_pk
         || claims.cnf != expected_client_pk
         || &claims.client_id != expected_client_id
-        || !required
-            .iter()
-            .all(|required| grant_covers(&claims.caps, required))
+        || !capability_sets_match(claims.caps.as_slice(), required.as_slice())
         || i64::try_from(claims.exp)
             .ok()
             .and_then(|exp| OffsetDateTime::from_unix_timestamp(exp).ok())
             .is_none_or(|expires_at| expires_at <= OffsetDateTime::now_utc())
     {
-        return Err(grant_restore_error());
+        return Err(ApplicationError::CreatorAuthorityUnavailable);
     }
     let credential =
         GrantCredential::import_delegated_state(state, client, pop_keys.signer(&key_id))
             .await
-            .map_err(|_| grant_restore_error())?;
+            .map_err(map_grant_restore_sdk_error)?;
     Ok(PubkySession::from_grant_credential(
         client.clone(),
         credential,
@@ -374,6 +374,17 @@ fn invalid_grant_state() -> ApplicationError {
 
 fn grant_restore_error() -> ApplicationError {
     grant_error("failed to restore grant creator authority")
+}
+
+fn map_grant_restore_sdk_error(error: pubky::Error) -> ApplicationError {
+    match error {
+        pubky::Error::Authentication(_) => ApplicationError::CreatorAuthorityUnavailable,
+        pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN,
+            ..
+        }) => ApplicationError::CreatorAuthorityUnavailable,
+        _ => grant_restore_error(),
+    }
 }
 
 #[cfg(test)]
@@ -442,15 +453,27 @@ mod tests {
         state: DelegatedGrantCredentialState,
         session_pubky: &PublicKey,
     ) -> Result<crate::application::models::GrantCreatorConnectFlowApproval, ApplicationError> {
+        approval_with_scopes(
+            state,
+            session_pubky,
+            &[
+                "/pub/locks.app/:rw".to_owned(),
+                "/priv/locks.app/:rw".to_owned(),
+            ],
+        )
+    }
+
+    fn approval_with_scopes(
+        state: DelegatedGrantCredentialState,
+        session_pubky: &PublicKey,
+        requested_scopes: &[String],
+    ) -> Result<crate::application::models::GrantCreatorConnectFlowApproval, ApplicationError> {
         grant_approval_from_parts(
             state,
             session_pubky,
             &ClientId::new(CLIENT_ID).unwrap(),
             &keys().public_key(&key_id()),
-            &[
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
-            ],
+            requested_scopes,
         )
     }
 
@@ -600,7 +623,7 @@ mod tests {
             ),
             (
                 signed_state(&issuer, CLIENT_ID, pop.clone(), "/pub/locks.app/:rw"),
-                "grant does not cover the requested scopes",
+                "grant capabilities do not exactly match the requested scopes",
             ),
             (
                 signed_state(
@@ -609,7 +632,7 @@ mod tests {
                     pop.clone(),
                     "/priv/locks.app/:r,/pub/locks.app/:rw",
                 ),
-                "grant does not cover the requested scopes",
+                "grant capabilities do not exactly match the requested scopes",
             ),
             (
                 signed_state(
@@ -618,7 +641,7 @@ mod tests {
                     pop.clone(),
                     "/priv/locks.app-evil/:rw,/pub/locks.app/:rw",
                 ),
-                "grant does not cover the requested scopes",
+                "grant capabilities do not exactly match the requested scopes",
             ),
         ] {
             assert_eq!(
@@ -628,6 +651,80 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn grant_approval_rejects_broader_and_extra_capabilities() {
+        let issuer = Keypair::random();
+        let pop = keys().public_key(&key_id());
+        let exact = [
+            "/priv/locks.app/:rw".to_owned(),
+            "/pub/locks.app/:rw".to_owned(),
+        ];
+
+        for (state, requested) in [
+            (
+                signed_state(&issuer, CLIENT_ID, pop.clone(), "/:rw"),
+                exact.as_slice(),
+            ),
+            (
+                signed_state(
+                    &issuer,
+                    CLIENT_ID,
+                    pop.clone(),
+                    "/priv/locks.app/:rw,/pub/locks.app/:rw,/pub/other.app/:r",
+                ),
+                exact.as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                approval_with_scopes(state, &issuer.public_key(), requested).unwrap_err(),
+                ApplicationError::CreatorAuthoritySecret {
+                    message: "grant capabilities do not exactly match the requested scopes"
+                        .to_owned()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn exact_capability_matching_rejects_extra_action() {
+        let granted = [Capability::from_str("/pub/locks.app/:rw").unwrap()];
+        let requested = [Capability::from_str("/pub/locks.app/:r").unwrap()];
+
+        assert!(!super::capability_sets_match(&granted, &requested));
+    }
+
+    #[test]
+    fn grant_restore_maps_invalid_and_revoked_credentials_to_unavailable() {
+        let invalid = pubky::Error::Authentication(pubky::errors::AuthError::Validation(
+            "invalid grant".to_owned(),
+        ));
+        let revoked = pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::UNAUTHORIZED,
+            message: "revoked".to_owned(),
+        });
+
+        for error in [invalid, revoked] {
+            assert_eq!(
+                super::map_grant_restore_sdk_error(error),
+                ApplicationError::CreatorAuthorityUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn grant_restore_keeps_dependency_response_failures_typed() {
+        let error = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+            message: "malformed homeserver response".to_owned(),
+        });
+
+        assert_eq!(
+            super::map_grant_restore_sdk_error(error),
+            ApplicationError::CreatorAuthoritySecret {
+                message: "failed to restore grant creator authority".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -731,12 +828,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(
-            error,
-            ApplicationError::CreatorAuthoritySecret {
-                message: "failed to restore grant creator authority".to_owned()
-            }
-        );
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
     }
 
     #[tokio::test]
@@ -771,11 +863,47 @@ mod tests {
             .await
             .unwrap_err();
 
+            assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_broader_and_extra_capabilities_before_network() {
+        let issuer = Keypair::random();
+        let pop = keys().public_key(&key_id());
+
+        for (state, required_scopes) in [
+            (
+                signed_state(&issuer, CLIENT_ID, pop.clone(), "/:rw"),
+                vec![
+                    "/priv/locks.app/:rw".to_owned(),
+                    "/pub/locks.app/:rw".to_owned(),
+                ],
+            ),
+            (
+                signed_state(
+                    &issuer,
+                    CLIENT_ID,
+                    pop.clone(),
+                    "/priv/locks.app/:rw,/pub/locks.app/:rw,/pub/other.app/:r",
+                ),
+                vec![
+                    "/priv/locks.app/:rw".to_owned(),
+                    "/pub/locks.app/:rw".to_owned(),
+                ],
+            ),
+        ] {
             assert_eq!(
-                error,
-                ApplicationError::CreatorAuthoritySecret {
-                    message: "failed to restore grant creator authority".to_owned()
-                }
+                restore_grant_session(
+                    &pubky::PubkyHttpClient::testnet().unwrap(),
+                    &keys(),
+                    &ClientId::new(CLIENT_ID).unwrap(),
+                    &required_scopes,
+                    &encode_grant_state(&state),
+                )
+                .await
+                .unwrap_err(),
+                ApplicationError::CreatorAuthorityUnavailable
             );
         }
     }

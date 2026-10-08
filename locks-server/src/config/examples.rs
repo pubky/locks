@@ -655,6 +655,7 @@ fn grant_connect_rejects_malformed_client_ids() {
     for client_id in [
         "https://locks.example",
         "locks.example/path",
+        "locks.example:8443",
         "user@locks.example",
         "locks example",
     ] {
