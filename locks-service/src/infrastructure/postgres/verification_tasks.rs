@@ -447,7 +447,6 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
                AND task.claimed_by = $2
                AND task.claim_token = $3
                AND task.claim_expires_at > timing.winner_time
-               AND task.admission_deadline_at > timing.winner_time
              RETURNING task.task_id::text",
         )
         .bind(task_id.to_string())
@@ -1197,6 +1196,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoice_admission_postgres_ready_accepts_live_claim_after_deadline() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let mut task = task(VerificationTaskStatus::Pending);
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+        let intent = InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: task.creator.clone(),
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            reader,
+        };
+        repo.insert_invoice_pending_task(task.clone(), intent)
+            .await
+            .unwrap();
+        let claim = repo
+            .claim_next_invoice_admission("worker-a", task.submitted_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!claim.deadline_expired);
+
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET admission_deadline_at = clock_timestamp() - INTERVAL '1 second'
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.schedule_invoice_admission_retry(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                task.submitted_at,
+                time::Duration::seconds(5),
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let ready = repo
+            .mark_invoice_admission_ready(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                task.submitted_at,
+            )
+            .await
+            .unwrap()
+            .expect("a live claim taken before the deadline may mark ready after it");
+        assert_eq!(ready.phase, InvoiceAdmissionPhase::Ready);
+        assert_eq!(ready.task.status, VerificationTaskStatus::Pending);
+        assert_eq!(ready.next_attempt_at, None);
+        assert_eq!(ready.retry_reason, None);
+        assert_eq!(
+            repo.claim_next_invoice_admission(
+                "worker-b",
+                task.submitted_at,
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn invoice_admission_ready_uses_time_after_waiting_for_row_lock() {
         let database = TestDatabase::create().await;
         let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
@@ -1354,18 +1430,6 @@ mod tests {
             .unwrap();
         assert_eq!(expired_claim.admission.attempt_count, 3);
         assert!(expired_claim.deadline_expired);
-        assert_eq!(
-            recreated_repo
-                .mark_invoice_admission_ready(
-                    &task.task_id,
-                    "worker-b",
-                    &expired_claim.claim_token,
-                    task.submitted_at,
-                )
-                .await
-                .unwrap(),
-            None
-        );
         let failed = recreated_repo
             .mark_invoice_admission_failed(
                 &task.task_id,

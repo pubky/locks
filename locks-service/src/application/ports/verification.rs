@@ -36,6 +36,8 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
     ) -> Result<Option<ClaimedInvoiceAdmission>, ApplicationError>;
 
     /// Marks invoice admission ready only for the exact live lease incarnation.
+    /// The admission deadline is deliberately not re-checked: a claim taken before the deadline
+    /// may finish after it, and Paykit has already committed the invoice by then.
     async fn mark_invoice_admission_ready(
         &self,
         task_id: &TaskId,

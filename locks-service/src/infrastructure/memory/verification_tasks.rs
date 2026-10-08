@@ -250,7 +250,6 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
             state.record.phase == InvoiceAdmissionPhase::InvoicePending
-                && state.record.admission_deadline_at > now
                 && state.claimed_by.as_deref() == Some(worker_id)
                 && state.claim_token.as_ref() == Some(claim_token)
                 && state
@@ -875,17 +874,6 @@ mod tests {
             .expect("deadline-expired admission remains eligible for terminalization");
         assert_eq!(claim.admission.task.task_id, task.task_id);
         assert!(claim.deadline_expired);
-        assert_eq!(
-            repo.mark_invoice_admission_ready(
-                &task.task_id,
-                "worker-a",
-                &claim.claim_token,
-                inserted.admission_deadline_at,
-            )
-            .await
-            .unwrap(),
-            None
-        );
         assert!(
             repo.mark_invoice_admission_failed(
                 &task.task_id,
@@ -897,6 +885,116 @@ mod tests {
             .await
             .unwrap()
             .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoice_admission_ready_accepts_live_claim_that_finishes_after_deadline() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let mut task = task(VerificationTaskStatus::Pending);
+        task.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        let inserted = repo
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let claimed_at = inserted.admission_deadline_at - time::Duration::seconds(5);
+        let claim = repo
+            .claim_next_invoice_admission("worker-a", claimed_at, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!claim.deadline_expired);
+
+        let ready = repo
+            .mark_invoice_admission_ready(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                inserted.admission_deadline_at + time::Duration::seconds(10),
+            )
+            .await
+            .unwrap()
+            .expect("a live claim taken before the deadline may mark ready after it");
+        assert_eq!(ready.phase, InvoiceAdmissionPhase::Ready);
+        assert_eq!(ready.task.status, VerificationTaskStatus::Pending);
+        assert_eq!(
+            repo.claim_next_invoice_admission(
+                "worker-b",
+                inserted.admission_deadline_at + time::Duration::minutes(5),
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn invoice_admission_deadline_still_bounds_retries_and_lease_fences_late_ready() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let mut task = task(VerificationTaskStatus::Pending);
+        task.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        let inserted = repo
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let claim = repo
+            .claim_next_invoice_admission(
+                "worker-a",
+                inserted.admission_deadline_at - time::Duration::seconds(5),
+                time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            repo.schedule_invoice_admission_retry(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                inserted.admission_deadline_at + time::Duration::seconds(1),
+                time::Duration::seconds(5),
+                None,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let after_lease = inserted.admission_deadline_at + time::Duration::minutes(2);
+        assert_eq!(
+            repo.mark_invoice_admission_ready(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                after_lease,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let reclaimed = repo
+            .claim_next_invoice_admission("worker-b", after_lease, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reclaimed.deadline_expired);
+        assert_eq!(
+            repo.mark_invoice_admission_ready(
+                &task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                after_lease,
+            )
+            .await
+            .unwrap(),
+            None
         );
     }
 

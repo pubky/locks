@@ -280,6 +280,82 @@ async fn invoice_worker_fails_status_only_conflict() {
 }
 
 #[tokio::test]
+async fn invoice_worker_marks_ready_when_paykit_200_arrives_after_deadline_under_live_claim() {
+    let repo = InMemoryVerificationTaskRepository::new();
+    let task = invoice_task();
+    let inserted = repo
+        .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+        .await
+        .unwrap();
+    let deadline = inserted.admission_deadline_at;
+    let clock = SharedClock::new(deadline - time::Duration::seconds(5));
+    let client = DeadlineCrossingInvoiceCreator {
+        clock: &clock,
+        response_at: deadline + time::Duration::seconds(15),
+    };
+    let jitter = FixedJitter(time::Duration::seconds(1));
+    let worker = InvoiceAdmissionWorker::new(
+        &repo,
+        &client,
+        &clock,
+        &jitter,
+        "invoice-worker".to_owned(),
+        time::Duration::minutes(1),
+    );
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Ready(task.task_id)
+    );
+    let admission = repo
+        .get_invoice_admission(&task.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.phase, InvoiceAdmissionPhase::Ready);
+    assert_eq!(admission.task.status, VerificationTaskStatus::Pending);
+    assert_eq!(admission.task.failure_message, None);
+    assert_eq!(worker.run_once().await.unwrap(), InvoiceWorkerTick::Idle);
+}
+
+#[tokio::test]
+async fn invoice_worker_fails_unclaimed_expired_admission_without_calling_paykit() {
+    let repo = InMemoryVerificationTaskRepository::new();
+    let task = invoice_task();
+    let inserted = repo
+        .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+        .await
+        .unwrap();
+    let client = RecordingInvoiceCreator::with_results([]);
+    let clock = FixedClock(inserted.admission_deadline_at + time::Duration::seconds(1));
+    let jitter = FixedJitter(time::Duration::seconds(1));
+    let worker = InvoiceAdmissionWorker::new(
+        &repo,
+        &client,
+        &clock,
+        &jitter,
+        "invoice-worker".to_owned(),
+        time::Duration::minutes(1),
+    );
+
+    assert_eq!(
+        worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Failed(task.task_id)
+    );
+    let failed = repo
+        .get_invoice_admission(&task.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.phase, InvoiceAdmissionPhase::Failed);
+    assert_eq!(
+        failed.task.failure_message.as_deref(),
+        Some("invoice admission deadline exceeded")
+    );
+    assert!(client.calls().is_empty());
+}
+
+#[tokio::test]
 async fn invoice_worker_terminalizes_only_typed_conflict_meanings_with_specific_reason() {
     for (error_code, expected_message) in [
         ("reader_not_payable", "reader is not payable"),
@@ -365,6 +441,41 @@ struct FixedClock(OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> OffsetDateTime {
         self.0
+    }
+}
+
+struct SharedClock(Mutex<OffsetDateTime>);
+
+impl SharedClock {
+    fn new(now: OffsetDateTime) -> Self {
+        Self(Mutex::new(now))
+    }
+
+    fn set(&self, now: OffsetDateTime) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl Clock for SharedClock {
+    fn now(&self) -> OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+struct DeadlineCrossingInvoiceCreator<'a> {
+    clock: &'a SharedClock,
+    response_at: OffsetDateTime,
+}
+
+#[async_trait]
+impl PaykitInvoiceCreator for DeadlineCrossingInvoiceCreator<'_> {
+    async fn create_invoice(
+        &self,
+        _request_id: Uuid,
+        _request: &PaykitInvoiceRequest,
+    ) -> Result<(), PaykitClientError> {
+        self.clock.set(self.response_at);
+        Ok(())
     }
 }
 
