@@ -76,7 +76,7 @@ const requiredSnippets = [
   'createContentLock(body: any): Promise<any>;',
   'deleteGuardedResource(options: DeleteGuardedResourceOptions): Promise<void>;',
   'setLockServicePointer(options: SetLockServicePointerOptions): Promise<void>;',
-  'paykitSetupStatus(): Promise<any>;',
+  'paykitSetupStatus(asset: string): Promise<any>;',
   'export class CreateContentLockRequestBuilder',
   'primaryResource(resource: any): CreateContentLockRequestBuilder;',
   'secondaryResource(resource: any): CreateContentLockRequestBuilder;',
@@ -103,8 +103,8 @@ await sdk.default(await readFile(wasmPath));
 if (typeof sdk.Creator.prototype.paykitSetupStatus !== 'function') {
   throw new Error('generated Creator missing paykitSetupStatus');
 }
-if (sdk.Creator.prototype.paykitSetupStatus.length !== 0) {
-  throw new Error('paykitSetupStatus must not accept a caller-supplied Creator');
+if (sdk.Creator.prototype.paykitSetupStatus.length !== 1) {
+  throw new Error('paykitSetupStatus accepts only an invoice denomination');
 }
 if (typeof sdk.Locks.hasPaykitData !== 'function') {
   throw new Error('generated Locks missing hasPaykitData');

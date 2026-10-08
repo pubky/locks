@@ -16,7 +16,7 @@ use locks_core::ids::{
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    LockServerConfig, PaykitPaymentAsset, VerifierType,
 };
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
@@ -84,6 +84,7 @@ impl ReaderPubkyResolver for AlwaysResolvesReader {
 struct RecordingPaykitSetupStatusProvider {
     result: Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>,
     creators: Mutex<Vec<CreatorPubky>>,
+    assets: Mutex<Vec<PaykitPaymentAsset>>,
 }
 
 impl RecordingPaykitSetupStatusProvider {
@@ -91,6 +92,7 @@ impl RecordingPaykitSetupStatusProvider {
         Self {
             result: Ok(status),
             creators: Mutex::new(Vec::new()),
+            assets: Mutex::new(Vec::new()),
         }
     }
 
@@ -98,6 +100,7 @@ impl RecordingPaykitSetupStatusProvider {
         Self {
             result: Err(error),
             creators: Mutex::new(Vec::new()),
+            assets: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,8 +114,10 @@ impl PaykitSetupStatusProvider for RecordingPaykitSetupStatusProvider {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
         self.creators.lock().unwrap().push(creator.clone());
+        self.assets.lock().unwrap().push(asset);
         self.result
     }
 }
@@ -2291,7 +2296,7 @@ async fn paykit_setup_status_route_derives_creator_and_projects_all_statuses() {
         let response = router(state)
             .oneshot(auth_request(
                 "GET",
-                "/creator/paykit/setup-status",
+                "/creator/paykit/setup-status?asset=USD",
                 "Bearer frontend-session-token",
             ))
             .await
@@ -2301,6 +2306,10 @@ async fn paykit_setup_status_route_derives_creator_and_projects_all_statuses() {
         let body = response_json(response).await;
         assert_eq!(body, json!({ "status": wire_status }));
         assert_eq!(provider.creators(), vec![creator()]);
+        assert_eq!(
+            *provider.assets.lock().unwrap(),
+            vec![PaykitPaymentAsset::Usd]
+        );
     }
 }
 
@@ -2315,7 +2324,7 @@ async fn paykit_setup_status_route_uses_creator_from_the_presented_session() {
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer other-session-token",
         ))
         .await
@@ -2332,7 +2341,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer frontend-session-token",
         ))
         .await
@@ -2356,7 +2365,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
         let response = router(state)
             .oneshot(auth_request(
                 "GET",
-                "/creator/paykit/setup-status",
+                "/creator/paykit/setup-status?asset=USD",
                 "Bearer frontend-session-token",
             ))
             .await
@@ -2371,7 +2380,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
 }
 
 #[tokio::test]
-async fn paykit_setup_status_route_rejects_query_and_body_after_authentication() {
+async fn paykit_setup_status_route_rejects_invalid_asset_creator_and_body_after_authentication() {
     let provider = Arc::new(RecordingPaykitSetupStatusProvider::status(
         PaykitSetupStatusKind::Ready,
     ));
@@ -2382,12 +2391,27 @@ async fn paykit_setup_status_route_rejects_query_and_body_after_authentication()
     for request in [
         auth_request(
             "GET",
+            "/creator/paykit/setup-status",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
+            "/creator/paykit/setup-status?asset=ETH",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
+            "/creator/paykit/setup-status?asset=USD&asset=USDT",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
             &format!("/creator/paykit/setup-status?creator={}", other_creator()),
             "Bearer frontend-session-token",
         ),
         Request::builder()
             .method("GET")
-            .uri("/creator/paykit/setup-status")
+            .uri("/creator/paykit/setup-status?asset=USD")
             .header(header::AUTHORIZATION, "Bearer frontend-session-token")
             .body(Body::from("{}"))
             .unwrap(),
@@ -2406,8 +2430,8 @@ async fn paykit_setup_status_route_rejects_query_and_body_after_authentication()
 async fn paykit_setup_status_route_preserves_frontend_session_auth_errors() {
     for authorization in [None, Some("Basic token"), Some("Bearer missing-token")] {
         let request = match authorization {
-            Some(value) => auth_request("GET", "/creator/paykit/setup-status", value),
-            None => empty_request("GET", "/creator/paykit/setup-status"),
+            Some(value) => auth_request("GET", "/creator/paykit/setup-status?asset=USD", value),
+            None => empty_request("GET", "/creator/paykit/setup-status?asset=USD"),
         };
         let response = router(test_state()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -2422,7 +2446,7 @@ async fn paykit_setup_status_route_preserves_frontend_session_auth_errors() {
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer expired-token",
         ))
         .await
@@ -2443,7 +2467,7 @@ async fn paykit_setup_status_route_authenticates_before_reading_an_oversized_bod
     .oneshot(
         Request::builder()
             .method("GET")
-            .uri("/creator/paykit/setup-status")
+            .uri("/creator/paykit/setup-status?asset=USD")
             .body(Body::from(vec![0_u8; 2 * 1024 * 1024 + 1]))
             .unwrap(),
     )

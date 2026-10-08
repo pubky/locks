@@ -359,7 +359,7 @@ marker, supported capabilities, freshness, or Paykit runtime readiness.
 ### Check Paykit setup readiness
 
 ```ts
-const result = await session.creator.paykitSetupStatus();
+const result = await session.creator.paykitSetupStatus("USD");
 
 switch (result.status) {
   case "ready":
@@ -374,8 +374,8 @@ switch (result.status) {
 }
 ```
 
-`paykitSetupStatus()` takes no Creator argument. It uses the current Locks frontend-session bearer
-and calls `GET /creator/paykit/setup-status` with no body. The Lock Server derives the Creator from
+`paykitSetupStatus(asset)` takes the invoice denomination (`"BTC"`, `"USD"`, or `"USDT"`), never a Creator identity. It uses the current Locks frontend-session bearer
+and calls `GET /creator/paykit/setup-status?asset=USD` with no body. The Lock Server derives the Creator from
 that session. The returned object contains only `status: "ready" | "setup_required" |
 "unavailable"`; malformed responses reject instead of being interpreted as setup readiness.
 

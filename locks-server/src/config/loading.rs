@@ -178,7 +178,7 @@ environment = "development" # One of: development, staging, production. developm
 
 [paykit]
 server_url = "{}" # Paykit Server base URL used by paykit-payment locks. Local dev default expects Paykit Server on 127.0.0.1:3001.
-minimum_confirmations = {} # Global confirmation threshold for payment satisfaction. 0 allows detected, amount-matched payments before block confirmation.
+minimum_confirmations = {} # Bitcoin confirmation threshold. 0 allows full on-time mempool payments. USDT requires verified Arbitrum inclusion.
 
 [creator_authority_acquisition]
 enabled = {} # true mounts hosted creator connect/session routes; false disables browser acquisition of creator authority.

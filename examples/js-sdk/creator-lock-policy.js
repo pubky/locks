@@ -1,3 +1,5 @@
+import { paymentAmountToAtomic } from './payment-amount.js';
+
 const DEV_STATIC = 'dev-static';
 const PAYKIT_PAYMENT = 'paykit-payment';
 
@@ -5,7 +7,8 @@ export function buildCreatorLockPolicy({
   lockType = DEV_STATIC,
   criterionId,
   devStaticSatisfied = true,
-  amountSats,
+  amount,
+  asset,
   recipientPubky,
   paykitSetupComplete = false,
 } = {}) {
@@ -29,21 +32,13 @@ export function buildCreatorLockPolicy({
     if (typeof recipientPubky !== 'string' || !recipientPubky) {
       throw new Error('paykit-payment requires the authenticated creator recipient');
     }
-    if (
-      typeof amountSats !== 'string'
-      || !amountSats
-      || !/^\d+$/.test(amountSats)
-      || !/[1-9]/.test(amountSats)
-    ) {
-      throw new Error('paykit-payment amount must be a positive decimal integer string');
-    }
     criterion = {
       criterion_id: normalizedCriterionId,
       verifier_type: PAYKIT_PAYMENT,
       params: {
         recipient_pubky: recipientPubky,
-        amount: amountSats,
-        asset: 'BTC',
+        amount: paymentAmountToAtomic(amount, asset),
+        asset,
       },
     };
   } else {
