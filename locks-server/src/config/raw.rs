@@ -453,8 +453,14 @@ struct RawDatabaseConfig {
 struct RawWorkerConfig {
     enabled: bool,
     poll_interval_ms: u64,
+    #[serde(default = "default_paykit_payment_retry_interval_seconds")]
+    paykit_payment_retry_interval_seconds: u64,
     claim_timeout_seconds: u64,
     worker_id: String,
+}
+
+fn default_paykit_payment_retry_interval_seconds() -> u64 {
+    3
 }
 
 #[derive(Debug, Deserialize)]
@@ -805,6 +811,9 @@ impl RawConfig {
         if self.worker.poll_interval_ms == 0 {
             return Err(ConfigError::InvalidWorkerPollInterval);
         }
+        let paykit_payment_retry_interval_seconds =
+            std::num::NonZeroU64::new(self.worker.paykit_payment_retry_interval_seconds)
+                .ok_or(ConfigError::InvalidPaykitPaymentRetryInterval)?;
         if paykit.is_some()
             && self.worker.enabled
             && self.worker.claim_timeout_seconds <= PAYKIT_REQUEST_TIMEOUT_SECONDS
@@ -830,6 +839,7 @@ impl RawConfig {
             worker: WorkerConfig {
                 enabled: self.worker.enabled,
                 poll_interval_ms: self.worker.poll_interval_ms,
+                paykit_payment_retry_interval_seconds,
                 claim_timeout_seconds: self.worker.claim_timeout_seconds,
                 worker_id: self.worker.worker_id,
             },

@@ -151,6 +151,7 @@ fn initialize_default_config(
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,
+            paykit_payment_retry_interval_seconds: std::num::NonZeroU64::new(3).unwrap(),
             claim_timeout_seconds: 60,
             worker_id: "default-worker".to_owned(),
         },
@@ -186,6 +187,7 @@ run_migrations_on_startup = {} # true runs embedded DB migrations at startup; fa
 [worker]
 enabled = {} # true runs the in-process verification worker; false leaves submitted tasks pending unless another worker process handles them.
 poll_interval_ms = {} # Worker polling interval in milliseconds. Must be > 0; lower is more responsive but creates more DB traffic.
+paykit_payment_retry_interval_seconds = {} # Seconds before retrying pending paykit-payment verification. Must be > 0; lower reduces status-to-entitlement latency but increases Paykit and DB traffic.
 claim_timeout_seconds = {} # Seconds before another worker can reclaim a stuck task. Too low risks duplicate work; too high delays recovery.
 worker_id = "{}" # Stable ID recorded in task claims/logs. Use a unique value per worker process in shared deployments.
 
@@ -252,6 +254,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.database.run_migrations_on_startup,
         config.worker.enabled,
         config.worker.poll_interval_ms,
+        config.worker.paykit_payment_retry_interval_seconds,
         config.worker.claim_timeout_seconds,
         config.worker.worker_id,
         config
@@ -359,6 +362,7 @@ mod tests {
         assert!(config_text.contains("[paykit]"));
         assert!(config_text.contains("server_url = \"http://127.0.0.1:3001\""));
         assert!(config_text.contains("minimum_confirmations = 0"));
+        assert!(config_text.contains("paykit_payment_retry_interval_seconds = 3"));
     }
 
     #[test]

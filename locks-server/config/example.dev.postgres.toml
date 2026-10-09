@@ -13,6 +13,7 @@ run_migrations_on_startup = true
 [worker]
 enabled = true
 poll_interval_ms = 250
+paykit_payment_retry_interval_seconds = 3
 claim_timeout_seconds = 60
 worker_id = "default-worker"
 

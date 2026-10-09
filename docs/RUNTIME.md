@@ -280,9 +280,10 @@ This mounts authenticated Pubky-backed creator publishing routes and grant-only 
 [worker]
 enabled = true
 poll_interval_ms = 250
+paykit_payment_retry_interval_seconds = 3
 ```
 
-`worker.poll_interval_ms` must be greater than zero whether the in-process worker is enabled or disabled. When enabled, the worker claims due pending verification tasks through private runtime storage and completes them through application use cases. Newly submitted tasks are immediately due. A retryable verification result returns the task to durable `pending` state with `next_attempt_at` 30 seconds in the future; it is not claimable again before that timestamp. Queue polling remains independently controlled by `worker.poll_interval_ms`. Retry scheduling preserves the current attempt count and releases the active claim.
+`worker.poll_interval_ms` and `worker.paykit_payment_retry_interval_seconds` must be greater than zero whether the in-process worker is enabled or disabled. When enabled, the worker claims due pending verification tasks through private runtime storage and completes them through application use cases. Newly submitted tasks are immediately due. A retryable `paykit-payment` result returns the task to durable `pending` state with `next_attempt_at` set to the configured Paykit retry interval (3 seconds by default); other verifier types retain the 30-second retry interval. A task is not claimable again before `next_attempt_at`. Queue polling remains independently controlled by `worker.poll_interval_ms`, so retry eligibility does not guarantee completion at exactly 3 seconds. Lower Paykit retry intervals can reduce status-to-entitlement latency but increase Paykit requests and database traffic. Retry scheduling preserves the current attempt count and releases the active claim.
 
 `dev-static` verification is registered only in `environment = "development"`. `paykit-payment` verification is registered when `[paykit]` is configured, regardless of environment. Staging/production completion uses the worker path, not the dev-only `POST /verification-task-completions` route.
 

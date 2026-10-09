@@ -184,6 +184,7 @@ pub struct DatabaseConfig {
 pub struct WorkerConfig {
     pub enabled: bool,
     pub poll_interval_ms: u64,
+    pub paykit_payment_retry_interval_seconds: std::num::NonZeroU64,
     pub claim_timeout_seconds: u64,
     pub worker_id: String,
 }
@@ -335,6 +336,8 @@ pub enum ConfigError {
     InvalidDatabaseMaxConnections,
     #[error("worker.poll_interval_ms must be greater than zero")]
     InvalidWorkerPollInterval,
+    #[error("worker.paykit_payment_retry_interval_seconds must be greater than zero")]
+    InvalidPaykitPaymentRetryInterval,
     #[error("rate_limits.trusted_proxy_hops must not exceed {max}")]
     InvalidTrustedProxyHops { max: usize },
     #[error(
