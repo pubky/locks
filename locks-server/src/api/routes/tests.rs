@@ -3937,6 +3937,7 @@ fn test_config(
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,
+            paykit_payment_retry_interval_seconds: std::num::NonZeroU64::new(3).unwrap(),
             claim_timeout_seconds: 60,
             worker_id: "test-worker".to_owned(),
         },

@@ -85,6 +85,44 @@ max_total_resource_bytes = 100000000
     assert_eq!(config.runtime.environment, RuntimeEnvironment::Development);
     assert_eq!(config.pubky.network, PubkyNetwork::Testnet);
     assert!(config.creator_authority_acquisition.enabled);
+    assert_eq!(config.worker.paykit_payment_retry_interval_seconds.get(), 3);
+}
+
+#[test]
+fn parses_custom_paykit_payment_retry_interval() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "poll_interval_ms = 250",
+        "poll_interval_ms = 250\npaykit_payment_retry_interval_seconds = 7",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(config.worker.paykit_payment_retry_interval_seconds.get(), 7);
+}
+
+#[test]
+fn rejects_zero_paykit_payment_retry_interval() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "poll_interval_ms = 250",
+        "poll_interval_ms = 250\npaykit_payment_retry_interval_seconds = 0",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidPaykitPaymentRetryInterval
+    ));
 }
 
 #[test]
