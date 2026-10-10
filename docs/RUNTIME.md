@@ -310,3 +310,11 @@ Scheduled retries and crash recovery are separate mechanisms. Expected retryable
 ```
 
 Health/readiness responses must remain secret-free. They must not include database URLs, secret paths, worker IDs, task counts, public keys, credentials, raw errors, or submitted proof material.
+
+`GET /version` reports the running release and build (see `docs/API.md`):
+
+```json
+{ "name": "Locks Server", "version": "0.1.0-rc10", "commit": "<git sha>", "built_at": "<RFC 3339>" }
+```
+
+It follows the same secret-free rule. The git commit is public build metadata, not a secret. Deploys that build the Docker image must pass `LOCKS_GIT_SHA` (and optionally `LOCKS_BUILT_AT`) as build args, or both fields report `unknown`.

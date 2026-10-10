@@ -15,7 +15,7 @@ use crate::api::creator_publishing::{
     set_lock_service_pointer_for_authenticated_creator,
 };
 use crate::api::paykit::paykit_setup_status_for_authenticated_creator;
-use crate::api::runtime::{healthz, readyz, well_known_locks_server};
+use crate::api::runtime::{healthz, readyz, version, well_known_locks_server};
 use crate::api::verification::{
     complete_verification_task, lookup_paykit_connection_state, lookup_verification_task,
     submit_proof_bundle,
@@ -27,6 +27,7 @@ pub fn router(state: AppState) -> Router {
     let expose_hosted_creator_connect_routes = state.config().creator_authority_acquisition.enabled;
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version))
         .route("/readyz", get(readyz))
         .route("/.well-known/locks-server", get(well_known_locks_server))
         .route("/proof-bundles", post(submit_proof_bundle))

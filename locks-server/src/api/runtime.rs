@@ -4,12 +4,22 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::api::dtos::{
-    HealthHttpResponse, ReadinessHttpResponse, WellKnownLocksServerHttpResponse,
+    HealthHttpResponse, ReadinessHttpResponse, VersionHttpResponse,
+    WellKnownLocksServerHttpResponse,
 };
 use crate::app_state::{AppState, RuntimeStorageKind};
 
 pub(super) async fn healthz() -> Json<HealthHttpResponse> {
     Json(HealthHttpResponse { status: "ok" })
+}
+
+pub(super) async fn version() -> Json<VersionHttpResponse> {
+    Json(VersionHttpResponse {
+        name: "Locks Server",
+        version: env!("CARGO_PKG_VERSION"),
+        commit: env!("LOCKS_GIT_SHA"),
+        built_at: env!("LOCKS_BUILT_AT"),
+    })
 }
 
 pub(super) async fn readyz(State(state): State<AppState>) -> Response {
