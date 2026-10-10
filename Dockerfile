@@ -36,6 +36,11 @@ COPY locks-e2e/Cargo.toml locks-e2e/Cargo.toml
 # Copy source after manifests.
 COPY . .
 
+# Build metadata reported by GET /version. `.git` is excluded from the build
+# context, so pass these as build args (for example LOCKS_GIT_SHA=$(git rev-parse HEAD)).
+ARG LOCKS_GIT_SHA=unknown
+ARG LOCKS_BUILT_AT=unknown
+
 # Build only the lock-server binary.
 RUN cargo build --release -p locks-server --bin locks-server
 

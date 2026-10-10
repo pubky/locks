@@ -57,6 +57,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `POST /frontend-sessions` | `200` JSON frontend session token handoff | No bearer auth. Requires one-time `code` plus matching `state`. | Response intentionally contains raw `session_token` exactly once; no creator authority secret, authorization URL, or one-time code reuse. | `400 invalid_request`, `400 frontend_session_state_mismatch`, `404 frontend_session_code_unavailable`, `410 frontend_session_code_expired`, `410 frontend_session_code_already_consumed`, `404` when route gated off |
 | `DELETE /frontend-sessions/current` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. Mounted with creator authority acquisition. | Token is request-only and is deleted from the frontend session store. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` when route gated off |
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
+| `GET /version` | `200` JSON running release and build | Public. Always mounted. CORS-enabled. | No secrets. Reports the crate version, git commit and build time baked in at build time. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
 | `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` submissions durably persist one pending invoice-admission task before any Reader/Paykit I/O; exact persisted replay returns same lifecycle. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `429 rate_limited` |
@@ -133,6 +134,27 @@ The SDK should verify all three fields:
 - `service == "pubky-locks-server"`
 - `api_version == "0.1"` for milestone 1
 - `lock_server` matches the explicit Lock Server Pubky resolved through PKARR
+
+The endpoint is public, always mounted, CORS-enabled, and must not return secrets or runtime storage details.
+
+### `GET /version`
+
+Returns the release and build the running Lock Server was compiled from, for monitoring, deploy checks and test harnesses.
+
+```json
+{
+  "name": "Locks Server",
+  "version": "0.1.0-rc10",
+  "commit": "<40-character git sha>",
+  "built_at": "2026-10-10T12:00:00Z"
+}
+```
+
+- `version` is the `locks-server` crate version.
+- `commit` comes from `LOCKS_GIT_SHA` at build time, else `git rev-parse HEAD`, else `unknown`.
+- `built_at` comes from `LOCKS_BUILT_AT` at build time (RFC 3339 by convention), else `unknown`.
+
+Docker builds have no `.git` in their context, so pass `--build-arg LOCKS_GIT_SHA=$(git rev-parse HEAD)` and optionally `--build-arg LOCKS_BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)`; without them both fields report `unknown`.
 
 The endpoint is public, always mounted, CORS-enabled, and must not return secrets or runtime storage details.
 

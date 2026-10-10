@@ -151,6 +151,22 @@ async fn healthz_returns_process_liveness_without_runtime_details() {
 }
 
 #[tokio::test]
+async fn version_returns_release_version_and_build_metadata() {
+    let response = router(test_state())
+        .oneshot(empty_request("GET", "/version"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body.as_object().unwrap().len(), 4);
+    assert_eq!(body["name"], "Locks Server");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(!body["commit"].as_str().unwrap().is_empty());
+    assert!(!body["built_at"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn well_known_locks_server_returns_service_version_and_lock_server_identity() {
     let response = router(test_state())
         .oneshot(empty_request("GET", "/.well-known/locks-server"))

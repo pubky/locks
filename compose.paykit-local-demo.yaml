@@ -215,6 +215,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        LOCKS_GIT_SHA: ${LOCKS_GIT_SHA:-unknown}
+        LOCKS_BUILT_AT: ${LOCKS_BUILT_AT:-unknown}
 
     depends_on:
       postgres:

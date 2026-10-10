@@ -27,6 +27,14 @@ pub struct HealthHttpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VersionHttpResponse {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub commit: &'static str,
+    pub built_at: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadinessHttpResponse {
     pub status: &'static str,
     pub runtime_storage: &'static str,
