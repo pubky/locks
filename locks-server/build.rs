@@ -4,12 +4,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LOCKS_GIT_SHA");
     println!("cargo:rerun-if-env-changed=LOCKS_BUILT_AT");
     // The reflog moves on every commit and checkout, so local builds pick up a new HEAD.
-    if std::path::Path::new("../.git/logs/HEAD").exists() {
-        println!("cargo:rerun-if-changed=../.git/logs/HEAD");
+    // Ask git for its path, since a linked worktree keeps it outside `../.git`.
+    if let Some(reflog) = git(&["rev-parse", "--git-path", "logs/HEAD"])
+        && std::path::Path::new(&reflog).exists()
+    {
+        println!("cargo:rerun-if-changed={reflog}");
     }
 
     let commit = env_value("LOCKS_GIT_SHA")
-        .or_else(git_head)
+        .or_else(|| git(&["rev-parse", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_owned());
     let built_at = env_value("LOCKS_BUILT_AT").unwrap_or_else(|| "unknown".to_owned());
 
@@ -24,14 +27,11 @@ fn env_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn git_head() -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let sha = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!sha.is_empty()).then_some(sha)
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
