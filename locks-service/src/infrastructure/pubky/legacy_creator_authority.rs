@@ -12,6 +12,8 @@ use crate::application::ports::{
 use crate::infrastructure::pubky::grant_connect_flow::{
     LockServerGrantPopKeys, restore_grant_session_for_creator,
 };
+use crate::infrastructure::pubky::grant_session_cache::GrantSessionCache;
+use crate::infrastructure::pubky::storage_client::PubkySessionImporter;
 
 /// Revalidates a stored legacy Pubky cookie-session secret.
 #[async_trait]
@@ -105,6 +107,26 @@ impl GrantCredentialRevalidator for PubkyGrantCredentialRevalidator {
         )
         .await
         .map(|_| ())
+    }
+}
+
+#[async_trait]
+impl<S, I> GrantCredentialRevalidator for std::sync::Arc<GrantSessionCache<S, I>>
+where
+    S: CreatorAuthorityStore,
+    I: PubkySessionImporter,
+    I::Session: Clone,
+{
+    async fn revalidate_grant_credential(
+        &self,
+        creator: &CreatorPubky,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError> {
+        let cached = self.session_for_creator(creator).await?;
+        if cached.record.secret.expose_secret() != secret.expose_secret() {
+            return Err(ApplicationError::CreatorAuthorityUnavailable);
+        }
+        Ok(())
     }
 }
 

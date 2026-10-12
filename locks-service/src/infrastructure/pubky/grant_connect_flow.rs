@@ -310,12 +310,11 @@ pub async fn restore_grant_session(
     required_scopes: &[String],
     secret: &CreatorAuthoritySecret,
 ) -> Result<PubkySession, ApplicationError> {
-    let state =
-        decode_grant_state(secret).map_err(|_| ApplicationError::CreatorAuthorityUnavailable)?;
+    let state = decode_grant_state(secret).map_err(|_| grant_validation_failure("stored_state"))?;
     let key_id = GrantPopKeyId::new(state.key_id.clone());
     let expected_client_pk = pop_keys.public_key(&key_id);
-    let claims = GrantClaims::decode(&state.grant_jws)
-        .map_err(|_| ApplicationError::CreatorAuthorityUnavailable)?;
+    let claims =
+        GrantClaims::decode(&state.grant_jws).map_err(|_| grant_validation_failure("grant_jws"))?;
     let required =
         requested_scopes_to_capabilities(required_scopes).map_err(|_| grant_restore_error())?;
     if state.client_pk != expected_client_pk
@@ -327,7 +326,7 @@ pub async fn restore_grant_session(
             .and_then(|exp| OffsetDateTime::from_unix_timestamp(exp).ok())
             .is_none_or(|expires_at| expires_at <= OffsetDateTime::now_utc())
     {
-        return Err(ApplicationError::CreatorAuthorityUnavailable);
+        return Err(grant_validation_failure("policy_or_expiry"));
     }
     let credential =
         GrantCredential::import_delegated_state(state, client, pop_keys.signer(&key_id))
@@ -376,13 +375,36 @@ fn grant_restore_error() -> ApplicationError {
     grant_error("failed to restore grant creator authority")
 }
 
+fn grant_validation_failure(error_class: &'static str) -> ApplicationError {
+    tracing::warn!(
+        stage = "grant_validate",
+        error_class,
+        "creator grant session restore failed"
+    );
+    ApplicationError::CreatorAuthorityUnavailable
+}
+
 fn map_grant_restore_sdk_error(error: pubky::Error) -> ApplicationError {
-    match error {
-        pubky::Error::Authentication(_) => ApplicationError::CreatorAuthorityUnavailable,
+    let (error_class, status) = match &error {
+        pubky::Error::Authentication(_) => ("authentication", None),
         pubky::Error::Request(pubky::errors::RequestError::Server {
-            status: pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN,
+            status: status @ (pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN),
             ..
-        }) => ApplicationError::CreatorAuthorityUnavailable,
+        }) => ("unauthorized", Some(status.as_u16())),
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. }) => {
+            ("server", Some(status.as_u16()))
+        }
+        pubky::Error::Request(_) => ("request", None),
+        _ => ("sdk", None),
+    };
+    tracing::warn!(
+        stage = "grant_exchange",
+        error_class,
+        status,
+        "creator grant session exchange failed"
+    );
+    match error_class {
+        "authentication" | "unauthorized" => ApplicationError::CreatorAuthorityUnavailable,
         _ => grant_restore_error(),
     }
 }

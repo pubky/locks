@@ -11,6 +11,7 @@ use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStore};
 use crate::infrastructure::pubky::grant_connect_flow::{
     LockServerGrantPopKeys, restore_grant_session,
 };
+use crate::infrastructure::pubky::grant_session_cache::GrantSessionCache;
 use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
 
 /// Bytes fetched from a creator-owned Pubky homeserver resource.
@@ -192,6 +193,8 @@ pub trait CreatorScopedPubkyStorageProvider: Send + Sync {
         &self,
         creator: &CreatorPubky,
     ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>;
+
+    async fn invalidate_creator_session(&self, _creator: &CreatorPubky) {}
 }
 
 /// Minimal imported Pubky session surface needed by the storage provider.
@@ -284,6 +287,54 @@ where
         }
 
         Ok(Box::new(session.into_storage()))
+    }
+}
+
+#[derive(Clone)]
+pub struct GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    cache: std::sync::Arc<GrantSessionCache<S, I>>,
+}
+
+impl<S, I> std::fmt::Debug for GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrantCreatorScopedPubkyStorageProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, I> GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    pub fn new(cache: std::sync::Arc<GrantSessionCache<S, I>>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl<S, I> CreatorScopedPubkyStorageProvider for GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    S: CreatorAuthorityStore,
+    I: PubkySessionImporter,
+    I::Session: Clone,
+{
+    async fn storage_for_creator(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+        let cached = self.cache.session_for_creator(creator).await?;
+        Ok(Box::new(cached.session.into_storage()))
+    }
+
+    async fn invalidate_creator_session(&self, creator: &CreatorPubky) {
+        self.cache.invalidate(creator).await;
     }
 }
 
@@ -519,6 +570,22 @@ impl<P> ProviderBackedPubkyHomeserverStorageClient<P> {
     }
 }
 
+impl<P> ProviderBackedPubkyHomeserverStorageClient<P>
+where
+    P: CreatorScopedPubkyStorageProvider,
+{
+    async fn finish_operation<T>(
+        &self,
+        creator: &CreatorPubky,
+        result: Result<T, ApplicationError>,
+    ) -> Result<T, ApplicationError> {
+        if matches!(result, Err(ApplicationError::CreatorAuthorityUnavailable)) {
+            self.provider.invalidate_creator_session(creator).await;
+        }
+        result
+    }
+}
+
 #[async_trait]
 impl<P> PubkyHomeserverStorageClient for ProviderBackedPubkyHomeserverStorageClient<P>
 where
@@ -530,11 +597,13 @@ where
         path: &str,
         body: serde_json::Value,
     ) -> Result<(), ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .put_json_value(path, body)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 
     async fn get_json_value_as_creator(
@@ -542,11 +611,13 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<serde_json::Value>, ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .get_json_value(path)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 
     async fn put_bytes_as_creator(
@@ -556,11 +627,13 @@ where
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<(), ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .put_bytes(path, bytes, content_type)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 
     async fn get_bytes_as_creator(
@@ -568,11 +641,13 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .get_bytes(path)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 
     async fn get_metadata_as_creator(
@@ -580,11 +655,13 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .get_metadata(path)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 
     async fn delete_as_creator(
@@ -592,11 +669,13 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<(), ApplicationError> {
-        self.provider
+        let result = self
+            .provider
             .storage_for_creator(creator)
             .await?
             .delete(path)
-            .await
+            .await;
+        self.finish_operation(creator, result).await
     }
 }
 
@@ -704,12 +783,38 @@ fn decode_pubky_etag(etag: &str) -> Option<[u8; 32]> {
 pub fn pubky_storage_error(
     operation: &'static str,
     path: &str,
-    error: impl std::fmt::Display,
+    error: impl std::fmt::Display + 'static,
 ) -> ApplicationError {
+    let error = &error as &dyn std::any::Any;
+    let unauthorized = error.downcast_ref::<pubky::Error>().is_some_and(|error| {
+        matches!(
+            error,
+            pubky::Error::Authentication(_)
+                | pubky::Error::Request(pubky::errors::RequestError::Server {
+                    status: pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN,
+                    ..
+                })
+        )
+    });
+    if unauthorized {
+        tracing::warn!(
+            stage = "storage_read",
+            operation,
+            error_class = "unauthorized",
+            "creator Pubky storage operation failed"
+        );
+        return ApplicationError::CreatorAuthorityUnavailable;
+    }
+    tracing::warn!(
+        stage = "storage_read",
+        operation,
+        error_class = "dependency",
+        "creator Pubky storage operation failed"
+    );
     let message = if is_private_locks_path(path) {
         format!("Pubky homeserver {operation} failed for private Locks path")
     } else {
-        format!("Pubky homeserver {operation} failed for {path}: {error}")
+        format!("Pubky homeserver {operation} failed")
     };
     ApplicationError::Storage { message }
 }
@@ -792,6 +897,21 @@ mod tests {
         assert!(!debug.contains("network timeout"));
     }
 
+    #[test]
+    fn pubky_storage_unauthorized_is_authority_unavailable_without_upstream_body() {
+        let error = pubky_storage_error(
+            "get",
+            "/priv/app.locks/content/secret.txt",
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status: pubky::StatusCode::UNAUTHORIZED,
+                message: "raw secret-bearing upstream body".to_owned(),
+            }),
+        );
+
+        assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+        assert!(!format!("{error:?}").contains("raw secret-bearing upstream body"));
+    }
+
     #[tokio::test]
     async fn provider_backed_client_asks_provider_for_creator_scoped_storage_before_each_operation()
     {
@@ -853,6 +973,21 @@ mod tests {
         assert_eq!(result, Err(ApplicationError::CreatorAuthorityUnavailable));
         assert_eq!(provider.seen_creators(), vec![creator()]);
         assert_eq!(provider.storage_operations(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn revoked_cached_session_is_invalidated_without_retrying_storage() {
+        let provider = RevokedSessionProvider::default();
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        assert_eq!(
+            client
+                .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(*provider.operations.lock().unwrap(), 1);
+        assert_eq!(*provider.invalidations.lock().unwrap(), vec![creator()]);
     }
 
     #[tokio::test]
@@ -1108,6 +1243,66 @@ mod tests {
                 .unwrap()
                 .push(format!("delete {creator} {path}"));
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RevokedSessionProvider {
+        operations: Arc<Mutex<usize>>,
+        invalidations: Arc<Mutex<Vec<CreatorPubky>>>,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for RevokedSessionProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+            Ok(Box::new(RevokedStorage {
+                operations: Arc::clone(&self.operations),
+            }))
+        }
+
+        async fn invalidate_creator_session(&self, creator: &CreatorPubky) {
+            self.invalidations.lock().unwrap().push(creator.clone());
+        }
+    }
+
+    #[derive(Debug)]
+    struct RevokedStorage {
+        operations: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for RevokedStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_json_value(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            *self.operations.lock().unwrap() += 1;
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            Err(ApplicationError::CreatorAuthorityUnavailable)
         }
     }
 
