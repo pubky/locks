@@ -502,7 +502,7 @@ for (const required of [
   'ARG PUBKY_HOMESERVER_REF=v0.11.0',
   'git clone --branch "${PUBKY_HOMESERVER_REF}" --depth 1',
   'https://github.com/pubky/pubky-homeserver.git',
-  'cargo update -p quinn-proto --precise 0.11.15',
+  'cargo update -p quinn-proto --precise 0.11.18',
 ]) {
   assert.ok(pubkyTestnetDockerfile.includes(required), `Pubky testnet image missing ${required}`);
 }

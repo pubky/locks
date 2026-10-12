@@ -39,10 +39,10 @@ use locks_service::{
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
-            LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys, PubkyBytesResource,
-            PubkyContentLockRepository, PubkyEntitlementRepository,
-            PubkyGrantCreatorConnectFlowClient, PubkyGrantCredentialRevalidator,
-            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionRevalidator,
+            GrantSessionCache, LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys,
+            PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
+            PubkyGrantCreatorConnectFlowClient, PubkyHomeserverStorageClient,
+            PubkyLegacyCookieSessionImporter, PubkyLegacyCookieSessionRevalidator,
             PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
             PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
@@ -159,18 +159,18 @@ impl PubkyHomeserverStorageClient for UnavailablePubkyHomeserverStorageClient {
     }
 }
 
-type CreatorAuthRuntime = (
+type CreatorAuthRuntime<S> = (
     Arc<dyn CreatorAuthorityManager>,
     Arc<dyn LegacyCreatorConnectFlowClient>,
     Option<Arc<dyn GrantCreatorConnectFlowClient>>,
-    Option<LockServerGrantPopKeys>,
+    Option<Arc<GrantSessionCache<S, PubkyLegacyCookieSessionImporter>>>,
 );
 
 fn creator_auth_runtime<S>(
     config: &LockServerRuntimeConfig,
     store: S,
     http: &pubky::PubkyHttpClient,
-) -> CreatorAuthRuntime
+) -> CreatorAuthRuntime<S>
 where
     S: CreatorAuthorityStore + Clone + 'static,
 {
@@ -205,14 +205,15 @@ where
             let keys = LockServerGrantPopKeys::from_lock_server_seed(keypair.secret());
             let client_id =
                 pubky::ClientId::new(&grant.client_id).expect("validated grant-connect client_id");
+            let importer = PubkyLegacyCookieSessionImporter::new(http.clone()).with_grant_policy(
+                keys.clone(),
+                client_id.clone(),
+                default_requested_scopes(),
+            );
+            let session_cache = Arc::new(GrantSessionCache::new(store.clone(), importer, 256));
             let manager = Arc::new(GrantCreatorAuthorityManager::new(
                 store,
-                PubkyGrantCredentialRevalidator::new(
-                    http.clone(),
-                    keys.clone(),
-                    client_id.clone(),
-                    default_requested_scopes(),
-                ),
+                Arc::clone(&session_cache),
             ));
             let grant_client = config.creator_authority_acquisition.enabled.then(|| {
                 Arc::new(PubkyGrantCreatorConnectFlowClient::new(
@@ -226,7 +227,7 @@ where
                 manager,
                 Arc::new(DisabledLegacyCreatorConnectFlowClient),
                 grant_client,
-                Some(keys),
+                Some(session_cache),
             )
         }
     }
@@ -485,21 +486,12 @@ impl AppState {
             creator_authority_manager,
             legacy_creator_connect_flow_client,
             grant_creator_connect_flow_client,
-            grant_pop_keys,
+            grant_session_cache,
         ) = creator_auth_runtime(&config, creator_authority_store.clone(), &pubky_http_client);
-        let grant_client_id = config
-            .creator_authority_acquisition
-            .grant_connect
-            .as_ref()
-            .map(|grant| {
-                pubky::ClientId::new(&grant.client_id).expect("validated grant-connect client_id")
-            });
         let creator_repositories = CreatorRepositoryAdapters::pubky_homeserver(
             creator_authority_store,
             pubky_http_client,
-            grant_pop_keys,
-            grant_client_id,
-            default_requested_scopes(),
+            grant_session_cache,
         );
 
         let private_runtime = PrivateRuntimeAdapters {
@@ -546,7 +538,7 @@ impl AppState {
             creator_authority_manager,
             legacy_creator_connect_flow_client,
             grant_creator_connect_flow_client,
-            _grant_pop_keys,
+            _grant_session_cache,
         ) = creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
         let creator_repositories = CreatorRepositoryAdapters::new(
             content_locks,

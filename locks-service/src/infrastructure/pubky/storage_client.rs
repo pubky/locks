@@ -11,6 +11,7 @@ use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStore};
 use crate::infrastructure::pubky::grant_connect_flow::{
     LockServerGrantPopKeys, restore_grant_session,
 };
+use crate::infrastructure::pubky::grant_session_cache::GrantSessionCache;
 use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
 
 /// Bytes fetched from a creator-owned Pubky homeserver resource.
@@ -185,13 +186,37 @@ pub trait CreatorScopedPubkyStorage: Send + Sync {
     async fn delete(&self, path: &str) -> Result<(), ApplicationError>;
 }
 
+/// Creator-scoped storage plus cache generation used to acquire it.
+pub struct AcquiredCreatorScopedPubkyStorage {
+    storage: Box<dyn CreatorScopedPubkyStorage>,
+    generation: Option<u64>,
+}
+
+impl AcquiredCreatorScopedPubkyStorage {
+    pub fn uncached(storage: Box<dyn CreatorScopedPubkyStorage>) -> Self {
+        Self {
+            storage,
+            generation: None,
+        }
+    }
+
+    pub fn cached(storage: Box<dyn CreatorScopedPubkyStorage>, generation: u64) -> Self {
+        Self {
+            storage,
+            generation: Some(generation),
+        }
+    }
+}
+
 /// Provides storage scoped to the requested creator's restorable Pubky session.
 #[async_trait]
 pub trait CreatorScopedPubkyStorageProvider: Send + Sync {
     async fn storage_for_creator(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>;
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>;
+
+    async fn invalidate_creator_session(&self, _creator: &CreatorPubky, _generation: u64) {}
 }
 
 /// Minimal imported Pubky session surface needed by the storage provider.
@@ -200,6 +225,7 @@ pub trait ImportedPubkySession: Send + Sync {
 
     fn public_key_z32(&self) -> String;
     fn into_storage(self) -> Self::Storage;
+    fn into_grant_storage(self) -> Self::Storage;
 }
 
 /// Imports restorable creator authority secrets into Pubky sessions.
@@ -257,7 +283,7 @@ where
     async fn storage_for_creator(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
         let record = self
             .store
             .get_creator_authority(creator)
@@ -268,22 +294,82 @@ where
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
 
-        let session = match record.auth_kind {
-            CreatorAuthorityAuthKind::LegacyCookie => {
+        let (session, grant_backed) = match record.auth_kind {
+            CreatorAuthorityAuthKind::LegacyCookie => (
                 self.importer
                     .import_legacy_cookie_session(&record.secret)
-                    .await?
-            }
-            CreatorAuthorityAuthKind::Grant => {
-                self.importer.import_grant_session(&record.secret).await?
-            }
+                    .await?,
+                false,
+            ),
+            CreatorAuthorityAuthKind::Grant => (
+                self.importer.import_grant_session(&record.secret).await?,
+                true,
+            ),
         };
         let restored_creator = creator_from_pubky_public_key_z32(&session.public_key_z32())?;
         if &restored_creator != creator {
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
 
-        Ok(Box::new(session.into_storage()))
+        let storage = if grant_backed {
+            session.into_grant_storage()
+        } else {
+            session.into_storage()
+        };
+        Ok(AcquiredCreatorScopedPubkyStorage::uncached(Box::new(
+            storage,
+        )))
+    }
+}
+
+#[derive(Clone)]
+pub struct GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    cache: std::sync::Arc<GrantSessionCache<S, I>>,
+}
+
+impl<S, I> std::fmt::Debug for GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrantCreatorScopedPubkyStorageProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, I> GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    I: PubkySessionImporter,
+{
+    pub fn new(cache: std::sync::Arc<GrantSessionCache<S, I>>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl<S, I> CreatorScopedPubkyStorageProvider for GrantCreatorScopedPubkyStorageProvider<S, I>
+where
+    S: CreatorAuthorityStore,
+    I: PubkySessionImporter,
+    I::Session: Clone,
+{
+    async fn storage_for_creator(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+        let cached = self.cache.session_for_creator(creator).await?;
+        Ok(AcquiredCreatorScopedPubkyStorage::cached(
+            Box::new(cached.session.into_grant_storage()),
+            cached.generation,
+        ))
+    }
+
+    async fn invalidate_creator_session(&self, creator: &CreatorPubky, generation: u64) {
+        self.cache.invalidate_generation(creator, generation).await;
     }
 }
 
@@ -385,17 +471,45 @@ impl ImportedPubkySession for PubkyImportedSession {
     fn into_storage(self) -> Self::Storage {
         SdkCreatorScopedPubkyStorage::new(self.0.storage())
     }
+
+    fn into_grant_storage(self) -> Self::Storage {
+        SdkCreatorScopedPubkyStorage::new_grant(self.0.storage())
+    }
 }
 
 /// Creator-scoped storage wrapper around the Pubky SDK session storage API.
 #[derive(Debug, Clone)]
 pub struct SdkCreatorScopedPubkyStorage {
     storage: pubky::SessionStorage,
+    grant_backed: bool,
 }
 
 impl SdkCreatorScopedPubkyStorage {
     pub fn new(storage: pubky::SessionStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            grant_backed: false,
+        }
+    }
+
+    fn new_grant(storage: pubky::SessionStorage) -> Self {
+        Self {
+            storage,
+            grant_backed: true,
+        }
+    }
+
+    fn map_error(
+        &self,
+        operation: &'static str,
+        path: &str,
+        error: pubky::Error,
+    ) -> ApplicationError {
+        if self.grant_backed {
+            pubky_storage_error_for_grant(operation, path, error)
+        } else {
+            pubky_storage_error(operation, path, error)
+        }
     }
 }
 
@@ -410,7 +524,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .put_json(path, &body)
             .await
             .map(|_| ())
-            .map_err(|error| pubky_storage_error("put", path, error))
+            .map_err(|error| self.map_error("put", path, error))
     }
 
     async fn get_json_value(
@@ -421,7 +535,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .storage
             .exists(path)
             .await
-            .map_err(|error| pubky_storage_error("head", path, error))?
+            .map_err(|error| self.map_error("head", path, error))?
         {
             return Ok(None);
         }
@@ -430,7 +544,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .get_json(path)
             .await
             .map(Some)
-            .map_err(|error| pubky_storage_error("get", path, error))
+            .map_err(|error| self.map_error("get", path, error))
     }
 
     async fn put_bytes(
@@ -443,7 +557,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .put(path, bytes)
             .await
             .map(|_| ())
-            .map_err(|error| pubky_storage_error("put", path, error))
+            .map_err(|error| self.map_error("put", path, error))
     }
 
     async fn get_bytes(&self, path: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
@@ -451,7 +565,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .storage
             .exists(path)
             .await
-            .map_err(|error| pubky_storage_error("head", path, error))?
+            .map_err(|error| self.map_error("head", path, error))?
         {
             return Ok(None);
         }
@@ -460,7 +574,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .storage
             .get(path)
             .await
-            .map_err(|error| pubky_storage_error("get", path, error))?;
+            .map_err(|error| self.map_error("get", path, error))?;
         let content_type = response
             .headers()
             .get("content-type")
@@ -469,7 +583,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
         let bytes = response
             .bytes()
             .await
-            .map_err(|error| pubky_storage_error("get", path, error))?
+            .map_err(|error| self.map_error("get", path, error.into()))?
             .to_vec();
         Ok(Some(PubkyBytesResource {
             bytes,
@@ -491,7 +605,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
                     content_hash: stats.etag.as_deref().and_then(decode_pubky_etag),
                 })
             })
-            .map_err(|error| pubky_storage_error("head", path, error))
+            .map_err(|error| self.map_error("head", path, error))
     }
 
     async fn delete(&self, path: &str) -> Result<(), ApplicationError> {
@@ -499,7 +613,7 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .delete(path)
             .await
             .map(|_| ())
-            .map_err(|error| pubky_storage_error("delete", path, error))
+            .map_err(|error| self.map_error("delete", path, error))
     }
 }
 
@@ -519,6 +633,27 @@ impl<P> ProviderBackedPubkyHomeserverStorageClient<P> {
     }
 }
 
+impl<P> ProviderBackedPubkyHomeserverStorageClient<P>
+where
+    P: CreatorScopedPubkyStorageProvider,
+{
+    async fn finish_operation<T>(
+        &self,
+        creator: &CreatorPubky,
+        generation: Option<u64>,
+        result: Result<T, ApplicationError>,
+    ) -> Result<T, ApplicationError> {
+        if matches!(result, Err(ApplicationError::CreatorAuthorityUnavailable))
+            && let Some(generation) = generation
+        {
+            self.provider
+                .invalidate_creator_session(creator, generation)
+                .await;
+        }
+        result
+    }
+}
+
 #[async_trait]
 impl<P> PubkyHomeserverStorageClient for ProviderBackedPubkyHomeserverStorageClient<P>
 where
@@ -530,10 +665,9 @@ where
         path: &str,
         body: serde_json::Value,
     ) -> Result<(), ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .put_json_value(path, body)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.put_json_value(path, body).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 
@@ -542,10 +676,9 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<serde_json::Value>, ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .get_json_value(path)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_json_value(path).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 
@@ -556,10 +689,9 @@ where
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<(), ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .put_bytes(path, bytes, content_type)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.put_bytes(path, bytes, content_type).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 
@@ -568,10 +700,9 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .get_bytes(path)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_bytes(path).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 
@@ -580,10 +711,9 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .get_metadata(path)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_metadata(path).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 
@@ -592,10 +722,9 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<(), ApplicationError> {
-        self.provider
-            .storage_for_creator(creator)
-            .await?
-            .delete(path)
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.delete(path).await;
+        self.finish_operation(creator, acquired.generation, result)
             .await
     }
 }
@@ -704,12 +833,91 @@ fn decode_pubky_etag(etag: &str) -> Option<[u8; 32]> {
 pub fn pubky_storage_error(
     operation: &'static str,
     path: &str,
-    error: impl std::fmt::Display,
+    error: impl std::fmt::Display + 'static,
 ) -> ApplicationError {
+    map_pubky_storage_error(operation, path, error, false)
+}
+
+fn pubky_storage_error_for_grant(
+    operation: &'static str,
+    path: &str,
+    error: impl std::fmt::Display + 'static,
+) -> ApplicationError {
+    map_pubky_storage_error(operation, path, error, true)
+}
+
+fn map_pubky_storage_error(
+    operation: &'static str,
+    path: &str,
+    error: impl std::fmt::Display + 'static,
+    grant_backed: bool,
+) -> ApplicationError {
+    let error = &error as &dyn std::any::Any;
+    let pubky_error = error.downcast_ref::<pubky::Error>();
+    let unauthorized = pubky_error.is_some_and(|error| {
+        matches!(error, pubky::Error::Authentication(_))
+            || matches!(
+                error,
+                pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+                    if matches!(
+                        *status,
+                        pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN
+                    )
+            )
+    });
+    if unauthorized {
+        tracing::warn!(
+            stage = "storage_operation",
+            operation,
+            error_class = "unauthorized",
+            "creator Pubky storage operation failed"
+        );
+        return ApplicationError::CreatorAuthorityUnavailable;
+    }
+    let transient_dependency = pubky_error.is_some_and(|error| {
+        matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::Transport(error))
+                if error.is_timeout()
+                    || error.is_connect()
+                    || error.is_request()
+                    || error.is_body()
+        ) || matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+                if status.is_server_error()
+        )
+    });
+    // Pinned Pubky SDK maps grant-refresh response-body failures, including
+    // timeouts after successful headers, to this operation-specific DecodeJson
+    // message. Keep the temporary 503 classification limited to that refresh
+    // operation rather than widening every JSON decode failure.
+    let grant_refresh_response_failure = pubky_error.is_some_and(|error| {
+        matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::DecodeJson { message })
+                if message.starts_with("decoding /auth/grant/session response:")
+        )
+    });
+    if grant_backed && (transient_dependency || grant_refresh_response_failure) {
+        tracing::warn!(
+            stage = "grant_backed_storage",
+            operation,
+            error_class = "dependency_unavailable",
+            "creator Pubky storage operation failed"
+        );
+        return ApplicationError::CreatorAuthorityUnavailable;
+    }
+    tracing::warn!(
+        stage = "storage_operation",
+        operation,
+        error_class = "dependency",
+        "creator Pubky storage operation failed"
+    );
     let message = if is_private_locks_path(path) {
         format!("Pubky homeserver {operation} failed for private Locks path")
     } else {
-        format!("Pubky homeserver {operation} failed for {path}: {error}")
+        format!("Pubky homeserver {operation} failed")
     };
     ApplicationError::Storage { message }
 }
@@ -722,19 +930,22 @@ fn is_private_locks_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
     use serde_json::json;
     use time::macros::datetime;
+    use tokio::io::AsyncWriteExt;
 
     use super::{
-        AuthorizingPubkyHomeserverStorageClient, CreatorScopedPubkyStorage,
-        CreatorScopedPubkyStorageProvider, ImportedPubkySession,
+        AcquiredCreatorScopedPubkyStorage, AuthorizingPubkyHomeserverStorageClient,
+        CreatorScopedPubkyStorage, CreatorScopedPubkyStorageProvider, ImportedPubkySession,
         LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
         PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
-        PubkySessionImporter, pubky_storage_error,
+        PubkySessionImporter, pubky_storage_error, pubky_storage_error_for_grant,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -790,6 +1001,205 @@ mod tests {
         assert!(!debug.contains("secret.txt"));
         assert!(!debug.contains("/priv/app.locks/content/secret.txt"));
         assert!(!debug.contains("network timeout"));
+    }
+
+    #[test]
+    fn pubky_storage_401_and_403_are_authority_unavailable_without_upstream_body() {
+        for status in [
+            pubky::StatusCode::UNAUTHORIZED,
+            pubky::StatusCode::FORBIDDEN,
+        ] {
+            let error = pubky_storage_error(
+                "get",
+                "/priv/app.locks/content/secret.txt",
+                pubky::Error::Request(pubky::errors::RequestError::Server {
+                    status,
+                    message: "raw secret-bearing upstream body".to_owned(),
+                }),
+            );
+
+            assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
+            assert!(!format!("{error:?}").contains("raw secret-bearing upstream body"));
+        }
+    }
+
+    #[test]
+    fn grant_backed_storage_5xx_is_authority_unavailable_but_legacy_stays_storage_error() {
+        let error = || {
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status: pubky::StatusCode::SERVICE_UNAVAILABLE,
+                message: "raw secret-bearing upstream body".to_owned(),
+            })
+        };
+
+        assert_eq!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", error()),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
+        assert!(matches!(
+            pubky_storage_error("get", "/pub/app.locks/config.json", error()),
+            ApplicationError::Storage { .. }
+        ));
+
+        let not_found = pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::NOT_FOUND,
+            message: "not found".to_owned(),
+        });
+        assert!(matches!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", not_found),
+            ApplicationError::Storage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_backed_storage_timeout_is_authority_unavailable_but_legacy_stays_storage_error()
+    {
+        async fn timeout_error() -> pubky::Error {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let error = reqwest::Client::builder()
+                .timeout(Duration::from_millis(10))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(error.is_timeout());
+            pubky::Error::Request(pubky::errors::RequestError::Transport(error))
+        }
+
+        assert_eq!(
+            pubky_storage_error_for_grant(
+                "put",
+                "/priv/app.locks/content/example.txt",
+                timeout_error().await,
+            ),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
+        assert!(matches!(
+            pubky_storage_error(
+                "put",
+                "/priv/app.locks/content/example.txt",
+                timeout_error().await,
+            ),
+            ApplicationError::Storage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_refresh_body_timeout_is_unavailable_but_storage_decode_failure_stays_storage() {
+        async fn refresh_body_timeout_message() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{\"token\":",
+                    )
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/auth/grant/session"))
+                .send()
+                .await
+                .unwrap();
+            let error = response.json::<serde_json::Value>().await.unwrap_err();
+            server.abort();
+            assert!(error.is_timeout());
+            format!("decoding /auth/grant/session response: {error}")
+        }
+
+        let timeout_message = refresh_body_timeout_message().await;
+        let refresh_timeout = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+            message: timeout_message.clone(),
+        });
+        assert_eq!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", refresh_timeout,),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
+        let legacy_refresh_timeout =
+            pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+                message: timeout_message,
+            });
+        assert!(matches!(
+            pubky_storage_error("get", "/pub/app.locks/config.json", legacy_refresh_timeout,),
+            ApplicationError::Storage { .. }
+        ));
+
+        let storage_decode = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+            message: "expected value at line 1 column 1".to_owned(),
+        });
+        assert!(matches!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", storage_decode,),
+            ApplicationError::Storage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_backed_malformed_stored_json_is_storage_error_without_session_eviction() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in ["not-json", r#"{"version":1}"#] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = DecodeThenSuccessProvider::new(format!("http://{address}/stored.json"));
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        let first = client
+            .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+            .await;
+        assert!(matches!(first, Err(ApplicationError::Storage { .. })));
+        assert_eq!(provider.invalidations(), 0);
+
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await
+                .unwrap(),
+            Some(json!({"version": 1}))
+        );
+        assert_eq!(provider.invalidations(), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_backed_unknown_reqwest_transport_error_fails_closed() {
+        let error = reqwest::Client::new()
+            .get("://invalid-url")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_builder());
+        assert!(!error.is_timeout());
+        assert!(!error.is_decode());
+
+        assert!(matches!(
+            pubky_storage_error_for_grant(
+                "get",
+                "/pub/app.locks/config.json",
+                pubky::Error::Request(pubky::errors::RequestError::Transport(error)),
+            ),
+            ApplicationError::Storage { .. }
+        ));
     }
 
     #[tokio::test]
@@ -856,6 +1266,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_cached_session_generation_is_invalidated_on_every_storage_path() {
+        let provider = RevokedSessionProvider::default();
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        assert_eq!(
+            client
+                .put_json_value_as_creator(&creator(), "/pub/app.locks/config.json", json!({}))
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .put_bytes_as_creator(
+                    &creator(),
+                    "/priv/app.locks/content/example.txt",
+                    Vec::new(),
+                    "text/plain",
+                )
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .get_metadata_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .delete_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(*provider.operations.lock().unwrap(), 6);
+        assert_eq!(
+            *provider.invalidations.lock().unwrap(),
+            vec![(creator(), 7); 6]
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_cookie_provider_missing_authority_returns_unavailable_without_importing() {
         let store = FakeCreatorAuthorityStore::new(None);
         let importer =
@@ -916,6 +1379,7 @@ mod tests {
 
         let storage = provider.storage_for_creator(&creator()).await.unwrap();
         storage
+            .storage
             .put_json_value("/pub/app.locks/config.json", json!({"version": 1}))
             .await
             .unwrap();
@@ -932,12 +1396,14 @@ mod tests {
             auth_kind: CreatorAuthorityAuthKind::Grant,
             ..creator_authority_record("delegated-grant-state")
         };
+        let imported_session = FakeImportedPubkySession::for_creator(creator_z32());
         let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new_grant(
             FakeCreatorAuthorityStore::new(Some(grant_record)),
-            FakePubkySessionImporter::new(Ok(FakeImportedPubkySession::for_creator(creator_z32()))),
+            FakePubkySessionImporter::new(Ok(imported_session.clone())),
         );
 
         provider.storage_for_creator(&creator()).await.unwrap();
+        assert!(imported_session.grant_storage_selected());
         assert_eq!(
             provider.importer().seen_secrets(),
             vec!["delegated-grant-state".to_owned()]
@@ -1111,6 +1577,183 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct RevokedSessionProvider {
+        operations: Arc<Mutex<usize>>,
+        invalidations: Arc<Mutex<Vec<(CreatorPubky, u64)>>>,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for RevokedSessionProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            Ok(AcquiredCreatorScopedPubkyStorage::cached(
+                Box::new(RevokedStorage {
+                    operations: Arc::clone(&self.operations),
+                }),
+                7,
+            ))
+        }
+
+        async fn invalidate_creator_session(&self, creator: &CreatorPubky, generation: u64) {
+            self.invalidations
+                .lock()
+                .unwrap()
+                .push((creator.clone(), generation));
+        }
+    }
+
+    #[derive(Debug)]
+    struct RevokedStorage {
+        operations: Arc<Mutex<usize>>,
+    }
+
+    impl RevokedStorage {
+        fn record_operation(&self) {
+            *self.operations.lock().unwrap() += 1;
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for RevokedStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_json_value(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            self.record_operation();
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DecodeThenSuccessProvider {
+        endpoint: String,
+        invalidated: Arc<AtomicBool>,
+        invalidations: Arc<AtomicUsize>,
+    }
+
+    impl DecodeThenSuccessProvider {
+        fn new(endpoint: String) -> Self {
+            Self {
+                endpoint,
+                invalidated: Arc::new(AtomicBool::new(false)),
+                invalidations: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn invalidations(&self) -> usize {
+            self.invalidations.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for DecodeThenSuccessProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            if self.invalidated.load(Ordering::SeqCst) {
+                return Err(ApplicationError::CreatorAuthorityUnavailable);
+            }
+            Ok(AcquiredCreatorScopedPubkyStorage::cached(
+                Box::new(DecodeThenSuccessStorage {
+                    endpoint: self.endpoint.clone(),
+                }),
+                7,
+            ))
+        }
+
+        async fn invalidate_creator_session(&self, _creator: &CreatorPubky, _generation: u64) {
+            self.invalidated.store(true, Ordering::SeqCst);
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct DecodeThenSuccessStorage {
+        endpoint: String,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for DecodeThenSuccessStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_json_value(
+            &self,
+            path: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            reqwest::get(&self.endpoint)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    assert!(error.is_decode());
+                    assert!(!error.is_timeout());
+                    pubky_storage_error_for_grant(
+                        "get",
+                        path,
+                        pubky::Error::Request(pubky::errors::RequestError::Transport(error)),
+                    )
+                })
+        }
+
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct FakeCreatorScopedPubkyStorageProvider {
         result: Result<FakeCreatorScopedPubkyStorage, ApplicationError>,
@@ -1149,11 +1792,11 @@ mod tests {
         async fn storage_for_creator(
             &self,
             creator: &CreatorPubky,
-        ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
             self.seen_creators.lock().unwrap().push(creator.clone());
             self.result
                 .clone()
-                .map(|storage| Box::new(storage) as Box<dyn CreatorScopedPubkyStorage>)
+                .map(|storage| AcquiredCreatorScopedPubkyStorage::uncached(Box::new(storage)))
         }
     }
 
@@ -1333,6 +1976,7 @@ mod tests {
     struct FakeImportedPubkySession {
         public_key_z32: String,
         storage: FakeCreatorScopedPubkyStorage,
+        grant_storage_selected: Arc<AtomicBool>,
     }
 
     impl FakeImportedPubkySession {
@@ -1340,7 +1984,12 @@ mod tests {
             Self {
                 public_key_z32: public_key_z32.to_owned(),
                 storage: FakeCreatorScopedPubkyStorage::default(),
+                grant_storage_selected: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        fn grant_storage_selected(&self) -> bool {
+            self.grant_storage_selected.load(Ordering::SeqCst)
         }
     }
 
@@ -1352,6 +2001,11 @@ mod tests {
         }
 
         fn into_storage(self) -> Self::Storage {
+            self.storage
+        }
+
+        fn into_grant_storage(self) -> Self::Storage {
+            self.grant_storage_selected.store(true, Ordering::SeqCst);
             self.storage
         }
     }
@@ -1371,7 +2025,7 @@ mod tests {
     }
 
     fn storage_error(
-        result: Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>,
+        result: Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>,
     ) -> ApplicationError {
         match result {
             Ok(_) => panic!("expected storage provider error"),
@@ -1380,7 +2034,7 @@ mod tests {
     }
 
     fn assert_storage_error(
-        result: Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>,
+        result: Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>,
         expected: ApplicationError,
     ) {
         assert_eq!(storage_error(result), expected);
