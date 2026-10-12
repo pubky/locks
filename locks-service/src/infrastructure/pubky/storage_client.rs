@@ -877,7 +877,11 @@ fn map_pubky_storage_error(
     let transient_dependency = pubky_error.is_some_and(|error| {
         matches!(
             error,
-            pubky::Error::Request(pubky::errors::RequestError::Transport(_))
+            pubky::Error::Request(pubky::errors::RequestError::Transport(error))
+                if error.is_timeout()
+                    || error.is_connect()
+                    || error.is_request()
+                    || error.is_body()
         ) || matches!(
             error,
             pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
@@ -926,7 +930,7 @@ fn is_private_locks_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1139,6 +1143,61 @@ mod tests {
         });
         assert!(matches!(
             pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", storage_decode,),
+            ApplicationError::Storage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_backed_malformed_stored_json_is_storage_error_without_session_eviction() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in ["not-json", r#"{"version":1}"#] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = DecodeThenSuccessProvider::new(format!("http://{address}/stored.json"));
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        let first = client
+            .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+            .await;
+        assert!(matches!(first, Err(ApplicationError::Storage { .. })));
+        assert_eq!(provider.invalidations(), 0);
+
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await
+                .unwrap(),
+            Some(json!({"version": 1}))
+        );
+        assert_eq!(provider.invalidations(), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn grant_backed_unknown_reqwest_transport_error_fails_closed() {
+        let error = reqwest::Client::new()
+            .get("://invalid-url")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_builder());
+        assert!(!error.is_timeout());
+        assert!(!error.is_decode());
+
+        assert!(matches!(
+            pubky_storage_error_for_grant(
+                "get",
+                "/pub/app.locks/config.json",
+                pubky::Error::Request(pubky::errors::RequestError::Transport(error)),
+            ),
             ApplicationError::Storage { .. }
         ));
     }
@@ -1592,6 +1651,106 @@ mod tests {
         async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
             self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DecodeThenSuccessProvider {
+        endpoint: String,
+        invalidated: Arc<AtomicBool>,
+        invalidations: Arc<AtomicUsize>,
+    }
+
+    impl DecodeThenSuccessProvider {
+        fn new(endpoint: String) -> Self {
+            Self {
+                endpoint,
+                invalidated: Arc::new(AtomicBool::new(false)),
+                invalidations: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn invalidations(&self) -> usize {
+            self.invalidations.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for DecodeThenSuccessProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            if self.invalidated.load(Ordering::SeqCst) {
+                return Err(ApplicationError::CreatorAuthorityUnavailable);
+            }
+            Ok(AcquiredCreatorScopedPubkyStorage::cached(
+                Box::new(DecodeThenSuccessStorage {
+                    endpoint: self.endpoint.clone(),
+                }),
+                7,
+            ))
+        }
+
+        async fn invalidate_creator_session(&self, _creator: &CreatorPubky, _generation: u64) {
+            self.invalidated.store(true, Ordering::SeqCst);
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct DecodeThenSuccessStorage {
+        endpoint: String,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for DecodeThenSuccessStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_json_value(
+            &self,
+            path: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            reqwest::get(&self.endpoint)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    assert!(error.is_decode());
+                    assert!(!error.is_timeout());
+                    pubky_storage_error_for_grant(
+                        "get",
+                        path,
+                        pubky::Error::Request(pubky::errors::RequestError::Transport(error)),
+                    )
+                })
+        }
+
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by malformed JSON regression")
         }
     }
 
