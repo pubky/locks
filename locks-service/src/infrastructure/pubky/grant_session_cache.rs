@@ -17,6 +17,7 @@ type RestoreResult<T> = Result<T, ApplicationError>;
 pub struct CachedGrantSession<T> {
     pub record: CreatorAuthorityRecord,
     pub session: T,
+    pub(crate) generation: u64,
 }
 
 #[derive(Debug)]
@@ -109,7 +110,10 @@ where
         let fingerprint = authority_fingerprint(&record);
 
         enum Action<T> {
-            Ready(T),
+            Ready {
+                generation: u64,
+                session: T,
+            },
             Wait {
                 generation: u64,
                 receiver: watch::Receiver<Option<RestoreResult<T>>>,
@@ -122,6 +126,10 @@ where
 
         let action = {
             let mut state = self.state.lock().await;
+            state.entries.retain(|_, entry| match &entry.value {
+                CacheValue::Ready(_) => true,
+                CacheValue::InFlight(receiver) => receiver.has_changed().is_ok(),
+            });
             state.access_counter = state.access_counter.wrapping_add(1);
             let access = state.access_counter;
             let same_authority = state
@@ -132,7 +140,10 @@ where
                 let entry = state.entries.get_mut(creator).expect("entry was present");
                 entry.last_used = access;
                 match &entry.value {
-                    CacheValue::Ready(session) => Action::Ready(session.clone()),
+                    CacheValue::Ready(session) => Action::Ready {
+                        generation: entry.generation,
+                        session: session.clone(),
+                    },
                     CacheValue::InFlight(receiver) => Action::Wait {
                         generation: entry.generation,
                         receiver: receiver.clone(),
@@ -175,7 +186,14 @@ where
         };
 
         match action {
-            Action::Ready(session) => Ok(CachedGrantSession { record, session }),
+            Action::Ready {
+                generation,
+                session,
+            } => Ok(CachedGrantSession {
+                record,
+                session,
+                generation,
+            }),
             Action::Wait {
                 generation,
                 mut receiver,
@@ -184,6 +202,7 @@ where
                     return result.map(|session| CachedGrantSession {
                         record: record.clone(),
                         session,
+                        generation,
                     });
                 }
                 if receiver.changed().await.is_err() {
@@ -219,7 +238,11 @@ where
                     Err(ApplicationError::CreatorAuthorityUnavailable)
                 };
                 let _ = sender.send(Some(result.clone()));
-                result.map(|session| CachedGrantSession { record, session })
+                result.map(|session| CachedGrantSession {
+                    record,
+                    session,
+                    generation,
+                })
             }
         }
     }
@@ -228,7 +251,7 @@ where
         self.state.lock().await.entries.remove(creator);
     }
 
-    async fn invalidate_generation(&self, creator: &CreatorPubky, generation: u64) {
+    pub(crate) async fn invalidate_generation(&self, creator: &CreatorPubky, generation: u64) {
         let mut state = self.state.lock().await;
         if state
             .entries
@@ -473,6 +496,33 @@ mod tests {
         assert_eq!(importer.calls(), 2);
     }
 
+    #[tokio::test]
+    async fn invalidation_only_removes_the_acquired_session_generation() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = RecordingImporter::successful(Duration::ZERO);
+        let cache = GrantSessionCache::new(store, importer.clone(), 8);
+
+        let old = cache.session_for_creator(&creator_a()).await.unwrap();
+        cache.invalidate(&creator_a()).await;
+        let replacement = cache.session_for_creator(&creator_a()).await.unwrap();
+
+        cache
+            .invalidate_generation(&creator_a(), old.generation)
+            .await;
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(importer.calls(), 2, "old failure must preserve replacement");
+
+        cache
+            .invalidate_generation(&creator_a(), replacement.generation)
+            .await;
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            importer.calls(),
+            3,
+            "current failure must evict its session"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn revalidation_rejects_authority_rotated_after_manager_lookup() {
         let events = RecordedEvents::default();
@@ -607,6 +657,65 @@ mod tests {
         .await
         .expect("a cancelled exchange must release the creator single-flight slot")
         .expect("a new exchange must restore the creator session");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_retries_after_the_restore_owner_is_cancelled() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = RecordingImporter::successful(Duration::from_millis(20));
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+
+        let owner = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        while importer.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        tokio::task::yield_now().await;
+        owner.abort();
+        owner.await.unwrap_err();
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter must retry after owner cancellation")
+            .expect("waiter task must complete")
+            .expect("waiter retry must restore the session");
+        assert_eq!(importer.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_exchange_releases_capacity_for_another_creator() {
+        let store = MutableAuthorityStore::with_records([
+            record(creator_a(), "grant-a"),
+            record(creator_b(), "grant-b"),
+        ]);
+        let importer = RecordingImporter::successful(Duration::from_millis(20));
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 1));
+
+        let exchange = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        while importer.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        exchange.abort();
+        exchange.await.unwrap_err();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.session_for_creator(&creator_b()),
+        )
+        .await
+        .expect("a cancelled exchange must release cache capacity")
+        .expect("another creator must restore after cancelled capacity owner");
+        assert_eq!(importer.calls(), 2);
+        assert_eq!(cache.cached_creator_count().await, 1);
     }
 
     #[tokio::test]

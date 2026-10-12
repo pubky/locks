@@ -186,15 +186,37 @@ pub trait CreatorScopedPubkyStorage: Send + Sync {
     async fn delete(&self, path: &str) -> Result<(), ApplicationError>;
 }
 
+/// Creator-scoped storage plus cache generation used to acquire it.
+pub struct AcquiredCreatorScopedPubkyStorage {
+    storage: Box<dyn CreatorScopedPubkyStorage>,
+    generation: Option<u64>,
+}
+
+impl AcquiredCreatorScopedPubkyStorage {
+    pub fn uncached(storage: Box<dyn CreatorScopedPubkyStorage>) -> Self {
+        Self {
+            storage,
+            generation: None,
+        }
+    }
+
+    pub fn cached(storage: Box<dyn CreatorScopedPubkyStorage>, generation: u64) -> Self {
+        Self {
+            storage,
+            generation: Some(generation),
+        }
+    }
+}
+
 /// Provides storage scoped to the requested creator's restorable Pubky session.
 #[async_trait]
 pub trait CreatorScopedPubkyStorageProvider: Send + Sync {
     async fn storage_for_creator(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>;
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>;
 
-    async fn invalidate_creator_session(&self, _creator: &CreatorPubky) {}
+    async fn invalidate_creator_session(&self, _creator: &CreatorPubky, _generation: u64) {}
 }
 
 /// Minimal imported Pubky session surface needed by the storage provider.
@@ -260,7 +282,7 @@ where
     async fn storage_for_creator(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
         let record = self
             .store
             .get_creator_authority(creator)
@@ -286,7 +308,9 @@ where
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
 
-        Ok(Box::new(session.into_storage()))
+        Ok(AcquiredCreatorScopedPubkyStorage::uncached(Box::new(
+            session.into_storage(),
+        )))
     }
 }
 
@@ -328,13 +352,16 @@ where
     async fn storage_for_creator(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+    ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
         let cached = self.cache.session_for_creator(creator).await?;
-        Ok(Box::new(cached.session.into_storage()))
+        Ok(AcquiredCreatorScopedPubkyStorage::cached(
+            Box::new(cached.session.into_storage()),
+            cached.generation,
+        ))
     }
 
-    async fn invalidate_creator_session(&self, creator: &CreatorPubky) {
-        self.cache.invalidate(creator).await;
+    async fn invalidate_creator_session(&self, creator: &CreatorPubky, generation: u64) {
+        self.cache.invalidate_generation(creator, generation).await;
     }
 }
 
@@ -577,10 +604,15 @@ where
     async fn finish_operation<T>(
         &self,
         creator: &CreatorPubky,
+        generation: Option<u64>,
         result: Result<T, ApplicationError>,
     ) -> Result<T, ApplicationError> {
-        if matches!(result, Err(ApplicationError::CreatorAuthorityUnavailable)) {
-            self.provider.invalidate_creator_session(creator).await;
+        if matches!(result, Err(ApplicationError::CreatorAuthorityUnavailable))
+            && let Some(generation) = generation
+        {
+            self.provider
+                .invalidate_creator_session(creator, generation)
+                .await;
         }
         result
     }
@@ -597,13 +629,10 @@ where
         path: &str,
         body: serde_json::Value,
     ) -> Result<(), ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .put_json_value(path, body)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.put_json_value(path, body).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 
     async fn get_json_value_as_creator(
@@ -611,13 +640,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<serde_json::Value>, ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .get_json_value(path)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_json_value(path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 
     async fn put_bytes_as_creator(
@@ -627,13 +653,10 @@ where
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<(), ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .put_bytes(path, bytes, content_type)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.put_bytes(path, bytes, content_type).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 
     async fn get_bytes_as_creator(
@@ -641,13 +664,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .get_bytes(path)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_bytes(path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 
     async fn get_metadata_as_creator(
@@ -655,13 +675,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .get_metadata(path)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.get_metadata(path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 
     async fn delete_as_creator(
@@ -669,13 +686,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<(), ApplicationError> {
-        let result = self
-            .provider
-            .storage_for_creator(creator)
-            .await?
-            .delete(path)
-            .await;
-        self.finish_operation(creator, result).await
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.delete(path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
     }
 }
 
@@ -835,8 +849,8 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        AuthorizingPubkyHomeserverStorageClient, CreatorScopedPubkyStorage,
-        CreatorScopedPubkyStorageProvider, ImportedPubkySession,
+        AcquiredCreatorScopedPubkyStorage, AuthorizingPubkyHomeserverStorageClient,
+        CreatorScopedPubkyStorage, CreatorScopedPubkyStorageProvider, ImportedPubkySession,
         LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
         PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
         PubkySessionImporter, pubky_storage_error,
@@ -976,18 +990,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_cached_session_is_invalidated_without_retrying_storage() {
+    async fn revoked_cached_session_generation_is_invalidated_on_every_storage_path() {
         let provider = RevokedSessionProvider::default();
         let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
 
+        assert_eq!(
+            client
+                .put_json_value_as_creator(&creator(), "/pub/app.locks/config.json", json!({}))
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .put_bytes_as_creator(
+                    &creator(),
+                    "/priv/app.locks/content/example.txt",
+                    Vec::new(),
+                    "text/plain",
+                )
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
         assert_eq!(
             client
                 .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
                 .await,
             Err(ApplicationError::CreatorAuthorityUnavailable)
         );
-        assert_eq!(*provider.operations.lock().unwrap(), 1);
-        assert_eq!(*provider.invalidations.lock().unwrap(), vec![creator()]);
+        assert_eq!(
+            client
+                .get_metadata_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(
+            client
+                .delete_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        assert_eq!(*provider.operations.lock().unwrap(), 6);
+        assert_eq!(
+            *provider.invalidations.lock().unwrap(),
+            vec![(creator(), 7); 6]
+        );
     }
 
     #[tokio::test]
@@ -1051,6 +1103,7 @@ mod tests {
 
         let storage = provider.storage_for_creator(&creator()).await.unwrap();
         storage
+            .storage
             .put_json_value("/pub/app.locks/config.json", json!({"version": 1}))
             .await
             .unwrap();
@@ -1249,7 +1302,7 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct RevokedSessionProvider {
         operations: Arc<Mutex<usize>>,
-        invalidations: Arc<Mutex<Vec<CreatorPubky>>>,
+        invalidations: Arc<Mutex<Vec<(CreatorPubky, u64)>>>,
     }
 
     #[async_trait]
@@ -1257,20 +1310,32 @@ mod tests {
         async fn storage_for_creator(
             &self,
             _creator: &CreatorPubky,
-        ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
-            Ok(Box::new(RevokedStorage {
-                operations: Arc::clone(&self.operations),
-            }))
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            Ok(AcquiredCreatorScopedPubkyStorage::cached(
+                Box::new(RevokedStorage {
+                    operations: Arc::clone(&self.operations),
+                }),
+                7,
+            ))
         }
 
-        async fn invalidate_creator_session(&self, creator: &CreatorPubky) {
-            self.invalidations.lock().unwrap().push(creator.clone());
+        async fn invalidate_creator_session(&self, creator: &CreatorPubky, generation: u64) {
+            self.invalidations
+                .lock()
+                .unwrap()
+                .push((creator.clone(), generation));
         }
     }
 
     #[derive(Debug)]
     struct RevokedStorage {
         operations: Arc<Mutex<usize>>,
+    }
+
+    impl RevokedStorage {
+        fn record_operation(&self) {
+            *self.operations.lock().unwrap() += 1;
+        }
     }
 
     #[async_trait]
@@ -1280,28 +1345,33 @@ mod tests {
             _: &str,
             _: serde_json::Value,
         ) -> Result<(), ApplicationError> {
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
         async fn get_json_value(
             &self,
             _: &str,
         ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
         async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
         async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
-            *self.operations.lock().unwrap() += 1;
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
         async fn get_metadata(
             &self,
             _: &str,
         ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
         async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
         }
     }
@@ -1344,11 +1414,11 @@ mod tests {
         async fn storage_for_creator(
             &self,
             creator: &CreatorPubky,
-        ) -> Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError> {
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
             self.seen_creators.lock().unwrap().push(creator.clone());
             self.result
                 .clone()
-                .map(|storage| Box::new(storage) as Box<dyn CreatorScopedPubkyStorage>)
+                .map(|storage| AcquiredCreatorScopedPubkyStorage::uncached(Box::new(storage)))
         }
     }
 
@@ -1566,7 +1636,7 @@ mod tests {
     }
 
     fn storage_error(
-        result: Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>,
+        result: Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>,
     ) -> ApplicationError {
         match result {
             Ok(_) => panic!("expected storage provider error"),
@@ -1575,7 +1645,7 @@ mod tests {
     }
 
     fn assert_storage_error(
-        result: Result<Box<dyn CreatorScopedPubkyStorage>, ApplicationError>,
+        result: Result<AcquiredCreatorScopedPubkyStorage, ApplicationError>,
         expected: ApplicationError,
     ) {
         assert_eq!(storage_error(result), expected);

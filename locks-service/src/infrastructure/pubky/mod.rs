@@ -23,10 +23,11 @@ pub use legacy_creator_authority::{
 pub use lock_service_pointers::PubkyLockServicePointerRepository;
 pub use priv_resources::PubkyPrivResourceRepository;
 pub use storage_client::{
-    AuthorizingPubkyHomeserverStorageClient, CreatorScopedPubkyStorage,
-    CreatorScopedPubkyStorageProvider, GrantCreatorScopedPubkyStorageProvider,
-    ImportedPubkySession, LegacyCookieCreatorScopedPubkyStorageProvider,
-    ProviderBackedPubkyHomeserverStorageClient, PubkyBytesResource, PubkyHomeserverStorageClient,
-    PubkyImportedSession, PubkyLegacyCookieSessionImporter, PubkyResourceMetadata,
-    PubkySessionImporter, SdkCreatorScopedPubkyStorage, pubky_storage_error,
+    AcquiredCreatorScopedPubkyStorage, AuthorizingPubkyHomeserverStorageClient,
+    CreatorScopedPubkyStorage, CreatorScopedPubkyStorageProvider,
+    GrantCreatorScopedPubkyStorageProvider, ImportedPubkySession,
+    LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
+    PubkyBytesResource, PubkyHomeserverStorageClient, PubkyImportedSession,
+    PubkyLegacyCookieSessionImporter, PubkyResourceMetadata, PubkySessionImporter,
+    SdkCreatorScopedPubkyStorage, pubky_storage_error,
 };
