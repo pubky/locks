@@ -111,6 +111,7 @@ jobs:
       - name: JS example behavior tests
         run: |
           npm --prefix examples/js-sdk run test:reader-load-state
+          npm --prefix examples/js-sdk run test:payment-amount
           npm --prefix examples/js-sdk run test:pubky
 
       - name: Paykit setup-status contract
