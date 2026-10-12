@@ -441,7 +441,7 @@ el.paykitAsset.addEventListener('change', () => {
   // A denomination change must not reinterpret a previously entered price.
   el.paykitAmount.value = '';
   el.paykitAmountLabel.textContent = el.paykitAsset.value === 'BTC'
-    ? 'Bitcoin Amount' : 'USD Amount';
+    ? 'Bitcoin Amount (sats)' : 'USD Amount';
   state.paykitSetupComplete = false;
   state.paykitSetupStatusRequestId += 1;
   closePaykitSetupIframe();
