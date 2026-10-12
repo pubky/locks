@@ -30,6 +30,7 @@ enum CacheValue<T> {
 struct CacheEntry<T> {
     fingerprint: [u8; 32],
     generation: u64,
+    observed_at: u64,
     last_used: u64,
     value: CacheValue<T>,
 }
@@ -38,6 +39,7 @@ struct CacheEntry<T> {
 struct CacheState<T> {
     entries: HashMap<CreatorPubky, CacheEntry<T>>,
     next_generation: u64,
+    next_observation: u64,
     access_counter: u64,
 }
 
@@ -46,6 +48,7 @@ impl<T> Default for CacheState<T> {
         Self {
             entries: HashMap::new(),
             next_generation: 0,
+            next_observation: 0,
             access_counter: 0,
         }
     }
@@ -100,10 +103,22 @@ where
         &self,
         creator: &CreatorPubky,
     ) -> Result<CachedGrantSession<I::Session>, ApplicationError> {
+        let observation = {
+            let mut state = self.state.lock().await;
+            state.next_observation = state.next_observation.wrapping_add(1);
+            state.next_observation
+        };
         let record = match self.load_current_grant(creator).await {
             Ok(record) => record,
             Err(error) => {
-                self.invalidate(creator).await;
+                let mut state = self.state.lock().await;
+                let superseded = state
+                    .entries
+                    .get(creator)
+                    .is_some_and(|entry| observation_is_newer(entry.observed_at, observation));
+                if !superseded {
+                    state.entries.remove(creator);
+                }
                 return Err(error);
             }
         };
@@ -122,6 +137,7 @@ where
                 generation: u64,
                 sender: watch::Sender<Option<RestoreResult<T>>>,
             },
+            Retry,
         }
 
         let action = {
@@ -138,6 +154,9 @@ where
                 .is_some_and(|entry| entry.fingerprint == fingerprint);
             if same_authority {
                 let entry = state.entries.get_mut(creator).expect("entry was present");
+                if observation_is_newer(observation, entry.observed_at) {
+                    entry.observed_at = observation;
+                }
                 entry.last_used = access;
                 match &entry.value {
                     CacheValue::Ready(session) => Action::Ready {
@@ -149,6 +168,12 @@ where
                         receiver: receiver.clone(),
                     },
                 }
+            } else if state
+                .entries
+                .get(creator)
+                .is_some_and(|entry| observation_is_newer(entry.observed_at, observation))
+            {
+                Action::Retry
             } else {
                 if !state.entries.contains_key(creator) && state.entries.len() >= self.capacity {
                     let evict = state
@@ -177,6 +202,7 @@ where
                     CacheEntry {
                         fingerprint,
                         generation,
+                        observed_at: observation,
                         last_used: access,
                         value: CacheValue::InFlight(receiver),
                     },
@@ -186,6 +212,7 @@ where
         };
 
         match action {
+            Action::Retry => Box::pin(self.session_for_creator(creator)).await,
             Action::Ready {
                 generation,
                 session,
@@ -377,6 +404,11 @@ fn authority_fingerprint(record: &CreatorAuthorityRecord) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn observation_is_newer(candidate: u64, reference: u64) -> bool {
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < (1_u64 << 63)
+}
+
 fn application_error_class(error: &ApplicationError) -> &'static str {
     match error {
         ApplicationError::CreatorAuthorityUnavailable => "authority_unavailable",
@@ -398,7 +430,7 @@ mod tests {
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
     use time::{Duration as TimeDuration, OffsetDateTime};
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{Layer, Registry};
@@ -574,6 +606,46 @@ mod tests {
             "cache_install",
             "superseded_generation",
             &["grant-a", "grant-a-rotated"],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_authority_lookup_cannot_replace_newer_grant_restore() {
+        let store = DelayedFirstLookupStore::new(record(creator_a(), "grant-a"));
+        let importer = GrantAwareImporter::default();
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+
+        let stale = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        store.first_lookup_captured.notified().await;
+
+        store.put(record(creator_a(), "grant-a-rotated")).await;
+        let replacement = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        importer.replacement_started.notified().await;
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+
+        store.release_first_lookup.notify_one();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        importer.release_replacement.notify_one();
+
+        stale.await.unwrap().unwrap();
+        replacement.await.unwrap().unwrap();
+        waiter.await.unwrap().unwrap();
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            importer.secrets(),
+            vec!["grant-a-rotated".to_owned()],
+            "stale lookup must retry against the replacement instead of restoring its old grant"
         );
     }
 
@@ -783,6 +855,97 @@ mod tests {
         ) -> Result<(), ApplicationError> {
             self.records.write().await.remove(creator);
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedFirstLookupStore {
+        record: Arc<RwLock<CreatorAuthorityRecord>>,
+        calls: Arc<AtomicUsize>,
+        first_lookup_captured: Arc<Notify>,
+        release_first_lookup: Arc<Notify>,
+    }
+
+    impl DelayedFirstLookupStore {
+        fn new(record: CreatorAuthorityRecord) -> Self {
+            Self {
+                record: Arc::new(RwLock::new(record)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                first_lookup_captured: Arc::new(Notify::new()),
+                release_first_lookup: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn put(&self, record: CreatorAuthorityRecord) {
+            *self.record.write().await = record;
+        }
+    }
+
+    #[async_trait]
+    impl CreatorAuthorityStore for DelayedFirstLookupStore {
+        async fn upsert_creator_authority(
+            &self,
+            authority: CreatorAuthorityRecord,
+        ) -> Result<(), ApplicationError> {
+            self.put(authority).await;
+            Ok(())
+        }
+
+        async fn get_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+            let record = self.record.read().await.clone();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_lookup_captured.notify_one();
+                self.release_first_lookup.notified().await;
+            }
+            Ok((record.creator == *creator).then_some(record))
+        }
+
+        async fn delete_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by delayed lookup test")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct GrantAwareImporter {
+        secrets: Arc<Mutex<Vec<String>>>,
+        replacement_started: Arc<Notify>,
+        release_replacement: Arc<Notify>,
+    }
+
+    impl GrantAwareImporter {
+        fn secrets(&self) -> Vec<String> {
+            self.secrets.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for GrantAwareImporter {
+        type Session = FakeImportedSession;
+
+        async fn import_legacy_cookie_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            unreachable!("grant cache never imports legacy cookie sessions")
+        }
+
+        async fn import_grant_session(
+            &self,
+            secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            let secret = secret.expose_secret().to_owned();
+            self.secrets.lock().unwrap().push(secret.clone());
+            if secret == "grant-a-rotated" {
+                self.replacement_started.notify_one();
+                self.release_replacement.notified().await;
+            }
+            Ok(FakeImportedSession::for_creator(&creator_a()))
         }
     }
 
