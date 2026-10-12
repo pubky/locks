@@ -27,5 +27,6 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

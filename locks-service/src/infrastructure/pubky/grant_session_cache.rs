@@ -1045,6 +1045,10 @@ mod tests {
         fn into_storage(self) -> Self::Storage {
             FakeStorage
         }
+
+        fn into_grant_storage(self) -> Self::Storage {
+            FakeStorage
+        }
     }
 
     #[derive(Debug, Clone)]
