@@ -149,6 +149,12 @@ where
                     if let Some(evict) = evict {
                         state.entries.remove(&evict);
                     } else {
+                        tracing::warn!(
+                            creator = %creator,
+                            stage = "cache_admission",
+                            error_class = "capacity_in_flight",
+                            "creator grant session restore failed"
+                        );
                         return Err(ApplicationError::CreatorAuthorityUnavailable);
                     }
                 }
@@ -204,6 +210,12 @@ where
                     }
                     result
                 } else {
+                    tracing::warn!(
+                        creator = %creator,
+                        stage = "cache_install",
+                        error_class = "superseded_generation",
+                        "creator grant session restore failed"
+                    );
                     Err(ApplicationError::CreatorAuthorityUnavailable)
                 };
                 let _ = sender.send(Some(result.clone()));
@@ -354,6 +366,7 @@ fn application_error_class(error: &ApplicationError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
+    use std::fmt;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -363,6 +376,9 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use tokio::sync::RwLock;
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::{Layer, Registry};
 
     use super::GrantSessionCache;
     use crate::application::errors::ApplicationError;
@@ -457,8 +473,10 @@ mod tests {
         assert_eq!(importer.calls(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn revalidation_rejects_authority_rotated_after_manager_lookup() {
+        let events = RecordedEvents::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
         let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a-rotated")]);
         let importer = RecordingImporter::successful(Duration::ZERO);
         let cache = Arc::new(GrantSessionCache::new(store, importer, 8));
@@ -470,10 +488,17 @@ mod tests {
                 .await,
             Err(ApplicationError::CreatorAuthorityUnavailable)
         );
+        events.assert_secret_safe_diagnostic(
+            "manager_record_validate",
+            "stale_manager_record",
+            &["grant-a", "grant-a-rotated"],
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn late_exchange_cannot_install_rotated_authority() {
+        let events = RecordedEvents::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
         let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
         let importer = RecordingImporter::successful(Duration::from_millis(60));
         let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
@@ -495,6 +520,42 @@ mod tests {
         current.unwrap();
         cache.session_for_creator(&creator_a()).await.unwrap();
         assert_eq!(importer.calls(), 2);
+        events.assert_secret_safe_diagnostic(
+            "cache_install",
+            "superseded_generation",
+            &["grant-a", "grant-a-rotated"],
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_saturation_reports_secret_safe_diagnostic() {
+        let events = RecordedEvents::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
+        let store = MutableAuthorityStore::with_records([
+            record(creator_a(), "grant-a"),
+            record(creator_b(), "grant-b"),
+        ]);
+        let importer = RecordingImporter::successful(Duration::from_secs(10));
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 1));
+        let in_flight = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        while importer.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            cache.session_for_creator(&creator_b()).await.unwrap_err(),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
+        in_flight.abort();
+        in_flight.await.unwrap_err();
+        events.assert_secret_safe_diagnostic(
+            "cache_admission",
+            "capacity_in_flight",
+            &["grant-a", "grant-b"],
+        );
     }
 
     #[tokio::test]
@@ -759,6 +820,69 @@ mod tests {
 
         async fn delete(&self, _path: &str) -> Result<(), ApplicationError> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordedEvents(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    impl RecordedEvents {
+        fn assert_secret_safe_diagnostic(
+            &self,
+            stage: &str,
+            error_class: &str,
+            forbidden_values: &[&str],
+        ) {
+            let events = self.0.lock().unwrap();
+            let event = events
+                .iter()
+                .find(|event| {
+                    event.get("stage").is_some_and(|value| value == stage)
+                        && event
+                            .get("error_class")
+                            .is_some_and(|value| value == error_class)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing diagnostic stage={stage} error_class={error_class}; events={events:?}"
+                    )
+                });
+            const SENSITIVE_FIELD_TERMS: [&str; 5] = ["grant", "secret", "session", "path", "body"];
+            assert!(
+                event
+                    .keys()
+                    .all(|key| { SENSITIVE_FIELD_TERMS.iter().all(|term| !key.contains(term)) }),
+                "diagnostic contains sensitive field: {event:?}"
+            );
+            assert!(
+                forbidden_values
+                    .iter()
+                    .all(|value| event.values().all(|field| !field.contains(value))),
+                "diagnostic contains sensitive value: {event:?}"
+            );
+        }
+    }
+
+    impl<S> Layer<S> for RecordedEvents
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut fields = HashMap::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
         }
     }
 

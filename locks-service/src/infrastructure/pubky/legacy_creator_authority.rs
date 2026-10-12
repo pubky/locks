@@ -124,6 +124,12 @@ where
     ) -> Result<(), ApplicationError> {
         let cached = self.session_for_creator(creator).await?;
         if cached.record.secret.expose_secret() != secret.expose_secret() {
+            tracing::warn!(
+                creator = %creator,
+                stage = "manager_record_validate",
+                error_class = "stale_manager_record",
+                "creator grant session restore failed"
+            );
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
         Ok(())
