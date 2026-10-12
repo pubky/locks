@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
@@ -63,6 +63,7 @@ where
     importer: I,
     capacity: usize,
     state: Arc<Mutex<CacheState<I::Session>>>,
+    authority_load_gates: Arc<Mutex<HashMap<CreatorPubky, Weak<Mutex<()>>>>>,
 }
 
 impl<S, I> Clone for GrantSessionCache<S, I>
@@ -76,6 +77,7 @@ where
             importer: self.importer.clone(),
             capacity: self.capacity,
             state: Arc::clone(&self.state),
+            authority_load_gates: Arc::clone(&self.authority_load_gates),
         }
     }
 }
@@ -96,6 +98,7 @@ where
             importer,
             capacity,
             state: Arc::new(Mutex::new(CacheState::default())),
+            authority_load_gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -103,6 +106,8 @@ where
         &self,
         creator: &CreatorPubky,
     ) -> Result<CachedGrantSession<I::Session>, ApplicationError> {
+        let authority_load_gate = self.authority_load_gate(creator).await;
+        let authority_load_guard = authority_load_gate.lock().await;
         let observation = {
             let mut state = self.state.lock().await;
             state.next_observation = state.next_observation.wrapping_add(1);
@@ -210,6 +215,8 @@ where
                 Action::Restore { generation, sender }
             }
         };
+        drop(authority_load_guard);
+        drop(authority_load_gate);
 
         match action {
             Action::Retry => Box::pin(self.session_for_creator(creator)).await,
@@ -334,6 +341,17 @@ where
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
         Ok(record)
+    }
+
+    async fn authority_load_gate(&self, creator: &CreatorPubky) -> Arc<Mutex<()>> {
+        let mut gates = self.authority_load_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(creator).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(creator.clone(), Arc::downgrade(&gate));
+        gate
     }
 
     async fn restore_current(
@@ -626,26 +644,62 @@ mod tests {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
         };
+        store.release_first_lookup.notify_one();
         importer.replacement_started.notified().await;
         let waiter = {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
         };
 
-        store.release_first_lookup.notify_one();
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
         importer.release_replacement.notify_one();
 
-        stale.await.unwrap().unwrap();
+        assert_eq!(
+            stale.await.unwrap().unwrap_err(),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
         replacement.await.unwrap().unwrap();
         waiter.await.unwrap().unwrap();
         cache.session_for_creator(&creator_a()).await.unwrap();
         assert_eq!(
             importer.secrets(),
+            vec!["grant-a".to_owned(), "grant-a-rotated".to_owned()],
+            "stale restore must fail while the replacement becomes current"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_request_with_stale_snapshot_cannot_replace_newer_grant_restore() {
+        let store = AdversarialSnapshotStore::new(record(creator_a(), "grant-a"));
+        let importer = GrantAwareImporter::default();
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+
+        let earlier = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        store.first_lookup_waiting.notified().await;
+
+        let later = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.session_for_creator(&creator_a()).await })
+        };
+        tokio::task::yield_now().await;
+
+        store.put(record(creator_a(), "grant-a-rotated")).await;
+        store.release_first_lookup.notify_one();
+        importer.replacement_started.notified().await;
+
+        store.release_second_lookup.notify_one();
+        tokio::task::yield_now().await;
+        importer.release_replacement.notify_one();
+
+        earlier.await.unwrap().unwrap();
+        later.await.unwrap().unwrap();
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            importer.secrets(),
             vec!["grant-a-rotated".to_owned()],
-            "stale lookup must retry against the replacement instead of restoring its old grant"
+            "a later request must not capture and install a stale authority snapshot"
         );
     }
 
@@ -908,6 +962,65 @@ mod tests {
             _creator: &CreatorPubky,
         ) -> Result<(), ApplicationError> {
             unimplemented!("not needed by delayed lookup test")
+        }
+    }
+
+    #[derive(Clone)]
+    struct AdversarialSnapshotStore {
+        record: Arc<RwLock<CreatorAuthorityRecord>>,
+        calls: Arc<AtomicUsize>,
+        first_lookup_waiting: Arc<Notify>,
+        release_first_lookup: Arc<Notify>,
+        release_second_lookup: Arc<Notify>,
+    }
+
+    impl AdversarialSnapshotStore {
+        fn new(record: CreatorAuthorityRecord) -> Self {
+            Self {
+                record: Arc::new(RwLock::new(record)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                first_lookup_waiting: Arc::new(Notify::new()),
+                release_first_lookup: Arc::new(Notify::new()),
+                release_second_lookup: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn put(&self, record: CreatorAuthorityRecord) {
+            *self.record.write().await = record;
+        }
+    }
+
+    #[async_trait]
+    impl CreatorAuthorityStore for AdversarialSnapshotStore {
+        async fn upsert_creator_authority(
+            &self,
+            authority: CreatorAuthorityRecord,
+        ) -> Result<(), ApplicationError> {
+            self.put(authority).await;
+            Ok(())
+        }
+
+        async fn get_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_lookup_waiting.notify_one();
+                self.release_first_lookup.notified().await;
+            }
+            let record = self.record.read().await.clone();
+            if call == 1 {
+                self.release_second_lookup.notified().await;
+            }
+            Ok((record.creator == *creator).then_some(record))
+        }
+
+        async fn delete_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by adversarial snapshot test")
         }
     }
 

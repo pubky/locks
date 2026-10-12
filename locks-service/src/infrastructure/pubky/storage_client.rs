@@ -884,7 +884,18 @@ fn map_pubky_storage_error(
                 if status.is_server_error()
         )
     });
-    if grant_backed && transient_dependency {
+    // Pinned Pubky SDK maps grant-refresh response-body failures, including
+    // timeouts after successful headers, to this operation-specific DecodeJson
+    // message. Keep the temporary 503 classification limited to that refresh
+    // operation rather than widening every JSON decode failure.
+    let grant_refresh_response_failure = pubky_error.is_some_and(|error| {
+        matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::DecodeJson { message })
+                if message.starts_with("decoding /auth/grant/session response:")
+        )
+    });
+    if grant_backed && (transient_dependency || grant_refresh_response_failure) {
         tracing::warn!(
             stage = "grant_backed_storage",
             operation,
@@ -923,6 +934,7 @@ mod tests {
     use locks_core::ids::CreatorPubky;
     use serde_json::json;
     use time::macros::datetime;
+    use tokio::io::AsyncWriteExt;
 
     use super::{
         AcquiredCreatorScopedPubkyStorage, AuthorizingPubkyHomeserverStorageClient,
@@ -1072,6 +1084,61 @@ mod tests {
                 "/priv/app.locks/content/example.txt",
                 timeout_error().await,
             ),
+            ApplicationError::Storage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn grant_refresh_body_timeout_is_unavailable_but_storage_decode_failure_stays_storage() {
+        async fn refresh_body_timeout_message() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{\"token\":",
+                    )
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/auth/grant/session"))
+                .send()
+                .await
+                .unwrap();
+            let error = response.json::<serde_json::Value>().await.unwrap_err();
+            server.abort();
+            assert!(error.is_timeout());
+            format!("decoding /auth/grant/session response: {error}")
+        }
+
+        let timeout_message = refresh_body_timeout_message().await;
+        let refresh_timeout = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+            message: timeout_message.clone(),
+        });
+        assert_eq!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", refresh_timeout,),
+            ApplicationError::CreatorAuthorityUnavailable
+        );
+        let legacy_refresh_timeout =
+            pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+                message: timeout_message,
+            });
+        assert!(matches!(
+            pubky_storage_error("get", "/pub/app.locks/config.json", legacy_refresh_timeout,),
+            ApplicationError::Storage { .. }
+        ));
+
+        let storage_decode = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
+            message: "expected value at line 1 column 1".to_owned(),
+        });
+        assert!(matches!(
+            pubky_storage_error_for_grant("get", "/pub/app.locks/config.json", storage_decode,),
             ApplicationError::Storage { .. }
         ));
     }
