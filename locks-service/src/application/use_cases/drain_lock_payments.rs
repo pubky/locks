@@ -112,6 +112,67 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
     ) -> Result<bool, ApplicationError> {
+        let persisted = self
+            .drains
+            .get_payment_drain(claim.job.job_id)
+            .await?
+            .ok_or_else(|| ApplicationError::InvalidContentLockDeletionState {
+                message: "payment drain cleanup token is missing".to_owned(),
+            })?;
+        let obligations = self.drains.list_obligations(claim.job.job_id).await?;
+        let mut replayed_publication = false;
+        for obligation in obligations
+            .iter()
+            .filter(|obligation| obligation.status == VerificationTaskStatus::PublishingEntitlement)
+        {
+            replayed_publication = true;
+            let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
+                ApplicationError::InvalidVerificationTaskState {
+                    message: "publishing payment task is missing entitlement payload".to_owned(),
+                }
+            })?;
+            let now = self.clock.now();
+            let Some(publication_token) = self
+                .drains
+                .begin_entitlement_publication(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    now,
+                    &obligation.task_id,
+                    &entitlement,
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            persist_entitlement(self.entitlements, entitlement).await?;
+            if !self
+                .drains
+                .persist_terminal_obligation(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    now,
+                    &obligation.task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: Some(publication_token),
+                        terminal_reason: None,
+                    },
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        if replayed_publication {
+            if persisted.status != PaymentDrainStatus::Completed {
+                return Ok(false);
+            }
+            return self.finish_completed_drain(claim, worker_id).await;
+        }
+
         let lock_resource = lock_resource(&claim);
         let summary = self
             .paykit
@@ -120,13 +181,6 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             .map_err(map_client_error)?
             .ok_or_else(|| ApplicationError::Verifier {
                 message: "Paykit payment drain not found".to_owned(),
-            })?;
-        let persisted = self
-            .drains
-            .get_payment_drain(claim.job.job_id)
-            .await?
-            .ok_or_else(|| ApplicationError::InvalidContentLockDeletionState {
-                message: "payment drain cleanup token is missing".to_owned(),
             })?;
         validate_aggregate_progress(&persisted, &summary)?;
         let now = self.clock.now();
@@ -144,7 +198,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             return Ok(false);
         }
 
-        for obligation in self.drains.list_obligations(claim.job.job_id).await? {
+        for obligation in obligations {
             if matches!(
                 obligation.status,
                 VerificationTaskStatus::Completed
@@ -153,49 +207,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             ) {
                 continue;
             }
-            if obligation.status == VerificationTaskStatus::PublishingEntitlement {
-                let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
-                    ApplicationError::InvalidVerificationTaskState {
-                        message: "publishing payment task is missing entitlement payload"
-                            .to_owned(),
-                    }
-                })?;
-                let now = self.clock.now();
-                let Some(publication_token) = self
-                    .drains
-                    .begin_entitlement_publication(
-                        claim.job.job_id,
-                        worker_id,
-                        claim.claim_token,
-                        now,
-                        &obligation.task_id,
-                        &entitlement,
-                    )
-                    .await?
-                else {
-                    return Ok(false);
-                };
-                persist_entitlement(self.entitlements, entitlement).await?;
-                if !self
-                    .drains
-                    .persist_terminal_obligation(
-                        claim.job.job_id,
-                        worker_id,
-                        claim.claim_token,
-                        now,
-                        &obligation.task_id,
-                        PaymentDrainTerminalTransition {
-                            status: VerificationTaskStatus::Completed,
-                            entitlement_publication_token: Some(publication_token),
-                            terminal_reason: None,
-                        },
-                    )
-                    .await?
-                {
-                    return Ok(false);
-                }
-                continue;
-            }
+
             let status = self
                 .paykit
                 .payment_request_status(&obligation.creator, &obligation.bundle_id)
@@ -274,11 +286,21 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             }
         }
 
-        if summary.status != PaymentDrainStatus::Completed
-            || !self
-                .drains
-                .all_obligations_terminal(claim.job.job_id)
-                .await?
+        if summary.status != PaymentDrainStatus::Completed {
+            return Ok(false);
+        }
+        self.finish_completed_drain(claim, worker_id).await
+    }
+
+    async fn finish_completed_drain(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> Result<bool, ApplicationError> {
+        if !self
+            .drains
+            .all_obligations_terminal(claim.job.job_id)
+            .await?
         {
             return Ok(false);
         }
