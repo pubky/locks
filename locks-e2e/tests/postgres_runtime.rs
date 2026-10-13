@@ -125,7 +125,7 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
 }
 
 #[tokio::test]
-async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window() {
+async fn manual_completion_rejects_legacy_paykit_task_without_authoritative_window() {
     let Some(database) = TestDatabase::create().await else {
         return;
     };
@@ -147,7 +147,9 @@ async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window
         .await
         .unwrap();
 
-    let response = router(app_state(database.pool().clone()))
+    let state = app_state(database.pool().clone());
+    seed_content_lock(&state, paykit_content_lock()).await;
+    let response = router(state)
         .oneshot(json_request(
             "POST",
             "/verification-task-completions",
@@ -158,13 +160,13 @@ async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         response_json(response).await,
         json!({
             "error": {
-                "code": "verification_task_not_found",
-                "message": "verification task not found"
+                "code": "unsupported_verifier_type",
+                "message": "unsupported verifier type"
             }
         })
     );

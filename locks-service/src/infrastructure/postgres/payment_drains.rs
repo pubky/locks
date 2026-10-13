@@ -818,6 +818,23 @@ mod tests {
             .unwrap();
             assert_eq!(status, "expired");
             assert_eq!(stored_reason.as_deref(), Some(reason.as_str()));
+            sqlx::query(
+                "DELETE FROM content_lock_deletion_task_snapshot WHERE deletion_job_id = $1",
+            )
+            .bind(job_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM verification_tasks WHERE deletion_job_id = $1")
+                .bind(job_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
+                .bind(job_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
         }
         database.cleanup().await;
     }
