@@ -273,13 +273,17 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 }
             }
         }
-        if replayed_publication {
-            if persisted.status != PaymentDrainStatus::Completed {
-                return Ok(false);
-            }
+        if persisted.status == PaymentDrainStatus::Completed
+            && self
+                .all_obligations_terminal(claim.job.job_id, evidence)
+                .await?
+        {
             return self
-                .finish_completed_drain(claim, worker_id, evidence)
+                .advance_completed_drain(claim, worker_id, evidence)
                 .await;
+        }
+        if replayed_publication {
+            return Ok(false);
         }
 
         let lock_resource = lock_resource(&claim);
@@ -442,17 +446,39 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         worker_id: &str,
         evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
-        match self.drains.all_obligations_terminal(claim.job.job_id).await {
-            Ok(true) => observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository),
-            Ok(false) => {
+        if !self
+            .all_obligations_terminal(claim.job.job_id, evidence)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.advance_completed_drain(claim, worker_id, evidence)
+            .await
+    }
+
+    async fn all_obligations_terminal(
+        &self,
+        job_id: uuid::Uuid,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
+        match self.drains.all_obligations_terminal(job_id).await {
+            Ok(terminal) => {
                 observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Ok(false);
+                Ok(terminal)
             }
             Err(error) => {
                 observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Err(error);
+                Err(error)
             }
         }
+    }
+
+    async fn advance_completed_drain(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
         match self
             .deletions
             .advance_phase(
