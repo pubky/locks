@@ -153,6 +153,49 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             ) {
                 continue;
             }
+            if obligation.status == VerificationTaskStatus::PublishingEntitlement {
+                let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
+                    ApplicationError::InvalidVerificationTaskState {
+                        message: "publishing payment task is missing entitlement payload"
+                            .to_owned(),
+                    }
+                })?;
+                let now = self.clock.now();
+                let Some(publication_token) = self
+                    .drains
+                    .begin_entitlement_publication(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        now,
+                        &obligation.task_id,
+                        &entitlement,
+                    )
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                persist_entitlement(self.entitlements, entitlement).await?;
+                if !self
+                    .drains
+                    .persist_terminal_obligation(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        now,
+                        &obligation.task_id,
+                        PaymentDrainTerminalTransition {
+                            status: VerificationTaskStatus::Completed,
+                            entitlement_publication_token: Some(publication_token),
+                            terminal_reason: None,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
             let status = self
                 .paykit
                 .payment_request_status(&obligation.creator, &obligation.bundle_id)
