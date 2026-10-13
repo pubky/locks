@@ -18,8 +18,8 @@ pub(super) fn guarded_resource_path_from_tail(raw_tail: &str) -> Result<String, 
             "invalid guarded resource path",
         )
     })?;
-    let path = format!("/priv/locks.app/content/{tail}");
-    if path == "/priv/locks.app/content/"
+    let path = format!("/priv/app.locks/content/{tail}");
+    if path == "/priv/app.locks/content/"
         || path.contains("..")
         || path.contains("//")
         || path.contains("://")

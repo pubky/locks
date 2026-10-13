@@ -5,11 +5,14 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use locks_core::lock_policy::VerifierType;
 use locks_core::verification::SubmittedProofBundle;
 use locks_service::application::errors::ApplicationError;
+use locks_service::application::models::{
+    InvoiceAdmissionPhase, InvoiceAdmissionRecord, InvoiceAdmissionRetryReason,
+};
 use locks_service::application::use_cases::complete_verification_task::{
     CompleteVerificationTaskRequest, CompleteVerificationTaskUseCase,
 };
@@ -31,16 +34,15 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
-use crate::paykit_http_client::{
-    PaykitClientError, PaykitConnectionStatusRequest, PaykitInvoiceRequest,
-};
+use crate::paykit_http_client::{PaykitClientError, PaykitConnectionStatusRequest};
 use crate::rate_limit::{
-    PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey,
+    PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey, client_ip,
 };
 
 pub(super) async fn submit_proof_bundle(
     State(state): State<AppState>,
-    ConnectInfo(client_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
@@ -51,7 +53,11 @@ pub(super) async fn submit_proof_bundle(
         .clone();
     let decision = state.verification_submission_rate_limiter().check(
         &VerificationSubmissionRateLimitKey {
-            client_address: client_address.ip(),
+            client_address: client_ip(
+                peer,
+                &headers,
+                state.config().rate_limits.trusted_proxy_hops,
+            ),
             creator,
         },
         state.clock().now(),
@@ -85,7 +91,18 @@ pub(super) async fn submit_proof_bundle(
         }
     };
 
-    Ok(Json(VerificationTaskLifecycleHttpResponse::from(submitted)).into_response())
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(&submitted.creator, &submitted.bundle_id)
+        .await?
+        .ok_or(ApplicationError::MissingRecord {
+            record: "verification_task",
+        })?;
+    let admission = state
+        .invoice_admissions()
+        .get_invoice_admission(&task.task_id)
+        .await?;
+    Ok(Json(project_lifecycle_response(submitted, admission.as_ref())).into_response())
 }
 
 struct PreparedSubmission {
@@ -105,6 +122,10 @@ async fn maybe_prepare_paykit_submission(
     if paykit_proofs.is_empty() {
         return Ok(PreparedSubmission { existing: None });
     }
+    let existing = submit_use_case.find_existing(submitted).await?;
+    if existing.is_some() {
+        return Ok(PreparedSubmission { existing });
+    }
     if submitted.proofs.len() != 1
         || paykit_proofs.len() != 1
         || !paykit_proofs[0]
@@ -117,30 +138,24 @@ async fn maybe_prepare_paykit_submission(
             "invalid paykit-payment proof bundle",
         ));
     }
-    let reader = submitted.reader_public_key.as_ref().ok_or_else(|| {
+    submitted.reader_public_key.as_ref().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::InvalidRequest,
             "paykit-payment requires reader_public_key",
         )
     })?;
-    ValidatePaykitPaymentSubmissionUseCase::new(state.content_locks().as_ref())
+    let validation = ValidatePaykitPaymentSubmissionUseCase::new(state.content_locks().as_ref())
         .execute(ValidatePaykitPaymentSubmissionRequest {
             submitted_proof_bundle: submitted.clone(),
         })
-        .await?;
-    if !state
-        .reader_pubky_resolver()
-        .reader_has_homeserver(reader)
-        .await
-    {
-        return Err(ApiError::new(
-            ApiErrorCode::ReaderPubkyUnresolvable,
-            "reader pubky is unresolvable",
-        ));
-    }
-    let existing = submit_use_case.find_existing(submitted).await?;
-    if existing.is_some() {
-        return Ok(PreparedSubmission { existing });
+        .await;
+    if let Err(error) = validation {
+        if let Some(existing) = submit_use_case.find_existing(submitted).await? {
+            return Ok(PreparedSubmission {
+                existing: Some(existing),
+            });
+        }
+        return Err(error.into());
     }
     let paykit = state.paykit_http_client().ok_or_else(|| {
         ApiError::new(
@@ -148,32 +163,18 @@ async fn maybe_prepare_paykit_submission(
             "paykit is not configured",
         )
     })?;
-    paykit
-        .create_invoice(&PaykitInvoiceRequest {
-            bundle_id: submitted.bundle_id.to_string(),
-            lock_resource: submitted.pubky_lock_resource.to_string(),
-            reader: reader.to_string(),
-        })
-        .await
-        .map_err(map_paykit_invoice_error)?;
-    Ok(PreparedSubmission { existing })
-}
-
-fn map_paykit_invoice_error(error: PaykitClientError) -> ApiError {
-    if matches!(
-        error,
-        PaykitClientError::NonSuccess {
-            status: StatusCode::CONFLICT,
-            ..
-        }
-    ) {
-        return ApplicationError::VerificationTaskConflict.into();
-    }
-
-    ApiError::new(
-        ApiErrorCode::PaykitInvoiceCreationFailed,
-        "paykit invoice creation failed",
-    )
+    let _ = paykit;
+    let submitted = submit_use_case
+        .execute_invoice_pending(
+            SubmitProofBundleRequest {
+                submitted_proof_bundle: submitted.clone(),
+            },
+            state.invoice_admissions().as_ref(),
+        )
+        .await?;
+    Ok(PreparedSubmission {
+        existing: Some(submitted),
+    })
 }
 
 pub(super) async fn lookup_verification_task(
@@ -181,14 +182,45 @@ pub(super) async fn lookup_verification_task(
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
 ) -> Result<Json<VerificationTaskLifecycleHttpResponse>, ApiError> {
     let request = parse_json(request)?;
-    let view = get_task_view_by_handle(&state, request).await?;
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(&request.creator, &request.bundle_id)
+        .await?
+        .ok_or(ApplicationError::MissingRecord {
+            record: "verification_task",
+        })?;
+    let admission = state
+        .invoice_admissions()
+        .get_invoice_admission(&task.task_id)
+        .await?;
+    let view = locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView::from(task);
+    Ok(Json(project_lifecycle_response(view, admission.as_ref())))
+}
 
-    Ok(Json(VerificationTaskLifecycleHttpResponse::from(view)))
+fn project_lifecycle_response(
+    view: locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView,
+    admission: Option<&InvoiceAdmissionRecord>,
+) -> VerificationTaskLifecycleHttpResponse {
+    let mut response = VerificationTaskLifecycleHttpResponse::from(view);
+    if admission.is_some_and(|value| {
+        value.retry_reason == Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded)
+    }) {
+        response.status_message = Some("Reader wallet setup needed".to_owned());
+    }
+    if let Some(admission) = admission.filter(|value| {
+        value.phase == InvoiceAdmissionPhase::InvoicePending
+            && response.status
+                == locks_service::application::models::VerificationTaskStatus::Pending
+    }) {
+        response.admission_deadline_at = Some(admission.admission_deadline_at);
+    }
+    response
 }
 
 pub(super) async fn lookup_paykit_connection_state(
     State(state): State<AppState>,
-    ConnectInfo(client_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
@@ -232,7 +264,11 @@ pub(super) async fn lookup_paykit_connection_state(
 
     let decision = state.paykit_connection_state_lookup_rate_limiter().check(
         &PaykitConnectionStateLookupRateLimitKey {
-            client_address: client_address.ip(),
+            client_address: client_ip(
+                peer,
+                &headers,
+                state.config().rate_limits.trusted_proxy_hops,
+            ),
             creator: task.creator.clone(),
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
         },
@@ -298,6 +334,14 @@ pub(super) async fn complete_verification_task(
                 record: "verification_task",
             },
         )?;
+    if state
+        .invoice_admissions()
+        .get_invoice_admission(&task.task_id)
+        .await?
+        .is_some_and(|admission| admission.phase != InvoiceAdmissionPhase::Ready)
+    {
+        return Err(ApplicationError::VerificationTaskConflict.into());
+    }
     let task_id = task.task_id;
     let verifiers = StaticCriterionVerifierRegistry::new()
         .with_dev_static(state.dev_static_verifier().as_ref());
@@ -332,51 +376,4 @@ async fn get_task_view_by_handle(
         })
         .await?;
     Ok(view)
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::http::StatusCode;
-    use serde_json::json;
-
-    use super::map_paykit_invoice_error;
-    use crate::paykit_http_client::PaykitClientError;
-
-    #[test]
-    fn paykit_invoice_conflict_maps_to_existing_task_conflict() {
-        let error = map_paykit_invoice_error(PaykitClientError::NonSuccess {
-            operation: "invoice creation",
-            status: StatusCode::CONFLICT,
-        });
-
-        assert_eq!(error.status_code(), StatusCode::CONFLICT);
-        assert_eq!(
-            serde_json::to_value(error.error_response()).unwrap(),
-            json!({
-                "error": {
-                    "code": "task_state_conflict",
-                    "message": "verification task state conflict"
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn other_paykit_invoice_failures_remain_generic_bad_gateway() {
-        let error = map_paykit_invoice_error(PaykitClientError::NonSuccess {
-            operation: "invoice creation",
-            status: StatusCode::BAD_REQUEST,
-        });
-
-        assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            serde_json::to_value(error.error_response()).unwrap(),
-            json!({
-                "error": {
-                    "code": "paykit_invoice_creation_failed",
-                    "message": "paykit invoice creation failed"
-                }
-            })
-        );
-    }
 }

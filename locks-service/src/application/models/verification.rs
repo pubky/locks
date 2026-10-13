@@ -1,10 +1,128 @@
 use time::OffsetDateTime;
 
-use locks_core::ids::{BundleId, CreatorPubky, LockId, LockServerPubky, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId, LockServerPubky, PubkyLockResource, TaskId};
 use locks_core::lock_policy::Criterion;
-use locks_core::verification::{Proof, SubmittedProofBundle};
+use locks_core::verification::{Proof, SubmittedProofBundle, VerifiedProofBundle};
 
 use crate::application::errors::ApplicationError;
+
+/// Only supported persisted invoice-admission intent version.
+pub const INVOICE_ADMISSION_INTENT_VERSION: u8 = 1;
+
+/// Immutable public Paykit invoice inputs retained before first outbound attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InvoiceAdmissionIntentV1 {
+    pub version: u8,
+    pub creator: CreatorPubky,
+    pub bundle_id: BundleId,
+    pub lock_resource: PubkyLockResource,
+    pub reader: CreatorPubky,
+}
+
+impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredIntent {
+            version: u8,
+            creator: CreatorPubky,
+            bundle_id: BundleId,
+            lock_resource: PubkyLockResource,
+            reader: CreatorPubky,
+        }
+
+        let stored = StoredIntent::deserialize(deserializer)?;
+        if stored.version != INVOICE_ADMISSION_INTENT_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported invoice admission intent version: {}",
+                stored.version
+            )));
+        }
+        if stored.lock_resource.creator() != &stored.creator {
+            return Err(serde::de::Error::custom(
+                "invoice admission creator does not match lock resource",
+            ));
+        }
+        Ok(Self {
+            version: stored.version,
+            creator: stored.creator,
+            bundle_id: stored.bundle_id,
+            lock_resource: stored.lock_resource,
+            reader: stored.reader,
+        })
+    }
+}
+
+/// Internal invoice admission phase. Public task lifecycle remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceAdmissionPhase {
+    InvoicePending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceAdmissionRetryReason {
+    ReaderWalletSetupNeeded,
+}
+
+impl InvoiceAdmissionRetryReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReaderWalletSetupNeeded => "reader_wallet_setup_needed",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "reader_wallet_setup_needed" => Some(Self::ReaderWalletSetupNeeded),
+            _ => None,
+        }
+    }
+}
+
+/// Durable invoice-admission state stored with one verification task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceAdmissionRecord {
+    pub task: VerificationTaskRecord,
+    pub phase: InvoiceAdmissionPhase,
+    pub intent: InvoiceAdmissionIntentV1,
+    pub admission_deadline_at: OffsetDateTime,
+    pub next_attempt_at: Option<OffsetDateTime>,
+    pub attempt_count: u32,
+    pub retry_reason: Option<InvoiceAdmissionRetryReason>,
+}
+
+/// Claimed invoice admission carrying exact lease-incarnation fencing token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedInvoiceAdmission {
+    pub admission: InvoiceAdmissionRecord,
+    pub claim_token: uuid::Uuid,
+    /// Storage-authoritative deadline result sampled after claim serialization.
+    pub deadline_expired: bool,
+}
+
+impl InvoiceAdmissionPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvoicePending => "invoice_pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "invoice_pending" => Some(Self::InvoicePending),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
 
 /// Verification task status used by the service layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,12 +131,52 @@ pub enum VerificationTaskStatus {
     Pending,
     /// Verification is currently running.
     InProgress,
+    /// Exact entitlement payload won the lifecycle race and awaits verified publication.
+    PublishingEntitlement,
     /// Verification succeeded and entitlement storage can be read.
     Completed,
     /// Verification failed and no entitlement should be created.
     Failed,
     /// Task state aged out before completion.
     Expired,
+}
+
+/// Canonical reason a Paykit-backed verification attempt ended without entitlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationTerminalReason {
+    PaymentRequestRejected,
+    PaymentRequestCanceled,
+    ProposalExpired,
+    PaymentDeadlineExpired,
+}
+
+impl VerificationTerminalReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PaymentRequestRejected => "payment_request_rejected",
+            Self::PaymentRequestCanceled => "payment_request_canceled",
+            Self::ProposalExpired => "proposal_expired",
+            Self::PaymentDeadlineExpired => "payment_deadline_expired",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "payment_request_rejected" => Some(Self::PaymentRequestRejected),
+            "payment_request_canceled" => Some(Self::PaymentRequestCanceled),
+            "proposal_expired" => Some(Self::ProposalExpired),
+            "payment_deadline_expired" => Some(Self::PaymentDeadlineExpired),
+            _ => None,
+        }
+    }
+}
+
+/// Closed criterion-verifier decision used by completion orchestration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CriterionVerificationOutcome {
+    Pending,
+    Satisfied(locks_core::verification::CriterionVerificationResult),
+    TerminalUnsatisfied(VerificationTerminalReason),
 }
 
 /// Persisted service-layer verification task state.
@@ -40,6 +198,10 @@ pub struct VerificationTaskRecord {
     pub completed_at: Option<OffsetDateTime>,
     /// Non-empty failure detail for failed tasks only.
     pub failure_message: Option<String>,
+    /// Typed no-entitlement reason for expired Paykit attempts only.
+    pub terminal_reason: Option<VerificationTerminalReason>,
+    /// Exact durable payload replayed while entitlement publication is pending.
+    pub entitlement_to_publish: Option<VerifiedProofBundle>,
 }
 
 /// Worker claim carrying the lease incarnation token required for fenced writes.
@@ -75,9 +237,16 @@ impl VerificationTaskRecord {
                 transitioned.started_at = None;
                 transitioned.completed_at = None;
                 transitioned.failure_message = None;
+                transitioned.terminal_reason = None;
+                transitioned.entitlement_to_publish = None;
             }
             VerificationTaskStatus::InProgress => {
                 transitioned.started_at = Some(at);
+            }
+            VerificationTaskStatus::PublishingEntitlement => {
+                return Err(ApplicationError::InvalidVerificationTaskState {
+                    message: "publishing transitions require an entitlement payload".to_owned(),
+                });
             }
             VerificationTaskStatus::Completed => {
                 transitioned.completed_at = Some(at);
@@ -87,24 +256,71 @@ impl VerificationTaskRecord {
                 transitioned.failure_message = trimmed_failure_message;
             }
             VerificationTaskStatus::Expired => {
-                transitioned.completed_at = Some(at);
+                return Err(ApplicationError::InvalidVerificationTaskState {
+                    message: "expired transitions require a terminal reason".to_owned(),
+                });
             }
         }
 
         Ok(transitioned)
     }
 
+    /// Persists exact entitlement payload before any external publication attempt.
+    pub fn begin_entitlement_publication(
+        &self,
+        entitlement: VerifiedProofBundle,
+    ) -> Result<Self, ApplicationError> {
+        self.validate_state()?;
+        self.validate_transition(VerificationTaskStatus::PublishingEntitlement)?;
+        let mut transitioned = self.clone();
+        transitioned.status = VerificationTaskStatus::PublishingEntitlement;
+        transitioned.entitlement_to_publish = Some(entitlement);
+        Ok(transitioned)
+    }
+
+    /// Marks publication complete only after equivalent entitlement read-back.
+    pub fn complete_entitlement_publication(
+        &self,
+        at: OffsetDateTime,
+    ) -> Result<Self, ApplicationError> {
+        self.transition_to(VerificationTaskStatus::Completed, at, None)
+    }
+
+    /// Terminalizes an actively running Paykit attempt without entitlement or failure.
+    pub fn expire(
+        &self,
+        reason: VerificationTerminalReason,
+        at: OffsetDateTime,
+    ) -> Result<Self, ApplicationError> {
+        self.validate_state()?;
+        self.validate_transition(VerificationTaskStatus::Expired)?;
+        if self.status != VerificationTaskStatus::InProgress {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "only an in-progress task can expire with a terminal reason".to_owned(),
+            });
+        }
+        let mut transitioned = self.clone();
+        transitioned.status = VerificationTaskStatus::Expired;
+        transitioned.completed_at = Some(at);
+        transitioned.failure_message = None;
+        transitioned.terminal_reason = Some(reason);
+        Ok(transitioned)
+    }
+
     fn validate_transition(&self, next: VerificationTaskStatus) -> Result<(), ApplicationError> {
-        use VerificationTaskStatus::{Completed, Expired, Failed, InProgress, Pending};
+        use VerificationTaskStatus::{
+            Completed, Expired, Failed, InProgress, Pending, PublishingEntitlement,
+        };
 
         let allowed = matches!(
             (self.status, next),
             (Pending, InProgress)
                 | (Pending, Expired)
                 | (InProgress, Pending)
-                | (InProgress, Completed)
+                | (InProgress, PublishingEntitlement)
                 | (InProgress, Failed)
                 | (InProgress, Expired)
+                | (PublishingEntitlement, Completed)
         );
 
         if allowed {
@@ -118,23 +334,38 @@ impl VerificationTaskRecord {
     }
 
     fn validate_state(&self) -> Result<(), ApplicationError> {
-        use VerificationTaskStatus::{Completed, Expired, Failed, InProgress, Pending};
+        use VerificationTaskStatus::{
+            Completed, Expired, Failed, InProgress, Pending, PublishingEntitlement,
+        };
 
         let valid = match self.status {
             Pending => {
                 self.started_at.is_none()
                     && self.completed_at.is_none()
                     && self.failure_message.is_none()
+                    && self.terminal_reason.is_none()
+                    && self.entitlement_to_publish.is_none()
             }
             InProgress => {
                 self.started_at.is_some()
                     && self.completed_at.is_none()
                     && self.failure_message.is_none()
+                    && self.terminal_reason.is_none()
+                    && self.entitlement_to_publish.is_none()
+            }
+            PublishingEntitlement => {
+                self.started_at.is_some()
+                    && self.completed_at.is_none()
+                    && self.failure_message.is_none()
+                    && self.terminal_reason.is_none()
+                    && self.entitlement_to_publish.is_some()
             }
             Completed => {
                 self.started_at.is_some()
                     && self.completed_at.is_some()
                     && self.failure_message.is_none()
+                    && self.terminal_reason.is_none()
+                    && self.entitlement_to_publish.is_some()
             }
             Failed => {
                 self.started_at.is_some()
@@ -143,8 +374,16 @@ impl VerificationTaskRecord {
                         .failure_message
                         .as_deref()
                         .is_some_and(|message| !message.trim().is_empty())
+                    && self.terminal_reason.is_none()
+                    && self.entitlement_to_publish.is_none()
             }
-            Expired => self.completed_at.is_some() && self.failure_message.is_none(),
+            Expired => {
+                self.started_at.is_some()
+                    && self.completed_at.is_some()
+                    && self.failure_message.is_none()
+                    && self.terminal_reason.is_some()
+                    && self.entitlement_to_publish.is_none()
+            }
         };
 
         if valid {

@@ -14,6 +14,7 @@ examples/js-sdk/creator-complete-flow.js
 examples/js-sdk/reader.html
 examples/js-sdk/reader-app.js
 examples/js-sdk/reader-flow.js
+examples/js-sdk/paykit-viewer-flow.js
 examples/js-sdk/scripts/init-config.mjs
 examples/js-sdk/scripts/homegate-bridge.mjs
 examples/js-sdk/scripts/create-user.mjs
@@ -211,12 +212,13 @@ npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
 Do not wrap these commands in `docker compose exec`. The host wrappers load private role
 state locally and bridge only bounded helper input into the relevant container.
 
-The Paykit Server build context uses the immutable `v0.1.0-rc3` tag, its compatible
-Locks context uses `v0.1.0-rc1`, Paykit Rust uses `v0.1.0-rc48`, and Pubky Homeserver uses
-`v0.11.0`. The active Locks checkout is used only for the Locks and browser-demo
-images being developed. No sibling repository checkout is required.
+The local demo selects immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`, the active Locks
+checkout, and Pubky Homeserver `v0.11.0`. Paykit Server local-demo build uses Paykit Rust
+`v0.1.0-rc71`; Locks workspace retains Paykit Rust `v0.1.0-rc56`. Contract checks derive
+server release ref from canonical Compose build context. No sibling repository checkout
+is required for source resolution.
 
-For coordinated pre-merge Paykit Server work, select an explicit absolute local worktree
+For coordinated Paykit Server work, select an explicit absolute local worktree
 without changing the committed public default:
 
 ```bash
@@ -350,7 +352,7 @@ That command signs up/registers the local `content-creator`, approves the auth s
 
 Click **Authenticate to Lock Server**.
 
-Both creator pages open the Lock Server `/connect` shell in an iframe modal. The raw legacy-connect authorization URL stays on the Lock Server origin.
+Both creator pages open the Lock Server `/connect` shell in an iframe modal. In grant mode the shell exposes one `signin_grant` QR/deeplink, never a cookie fallback; raw authorization state stays on Lock Server origin.
 
 The shell returns `{ state, code }` directly to the parent with `postMessage`. The parent accepts the result only from the exact Lock Server origin and iframe window, then validates the state before exchanging the one-time code. The configured callback URL supplies the parent target origin; the browser does not navigate to it:
 
@@ -379,7 +381,7 @@ Rules:
 - file upload only
 - guarded path prefix is fixed:
   ```text
-  /priv/locks.app/content/
+  /priv/app.locks/content/
   ```
 - only the filename segment is editable
 - `/` in filename is rejected
@@ -449,12 +451,14 @@ The Node demo server does not write Locks resources directly to the homeserver.
 After success, the page displays the **Viewer content lock resource**:
 
 ```text
-<creator_pubky>/pub/locks.app/<lock_id>.json
+<creator_pubky>/pub/app.locks/<lock_id>.json
 ```
 
 ## Reader browser flow
 
 The browser remains unauthenticated. A `paykit-payment` proof carries the public key prepared by the native helper; the browser never receives the reader secret or encrypted Paykit state.
+
+For SDK consumers who do not need this demo's helper/server orchestration, [`paykit-viewer-flow.js`](paykit-viewer-flow.js) is the concise copyable browser flow. [`docs/SDK_PAYKIT_VIEWER.md`](../../docs/SDK_PAYKIT_VIEWER.md) documents its public exports, exact request/response shapes, lifecycle terminals, independent connection-state observation, and bearer-only credential use.
 
 1. Copy the creator demo's **Viewer content lock resource** and paste it into the reader demo.
 2. Click **Load lock**. The browser SDK validates the content lock and resolves the Lock Server.
@@ -500,3 +504,11 @@ This does not run live browser flows. It verifies that the examples keep the agr
 - Compose generates closed Locks and Paykit TOML from actual local identities; trusted-key placeholders are never runnable configuration.
 - The second auth flow must use Lock Server `/connect`, not a demo-origin rendering of the raw `authorization_url`.
 - The examples do not use a gateway/base URL fallback. SDK calls resolve through browser PKARR/domain paths using the configured local PKARR relay.
+
+### Price currencies and checkout
+
+Creators price content in BTC (entered in sats) or USD (up to two decimal places). USDT is a payment method, not a price-currency choice. The public lock stores the amount as an integer string in that denomination's smallest unit. Changing currency clears the price and checks setup readiness again. The default Paykit Server configuration omits `[usdt]`: setup requests only the Bitcoin account, and both price currencies are payable in Bitcoin. USDT receiving requires explicitly enabling that server configuration and compatible wallets.
+
+Paykit Server creates the immutable request and fixed conversion rates, using its configured BTC/USD source and USD/USDT parity. The default converted-payment window is one hour (configured on Paykit Server). Readers pay one of the accepted methods in Bitkit; fees are additional. Locks never performs conversion or accepts cross-chain bridge receipts. Full on-time USDT payment unlocks after verified Arbitrum inclusion.
+
+The local regtest reader helper remains Bitcoin-only. For a USDT flow use staging mode with real Bitkit and the matching Paykit Server USDT configuration. The local HTTP tests use server status fixtures; they do not execute blockchain payments. Deploy the SDK, Locks, and the per-rail Paykit Server contract together.

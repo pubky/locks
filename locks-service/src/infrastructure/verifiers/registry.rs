@@ -53,7 +53,7 @@ mod tests {
     use locks_core::verification::CriterionVerificationResult;
 
     use crate::application::errors::ApplicationError;
-    use crate::application::models::CriterionVerificationRequest;
+    use crate::application::models::{CriterionVerificationOutcome, CriterionVerificationRequest};
     use crate::application::ports::{CriterionVerifier, CriterionVerifierRegistry};
     use crate::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
@@ -91,7 +91,11 @@ mod tests {
             .verifier_for(VerifierType::DevStatic)
             .expect("registered dev-static verifier");
 
-        let result = registered.verify(request()).await.unwrap();
+        let CriterionVerificationOutcome::Satisfied(result) =
+            registered.verify(request()).await.unwrap()
+        else {
+            panic!("registered fake should return criterion evidence");
+        };
 
         assert_eq!(result.criterion_id, "criterion-1");
         assert!(result.satisfied);
@@ -131,14 +135,16 @@ mod tests {
         async fn verify(
             &self,
             request: CriterionVerificationRequest,
-        ) -> Result<CriterionVerificationResult, ApplicationError> {
-            Ok(CriterionVerificationResult {
-                criterion_id: request.criterion.criterion_id,
-                satisfied: true,
-                verified_at: request.verified_at,
-                verified_by: request.verified_by,
-                verifier_type: request.criterion.verifier_type,
-            })
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Ok(CriterionVerificationOutcome::Satisfied(
+                CriterionVerificationResult {
+                    criterion_id: request.criterion.criterion_id,
+                    satisfied: true,
+                    verified_at: request.verified_at,
+                    verified_by: request.verified_by,
+                    verifier_type: request.criterion.verifier_type,
+                },
+            ))
         }
     }
 }

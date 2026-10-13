@@ -120,7 +120,7 @@ POST /creator/lock-service-config
   -> SetLockServicePointerUseCase
   -> dev/test-gated local creator publishing route
   -> body includes creator and default Lock Server identity
-  -> stores/replaces local creator config whose canonical future Pubky path is /pub/locks.app/config.json
+  -> stores/replaces local creator config whose canonical future Pubky path is /pub/app.locks/config.json
 
 GET /healthz
   -> runtime liveness only
@@ -131,7 +131,7 @@ GET /readyz
   -> returns { "status": "ready"|"not_ready", "runtime_storage": "ephemeral"|"persisted" }
 ```
 
-`POST /proof-bundles` returns lifecycle metadata for the public verification attempt handle: `creator`, `bundle_id`, `status`, `submitted_at`, `started_at`, `completed_at`, and `failure_message`. It does not return `task_id`, `pubky_lock_resource`, or the submitted proof bundle. Rationale: `{ creator, bundle_id }` is the durable viewer-held handle for the verification attempt, while Task ID is only internal runtime coordination state.
+`POST /proof-bundles` returns lifecycle metadata for the public verification attempt handle: `creator`, `bundle_id`, `status`, `submitted_at`, `started_at`, `completed_at`, `failure_message`, nullable viewer-safe `status_message`, nullable DB-owned `admission_deadline_at`, and `terminal_reason`. It does not return `task_id`, `pubky_lock_resource`, or the submitted proof bundle. Rationale: `{ creator, bundle_id }` is the durable viewer-held handle for the verification attempt, while Task ID is only internal runtime coordination state. For Paykit payment submissions, task plus immutable invoice-admission intent are durable before Reader/Paykit I/O; clients poll same handle instead of resubmitting to drive retries. Pending deadline projection exposes stalled-worker evidence without synthesizing failure; terminalization remains worker-owned.
 
 HTTP DTOs use a mixed approach. `locks-core` protocol/domain payloads that are already explicit versioned wire contracts, such as `SubmittedProofBundle`, may be reused inside HTTP envelopes. Route envelopes, status responses, credential responses, and errors get separate `locks-server` DTOs so HTTP shape can evolve without exposing application model internals just because they currently serialize conveniently.
 
@@ -143,7 +143,7 @@ The proxy-read response returns raw bytes, not JSON/base64. Successful proxy-rea
 
 Creator publishing routes are local dev/test product surface, not production Pubky publishing. `POST /creator/priv-resources`, `POST /creator/content-locks`, and `POST /creator/lock-service-config` are unauthenticated while local because real creator authorization depends on Pubky capability/session work. They must be mounted only when an explicit creator-publishing config flag is enabled in dev/test runtime, and production runtime must reject configs that expose them. Do not add fake shared-secret/admin-token auth.
 
-`POST /creator/priv-resources` overwrites the current local guarded resource by creator/path. `POST /creator/content-locks` verifies that the referenced guarded resource currently exists and matches path, hash, content type, and size before creating a content lock. `POST /creator/lock-service-config` stores the creator's default Lock Service Pointer for `/pub/locks.app/config.json`, but content lock creation does not require it. These semantics exercise local creator-to-viewer flow without adding fake Pubky writes.
+`POST /creator/priv-resources` overwrites the current local guarded resource by creator/path. `POST /creator/content-locks` verifies that the referenced guarded resource currently exists and matches path, hash, content type, and size before creating a content lock. `POST /creator/lock-service-config` stores the creator's default Lock Service Pointer for `/pub/app.locks/config.json`, but content lock creation does not require it. These semantics exercise local creator-to-viewer flow without adding fake Pubky writes.
 
 Proxy-read accepts credentials only through `Authorization: Bearer <credential>`. The `Bearer` scheme is case-insensitive, but parsing is otherwise strict: exactly one `Authorization` header, exactly one non-empty token after the scheme, no query-string credential, and no body credential. Missing or malformed bearer credentials map to `401 invalid_access_credential`.
 

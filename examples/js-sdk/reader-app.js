@@ -1,3 +1,4 @@
+import { formatPaymentAmount } from './payment-amount.js';
 import {
   classifyPaymentLifecycle,
   connectionStateIndicator,
@@ -24,6 +25,11 @@ import {
   createPaykitDataCheckController,
 } from './reader-staging-paykit.js';
 import { buildPersistedReaderState, restorePersistedReaderState } from './reader-persistence.js';
+import {
+  describeReaderLoadState,
+  paymentLifecycleTerminalError,
+  validateContentLockResource,
+} from './reader-load-state.js';
 
 const STATE_KEY = 'pubky-locks-reader-demo.state';
 
@@ -41,6 +47,7 @@ const state = {
   paykitPaymentRequest: null,
   baselinePaymentRequestId: null,
   loadingLock: false,
+  loadError: '',
   submittingProof: false,
   paymentPolling: false,
   loaded: null,
@@ -74,6 +81,7 @@ const el = {
   load: document.querySelector('#load-content-lock'),
   loadStatus: document.querySelector('#load-status'),
   loadedOutput: document.querySelector('#loaded-lock-output'),
+  paymentPrice: document.querySelector('#payment-price'),
   verifierType: document.querySelector('#verifier-type'),
   proofSatisfied: document.querySelector('#proof-satisfied'),
   paykitReaderCommands: document.querySelector('#paykit-reader-commands'),
@@ -143,6 +151,7 @@ function bindEvents() {
       paykitPaymentRequest: null,
       baselinePaymentRequestId: null,
       loadingLock: false,
+      loadError: '',
       submittingProof: false,
       paymentPolling: false,
       loaded: null,
@@ -163,6 +172,7 @@ function bindEvents() {
 
   el.resource.addEventListener('input', () => {
     const resource = el.resource.value.trim();
+    state.loadError = '';
     if (resource !== state.resource) {
       invalidateWorkflow();
       clearVerificationState({ clearLoaded: true });
@@ -268,6 +278,7 @@ async function loadLock() {
   invalidateWorkflow();
   clearVerificationState({ clearLoaded: true });
   state.resource = resource;
+  state.loadError = '';
   state.loadingLock = true;
   const incarnation = workflowIncarnation;
   const loadToken = Symbol('load-lock');
@@ -275,6 +286,7 @@ async function loadLock() {
   persistState();
   render();
   try {
+    validateContentLockResource(resource);
     await postClientLog('info', 'reader-load-lock-started', { resource });
     if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     el.loadStatus.textContent = 'Loading content lock...';
@@ -302,7 +314,7 @@ async function loadLock() {
   } catch (error) {
     if (activeLoadToken !== loadToken || incarnation !== workflowIncarnation) return;
     await postClientLog('error', 'reader-load-lock-failed', serializeError(error));
-    showError(el.loadStatus, error);
+    state.loadError = error?.message ?? String(error);
   } finally {
     if (activeLoadToken === loadToken) {
       activeLoadToken = null;
@@ -520,8 +532,9 @@ async function pollPaymentLifecycle(handle = currentPaymentHandle()) {
         await delay(1_000);
         continue;
       }
-      if (status === 'failed' || status === 'expired' || classification === 'failed') {
-        throw new Error(`payment verification ended with status ${status}`);
+      const terminalError = paymentLifecycleTerminalError(lifecycle);
+      if (terminalError || classification === 'failed') {
+        throw new Error(terminalError ?? `payment verification ended with status ${status}`);
       }
       if (classification === 'completed') {
         await postClientLog('info', 'reader-payment-poll-completed', handleDetails(handle));
@@ -696,7 +709,7 @@ function render() {
     el.paykitReaderStatus.className = 'muted';
   }
   el.paykitReaderPayment.textContent = stagingMode
-    ? (state.bundleId ? 'Complete the Payment Request in the external reader Bitkit, then resume payment verification polling.' : '')
+    ? (state.bundleId ? 'Pay the request in Bitkit using one of its accepted payment methods, then resume payment verification polling.' : '')
     : state.paykitPaymentRequest
     ? format({
       payment_request_id: state.paykitPaymentRequest.payment_request_id,
@@ -708,20 +721,19 @@ function render() {
     })
     : '';
 
-  if (state.loadingLock) {
-    el.loadStatus.textContent = 'Loading content lock...';
-    el.loadStatus.className = 'muted';
-  } else if (state.loaded) {
-    el.loadStatus.textContent = 'Content lock loaded.';
-    el.loadStatus.className = 'ok';
-  } else if (state.resource) {
-    el.loadStatus.textContent = 'Ready to load content lock.';
-    el.loadStatus.className = 'muted';
-  } else {
-    el.loadStatus.textContent = 'Paste a content lock resource.';
-    el.loadStatus.className = 'muted';
-  }
+  const loadStatus = describeReaderLoadState(state);
+  el.loadStatus.textContent = loadStatus.message;
+  el.loadStatus.className = loadStatus.className;
   el.loadedOutput.textContent = format(state.loaded);
+  const payment = state.loaded?.contentLock?.criteria?.find((criterion) => criterion.verifier_type === 'paykit-payment');
+  el.paymentPrice.hidden = !payment;
+  if (payment) {
+    try {
+      el.paymentPrice.textContent = `Price: ${formatPaymentAmount(payment.params.amount, payment.params.asset)}`;
+    } catch {
+      el.paymentPrice.textContent = 'See the Payment Request in Bitkit for the price.';
+    }
+  }
   renderLockResources();
 
   el.submitProof.disabled = state.loadingLock
@@ -732,7 +744,10 @@ function render() {
     el.proofStatus.textContent = 'Submitting proof bundle...';
     el.proofStatus.className = 'muted';
   } else if (state.lifecycle) {
-    el.proofStatus.textContent = `Proof submitted. Status: ${state.lifecycle.status}`;
+    const terminalReason = state.lifecycle.terminal_reason;
+    el.proofStatus.textContent = terminalReason
+      ? `Proof submitted. Status: ${state.lifecycle.status} (${terminalReason}); retry with a new Bundle ID.`
+      : `Proof submitted. Status: ${state.lifecycle.status}`;
     el.proofStatus.className = ['failed', 'expired'].includes(state.lifecycle.status) ? 'error' : 'ok';
   } else {
     el.proofStatus.textContent = state.loaded ? 'Ready to submit proof bundle.' : 'Waiting for loaded lock.';

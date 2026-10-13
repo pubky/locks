@@ -100,19 +100,24 @@ Creator repositories are not operator-selectable. Server runtime always uses Pub
 ```toml
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["http://localhost:3000"]
 ```
 
-`legacy-connect` is the only accepted method. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` must contain at least one exact `http`/`https` origin with scheme and authority only; grant mode does not fall back to legacy or top-level origins. Paths, query strings, and fragments are rejected. A single wildcard entry is accepted only outside production and must not be mixed with concrete origins.
 
-When enabled, the Lock Server starts and completes legacy Pubky auth, stores encrypted creator authority, then issues a short-lived code that pubky.app/browser clients exchange for a Locks-local frontend session token.
+When enabled, the Lock Server derives a distinct PoP key for each pending flow from the Lock Server signing seed, starts grant auth, validates exact issuer/session identity, `client_id`, PoP key, exact requested capability set, and expiry, then stores only encrypted delegated restore state. PoP private keys, grant bearers, authorization URLs, and frontend session tokens are not stored in creator authority. The short-lived callback code and Locks-local frontend session protocol remain unchanged.
 
-`legacy_connect.allowed_return_origins` entries are exact `http`/`https` origins with scheme and authority only. Paths, query strings, and fragments are rejected. A single wildcard entry, `allowed_return_origins = ["*"]`, is accepted and means `/connect` may use the origin from `return_to`; wildcard must not be mixed with concrete origins.
+`legacy-connect` remains an explicit compatibility mode for older operator/test flows. It uses `[creator_authority_acquisition.legacy_connect]`. Grant mode rejects stored `LegacyCookie` authority instead of silently using it; creators must reconnect with a grant after switching modes. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+
+Grant PoP keys depend on both the configured Lock Server signing seed and a fixed derivation context. Rotating that seed or changing the context makes stored grants unrestorable; reconnect creators before such a rotation. Restore exchanges delegated state with the homeserver stored at approval time; a creator who moves homeserver must reconnect. The delegated callback signs only a syntactically closed Pubky PoP JWS input (`EdDSA`, `pubky-pop`, exact `aud`/`gid`/`iat`/`nonce` claims); grant ID and homeserver audience validation remain inside the pinned SDK credential exchange because its callback does not expose expected context separately. Grant composition currently uses pinned Pubky SDK delegated-flow APIs that are `#[doc(hidden)]`; upgrading `pubky` requires explicit compatibility and signing-boundary review or an upstream public server-held delegated signer API.
+
+The pinned Pubky SDK reports cached grant-bearer refresh transport/5xx failures through the same public error variants as ordinary homeserver storage transport/5xx failures. Upstream issue pubky/pubky#698 remains open, so in `grant-connect` mode Locks temporarily maps both classes to coarse `503 creator_authority_unavailable` and invalidates only the cache generation used by that operation. Grant-backed reads then reacquire creator storage and replay the same read once; this can add one read retry for an ordinary storage transport/5xx failure. Writes and deletes are never replayed because their side effects may already have occurred. `legacy-connect` keeps ordinary storage transport/5xx failures mapped as internal storage errors and does not use the read retry. Logs expose only operation stage and closed error class, never upstream bodies, paths, grants, or bearers.
 
 ## PKARR and browser SDK reachability
 
@@ -149,7 +154,7 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, the Lock Server calls `POST /invoices` during `POST /proof-bundles` before creating a verification task. Exact persisted payment-submission replay returns the existing lifecycle without calling Paykit. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Workers call `POST /transactions/status` while completing pending payment verification tasks. Every Paykit request body is canonical JSON signed through `X-Paykit-Signature` with the existing Lock Server keypair; therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, `POST /proof-bundles` durably persists the pending verification task and immutable invoice-admission intent before any Reader homeserver or Paykit I/O, then returns that pending lifecycle. Exact persisted replay returns the same lifecycle. A claimed invoice-admission worker calls Paykit `POST /invoices` with the persisted request and stable task UUID in `X-Request-ID`; browser clients poll the existing task and never resubmit to drive admission. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Verification workers call `POST /payment-requests/status` only after invoice admission is ready. Every Paykit request body is canonical JSON. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body` with the existing Lock Server keypair; body-only signatures are not supported. Therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
 Public connection-state lookups have independent process-local admission control. Defaults are 60 requests per 60-second window for each `(client IP, creator, bundle_id)`, a process-wide token bucket of 50 requests per second with burst 50, 16 concurrent outbound Paykit status requests, and at most 10,000 retained windows across the process:
 
@@ -165,13 +170,40 @@ global_burst = 50
 
 Fixed-window rejection includes its remaining window in `Retry-After`; token-bucket and concurrency rejection use one second. When `max_entries` is full, new keys are rejected until expired windows are evicted. Any bound returns `429 rate_limited` before another request reaches Paykit. Defaults reserve half of Paykit Server `v0.1.0-rc3`'s default signed-request rate for invoice creation, payment-status checks, and other callers. Operators using non-default Paykit limits or multiple Locks processes must keep aggregate Locks limits below Paykit's signed-request budget.
 
-Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Redirects are never followed for any signed Paykit request: `paykit.server_url` must name the final origin, and every `3xx` is handled as a non-success response. Invoice timeouts fail submission with `paykit_invoice_creation_failed`; connection-state timeouts fail only that read with `paykit_connection_state_timeout`; payment-status timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
+Paykit HTTP connections have a 5-second connect timeout and every request has a 20-second whole-request timeout. Redirects are never followed for any signed Paykit request: `paykit.server_url` must name the final origin, and every `3xx` is handled as a non-success response. Invoice transport failures, invalid/ambiguous success responses, typed Reader setup or registry failures, `429`, and every `5xx` response remain durable and retryable with full jitter from a 2-second cap through a 60-second cap. Safe numeric `Retry-After` hints are clamped to 60 seconds. Retries never extend the DB-owned 10-minute admission deadline; deadline expiry fails the task without entitlement. Pending lifecycle responses expose that persisted deadline, while only the worker may persist failure; DB time owns enforcement, so browser/host clock skew makes local countdowns approximate. During Reader wallet setup or malformed/oversized registry retry, task polling projects the viewer-safe `Reader wallet setup needed` message and keeps it sticky across other transient retries; clients keep polling the same task. Connection-state timeouts fail only that read with `paykit_connection_state_timeout`; payment-status timeouts remain pending/retryable. When `[paykit]` and the in-process worker are both enabled, `worker.claim_timeout_seconds` must be greater than 20 so a Paykit request cannot outlive the worker claim lease. External worker deployments must preserve the same timeout/lease relationship operationally.
 
-Every claimed verification task receives a fresh opaque claim token. Retry, completion, and failure transitions require the exact token, worker ID, `in_progress` state, and an unexpired lease, so a stale process cannot write after the same worker ID reclaims the task. Pubky entitlement publication cannot be atomic with the Postgres transition: a stale worker may publish a valid entitlement but cannot persist terminal task state. After any publication error, Locks reads the entitlement back; the current owner recovers only when the stored entitlement decision matches in every field except verifier-owned `verified_at` timestamps. A missing or mismatched entitlement preserves the failure. The Pubky adapter remains check-then-put, so claim fencing does not make concurrent homeserver writes atomic; it only fences Postgres task state.
+Every claimed verification task receives a fresh opaque claim token. Retry, completion, and failure transitions require the exact token, worker ID, `in_progress` state, and an unexpired lease, so a stale process cannot write after the same worker ID reclaims the task. Pubky entitlement publication cannot be atomic with the Postgres transition: a stale worker may publish a valid entitlement but cannot persist terminal task state. After any publication error, Locks reads the entitlement back; the current owner recovers only when the stored entitlement is exactly equal to the persisted publication payload, including `verified_at`. A missing or mismatched entitlement preserves the failure. The Pubky adapter remains check-then-put, so claim fencing does not make concurrent homeserver writes atomic; it only fences Postgres task state.
 
-`minimum_confirmations = 0` accepts a Paykit status of `detected` or `confirmed` when `amount_matched = true`. Values above zero require `status = "confirmed"` and at least that many confirmations. `undetected`, insufficient confirmations, or `amount_matched = false` keep the task pending/retryable.
+`minimum_confirmations` applies only to Bitcoin: zero permits mempool detection, and a positive threshold requires that many Bitcoin confirmations. USDT requires a successful, verified Arbitrum payment included in at least one block; it does not wait for finality. For either rail, `amount_matched` and `paid_on_time` must both be true on that observation. Partial payments on different rails never combine. Missing/reorged evidence, an underpayment, or a late payment cannot grant access. Locks uses the Paykit server's verified per-rail facts, never payer-submitted amounts or transaction hashes. Request rejection, cancellation, proposal expiry, or accepted-payment deadline expiry terminalizes the current task as `expired` with a typed reason and no entitlement, even when factual payment evidence is confirmed. Locks does not derive expiry from local time. Transport failures, timeouts, response-body read failures, and every non-`200` response remain no-entitlement and pending/retryable; a typed `409 Conflict` remains operator-visible. A `200` response with malformed JSON, missing or unknown fields, unknown states, an oversized body, or invalid or misordered timestamps fails closed as `failed` with no entitlement. Both `failed` and `expired` require a fresh Bundle ID for another attempt.
 
 Omitting `[paykit]` prevents creation of new payment lifecycle identities and connection-state lookup. Existing exact payment-submission replays still return their persisted lifecycle. Non-payment verifier flows continue to run. New `paykit-payment` submissions return `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
+
+## Client address behind reverse proxies
+
+Per-client rate limits for `POST /proof-bundles` and `POST /paykit-connection-state-lookups` are keyed by client IP. By default the client IP is the TCP peer address. Behind a reverse proxy or load balancer, the TCP peer is the proxy, so every client shares one key.
+
+```toml
+[rate_limits]
+trusted_proxy_hops = 0
+
+[rate_limits.verification_submission]
+enabled = true
+max_requests = 60
+window_seconds = 60
+```
+
+A `[rate_limits]` table still requires `[rate_limits.verification_submission]`.
+
+| `trusted_proxy_hops` | Client IP |
+| --- | --- |
+| `0` (default) | TCP peer address. `X-Forwarded-For` is ignored. |
+| `1`–`8` | The `n`th `X-Forwarded-For` entry counted from the right, across all header lines in order. Entries further left are never used. |
+
+Set `trusted_proxy_hops` to the number of proxies in front of the Lock Server that each append one `X-Forwarded-For` entry. One load balancer is `1`; a CDN in front of a load balancer is `2`. Proxies must append to an incoming `X-Forwarded-For` rather than pass it through unmodified, and the Lock Server must not be reachable except through them.
+
+A value higher than the real proxy count selects an entry the client wrote, so any client can choose its own rate-limit key and bypass per-client limits. A value lower than the real proxy count keys clients by a proxy address, so clients behind that proxy share one key. When `X-Forwarded-For` has fewer than `n` entries, or the selected entry is not an IP address, the TCP peer is used. Values above `8` fail config loading. Real proxy chains are shorter, so a larger value is almost certainly a misconfiguration that trusts client-written entries.
+
+Entries may be an IP address, `ipv4:port`, `[ipv6]`, or `[ipv6]:port`. A bare IPv6 address is never split at a colon. IPv4-mapped IPv6 entries (`::ffff:203.0.113.10`) are keyed as their IPv4 address. Header values are not logged. `X-Real-IP` and `Forwarded` are not read.
 
 ## Runtime storage
 
@@ -181,6 +213,14 @@ Operator-facing readiness uses semantic storage labels:
 - `persisted`: Postgres-backed private runtime composition.
 
 Postgres is private runtime storage for verification tasks, task claiming, access credentials, frontend sessions, and creator-granted homeserver session material. It is not storage for Pubky-owned content locks, guarded resources, Lock Service Pointers, or verified proof bundles.
+
+Migration `0010_reset_prototype_runtime_state` performs the approved one-time destructive reset for the coordinated Paykit Server `0.1.0-rc7` and Locks Server `0.1.0-rc8` prototype deployment. It clears Locks-owned verification tasks, access credentials, creator authority, pending connect flows, frontend session codes, and frontend sessions. SQLx records the migration once; later starts preserve post-upgrade state. It does not drop the schema or migration ledger, does not touch the separate Paykit database, and does not delete Pubky-hosted content locks, guarded resources, Lock Service Pointers, or verified proof bundles. Stop every Paykit Server and Locks Server instance, verify both configured databases are dedicated disposable databases, stage both revisions, then start one instance of each service and let both migrations complete. Do not deploy or start either revision alone. Reacquire creator authority, frontend sessions, and Paykit Creator setup after startup. No production data migration is claimed.
+
+Migration `0011_verification_terminal_reason` performs the approved staging-only reset of `verification_tasks`, then adds the closed terminal-reason column and lifecycle constraint. Scope is limited to incompatible Locks verification-task rows; access credentials, creator authority, frontend sessions, unrelated Locks tables, the Paykit database, and Pubky-hosted data are untouched. Existing staging attempts must be resubmitted with fresh Bundle IDs after the coordinated cutover.
+
+Migration `0013_invoice_admission_foundation` adds Lock-Server-private, versioned invoice-admission intent, `invoice_pending`/`ready`/`failed` phase, database-time ten-minute deadline, due/attempt fields, and claim-token lease fencing to existing verification tasks. Existing tasks are marked `ready` because tasks created before this migration were already admitted. Verification claims exclude `invoice_pending` tasks. Current runtime wires new payment submission to this durable phase and runs invoice admission through its separately claimed worker before verification.
+
+Migration `0014_invoice_admission_retry_reason` adds the closed `reader_wallet_setup_needed` retry projection for pending invoice admission. It supports viewer-safe task polling while Reader wallet registry setup is retried; it does not grant entitlement or mark invoice admission ready.
 
 Creator-granted session material is encrypted before storage. The server-side encryption key comes from an env var named by config:
 
@@ -212,7 +252,7 @@ enabled = true
 method = "legacy-connect"
 ```
 
-This mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route.
+This legacy development shape mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route. Use the grant-connect configuration above for Ring 2.0 / Bitkit grant testing.
 
 ## Staging/production shape
 
@@ -227,13 +267,14 @@ environment = "staging" # or "production"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 ```
 
-This mounts authenticated Pubky-backed creator publishing routes and hosted legacy-connect/session routes. It does not mount the dev completion route.
+This mounts authenticated Pubky-backed creator publishing routes and grant-only hosted connect/session routes. It does not mount the dev completion route.
 
 ## Worker
 
@@ -241,13 +282,14 @@ This mounts authenticated Pubky-backed creator publishing routes and hosted lega
 [worker]
 enabled = true
 poll_interval_ms = 250
+paykit_payment_retry_interval_seconds = 3
 ```
 
-`worker.poll_interval_ms` must be greater than zero whether the in-process worker is enabled or disabled. When enabled, the worker claims due pending verification tasks through private runtime storage and completes them through application use cases. Newly submitted tasks are immediately due. A retryable verification result returns the task to durable `pending` state with `next_attempt_at` 30 seconds in the future; it is not claimable again before that timestamp. Queue polling remains independently controlled by `worker.poll_interval_ms`. Retry scheduling preserves the current attempt count and releases the active claim.
+`worker.poll_interval_ms` and `worker.paykit_payment_retry_interval_seconds` must be greater than zero whether the in-process worker is enabled or disabled. When enabled, the worker claims due pending verification tasks through private runtime storage and completes them through application use cases. Newly submitted tasks are immediately due. A retryable `paykit-payment` result returns the task to durable `pending` state with `next_attempt_at` set to the configured Paykit retry interval (3 seconds by default); other verifier types retain the 30-second retry interval. A task is not claimable again before `next_attempt_at`. Queue polling remains independently controlled by `worker.poll_interval_ms`, so retry eligibility does not guarantee completion at exactly 3 seconds. Lower Paykit retry intervals can reduce status-to-entitlement latency but increase Paykit requests and database traffic. Retry scheduling preserves the current attempt count and releases the active claim.
 
 `dev-static` verification is registered only in `environment = "development"`. `paykit-payment` verification is registered when `[paykit]` is configured, regardless of environment. Staging/production completion uses the worker path, not the dev-only `POST /verification-task-completions` route.
 
-For `paykit-payment`, every Paykit status-call failure schedules a normal pending retry and is logged as retry telemetry rather than a verification failure. This includes network errors, timeouts, all non-2xx responses (including `404` and authentication/authorization failures), and malformed success bodies. V1 has no terminal Paykit payment-failure status.
+For `paykit-payment`, valid request rejection/cancellation and proposal/payment expiry persist an `expired` task with typed `terminal_reason`, no failure message, no entitlement, and no retry. Retryable availability failures schedule a normal pending retry and are logged as retry telemetry rather than verification failure. This includes network and response-body read errors, timeouts, and non-`200` responses such as authentication/authorization failures; `409 Conflict` remains operator-visible and is not converted into payment rejection. Malformed JSON, missing or unknown fields, unknown states, oversized bodies, and invalid or misordered timestamps in a `200` response are permanent contract failures: the worker persists `failed` with a viewer-safe failure message, issues no entitlement, and does not retry that Bundle ID.
 
 Scheduled retries and crash recovery are separate mechanisms. Expected retryable results explicitly release the current claim and set `next_attempt_at`. If a worker crashes while a task is `in_progress`, another worker may reclaim it only after `claim_expires_at`; only the worker that still owns an active claim may schedule its retry.
 

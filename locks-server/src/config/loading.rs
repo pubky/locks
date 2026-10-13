@@ -4,9 +4,9 @@ use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_
 use super::raw::RawConfig;
 use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PaykitConfig, PkdnsConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
-    SecretsConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
+    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
 
@@ -91,6 +91,11 @@ fn validate_existing_config_secret(
     if config.paykit.is_some() {
         validate_paykit_signing_seed(secret_path)?;
     }
+    if config.creator_authority_acquisition.method
+        == CreatorAuthorityAcquisitionMethod::GrantConnect
+    {
+        validate_grant_signing_seed(secret_path)?;
+    }
 
     Ok(())
 }
@@ -104,6 +109,17 @@ fn validate_paykit_signing_seed(secret_path: &Path) -> Result<(), ConfigError> {
     parse_lock_server_keypair_seed(&secret)
         .map(|_| ())
         .map_err(|_| ConfigError::InvalidPaykitSigningSeed)
+}
+
+fn validate_grant_signing_seed(secret_path: &Path) -> Result<(), ConfigError> {
+    let secret =
+        std::fs::read_to_string(secret_path).map_err(|source| ConfigError::DerivePublicKey {
+            path: secret_path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+    parse_lock_server_keypair_seed(&secret)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidGrantSigningSeed)
 }
 
 fn initialize_default_config(
@@ -135,6 +151,7 @@ fn initialize_default_config(
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,
+            paykit_payment_retry_interval_seconds: std::num::NonZeroU64::new(3).unwrap(),
             claim_timeout_seconds: 60,
             worker_id: "default-worker".to_owned(),
         },
@@ -170,6 +187,7 @@ run_migrations_on_startup = {} # true runs embedded DB migrations at startup; fa
 [worker]
 enabled = {} # true runs the in-process verification worker; false leaves submitted tasks pending unless another worker process handles them.
 poll_interval_ms = {} # Worker polling interval in milliseconds. Must be > 0; lower is more responsive but creates more DB traffic.
+paykit_payment_retry_interval_seconds = {} # Seconds before retrying pending paykit-payment verification. Must be > 0; lower reduces status-to-entitlement latency but increases Paykit and DB traffic.
 claim_timeout_seconds = {} # Seconds before another worker can reclaim a stuck task. Too low risks duplicate work; too high delays recovery.
 worker_id = "{}" # Stable ID recorded in task claims/logs. Use a unique value per worker process in shared deployments.
 
@@ -178,11 +196,11 @@ environment = "development" # One of: development, staging, production. developm
 
 [paykit]
 server_url = "{}" # Paykit Server base URL used by paykit-payment locks. Local dev default expects Paykit Server on 127.0.0.1:3001.
-minimum_confirmations = {} # Global confirmation threshold for payment satisfaction. 0 allows detected, amount-matched payments before block confirmation.
+minimum_confirmations = {} # Bitcoin confirmation threshold. 0 allows full on-time mempool payments. USDT requires verified Arbitrum inclusion.
 
 [creator_authority_acquisition]
 enabled = {} # true mounts hosted creator connect/session routes; false disables browser acquisition of creator authority.
-method = "legacy-connect" # Currently only legacy-connect is supported. It uses Pubky auth via Ring/signer and stores creator authority server-side.
+method = "legacy-connect" # One of: legacy-connect, grant-connect. Grant mode requires a grant_connect table with client_id and allowed_return_origins.
 frontend_session_ttl_seconds = {} # Locks-local browser session lifetime after connect. Higher values reduce reauth; lower values reduce stolen-token lifetime.
 frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep short; browser must exchange it quickly for a frontend session.
 
@@ -206,6 +224,9 @@ public_pubky_tls_port = {} # Public PubkyTLS port advertised for the Lock Server
 public_icann_http_port = {} # Public HTTP port advertised for ICANN/HTTP access. Use the proxy/listener port clients reach, commonly 80 or 443.
 icann_domain = "{}" # ICANN DNS name advertised for HTTP access. Local default is localhost; production should be the public hostname.
 key_republisher_interval_seconds = {} # How often the server republishes identity records. Lower improves recovery from relay loss; higher reduces background traffic.
+
+[rate_limits]
+trusted_proxy_hops = {} # Number of reverse proxies in front of this server that append X-Forwarded-For. 0 keys rate limits by TCP peer and ignores the header; a value above the real proxy count lets clients spoof their rate-limit key. At most 8.
 
 [rate_limits.verification_submission]
 enabled = {} # true limits proof-bundle submissions per creator/client window; false disables this abuse control.
@@ -233,6 +254,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.database.run_migrations_on_startup,
         config.worker.enabled,
         config.worker.poll_interval_ms,
+        config.worker.paykit_payment_retry_interval_seconds,
         config.worker.claim_timeout_seconds,
         config.worker.worker_id,
         config
@@ -259,6 +281,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config.pkdns.public_icann_http_port.unwrap_or(80),
         config.pkdns.icann_domain.as_deref().unwrap_or("localhost"),
         config.pkdns.key_republisher_interval_seconds,
+        config.rate_limits.trusted_proxy_hops,
         config.rate_limits.verification_submission.enabled,
         config.rate_limits.verification_submission.max_requests,
         config.rate_limits.verification_submission.window_seconds,
@@ -303,7 +326,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FilesystemLockServerIdentityProvider;
+    use crate::config::{FilesystemLockServerIdentityProvider, GrantConnectAcquisitionConfig};
     use tempfile::tempdir;
 
     #[test]
@@ -339,6 +362,7 @@ mod tests {
         assert!(config_text.contains("[paykit]"));
         assert!(config_text.contains("server_url = \"http://127.0.0.1:3001\""));
         assert!(config_text.contains("minimum_confirmations = 0"));
+        assert!(config_text.contains("paykit_payment_retry_interval_seconds = 3"));
     }
 
     #[test]
@@ -368,5 +392,42 @@ mod tests {
                 .unwrap_err();
 
         assert!(matches!(error, ConfigError::InvalidPaykitSigningSeed));
+    }
+
+    #[test]
+    fn grant_connect_requires_signing_seed_secret_on_startup() {
+        let home = tempdir().unwrap();
+        unsafe {
+            std::env::set_var(
+                "PUBKY_LOCK_DATABASE_URL",
+                "postgres://locks:***@localhost/locks_test",
+            );
+        }
+        let mut generated =
+            load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
+                .unwrap();
+        generated.paykit = None;
+        generated.creator_authority_acquisition.method =
+            CreatorAuthorityAcquisitionMethod::GrantConnect;
+        generated.creator_authority_acquisition.grant_connect =
+            Some(GrantConnectAcquisitionConfig {
+                client_id: "locks.example".to_owned(),
+                allowed_return_origins: vec!["https://pubky.app".to_owned()],
+            });
+        let secret_path = home.path().join(".pubky-lock/secret.sess");
+        std::fs::write(
+            &secret_path,
+            format!(
+                "{}:legacy-session-secret",
+                generated.credentials.lock_server_public_key
+            ),
+        )
+        .unwrap();
+
+        let error =
+            validate_existing_config_secret(&generated, &FilesystemLockServerIdentityProvider)
+                .unwrap_err();
+
+        assert!(matches!(error, ConfigError::InvalidGrantSigningSeed));
     }
 }

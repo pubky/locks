@@ -247,14 +247,14 @@ mod tests {
             url.host_str(),
             Some("_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
         );
-        assert_eq!(url.path(), "/pub/locks.app/config.json");
+        assert_eq!(url.path(), "/pub/app.locks/config.json");
         assert_eq!(url.query(), None);
     }
 
     #[test]
     fn content_lock_resource_url_uses_canonical_public_lock_path() {
         let resource = PubkyLockResource::from_str(
-            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
         )
         .unwrap();
 
@@ -267,7 +267,7 @@ mod tests {
         );
         assert_eq!(
             url.path(),
-            "/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            "/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
         );
         assert_eq!(url.query(), None);
     }
@@ -275,14 +275,14 @@ mod tests {
     #[test]
     fn content_lock_response_validation_rejects_creator_mismatch() {
         let expected = PubkyLockResource::from_str(
-            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
         )
         .unwrap();
         let mismatched = json!({
             "version": 1,
             "creator": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
             "primary_resource": {
-                "path": "/priv/locks.app/content/demo.txt",
+                "path": "/priv/app.locks/content/demo.txt",
                 "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
                 "content_type": "text/plain",
                 "size": 12
@@ -341,7 +341,7 @@ mod tests {
             )
             .unwrap(),
             primary_resource: Some(GuardedResource {
-                path: "/priv/locks.app/content/demo.txt".to_owned(),
+                path: "/priv/app.locks/content/demo.txt".to_owned(),
                 hash: GuardedResourceHash::from_bytes([7; 32]),
                 content_type: "text/plain".to_owned(),
                 size: 12,

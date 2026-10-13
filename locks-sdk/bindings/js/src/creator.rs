@@ -384,11 +384,15 @@ impl Creator {
 
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = paykitSetupStatus)]
-    pub async fn paykit_setup_status(&self) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+    pub async fn paykit_setup_status(
+        &self,
+        asset: String,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
         let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
         let request = self
-            .build_paykit_setup_status_request()
+            .build_paykit_setup_status_request(&asset)
+            .map_err(crate::js_error::invalid_input)?
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
@@ -455,8 +459,13 @@ impl Creator {
 
     #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(crate) fn build_paykit_setup_status_request(&self) -> JsAuthorizedRequestPlan {
-        self.authorized_request_plan(self.session.inner().creator().paykit_setup_status())
+    pub(crate) fn build_paykit_setup_status_request(
+        &self,
+        asset: &str,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
+        let asset = serde_json::from_value(serde_json::Value::String(asset.to_owned()))
+            .map_err(|_| "payment asset must be BTC, USD, or USDT".to_owned())?;
+        Ok(self.authorized_request_plan(self.session.inner().creator().paykit_setup_status(asset)))
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -586,7 +595,7 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_primary_only_build_succeeds() {
         let builder = complete_builder();
-        let primary = resource("/priv/locks.app/content/example.txt", "hash", 13);
+        let primary = resource("/priv/app.locks/content/example.txt", "hash", 13);
         builder.state.borrow_mut().primary_resource = Some(primary.clone());
 
         let body = builder.build_value().unwrap();
@@ -601,7 +610,7 @@ mod tests {
         let builder = complete_builder();
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -611,7 +620,7 @@ mod tests {
 
         assert!(body.get("primary_resource").is_none());
         assert_eq!(
-            body["secondary_resources"]["/priv/locks.app/content/secondary.txt"],
+            body["secondary_resources"]["/priv/app.locks/content/secondary.txt"],
             serde_json::json!({
                 "hash": "secondary-hash",
                 "content_type": "text/plain",
@@ -624,13 +633,13 @@ mod tests {
     fn create_content_lock_request_builder_primary_and_secondary_build_succeeds() {
         let builder = complete_builder();
         builder.state.borrow_mut().primary_resource = Some(resource(
-            "/priv/locks.app/content/example.txt",
+            "/priv/app.locks/content/example.txt",
             "primary-hash",
             13,
         ));
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -655,7 +664,7 @@ mod tests {
     fn create_content_lock_request_builder_rejects_missing_non_resource_fields() {
         let builder = CreateContentLockRequestBuilder::new();
         builder.state.borrow_mut().primary_resource =
-            Some(resource("/priv/locks.app/content/example.txt", "hash", 13));
+            Some(resource("/priv/app.locks/content/example.txt", "hash", 13));
 
         let err = builder.build_value().unwrap_err();
 
@@ -690,7 +699,7 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_rejects_duplicate_secondary_path() {
         let builder = complete_builder();
-        let secondary = resource("/priv/locks.app/content/secondary.txt", "hash", 7);
+        let secondary = resource("/priv/app.locks/content/secondary.txt", "hash", 7);
         builder.add_secondary_resource(secondary.clone()).unwrap();
 
         let err = builder.add_secondary_resource(secondary).unwrap_err();
@@ -702,14 +711,14 @@ mod tests {
     fn create_content_lock_request_builder_rejects_primary_secondary_duplicate_path() {
         let builder = complete_builder();
         builder.state.borrow_mut().primary_resource = Some(resource(
-            "/priv/locks.app/content/example.txt",
+            "/priv/app.locks/content/example.txt",
             "primary-hash",
             13,
         ));
 
         let err = builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/example.txt",
+                "/priv/app.locks/content/example.txt",
                 "secondary-hash",
                 7,
             ))
@@ -721,12 +730,12 @@ mod tests {
     #[test]
     fn create_content_lock_request_builder_build_snapshots_do_not_mutate() {
         let builder = complete_builder();
-        let primary = resource("/priv/locks.app/content/example.txt", "hash", 13);
+        let primary = resource("/priv/app.locks/content/example.txt", "hash", 13);
         builder.state.borrow_mut().primary_resource = Some(primary.clone());
         let first = builder.build_value().unwrap();
         builder
             .add_secondary_resource(resource(
-                "/priv/locks.app/content/secondary.txt",
+                "/priv/app.locks/content/secondary.txt",
                 "secondary-hash",
                 7,
             ))
@@ -768,13 +777,21 @@ mod tests {
     fn paykit_setup_status_request_uses_current_session_without_creator_argument() {
         let creator = Creator::new(test_session());
 
-        let request = creator.build_paykit_setup_status_request();
+        let request = creator.build_paykit_setup_status_request("USDT").unwrap();
 
         assert_eq!(request.method, "GET");
-        assert_eq!(request.path, "/creator/paykit/setup-status");
+        assert_eq!(request.path, "/creator/paykit/setup-status?asset=USDT");
         assert_eq!(request.authorization, "Bearer frontend-session-secret");
         assert_eq!(request.content_type, None);
         assert_eq!(request.body, JsRequestBody::Empty);
+    }
+
+    #[test]
+    fn paykit_setup_status_rejects_unsupported_denominations() {
+        let creator = Creator::new(test_session());
+        for asset in ["", "btc", "ETH", "USDT&creator=other"] {
+            assert!(creator.build_paykit_setup_status_request(asset).is_err());
+        }
     }
 
     #[test]
@@ -803,7 +820,7 @@ mod tests {
         let creator = Creator::new(test_session());
         let body = serde_json::json!({
             "primary_resource": {
-                "path": "/priv/locks.app/content/example.txt",
+                "path": "/priv/app.locks/content/example.txt",
                 "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
                 "content_type": "text/plain",
                 "size": 13

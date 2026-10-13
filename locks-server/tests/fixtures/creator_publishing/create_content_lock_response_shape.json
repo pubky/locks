@@ -1,11 +1,11 @@
 {
   "lock_id": "<lock_id>",
-  "content_lock_path": "/pub/locks.app/<lock_id>.json",
+  "content_lock_path": "/pub/app.locks/<lock_id>.json",
   "content_lock": {
     "version": 1,
     "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
     "primary_resource": {
-      "path": "/priv/locks.app/content/example.txt",
+      "path": "/priv/app.locks/content/example.txt",
       "hash": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
       "content_type": "text/plain",
       "size": 13

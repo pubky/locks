@@ -1,14 +1,58 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use axum::http::HeaderMap;
 use locks_core::ids::{BundleId, CreatorPubky};
 use time::OffsetDateTime;
 
 use crate::config::{
     PaykitConnectionStateLookupRateLimitConfig, VerificationSubmissionRateLimitConfig,
 };
+
+const X_FORWARDED_FOR: &str = "x-forwarded-for";
+
+/// Returns the client address used to key per-client rate limits.
+///
+/// With `trusted_proxy_hops = 0` the TCP peer is the client and `X-Forwarded-For` is
+/// ignored. With `n > 0`, each of `n` trusted proxies appends one `X-Forwarded-For`
+/// entry, so the client is the `n`th entry from the right across all header lines.
+/// Entries further left are client-supplied and never used. A chain shorter than `n`,
+/// or an `n`th entry that is not an IP address, falls back to the TCP peer.
+pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_hops: usize) -> IpAddr {
+    let Some(index) = trusted_proxy_hops.checked_sub(1) else {
+        return peer.ip();
+    };
+    headers
+        .get_all(X_FORWARDED_FOR)
+        .iter()
+        .rev()
+        .flat_map(|value| value.as_bytes().rsplit(|byte| *byte == b','))
+        .filter(|entry| !entry.trim_ascii().is_empty())
+        .nth(index)
+        .and_then(parse_forwarded_ip)
+        .unwrap_or_else(|| peer.ip())
+}
+
+/// Parses one `X-Forwarded-For` entry: a bare IP address, `ipv4:port`, `[ipv6]:port`,
+/// or `[ipv6]`. A bare IPv6 address is never split at a colon, so `2001:db8::1:443` is
+/// an address, not an address and port.
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) become their IPv4 address so that a
+/// client is not split across two keys when proxies differ in how they write IPv4.
+fn parse_forwarded_ip(entry: &[u8]) -> Option<IpAddr> {
+    let entry = std::str::from_utf8(entry.trim_ascii()).ok()?;
+    let ip = if let Ok(ip) = entry.parse::<IpAddr>() {
+        ip
+    } else if let Ok(address) = entry.parse::<SocketAddr>() {
+        address.ip()
+    } else {
+        let bracketed = entry.strip_prefix('[')?.strip_suffix(']')?;
+        IpAddr::V6(bracketed.parse::<Ipv6Addr>().ok()?)
+    };
+    Some(ip.to_canonical())
+}
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -247,20 +291,165 @@ fn retry_after_seconds(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::str::FromStr;
     use std::time::{Duration, Instant};
 
+    use axum::http::{HeaderMap, HeaderValue};
     use locks_core::ids::{BundleId, CreatorPubky};
     use time::macros::datetime;
 
     use super::{
         InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
-        PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey,
+        PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey, client_ip,
     };
     use crate::config::{
         PaykitConnectionStateLookupRateLimitConfig, VerificationSubmissionRateLimitConfig,
     };
+
+    const PEER: &str = "10.0.0.1:443";
+
+    #[test]
+    fn client_ip_selects_trusted_forwarded_entry() {
+        let cases: &[(&str, usize, &[&str], &str)] = &[
+            ("no hops ignores header", 0, &["203.0.113.10"], "10.0.0.1"),
+            (
+                "no hops ignores spoofed chain",
+                0,
+                &["198.51.100.7, 203.0.113.10"],
+                "10.0.0.1",
+            ),
+            ("no header", 1, &[], "10.0.0.1"),
+            ("one hop", 1, &["203.0.113.10"], "203.0.113.10"),
+            (
+                "one hop takes rightmost",
+                1,
+                &["198.51.100.7, 203.0.113.10"],
+                "203.0.113.10",
+            ),
+            (
+                "two hops skip appending proxy",
+                2,
+                &["203.0.113.10, 192.0.2.1"],
+                "203.0.113.10",
+            ),
+            (
+                "spoofed left entries ignored",
+                2,
+                &["1.1.1.1, 8.8.8.8, 203.0.113.10, 192.0.2.1"],
+                "203.0.113.10",
+            ),
+            ("short chain", 2, &["203.0.113.10"], "10.0.0.1"),
+            ("empty value", 1, &[""], "10.0.0.1"),
+            ("only separators", 1, &[" , ,"], "10.0.0.1"),
+            ("unknown token", 1, &["unknown"], "10.0.0.1"),
+            ("garbage", 1, &["203.0.113.10, not-an-ip"], "10.0.0.1"),
+            ("cidr is not an address", 1, &["203.0.113.0/24"], "10.0.0.1"),
+            (
+                "malformed left entry ignored",
+                1,
+                &["not-an-ip, 203.0.113.10"],
+                "203.0.113.10",
+            ),
+            (
+                "empty elements skipped",
+                2,
+                &["203.0.113.10,, 192.0.2.1,"],
+                "203.0.113.10",
+            ),
+            (
+                "whitespace trimmed",
+                1,
+                &[" \t203.0.113.10\t "],
+                "203.0.113.10",
+            ),
+            (
+                "multiple lines in order",
+                2,
+                &["198.51.100.7", "203.0.113.10", "192.0.2.1"],
+                "203.0.113.10",
+            ),
+            (
+                "entries span lines",
+                3,
+                &["198.51.100.7, 203.0.113.10", "192.0.2.1, 192.0.2.2"],
+                "203.0.113.10",
+            ),
+            ("ipv4 with port", 1, &["203.0.113.10:5555"], "203.0.113.10"),
+            ("ipv6", 1, &["2001:db8::1"], "2001:db8::1"),
+            ("bracketed ipv6", 1, &["[2001:db8::1]"], "2001:db8::1"),
+            (
+                "bracketed ipv6 with port",
+                1,
+                &["[2001:db8::1]:443"],
+                "2001:db8::1",
+            ),
+            (
+                "bare ipv6 suffix is not a port",
+                1,
+                &["2001:db8::1:443"],
+                "2001:db8::1:443",
+            ),
+            (
+                "bracketed ipv4 rejected",
+                1,
+                &["[203.0.113.10]"],
+                "10.0.0.1",
+            ),
+            (
+                "ipv4-mapped ipv6",
+                1,
+                &["::ffff:203.0.113.10"],
+                "203.0.113.10",
+            ),
+            ("ipv6 loopback kept", 1, &["::1"], "::1"),
+        ];
+
+        for (name, hops, lines, expected) in cases {
+            let mut headers = HeaderMap::new();
+            for line in *lines {
+                headers.append("x-forwarded-for", HeaderValue::from_str(line).unwrap());
+            }
+
+            assert_eq!(
+                client_ip(PEER.parse().unwrap(), &headers, *hops),
+                expected.parse::<IpAddr>().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_ip_ignores_non_utf8_left_entries() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\xfe, 203.0.113.10").unwrap(),
+        );
+
+        assert_eq!(
+            client_ip(PEER.parse().unwrap(), &headers, 1),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))
+        );
+        assert_eq!(
+            client_ip(PEER.parse().unwrap(), &headers, 2),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn client_ip_without_hops_returns_ipv6_peer_unchanged() {
+        let peer: SocketAddr = "[::ffff:10.0.0.1]:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+
+        assert_eq!(client_ip(peer, &headers, 0), peer.ip());
+        assert_eq!(
+            client_ip(peer, &HeaderMap::new(), 1),
+            peer.ip(),
+            "fallback keeps the peer as accepted"
+        );
+    }
 
     #[test]
     fn global_rejection_does_not_consume_fixed_window_budget() {

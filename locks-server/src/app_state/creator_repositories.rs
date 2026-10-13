@@ -8,6 +8,7 @@ use locks_service::{
     infrastructure::{
         postgres::PostgresCreatorAuthorityStore,
         pubky::{
+            GrantCreatorScopedPubkyStorageProvider, GrantSessionCache,
             LegacyCookieCreatorScopedPubkyStorageProvider,
             ProviderBackedPubkyHomeserverStorageClient, PubkyContentLockRepository,
             PubkyEntitlementRepository, PubkyHomeserverStorageClient,
@@ -43,12 +44,23 @@ impl CreatorRepositoryAdapters {
     pub(super) fn pubky_homeserver(
         creator_authority_store: PostgresCreatorAuthorityStore,
         pubky_http_client: pubky::PubkyHttpClient,
+        grant_session_cache: Option<
+            Arc<GrantSessionCache<PostgresCreatorAuthorityStore, PubkyLegacyCookieSessionImporter>>,
+        >,
     ) -> Self {
-        let importer = PubkyLegacyCookieSessionImporter::new(pubky_http_client);
-        let provider =
-            LegacyCookieCreatorScopedPubkyStorageProvider::new(creator_authority_store, importer);
-        let client: Arc<dyn PubkyHomeserverStorageClient> =
-            Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(provider));
+        let client: Arc<dyn PubkyHomeserverStorageClient> = match grant_session_cache {
+            Some(cache) => Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(
+                GrantCreatorScopedPubkyStorageProvider::new(cache),
+            )),
+            None => {
+                let importer = PubkyLegacyCookieSessionImporter::new(pubky_http_client);
+                let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new(
+                    creator_authority_store,
+                    importer,
+                );
+                Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(provider))
+            }
+        };
 
         Self::new(
             Arc::new(PubkyContentLockRepository::new(client.clone())),

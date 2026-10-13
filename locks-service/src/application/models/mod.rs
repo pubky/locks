@@ -19,23 +19,83 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
 
-    use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
+        SubmittedProofBundle, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
+        VerifiedProofBundle,
+    };
 
     use super::{
         AccessCredential, AccessCredentialLookupKey, AccessCredentialPolicy,
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
         CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
         DEFAULT_ACCESS_CREDENTIAL_TTL_SECONDS, FrontendSessionCode, FrontendSessionCodeRecord,
-        FrontendSessionRecord, FrontendSessionToken, PendingCreatorConnectFlowRecord,
-        VerificationTaskRecord, VerificationTaskStatus,
+        FrontendSessionRecord, FrontendSessionToken, INVOICE_ADMISSION_INTENT_VERSION,
+        InvoiceAdmissionIntentV1, InvoiceAdmissionPhase, PendingCreatorConnectFlowRecord,
+        VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::errors::ApplicationError;
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
     const TASK_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn invoice_admission_intent_v1_has_closed_canonical_json_shape() {
+        let intent = InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            lock_resource: PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+            ))
+            .unwrap(),
+            reader: CreatorPubky::from_str(
+                "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            )
+            .unwrap(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&intent).unwrap(),
+            json!({
+                "version": 1,
+                "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                "bundle_id": BUNDLE_ID,
+                "lock_resource": format!(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+                ),
+                "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<InvoiceAdmissionIntentV1>(
+                serde_json::to_value(&intent).unwrap()
+            )
+            .unwrap(),
+            intent
+        );
+        assert!(serde_json::from_value::<InvoiceAdmissionIntentV1>(json!({
+            "version": 2,
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "bundle_id": BUNDLE_ID,
+            "lock_resource": format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+            ),
+            "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+        })).is_err());
+        assert_eq!(
+            InvoiceAdmissionPhase::InvoicePending.as_str(),
+            "invoice_pending"
+        );
+        assert_eq!(InvoiceAdmissionPhase::Ready.as_str(), "ready");
+        assert_eq!(InvoiceAdmissionPhase::Failed.as_str(), "failed");
+    }
 
     #[test]
     fn access_credential_debug_output_redacts_bearer_value() {
@@ -95,8 +155,8 @@ mod tests {
             .unwrap(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new("legacy-cookie-session-secret"),
             session_expires_at: None,
@@ -144,8 +204,8 @@ mod tests {
                 "pubkyauth://relay.example/connect?client_secret=super-secret-client-secret",
             ),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: datetime!(2026-06-17 12:00:00 UTC),
             expires_at: datetime!(2026-06-17 12:05:00 UTC),
@@ -253,18 +313,30 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_task_transitions_to_completed_and_sets_completed_at() {
+    fn entitlement_publication_intent_precedes_completion_and_preserves_exact_payload() {
         let task = in_progress_task();
         let completed_at = datetime!(2026-05-29 12:03:00 UTC);
+        let entitlement = entitlement();
 
-        let transitioned = task
-            .transition_to(VerificationTaskStatus::Completed, completed_at, None)
+        let publishing = task
+            .begin_entitlement_publication(entitlement.clone())
+            .unwrap();
+        assert_eq!(
+            publishing.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(publishing.entitlement_to_publish, Some(entitlement));
+        assert_eq!(publishing.completed_at, None);
+
+        let transitioned = publishing
+            .complete_entitlement_publication(completed_at)
             .unwrap();
 
         assert_eq!(transitioned.status, VerificationTaskStatus::Completed);
         assert_eq!(transitioned.started_at, task.started_at);
         assert_eq!(transitioned.completed_at, Some(completed_at));
         assert_eq!(transitioned.failure_message, None);
+        assert!(transitioned.entitlement_to_publish.is_some());
     }
 
     #[test]
@@ -289,25 +361,23 @@ mod tests {
     }
 
     #[test]
-    fn pending_or_in_progress_task_can_expire_without_failure_message() {
+    fn in_progress_task_expires_with_typed_reason_without_failure_message() {
         let expired_at = datetime!(2026-05-29 12:04:00 UTC);
-
-        let from_pending = pending_task()
-            .transition_to(VerificationTaskStatus::Expired, expired_at, None)
-            .unwrap();
         let from_in_progress = in_progress_task()
-            .transition_to(VerificationTaskStatus::Expired, expired_at, None)
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                expired_at,
+            )
             .unwrap();
-
-        assert_eq!(from_pending.status, VerificationTaskStatus::Expired);
-        assert_eq!(from_pending.started_at, None);
-        assert_eq!(from_pending.completed_at, Some(expired_at));
-        assert_eq!(from_pending.failure_message, None);
 
         assert_eq!(from_in_progress.status, VerificationTaskStatus::Expired);
         assert!(from_in_progress.started_at.is_some());
         assert_eq!(from_in_progress.completed_at, Some(expired_at));
         assert_eq!(from_in_progress.failure_message, None);
+        assert_eq!(
+            from_in_progress.terminal_reason,
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        );
     }
 
     #[test]
@@ -351,7 +421,9 @@ mod tests {
 
     #[test]
     fn non_failed_transitions_reject_failure_message() {
-        let task = in_progress_task();
+        let task = in_progress_task()
+            .begin_entitlement_publication(entitlement())
+            .unwrap();
 
         let error = task
             .transition_to(
@@ -399,6 +471,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 
@@ -415,6 +489,7 @@ mod tests {
             status: VerificationTaskStatus::Completed,
             started_at: Some(datetime!(2026-05-29 12:01:00 UTC)),
             completed_at: Some(datetime!(2026-05-29 12:03:00 UTC)),
+            entitlement_to_publish: Some(entitlement()),
             ..pending_task()
         }
     }
@@ -424,7 +499,7 @@ mod tests {
             version: SUBMITTED_PROOF_BUNDLE_VERSION,
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             reader_public_key: None,
@@ -433,6 +508,28 @@ mod tests {
                 verifier_type: VerifierType::DevStatic,
                 payload: json!({}),
             }],
+        }
+    }
+
+    fn entitlement() -> VerifiedProofBundle {
+        let submitted = submitted_proof_bundle();
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: submitted.bundle_id,
+            pubky_lock_resource: submitted.pubky_lock_resource,
+            verification_result: VerificationResult {
+                criteria: vec![CriterionVerificationResult {
+                    criterion_id: "criterion-1".to_owned(),
+                    satisfied: true,
+                    verified_at: datetime!(2026-05-29 12:02:00 UTC),
+                    verified_by: LockServerPubky::from_str(
+                        "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                    )
+                    .unwrap(),
+                    verifier_type: VerifierType::DevStatic,
+                }],
+            },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
         }
     }
 }

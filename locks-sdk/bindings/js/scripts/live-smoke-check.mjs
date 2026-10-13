@@ -1,8 +1,8 @@
 const required = [
   ['LOCKS_LIVE_LOCK_SERVER', 'Lock Server Pubky with a browser-usable PKARR endpoint'],
   ['LOCKS_LIVE_PKARR_RELAY', 'PKARR relay URL; local pubky-testnet uses http://127.0.0.1:15411'],
-  ['LOCKS_LIVE_CREATOR', 'Creator Pubky that publishes /pub/locks.app/config.json'],
-  ['LOCKS_LIVE_CONTENT_LOCK_RESOURCE', 'Canonical pubky.../pub/locks.app/<lock_id>.json resource'],
+  ['LOCKS_LIVE_CREATOR', 'Creator Pubky that publishes /pub/app.locks/config.json'],
+  ['LOCKS_LIVE_CONTENT_LOCK_RESOURCE', 'Canonical pubky.../pub/app.locks/<lock_id>.json resource'],
   ['LOCKS_LIVE_DEMO_ORIGIN', 'Origin allowed by creator_authority_acquisition.legacy_connect.allowed_return_origins'],
 ];
 

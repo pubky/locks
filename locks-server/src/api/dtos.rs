@@ -7,7 +7,7 @@ use locks_core::lock_policy::{ContentLock, GuardedResource};
 use locks_core::lock_service_pointer::LockServicePointer;
 use locks_core::verification::SubmittedProofBundle;
 use locks_service::application::models::{
-    AccessCredential, FrontendSessionCode, VerificationTaskStatus,
+    AccessCredential, FrontendSessionCode, VerificationTaskStatus, VerificationTerminalReason,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::{
     ExchangeFrontendSessionCodeRequest, ExchangeFrontendSessionCodeResponse,
@@ -89,6 +89,11 @@ pub struct VerificationTaskLifecycleHttpResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
     pub failure_message: Option<String>,
+    pub status_message: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub admission_deadline_at: Option<OffsetDateTime>,
+    #[serde(serialize_with = "serialize_optional_terminal_reason")]
+    pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
 impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpResponse {
@@ -101,6 +106,9 @@ impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpRespon
             started_at: view.started_at,
             completed_at: view.completed_at,
             failure_message: view.failure_message,
+            status_message: None,
+            admission_deadline_at: None,
+            terminal_reason: view.terminal_reason,
         }
     }
 }
@@ -203,11 +211,26 @@ where
 {
     serializer.serialize_str(match status {
         VerificationTaskStatus::Pending => "pending",
-        VerificationTaskStatus::InProgress => "in_progress",
+        VerificationTaskStatus::InProgress | VerificationTaskStatus::PublishingEntitlement => {
+            "in_progress"
+        }
         VerificationTaskStatus::Completed => "completed",
         VerificationTaskStatus::Failed => "failed",
         VerificationTaskStatus::Expired => "expired",
     })
+}
+
+fn serialize_optional_terminal_reason<S>(
+    reason: &Option<VerificationTerminalReason>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match reason {
+        Some(reason) => serializer.serialize_some(reason.as_str()),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn serialize_access_credential<S>(
@@ -273,6 +296,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
         });
 
         let json = serde_json::to_value(response).unwrap();
@@ -308,6 +332,7 @@ mod tests {
             started_at: Some(datetime!(2026-05-29 12:01:00 UTC)),
             completed_at: Some(datetime!(2026-05-29 12:02:00 UTC)),
             failure_message: None,
+            terminal_reason: None,
         });
 
         let json = serde_json::to_value(response).unwrap();
@@ -322,6 +347,31 @@ mod tests {
         assert_eq!(json["started_at"], "2026-05-29T12:01:00Z");
         assert_eq!(json["completed_at"], "2026-05-29T12:02:00Z");
         assert_no_keys(&json, &["task_id", "credential", "credential_issuance"]);
+    }
+
+    #[test]
+    fn expired_verification_task_response_serializes_typed_terminal_reason() {
+        let response = VerificationTaskLifecycleHttpResponse::from(VerificationTaskLifecycleView {
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            status: VerificationTaskStatus::Expired,
+            submitted_at: datetime!(2026-05-29 12:00:00 UTC),
+            started_at: Some(datetime!(2026-05-29 12:01:00 UTC)),
+            completed_at: Some(datetime!(2026-05-29 12:02:00 UTC)),
+            failure_message: None,
+            terminal_reason: Some(
+                locks_service::application::models::VerificationTerminalReason::ProposalExpired,
+            ),
+        });
+
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["status"], "expired");
+        assert_eq!(json["terminal_reason"], "proposal_expired");
+        assert_eq!(json["failure_message"], Value::Null);
     }
 
     #[test]
@@ -440,8 +490,8 @@ mod tests {
             authorized: true,
             auth_kind: Some(CreatorAuthorityAuthKind::LegacyCookie),
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             session_expires_at: None,
         });
@@ -456,7 +506,7 @@ mod tests {
         assert_eq!(json["auth_kind"], "legacy_cookie");
         assert_eq!(
             json["granted_scopes"],
-            json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+            json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
         );
         assert_eq!(json["session_expires_at"], Value::Null);
         assert_no_keys(
@@ -477,7 +527,7 @@ mod tests {
             version: SUBMITTED_PROOF_BUNDLE_VERSION,
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             reader_public_key: None,

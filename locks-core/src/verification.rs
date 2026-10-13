@@ -116,7 +116,7 @@ mod tests {
 
     fn pubky_lock_resource_fixture() -> PubkyLockResource {
         PubkyLockResource::from_str(&format!(
-            "{}/pub/locks.app/{LOCK_ID}.json",
+            "{}/pub/app.locks/{LOCK_ID}.json",
             test_pubky_identity()
         ))
         .unwrap()

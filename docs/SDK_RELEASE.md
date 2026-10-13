@@ -4,7 +4,7 @@ This document tracks what remains before the JS/WASM browser SDK can be publishe
 
 ## Current status
 
-The SDK API foundation is implemented and locally verified. The package is not publish-ready because final release policy is not decided.
+The SDK API foundation is implemented. Public release policy uses `@synonymdev/locks-sdk`, public npm access, and the `rc` dist-tag for release candidates.
 
 Run the metadata audit:
 
@@ -14,33 +14,11 @@ npm --prefix locks-sdk/bindings/js run release:audit
 
 The command is intentionally informational and exits 0. It reports blockers without pretending policy decisions are resolved.
 
-## Current publish blockers
+## Package layout
 
-### 1. Publishing switch
+The public package is `@synonymdev/locks-sdk`. Its root manifest exports generated wasm-pack JS, declarations, and WASM from `pkg/`. The internal generated package name remains `locks-sdk-wasm`; it is not published as a separate package.
 
-`locks-sdk/bindings/js/package.json` currently has:
-
-```json
-"private": true
-```
-
-Do not flip this until the final package name, registry ownership, and dry-run checklist are approved.
-
-### 2. Generated wasm-pack package name
-
-The scaffold package is:
-
-```text
-@pubky/locks-sdk
-```
-
-The generated package under `locks-sdk/bindings/js/pkg/` is currently:
-
-```text
-locks-sdk-wasm
-```
-
-because wasm-pack derives it from the Rust crate name. Decide whether to keep that generated name, adjust wasm-pack metadata/build output, or publish from a wrapper package.
+Release-candidate publication must use npm's `rc` dist-tag so prereleases never replace `latest`.
 
 ## Pre-publish checklist
 
@@ -54,7 +32,7 @@ Once policy is decided:
 npm --prefix locks-sdk/bindings/js test
 npm --prefix locks-sdk/bindings/js run release:audit
 npm --prefix locks-sdk/bindings/js run build
-npm --prefix locks-sdk/bindings/js publish --dry-run
+npm pack ./locks-sdk/bindings/js --dry-run
 ```
 
 4. Run workspace gates:
@@ -65,6 +43,14 @@ TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/locks_test' cargo
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
+
+5. Publish from an authenticated account with `@synonymdev` package permission:
+
+```bash
+npm publish ./locks-sdk/bindings/js --access public --tag rc
+```
+
+6. Read back registry metadata and verify package version, public access, and `rc` dist-tag.
 
 ## Explicit non-goals
 

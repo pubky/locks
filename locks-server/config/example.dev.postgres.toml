@@ -13,6 +13,7 @@ run_migrations_on_startup = true
 [worker]
 enabled = true
 poll_interval_ms = 250
+paykit_payment_retry_interval_seconds = 3
 claim_timeout_seconds = 60
 worker_id = "default-worker"
 
@@ -51,6 +52,10 @@ public_pubky_tls_port = 6287
 public_icann_http_port = 80
 icann_domain = "localhost"
 key_republisher_interval_seconds = 3600
+
+[rate_limits]
+# Number of reverse proxies that append X-Forwarded-For. 0 keys limits by TCP peer.
+trusted_proxy_hops = 0
 
 [rate_limits.verification_submission]
 enabled = true

@@ -7,7 +7,7 @@ The browser SDK foundation exists in two layers:
 - `locks-sdk`: Rust SDK core and canonical request planner for deterministic request construction, `.well-known` validation, viewer/access request helpers, session export/restore, and browser transport rewrite helpers.
 - `locks-sdk/bindings/js`: `wasm-bindgen` JS/WASM wrapper crate exposing browser-facing `Locks`, `Viewer`, `Session`, and `Creator` APIs by wrapping the Rust SDK request planners rather than duplicating route/method/body construction.
 
-The JS/WASM binding now resolves the Lock Server PKARR record at runtime for browser connect URLs, frontend-session exchange, viewer/access calls, signout, and authenticated creator calls. Requests are rewritten to the browser-usable domain endpoint while preserving path/query and carrying the original Lock Server key as `pubky-host`. The binding crate has a private npm package scaffold for local `wasm-pack` builds, but generated `pkg/` artifacts are ignored for now; publishing policy remains follow-up work.
+The JS/WASM binding resolves the Lock Server PKARR record at runtime for browser connect URLs, frontend-session exchange, viewer/access calls, signout, and authenticated creator calls. Requests are rewritten to the browser-usable domain endpoint while preserving path/query and carrying the original Lock Server key as `pubky-host`. The public npm wrapper package is `@synonymdev/locks-sdk`; generated `pkg/` artifacts remain ignored because release builds regenerate them with `wasm-pack`.
 
 JSON-like JS/WASM API return values are plain JavaScript objects/arrays, not nested `Map` trees. This applies to content-lock request builder output, public content-lock reads, and viewer lifecycle/access-credential JSON responses, so browser callers can use normal property access and `JSON.stringify` without adapter code.
 
@@ -25,9 +25,9 @@ npm --prefix locks-sdk/bindings/js run live:smoke:check
 npm --prefix locks-sdk/bindings/js test
 ```
 
-`build` runs `wasm-pack build --target web --out-dir pkg`. `smoke:pkg` rebuilds the generated package and verifies that `pkg/package.json` and `pkg/locks_sdk_wasm.d.ts` expose the documented browser SDK API. `smoke:demo` verifies the static demo stays aligned with the generated package import and documented auth/session/creator flow. `smoke:examples` verifies the copyable root `examples/js-sdk/` flows stay aligned with the documented SDK API. `release:audit` reports package publishing blockers; see [`SDK_RELEASE.md`](SDK_RELEASE.md). `live:smoke:check` reports the live Pubky/testnet prerequisites; see [`SDK_LIVE_SMOKE.md`](SDK_LIVE_SMOKE.md). `test` runs the native binding tests, `wasm32-unknown-unknown` compile check, package smoke check, demo smoke check, and examples smoke check. The generated `locks-sdk/bindings/js/pkg/` directory is intentionally ignored until package publishing policy is finalized.
+`build` runs `wasm-pack build --target web --out-dir pkg`. `smoke:pkg` rebuilds generated output and verifies that `pkg/package.json` and `pkg/locks_sdk_wasm.d.ts` expose documented browser SDK API. `smoke:demo` verifies static demo alignment. `smoke:examples` verifies copyable root examples. `release:audit` checks public package metadata; see [`SDK_RELEASE.md`](SDK_RELEASE.md). `test` runs native binding tests, wasm compile check, package smoke, demo smoke, and examples smoke. Generated `pkg/` remains ignored and is rebuilt automatically by npm's `prepack` lifecycle.
 
-The private scaffold package is named `@pubky/locks-sdk`; the current wasm-pack generated package under `pkg/` is named `locks-sdk-wasm` because it follows the Rust crate name. Treat the generated name as local build output until publishing policy chooses the final public npm package name.
+The public package is `@synonymdev/locks-sdk`. It wraps generated `pkg/locks_sdk_wasm.js`, declarations, and WASM as package-root exports. The internal wasm-pack manifest remains build output rather than npm publication metadata.
 
 ## Local browser demo
 
@@ -50,7 +50,7 @@ Open:
 http://127.0.0.1:8080/demo/
 ```
 
-The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working `legacy-connect` creator acquisition.
+The demo imports `../pkg/locks_sdk_wasm.js`, so it only exercises locally generated wasm-pack output. It still requires a real configured Lock Server Pubky with a browser-usable PKARR domain endpoint and working creator acquisition.
 
 `smoke:demo` is a static alignment check, not a live browser integration test:
 
@@ -68,6 +68,8 @@ examples/js-sdk/
 
 They are application examples, not operator scripts. Use them when integrating the SDK into a browser app. They cover creator connect/publishing and viewer discovery/access flows, while keeping verifier-specific proof construction caller-owned. For `paykit-payment`, callers construct a single proof with `verifier_type = "paykit-payment"`, `payload = {}`, and top-level `reader_public_key` on the submitted proof bundle; payment details come from the creator's content lock params, not the submitted proof payload.
 
+For a focused, copyable Paykit viewer flow plus exact request/response and terminal-state handling, see [`SDK_PAYKIT_VIEWER.md`](SDK_PAYKIT_VIEWER.md) and [`examples/js-sdk/paykit-viewer-flow.js`](../examples/js-sdk/paykit-viewer-flow.js). The signed Paykit lifecycle integration adds no new SDK export; that flow composes existing public viewer calls.
+
 Run the static drift check:
 
 ```bash
@@ -84,9 +86,10 @@ environment = "production"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 
-[creator_authority_acquisition.legacy_connect]
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 
 [pubky]
@@ -150,7 +153,7 @@ This remains the stable browser path.
 Creators publish their current default Lock Server at:
 
 ```text
-/pub/locks.app/config.json
+/pub/app.locks/config.json
 ```
 
 Expected pointer shape:
@@ -181,11 +184,11 @@ const locksFromPointer = Locks.fromCreatorLockServicePointer(pointer);
 const locksFromCreator = await Locks.forCreator("pubky...");
 ```
 
-`Locks.forCreator` performs a browser PKARR/domain lookup for the creator homeserver, fetches `/pub/locks.app/config.json`, validates the pointer JSON, then uses the discovered `default_lock_server`. It does not use a gateway/base URL fallback.
+`Locks.forCreator` performs a browser PKARR/domain lookup for the creator homeserver, fetches `/pub/app.locks/config.json`, validates the pointer JSON, then uses the discovered `default_lock_server`. It does not use a gateway/base URL fallback.
 
 ## Connect flow
 
-The first browser auth surface is the Lock-Server-hosted `legacy-connect` shell. pubky.app or another creator UI never receives the secret-bearing legacy Pubky `authorization_url`; it only receives a short-lived `code` and caller-managed `state` on the configured callback URL.
+The browser auth surface is the Lock-Server-hosted connect shell. In grant mode it renders exactly one `signin_grant` QR/deeplink and no cookie fallback. Creator UI receives only a short-lived `code` and caller-managed `state` on the configured callback URL; PoP keys, delegated restore state, and authorization URLs remain server-owned.
 
 ```ts
 import { Locks, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions } from "locks-sdk-wasm";
@@ -268,7 +271,7 @@ import { RegisterGuardedResourceOptions } from "locks-sdk-wasm";
 const bytes = new TextEncoder().encode("guarded bytes");
 const registered = await session.creator.registerGuardedResource(
   new RegisterGuardedResourceOptions(
-    "example.txt", // relative path under /priv/locks.app/content/
+    "example.txt", // relative path under /priv/app.locks/content/
     "text/plain",
     bytes,
   ),
@@ -285,7 +288,7 @@ Content-Type: text/plain
 guarded bytes
 ```
 
-Callers supply only the relative content path, not the full `/priv/locks.app/content/` path. The request body is raw bytes (`Uint8Array` in JS/WASM), not JSON/base64.
+Callers supply only the relative content path, not the full `/priv/app.locks/content/` path. The request body is raw bytes (`Uint8Array` in JS/WASM), not JSON/base64.
 
 ### Create content lock
 
@@ -357,7 +360,7 @@ marker, supported capabilities, freshness, or Paykit runtime readiness.
 ### Check Paykit setup readiness
 
 ```ts
-const result = await session.creator.paykitSetupStatus();
+const result = await session.creator.paykitSetupStatus("USD");
 
 switch (result.status) {
   case "ready":
@@ -372,8 +375,8 @@ switch (result.status) {
 }
 ```
 
-`paykitSetupStatus()` takes no Creator argument. It uses the current Locks frontend-session bearer
-and calls `GET /creator/paykit/setup-status` with no body. The Lock Server derives the Creator from
+`paykitSetupStatus(asset)` takes the invoice denomination (`"BTC"`, `"USD"`, or `"USDT"`), never a Creator identity. It uses the current Locks frontend-session bearer
+and calls `GET /creator/paykit/setup-status?asset=USD` with no body. The Lock Server derives the Creator from
 that session. The returned object contains only `status: "ready" | "setup_required" |
 "unavailable"`; malformed responses reject instead of being interpreted as setup readiness.
 
@@ -387,31 +390,33 @@ Viewer apps can read public lock policy JSON from a canonical Pubky lock resourc
 
 ```ts
 const contentLock = await Locks.readContentLock(
-  "pubky.../pub/locks.app/<lock_id>.json",
+  "pubky.../pub/app.locks/<lock_id>.json",
 );
 
 const locksForContent = await Locks.forContentLock(
-  "pubky.../pub/locks.app/<lock_id>.json",
+  "pubky.../pub/app.locks/<lock_id>.json",
 );
 ```
 
 `readContentLock` performs a browser PKARR/domain lookup for the creator homeserver, fetches the public content lock JSON without auth, validates that the returned content lock matches the requested resource, and returns the validated JSON. It does not solve lock criteria or submit proofs.
 
-`forContentLock` performs the same content lock read, then selects the Lock Server: it prefers the content lock's per-lock `lock_server.override`; if absent, it discovers the creator's default Lock Server through `/pub/locks.app/config.json`.
+`forContentLock` performs the same content lock read, then selects the Lock Server: it prefers the content lock's per-lock `lock_server.override`; if absent, it discovers the creator's default Lock Server through `/pub/app.locks/config.json`.
 
 ### Submit proof bundle
 
 ```ts
-import { BundleId, VerificationTaskHandleOptions } from "locks-sdk-wasm";
+import init, { BundleId, VerificationTaskHandleOptions } from "@synonymdev/locks-sdk";
 
+await init();
 const viewer = locks.viewer;
-const bundleId = BundleId.generate().toString(); // caller must store durably; bearer-like recovery handle
+const bundleId = BundleId.generate().toString();
+await persistBundleId(bundleId); // application-owned durable, secret-safe storage
 const creator = "pubky...";
 
 const lifecycle = await viewer.submitProofBundle({
   version: 1,
   bundle_id: bundleId,
-  pubky_lock_resource: `${creator}/pub/locks.app/<lock_id>.json`,
+  pubky_lock_resource: `${creator}/pub/app.locks/<lock_id>.json`,
   proofs: [
     {
       criterion_id: "criterion-1",
