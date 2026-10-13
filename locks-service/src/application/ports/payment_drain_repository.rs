@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+use locks_core::verification::VerifiedProofBundle;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::VerificationTaskStatus;
+use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
 
 use super::PaymentDrainSummary;
 
@@ -18,12 +19,14 @@ pub struct PaymentDrainObligation {
     pub invoice_created_at: OffsetDateTime,
     pub payment_deadline: OffsetDateTime,
     pub status: VerificationTaskStatus,
+    pub entitlement_to_publish: Option<VerifiedProofBundle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaymentDrainTerminalTransition {
     pub status: VerificationTaskStatus,
     pub entitlement_publication_token: Option<Uuid>,
+    pub terminal_reason: Option<VerificationTerminalReason>,
 }
 
 #[async_trait]
@@ -63,6 +66,7 @@ pub trait PaymentDrainRepository: Send + Sync {
         claim_token: Uuid,
         now: OffsetDateTime,
         task_id: &TaskId,
+        entitlement: &VerifiedProofBundle,
     ) -> Result<Option<Uuid>, ApplicationError>;
 
     async fn persist_terminal_obligation(

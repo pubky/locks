@@ -8,6 +8,7 @@ use locks_core::verification::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedContentLockDeletionJob, ContentLockDeletionPhase, VerificationTaskStatus,
+    VerificationTerminalReason,
 };
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, EntitlementRepository, PaymentDrainClient,
@@ -167,13 +168,32 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     message: "Paykit payment window changed during deletion".to_owned(),
                 });
             }
-            let Some(next_status) = classify_payment_task(status, self.minimum_confirmations)?
+            let Some((next_status, terminal_reason)) =
+                classify_payment_task(status, self.minimum_confirmations)?
             else {
                 continue;
             };
             let now = self.clock.now();
             let mut entitlement_publication_token = None;
             if next_status == VerificationTaskStatus::Completed {
+                let entitlement =
+                    obligation
+                        .entitlement_to_publish
+                        .unwrap_or_else(|| VerifiedProofBundle {
+                            version: VERIFIED_PROOF_BUNDLE_VERSION,
+                            bundle_id: obligation.bundle_id.clone(),
+                            pubky_lock_resource: obligation.lock_resource.clone(),
+                            verification_result: VerificationResult {
+                                criteria: vec![CriterionVerificationResult {
+                                    criterion_id: obligation.criterion_id.clone(),
+                                    satisfied: true,
+                                    verified_at: now,
+                                    verified_by: self.verified_by.clone(),
+                                    verifier_type: VerifierType::PaykitPayment,
+                                }],
+                            },
+                            entitlement_lifetime: EntitlementLifetime::Unbounded,
+                        });
                 let Some(publication_token) = self
                     .drains
                     .begin_entitlement_publication(
@@ -182,25 +202,11 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                         claim.claim_token,
                         now,
                         &obligation.task_id,
+                        &entitlement,
                     )
                     .await?
                 else {
                     return Ok(false);
-                };
-                let entitlement = VerifiedProofBundle {
-                    version: VERIFIED_PROOF_BUNDLE_VERSION,
-                    bundle_id: obligation.bundle_id.clone(),
-                    pubky_lock_resource: obligation.lock_resource.clone(),
-                    verification_result: VerificationResult {
-                        criteria: vec![CriterionVerificationResult {
-                            criterion_id: obligation.criterion_id.clone(),
-                            satisfied: true,
-                            verified_at: now,
-                            verified_by: self.verified_by.clone(),
-                            verifier_type: VerifierType::PaykitPayment,
-                        }],
-                    },
-                    entitlement_lifetime: EntitlementLifetime::Unbounded,
                 };
                 persist_entitlement(self.entitlements, entitlement).await?;
                 entitlement_publication_token = Some(publication_token);
@@ -216,6 +222,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     PaymentDrainTerminalTransition {
                         status: next_status,
                         entitlement_publication_token,
+                        terminal_reason,
                     },
                 )
                 .await?
@@ -257,22 +264,23 @@ async fn persist_entitlement(
     entitlements: &dyn EntitlementRepository,
     entitlement: VerifiedProofBundle,
 ) -> Result<(), ApplicationError> {
-    if let Err(error) = entitlements
+    let write_error = entitlements
         .insert_verified_proof_bundle(entitlement.clone())
         .await
+        .err();
+    let existing = entitlements
+        .get_verified_proof_bundle(
+            entitlement.pubky_lock_resource.creator(),
+            &entitlement.bundle_id,
+        )
+        .await?;
+    if !existing
+        .as_ref()
+        .is_some_and(|existing| same_entitlement_decision(existing, &entitlement))
     {
-        let existing = entitlements
-            .get_verified_proof_bundle(
-                entitlement.pubky_lock_resource.creator(),
-                &entitlement.bundle_id,
-            )
-            .await?;
-        if !existing
-            .as_ref()
-            .is_some_and(|existing| same_entitlement_decision(existing, &entitlement))
-        {
-            return Err(error);
-        }
+        return Err(write_error.unwrap_or_else(|| ApplicationError::Storage {
+            message: "published entitlement was not equivalent on read-back".to_owned(),
+        }));
     }
     Ok(())
 }
@@ -319,7 +327,8 @@ fn validate_aggregate_progress(
 pub(crate) fn classify_payment_task(
     status: PaymentRequestStatus,
     minimum_confirmations: u32,
-) -> Result<Option<VerificationTaskStatus>, ApplicationError> {
+) -> Result<Option<(VerificationTaskStatus, Option<VerificationTerminalReason>)>, ApplicationError>
+{
     if matches!(
         status.request_state,
         PaymentRequestState::RecoveryRequired
@@ -331,15 +340,23 @@ pub(crate) fn classify_payment_task(
             message: "Paykit payment request entered an unsupported failure state".to_owned(),
         });
     }
-    if matches!(
-        status.request_state,
-        PaymentRequestState::Rejected
-            | PaymentRequestState::Canceled
-            | PaymentRequestState::ProposalExpired
-    ) || (status.request_state == PaymentRequestState::Accepted
-        && status.payment_state == PaymentState::Expired)
-    {
-        return Ok(Some(VerificationTaskStatus::Expired));
+    let terminal_reason = match (status.request_state, status.payment_state) {
+        (PaymentRequestState::Rejected, _) => {
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        }
+        (PaymentRequestState::Canceled, _) => {
+            Some(VerificationTerminalReason::PaymentRequestCanceled)
+        }
+        (PaymentRequestState::ProposalExpired, _) => {
+            Some(VerificationTerminalReason::ProposalExpired)
+        }
+        (PaymentRequestState::Accepted, PaymentState::Expired) => {
+            Some(VerificationTerminalReason::PaymentDeadlineExpired)
+        }
+        _ => None,
+    };
+    if let Some(reason) = terminal_reason {
+        return Ok(Some((VerificationTaskStatus::Expired, Some(reason))));
     }
 
     if status.request_state != PaymentRequestState::Accepted || !status.amount_matched {
@@ -352,12 +369,12 @@ pub(crate) fn classify_payment_task(
             PaymentState::Detected | PaymentState::Confirmed
         )
     {
-        return Ok(Some(VerificationTaskStatus::Completed));
+        return Ok(Some((VerificationTaskStatus::Completed, None)));
     }
 
     Ok((status.payment_state == PaymentState::Confirmed
         && status.confirmations >= minimum_confirmations)
-        .then_some(VerificationTaskStatus::Completed))
+        .then_some((VerificationTaskStatus::Completed, None)))
 }
 
 #[cfg(test)]
@@ -366,7 +383,7 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use time::macros::datetime;
 
-    use crate::application::models::VerificationTaskStatus;
+    use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
     use crate::application::ports::{
         PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary, PaymentRequestState,
         PaymentRequestStatus, PaymentState,
@@ -430,14 +447,23 @@ mod tests {
 
     #[test]
     fn terminal_unpaid_states_expire_without_failure() {
-        for request_state in [
-            PaymentRequestState::Rejected,
-            PaymentRequestState::Canceled,
-            PaymentRequestState::ProposalExpired,
+        for (request_state, reason) in [
+            (
+                PaymentRequestState::Rejected,
+                VerificationTerminalReason::PaymentRequestRejected,
+            ),
+            (
+                PaymentRequestState::Canceled,
+                VerificationTerminalReason::PaymentRequestCanceled,
+            ),
+            (
+                PaymentRequestState::ProposalExpired,
+                VerificationTerminalReason::ProposalExpired,
+            ),
         ] {
             assert_eq!(
                 classify_payment_task(status(request_state, PaymentState::Undetected, 0, false), 6),
-                Ok(Some(VerificationTaskStatus::Expired))
+                Ok(Some((VerificationTaskStatus::Expired, Some(reason))))
             );
         }
         assert_eq!(
@@ -450,7 +476,10 @@ mod tests {
                 ),
                 6,
             ),
-            Ok(Some(VerificationTaskStatus::Expired))
+            Ok(Some((
+                VerificationTaskStatus::Expired,
+                Some(VerificationTerminalReason::PaymentDeadlineExpired)
+            )))
         );
     }
 
@@ -466,7 +495,7 @@ mod tests {
                 ),
                 0,
             ),
-            Ok(Some(VerificationTaskStatus::Completed))
+            Ok(Some((VerificationTaskStatus::Completed, None)))
         );
         assert_eq!(
             classify_payment_task(
@@ -502,7 +531,7 @@ mod tests {
                 ),
                 6,
             ),
-            Ok(Some(VerificationTaskStatus::Completed))
+            Ok(Some((VerificationTaskStatus::Completed, None)))
         );
     }
 

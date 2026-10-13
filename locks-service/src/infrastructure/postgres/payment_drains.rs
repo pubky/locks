@@ -2,12 +2,13 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+use locks_core::verification::VerifiedProofBundle;
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::VerificationTaskStatus;
+use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
 use crate::application::ports::{
     PaymentDrainCleanupToken, PaymentDrainObligation, PaymentDrainRepository, PaymentDrainStatus,
     PaymentDrainSummary, PaymentDrainTerminalTransition,
@@ -34,6 +35,7 @@ struct ObligationRow {
     invoice_created_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
     status: String,
+    entitlement_to_publish: Option<serde_json::Value>,
 }
 
 #[derive(FromRow)]
@@ -195,8 +197,10 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                     snapshot.bundle_id, snapshot.pubky_lock_resource,
                     snapshot.criterion_id,
                     snapshot.invoice_created_at, snapshot.payment_deadline,
-                    COALESCE(snapshot.resolved_status, snapshot.status_at_cutoff) AS status
+                    task.status, task.entitlement_to_publish
              FROM content_lock_deletion_task_snapshot AS snapshot
+             JOIN verification_tasks AS task
+               ON task.task_id = snapshot.verification_task_id
              WHERE snapshot.deletion_job_id = $1
                AND snapshot.paykit_admission_required = TRUE
              ORDER BY snapshot.verification_task_id",
@@ -215,8 +219,10 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         claim_token: Uuid,
         now: OffsetDateTime,
         task_id: &TaskId,
+        entitlement: &VerifiedProofBundle,
     ) -> Result<Option<Uuid>, ApplicationError> {
         let publication_token = Uuid::new_v4();
+        let entitlement = serde_json::to_value(entitlement).map_err(storage_display)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let owns_claim: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -240,7 +246,10 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         }
         let admitted = sqlx::query_scalar(
             "UPDATE verification_tasks AS task
-             SET entitlement_publication_claim_token =
+             SET status = 'publishing_entitlement',
+                 started_at = COALESCE(task.started_at, $4),
+                 entitlement_to_publish = COALESCE(task.entitlement_to_publish, $7),
+                 entitlement_publication_claim_token =
                      COALESCE(task.entitlement_publication_claim_token, $6),
                  updated_at = $4
              FROM content_lock_deletion_jobs AS deletion,
@@ -255,7 +264,15 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                AND snapshot.resolved_status IS NULL
                AND task.task_id = $5::uuid
                AND task.deletion_job_id = deletion.job_id
-               AND task.status IN ('pending', 'in_progress')
+               AND (
+                    (task.status IN ('pending', 'in_progress')
+                     AND task.entitlement_to_publish IS NULL
+                     AND task.entitlement_publication_claim_token IS NULL)
+                    OR
+                    (task.status = 'publishing_entitlement'
+                     AND task.entitlement_to_publish = $7
+                     AND task.entitlement_publication_claim_token IS NOT NULL)
+               )
              RETURNING task.entitlement_publication_claim_token",
         )
         .bind(deletion_job_id)
@@ -264,6 +281,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         .bind(now)
         .bind(task_id.to_string())
         .bind(publication_token)
+        .bind(entitlement)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -283,46 +301,83 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         let PaymentDrainTerminalTransition {
             status,
             entitlement_publication_token,
+            terminal_reason,
         } = transition;
         if !matches!(
-            status,
-            VerificationTaskStatus::Completed | VerificationTaskStatus::Expired
+            (status, entitlement_publication_token, terminal_reason),
+            (VerificationTaskStatus::Completed, Some(_), None)
+                | (VerificationTaskStatus::Expired, None, Some(_))
         ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "payment drain transition must be completed or expired".to_owned(),
+                message: "payment drain terminal transition has an invalid canonical shape"
+                    .to_owned(),
             });
         }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let updated = sqlx::query(
-            "UPDATE verification_tasks AS task
-             SET status = $6, started_at = COALESCE(started_at, $5), completed_at = $5,
-                 failure_message = NULL, claimed_by = NULL, claim_token = NULL,
-                 claim_expires_at = NULL, next_attempt_at = NULL,
-                 last_attempt_error = NULL, entitlement_publication_claim_token = NULL,
-                 updated_at = $5
-             FROM content_lock_deletion_jobs AS deletion,
-                  content_lock_deletion_task_snapshot AS snapshot
-             WHERE deletion.job_id = $1 AND deletion.state = 'running'
-               AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
-               AND deletion.force_requested_at IS NULL
-               AND snapshot.deletion_job_id = deletion.job_id
-               AND snapshot.verification_task_id = task.task_id
-               AND snapshot.paykit_admission_required = TRUE
-               AND snapshot.resolved_status IS NULL
-               AND task.task_id = $4::uuid
-               AND task.status IN ('pending', 'in_progress')
-               AND task.entitlement_publication_claim_token IS NOT DISTINCT FROM $7",
-        )
-        .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(task_id.to_string())
-        .bind(now)
-        .bind(status_to_database(status))
-        .bind(entitlement_publication_token)
-        .execute(&mut *transaction)
-        .await
+        let updated = if status == VerificationTaskStatus::Completed {
+            sqlx::query(
+                "UPDATE verification_tasks AS task
+                 SET status = 'completed', completed_at = $5, failure_message = NULL,
+                     terminal_reason = NULL, claimed_by = NULL, claim_token = NULL,
+                     claim_expires_at = NULL, next_attempt_at = NULL,
+                     last_attempt_error = NULL, entitlement_publication_claim_token = NULL,
+                     updated_at = $5
+                 FROM content_lock_deletion_jobs AS deletion,
+                      content_lock_deletion_task_snapshot AS snapshot
+                 WHERE deletion.job_id = $1 AND deletion.state = 'running'
+                   AND deletion.claimed_by = $2 AND deletion.claim_token = $3
+                   AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
+                   AND deletion.force_requested_at IS NULL
+                   AND snapshot.deletion_job_id = deletion.job_id
+                   AND snapshot.verification_task_id = task.task_id
+                   AND snapshot.paykit_admission_required = TRUE
+                   AND snapshot.resolved_status IS NULL
+                   AND task.task_id = $4::uuid
+                   AND task.status = 'publishing_entitlement'
+                   AND task.entitlement_to_publish IS NOT NULL
+                   AND task.entitlement_publication_claim_token = $6",
+            )
+            .bind(deletion_job_id)
+            .bind(worker_id)
+            .bind(claim_token)
+            .bind(task_id.to_string())
+            .bind(now)
+            .bind(entitlement_publication_token)
+            .execute(&mut *transaction)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE verification_tasks AS task
+                 SET status = 'expired', started_at = COALESCE(started_at, $5),
+                     completed_at = $5, failure_message = NULL, terminal_reason = $6,
+                     entitlement_to_publish = NULL, claimed_by = NULL, claim_token = NULL,
+                     claim_expires_at = NULL, next_attempt_at = NULL,
+                     last_attempt_error = NULL, entitlement_publication_claim_token = NULL,
+                     updated_at = $5
+                 FROM content_lock_deletion_jobs AS deletion,
+                      content_lock_deletion_task_snapshot AS snapshot
+                 WHERE deletion.job_id = $1 AND deletion.state = 'running'
+                   AND deletion.claimed_by = $2 AND deletion.claim_token = $3
+                   AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
+                   AND deletion.force_requested_at IS NULL
+                   AND snapshot.deletion_job_id = deletion.job_id
+                   AND snapshot.verification_task_id = task.task_id
+                   AND snapshot.paykit_admission_required = TRUE
+                   AND snapshot.resolved_status IS NULL
+                   AND task.task_id = $4::uuid
+                   AND task.status IN ('pending', 'in_progress')
+                   AND task.entitlement_to_publish IS NULL
+                   AND task.entitlement_publication_claim_token IS NULL",
+            )
+            .bind(deletion_job_id)
+            .bind(worker_id)
+            .bind(claim_token)
+            .bind(task_id.to_string())
+            .bind(now)
+            .bind(terminal_reason.map(VerificationTerminalReason::as_str))
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(storage_error)?;
         if updated.rows_affected() != 1 {
             transaction.rollback().await.map_err(storage_error)?;
@@ -381,6 +436,11 @@ fn row_to_obligation(row: ObligationRow) -> Result<PaymentDrainObligation, Appli
         invoice_created_at: row.invoice_created_at,
         payment_deadline: row.payment_deadline,
         status: status_from_database(&row.status)?,
+        entitlement_to_publish: row
+            .entitlement_to_publish
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(storage_display)?,
     })
 }
 
@@ -471,13 +531,22 @@ fn storage_display(error: impl std::fmt::Display) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use locks_core::ids::{BundleId, PubkyLockResource, TaskId};
+    use locks_core::verification::{
+        EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+    };
+    use sqlx::PgPool;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
+    use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
     use crate::application::ports::{
         PaymentDrainCleanupToken, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
+        PaymentDrainTerminalTransition,
     };
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -631,5 +700,205 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn publication_intent_replays_exactly_and_completed_row_satisfies_constraints() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let (job_id, claim_token, task_id, now) = insert_obligation(database.pool(), 1).await;
+        let entitlement = entitlement(1);
+
+        let first_token = repository
+            .begin_entitlement_publication(
+                job_id,
+                "worker",
+                claim_token,
+                now,
+                &task_id,
+                &entitlement,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let replay_token = repository
+            .begin_entitlement_publication(
+                job_id,
+                "worker",
+                claim_token,
+                now,
+                &task_id,
+                &entitlement,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay_token, first_token);
+        let obligations = repository.list_obligations(job_id).await.unwrap();
+        assert_eq!(
+            obligations[0].status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(
+            obligations[0].entitlement_to_publish,
+            Some(entitlement.clone())
+        );
+
+        assert!(
+            repository
+                .persist_terminal_obligation(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    now,
+                    &task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: Some(first_token),
+                        terminal_reason: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let (status, stored, reason): (String, Option<serde_json::Value>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, entitlement_to_publish, terminal_reason
+                 FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_id.to_string().parse::<Uuid>().unwrap())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(stored, Some(serde_json::to_value(entitlement).unwrap()));
+        assert_eq!(reason, None);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn every_typed_expiry_row_satisfies_constraints() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        for (index, reason) in [
+            VerificationTerminalReason::PaymentRequestRejected,
+            VerificationTerminalReason::PaymentRequestCanceled,
+            VerificationTerminalReason::ProposalExpired,
+            VerificationTerminalReason::PaymentDeadlineExpired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (job_id, claim_token, task_id, now) =
+                insert_obligation(database.pool(), u8::try_from(index + 2).unwrap()).await;
+            assert!(
+                repository
+                    .persist_terminal_obligation(
+                        job_id,
+                        "worker",
+                        claim_token,
+                        now,
+                        &task_id,
+                        PaymentDrainTerminalTransition {
+                            status: VerificationTaskStatus::Expired,
+                            entitlement_publication_token: None,
+                            terminal_reason: Some(reason),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            );
+            let (status, stored_reason): (String, Option<String>) = sqlx::query_as(
+                "SELECT status, terminal_reason FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_id.to_string().parse::<Uuid>().unwrap())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(status, "expired");
+            assert_eq!(stored_reason.as_deref(), Some(reason.as_str()));
+        }
+        database.cleanup().await;
+    }
+
+    async fn insert_obligation(
+        pool: &PgPool,
+        discriminator: u8,
+    ) -> (Uuid, Uuid, TaskId, OffsetDateTime) {
+        let job_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let task_uuid = Uuid::new_v4();
+        let task_id = TaskId::from_str(&task_uuid.to_string()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let bundle_id = format!("000G40R40M30E209185GR38E{:02X}", discriminator);
+        let lock_resource = format!(
+            "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+        );
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, $2, 'lock', '{}'::jsonb, $3,
+                     'running', 'drain_payments', 'worker', $4, $5)",
+        )
+        .bind(job_id)
+        .bind(creator)
+        .bind(now)
+        .bind(claim_token)
+        .bind(now + time::Duration::minutes(5))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                  submitted_at, deletion_job_id)
+             VALUES ($1, $2, $3, 'pending', '{}'::jsonb, $4, $5)",
+        )
+        .bind(task_uuid)
+        .bind(creator)
+        .bind(&bundle_id)
+        .bind(now)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, criterion_id, status_at_cutoff,
+                  paykit_admission_required, invoice_created_at, payment_deadline)
+             VALUES ($1, $2, $3, $4, $5, 'criterion-1', 'pending', TRUE, $6, $7)",
+        )
+        .bind(job_id)
+        .bind(task_uuid)
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(lock_resource)
+        .bind(now)
+        .bind(now + time::Duration::hours(1))
+        .execute(pool)
+        .await
+        .unwrap();
+        (job_id, claim_token, task_id, now)
+    }
+
+    fn entitlement(discriminator: u8) -> VerifiedProofBundle {
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: BundleId::from_str(&format!(
+                "000G40R40M30E209185GR38E{:02X}",
+                discriminator
+            ))
+            .unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            ))
+            .unwrap(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        }
     }
 }
