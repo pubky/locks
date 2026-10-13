@@ -118,7 +118,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         job.validate_state(false)?;
         let frozen = serde_json::to_value(&job.frozen_content_lock).map_err(storage_display)?;
         let lock_resource = format!(
-            "{}/pub/locks.app/{}.json",
+            "{}/pub/app.locks/{}.json",
             job.creator,
             job.lock_id.as_str()
         );
@@ -848,9 +848,7 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
+            Err(ApplicationError::ContentLockDeletionInProgress)
         );
 
         let admitted_after = verification_task(&lock, BundleId::from_bytes([2; 16]));
@@ -1362,7 +1360,7 @@ mod tests {
 
     fn verification_task(lock: &ContentLock, bundle_id: BundleId) -> VerificationTaskRecord {
         let lock_resource = PubkyLockResource::from_str(&format!(
-            "{}/pub/locks.app/{}.json",
+            "{}/pub/app.locks/{}.json",
             lock.creator,
             lock.lock_id().unwrap()
         ))
@@ -1420,7 +1418,7 @@ mod tests {
             creator: CreatorPubky::from_str(CREATOR).unwrap(),
             primary_resource: Some(
                 GuardedResource::new(
-                    "/priv/locks.app/content/post.json".to_owned(),
+                    "/priv/app.locks/content/post.json".to_owned(),
                     GuardedResourceHash::from_bytes([7; 32]),
                     "application/json".to_owned(),
                     42,
