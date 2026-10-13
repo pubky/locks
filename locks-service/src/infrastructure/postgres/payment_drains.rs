@@ -591,7 +591,10 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locks_core::ids::TaskId;
+    use locks_core::ids::{BundleId, PubkyLockResource, TaskId};
+    use locks_core::verification::{
+        EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+    };
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -751,6 +754,80 @@ mod tests {
             Some(completed)
         );
 
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn publication_intent_replays_exactly_and_completed_row_satisfies_constraints() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let task_uuid = Uuid::new_v4();
+        let task_id = TaskId::from_str(&task_uuid.to_string()).unwrap();
+        let claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        insert_terminal_obligation(database.pool(), job_id, task_uuid, claim_token, now).await;
+        let entitlement = entitlement();
+
+        let first_token = repository
+            .begin_entitlement_publication(job_id, "worker", claim_token, &task_id, &entitlement)
+            .await
+            .unwrap()
+            .unwrap();
+        let replay_token = repository
+            .begin_entitlement_publication(job_id, "worker", claim_token, &task_id, &entitlement)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay_token, first_token);
+
+        let (status, stored, stored_token): (String, Option<serde_json::Value>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT status, entitlement_to_publish, entitlement_publication_claim_token
+                 FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_uuid)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "publishing_entitlement");
+        assert_eq!(stored, Some(serde_json::to_value(&entitlement).unwrap()));
+        assert_eq!(stored_token, Some(first_token));
+
+        assert!(
+            repository
+                .persist_terminal_obligation(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: Some(first_token),
+                        terminal_reason: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let (status, stored, reason, stored_token): (
+            String,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT status, entitlement_to_publish, terminal_reason,
+                    entitlement_publication_claim_token
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(task_uuid)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(stored, Some(serde_json::to_value(entitlement).unwrap()));
+        assert_eq!(reason, None);
+        assert_eq!(stored_token, None);
         database.cleanup().await;
     }
 
@@ -1173,5 +1250,19 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    fn entitlement() -> VerifiedProofBundle {
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            ))
+            .unwrap(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        }
     }
 }
