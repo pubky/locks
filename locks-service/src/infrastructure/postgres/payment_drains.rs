@@ -496,6 +496,7 @@ fn status_from_database(value: &str) -> Result<VerificationTaskStatus, Applicati
     match value {
         "pending" => Ok(VerificationTaskStatus::Pending),
         "in_progress" => Ok(VerificationTaskStatus::InProgress),
+        "publishing_entitlement" => Ok(VerificationTaskStatus::PublishingEntitlement),
         "completed" => Ok(VerificationTaskStatus::Completed),
         "failed" => Ok(VerificationTaskStatus::Failed),
         "expired" => Ok(VerificationTaskStatus::Expired),
