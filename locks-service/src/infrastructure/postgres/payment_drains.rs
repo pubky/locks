@@ -1125,10 +1125,9 @@ mod tests {
             "INSERT INTO content_lock_deletion_task_snapshot
                  (deletion_job_id, verification_task_id, creator, bundle_id,
                   pubky_lock_resource, criterion_id, status_at_cutoff,
-                  paykit_admission_required, payment_in_hours,
-                  invoice_created_at, payment_deadline)
+                  paykit_admission_required, invoice_created_at, payment_deadline)
              VALUES ($1, $2, 'creator', 'bundle', 'pubkycreator/pub/app.locks/lock.json',
-                     'payment', 'pending', TRUE, 1, $3, $4)",
+                     'payment', 'pending', TRUE, $3, $4)",
         )
         .bind(job_id)
         .bind(task_id)
