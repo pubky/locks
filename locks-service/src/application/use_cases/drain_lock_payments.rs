@@ -166,11 +166,16 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Ok(false);
             }
         }
+        if persisted.status == PaymentDrainStatus::Completed
+            && self
+                .drains
+                .all_obligations_terminal(claim.job.job_id)
+                .await?
+        {
+            return self.advance_completed_drain(claim, worker_id).await;
+        }
         if replayed_publication {
-            if persisted.status != PaymentDrainStatus::Completed {
-                return Ok(false);
-            }
-            return self.finish_completed_drain(claim, worker_id).await;
+            return Ok(false);
         }
 
         let lock_resource = lock_resource(&claim);
@@ -304,6 +309,14 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         {
             return Ok(false);
         }
+        self.advance_completed_drain(claim, worker_id).await
+    }
+
+    async fn advance_completed_drain(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> Result<bool, ApplicationError> {
         Ok(self
             .deletions
             .advance_phase(
