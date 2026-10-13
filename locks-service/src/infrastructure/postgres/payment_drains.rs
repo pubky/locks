@@ -781,6 +781,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replay_token, first_token);
+        let obligations = repository.list_obligations(job_id).await.unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(
+            obligations[0].status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(
+            obligations[0].entitlement_to_publish.as_ref(),
+            Some(&entitlement)
+        );
 
         let (status, stored, stored_token): (String, Option<serde_json::Value>, Option<Uuid>) =
             sqlx::query_as(
@@ -1227,7 +1237,9 @@ mod tests {
             "INSERT INTO verification_tasks
                  (task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id,
                   deletion_job_id)
-             VALUES ($1, 'pending', '{}'::jsonb, $2, 'creator', 'bundle', $3)",
+             VALUES ($1, 'pending', '{}'::jsonb, $2,
+                     'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+                     '000G40R40M30E209185GR38E1W', $3)",
         )
         .bind(task_id)
         .bind(now)
@@ -1241,7 +1253,10 @@ mod tests {
                   pubky_lock_resource, criterion_id, status_at_cutoff,
                   paykit_admission_required, payment_in_hours,
                   invoice_created_at, payment_deadline)
-             VALUES ($1, $2, 'creator', 'bundle', 'pubkycreator/pub/app.locks/lock.json',
+             VALUES ($1, $2,
+                     'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+                     '000G40R40M30E209185GR38E1W',
+                     'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json',
                      'payment', 'pending', TRUE, 1, $3, $4)",
         )
         .bind(job_id)
