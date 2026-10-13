@@ -9,7 +9,7 @@ const session = { id: 'session' };
 const signer = {
   pkdns: {
     free() {},
-    async publishHomeserverForce(value) {
+    async publishHomeserverIfStale(value) {
       calls.push(['publish', value]);
     },
   },
