@@ -65,6 +65,32 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
         &self,
         request: IssueAccessCredentialRequest,
     ) -> Result<IssuedAccessCredential, ApplicationError> {
+        let now = self.clock.now();
+        if self
+            .credential_store
+            .final_credential_available(&request.creator, &request.bundle_id, now)
+            .await?
+        {
+            let candidate = self
+                .credential_generator
+                .generate_access_credential()
+                .await?;
+            if let Some(final_credential) = self
+                .credential_store
+                .issue_or_replay_final_credential(
+                    &request.creator,
+                    &request.bundle_id,
+                    now,
+                    candidate,
+                )
+                .await?
+            {
+                return Ok(IssuedAccessCredential {
+                    credential: final_credential.credential,
+                    expires_at: final_credential.expires_at,
+                });
+            }
+        }
         let valid_entitlement = load_valid_entitlement(
             self.entitlements,
             self.content_locks,
@@ -79,7 +105,7 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
                 .access_policy
                 .requested_credential_ttl_seconds,
         )?;
-        let expires_at = self.clock.now() + Duration::seconds(requested_ttl_seconds as i64);
+        let expires_at = now + Duration::seconds(requested_ttl_seconds as i64);
         let credential = self
             .credential_generator
             .generate_access_credential()
@@ -88,6 +114,7 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
 
         self.credential_store
             .insert_access_credential(
+                &valid_entitlement.lock_id,
                 lookup_key,
                 AccessCredentialRecord {
                     creator: request.creator,

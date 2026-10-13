@@ -1,4 +1,4 @@
-use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky};
+use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, LockId};
 use locks_core::lock_policy::ContentLock;
 use locks_core::verification::VerifiedProofBundle;
 
@@ -10,6 +10,8 @@ use crate::application::ports::{ContentLockRepository, EntitlementRepository};
 pub(super) struct ValidEntitlement {
     /// Current hash-verified content lock referenced by the entitlement.
     pub content_lock: ContentLock,
+    /// Canonical Lock ID verified against the entitlement path.
+    pub lock_id: LockId,
 }
 
 /// Loads and validates current entitlement state for credential issuance/validation.
@@ -25,7 +27,7 @@ pub(super) async fn load_valid_entitlement(
         .ok_or(ApplicationError::EntitlementNotFound)?;
 
     let content_lock = load_current_content_lock(content_locks, &verified_proof_bundle).await?;
-    verify_content_lock_identity(
+    let lock_id = verify_content_lock_identity(
         &content_lock,
         verified_proof_bundle
             .pubky_lock_resource
@@ -36,7 +38,10 @@ pub(super) async fn load_valid_entitlement(
         return Err(ApplicationError::EntitlementNotSatisfied);
     }
 
-    Ok(ValidEntitlement { content_lock })
+    Ok(ValidEntitlement {
+        content_lock,
+        lock_id,
+    })
 }
 
 async fn load_current_content_lock(
@@ -57,7 +62,7 @@ async fn load_current_content_lock(
 pub(super) fn verify_content_lock_identity(
     content_lock: &ContentLock,
     content_lock_path: &ContentLockPath,
-) -> Result<(), ApplicationError> {
+) -> Result<LockId, ApplicationError> {
     let actual =
         content_lock
             .lock_id()
@@ -67,7 +72,7 @@ pub(super) fn verify_content_lock_identity(
     let expected = content_lock_path.lock_id().clone();
 
     if actual == expected {
-        Ok(())
+        Ok(actual)
     } else {
         Err(ApplicationError::ContentLockHashMismatch { expected, actual })
     }
