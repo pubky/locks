@@ -165,6 +165,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             next_attempt_at: Some(task.submitted_at),
             attempt_count: 0,
             retry_reason: None,
+            invoice_created_at: None,
+            payment_deadline: None,
         };
         self.invoice_admissions.write().await.insert(
             task.task_id,
@@ -246,7 +248,14 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
+        if payment_deadline <= invoice_created_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "invoice payment deadline must follow invoice creation".to_owned(),
+            });
+        }
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
             state.record.phase == InvoiceAdmissionPhase::InvoicePending
@@ -259,6 +268,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             return Ok(None);
         };
         state.record.phase = InvoiceAdmissionPhase::Ready;
+        state.record.invoice_created_at = Some(invoice_created_at);
+        state.record.payment_deadline = Some(payment_deadline);
         state.record.next_attempt_at = None;
         state.record.retry_reason = None;
         state.claimed_by = None;
@@ -344,6 +355,7 @@ fn validate_invoice_admission_inputs(
     intent: &InvoiceAdmissionIntentV1,
 ) -> Result<(), ApplicationError> {
     if intent.version != INVOICE_ADMISSION_INTENT_VERSION
+        || intent.payment_in == 0
         || task.status != VerificationTaskStatus::Pending
         || task.creator != intent.creator
         || task.submitted_proof_bundle.bundle_id != intent.bundle_id
@@ -602,6 +614,8 @@ mod tests {
                 "worker-a",
                 &uuid::Uuid::new_v4(),
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -638,6 +652,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -914,6 +930,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 inserted.admission_deadline_at + time::Duration::seconds(10),
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -974,6 +992,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 after_lease,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -991,6 +1011,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 after_lease,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -1050,6 +1072,7 @@ mod tests {
                 "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
             )
             .unwrap(),
+            payment_in: 24,
         }
     }
 }

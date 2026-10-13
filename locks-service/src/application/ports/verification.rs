@@ -44,6 +44,8 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
 
     /// Returns exact live lease to durable due state without resetting attempts.
@@ -122,17 +124,6 @@ pub trait VerificationTaskRepository: Send + Sync {
 /// Worker-facing port for claiming verification task leases.
 #[async_trait]
 pub trait VerificationTaskClaimer: Send + Sync {
-    /// Fences entitlement publication before external storage I/O.
-    ///
-    /// Returns false when the exact lease is lost or deletion already owns the task.
-    async fn begin_claimed_entitlement_publication(
-        &self,
-        task_id: &TaskId,
-        worker_id: &str,
-        claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
-    ) -> Result<bool, ApplicationError>;
-
     /// Claims one pending or expired in-progress verification task for a worker.
     ///
     /// Returns `Ok(None)` when no task is claimable. Every successful claim includes a fresh

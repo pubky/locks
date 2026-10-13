@@ -22,7 +22,8 @@ use locks_service::{
             CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
             FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
             GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
-            LockServicePointerRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
+            VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::start_creator_connect_flow::default_requested_scopes,
     },
@@ -39,7 +40,8 @@ use locks_service::{
             PostgresContentLockDeletionRepository, PostgresContentLockOwnershipRepository,
             PostgresCreatorAuthorityStore, PostgresCreatorConnectFlowStore,
             PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
-            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
+            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
+            PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
@@ -247,6 +249,7 @@ pub struct AppState {
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
     content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
     content_lock_deletions: Arc<dyn ContentLockDeletionRepository>,
+    payment_drains: Option<Arc<dyn PaymentDrainRepository>>,
     invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
@@ -275,6 +278,7 @@ pub struct AppState {
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
+    payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -630,6 +634,13 @@ impl AppState {
                 Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
                 None => Arc::new(InMemoryContentLockDeletionRepository::new()),
             };
+        let payment_drains = postgres_pool.as_ref().map(|pool| {
+            Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
+                as Arc<dyn PaymentDrainRepository>
+        });
+        let payment_drain_client = paykit_http_client
+            .as_ref()
+            .map(|client| Arc::clone(client) as Arc<dyn PaymentDrainClient>);
         let paykit_setup_status_provider = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
@@ -643,6 +654,7 @@ impl AppState {
             lock_service_pointers: creator_repositories.lock_service_pointers,
             content_lock_ownership: private_runtime.content_lock_ownership,
             content_lock_deletions,
+            payment_drains,
             invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
@@ -670,6 +682,7 @@ impl AppState {
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
+            payment_drain_client,
         }
     }
 
@@ -699,6 +712,14 @@ impl AppState {
 
     pub fn content_lock_deletions(&self) -> &Arc<dyn ContentLockDeletionRepository> {
         &self.content_lock_deletions
+    }
+
+    pub fn payment_drains(&self) -> Option<&Arc<dyn PaymentDrainRepository>> {
+        self.payment_drains.as_ref()
+    }
+
+    pub fn payment_drain_client(&self) -> Option<&Arc<dyn PaymentDrainClient>> {
+        self.payment_drain_client.as_ref()
     }
 
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {

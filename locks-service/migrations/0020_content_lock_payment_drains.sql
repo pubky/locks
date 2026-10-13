@@ -5,7 +5,6 @@ ALTER TABLE content_lock_deletion_task_snapshot
     ADD COLUMN criterion_id TEXT,
     ADD COLUMN status_at_cutoff TEXT,
     ADD COLUMN paykit_admission_required BOOLEAN,
-    ADD COLUMN payment_in_hours BIGINT,
     ADD COLUMN invoice_created_at TIMESTAMPTZ,
     ADD COLUMN payment_deadline TIMESTAMPTZ,
     ADD COLUMN resolved_status TEXT,
@@ -22,7 +21,7 @@ COMMENT ON COLUMN verification_tasks.deletion_job_id IS
 
 ALTER TABLE content_lock_deletion_task_snapshot
     ADD CONSTRAINT content_lock_deletion_task_snapshot_cutoff_status_valid
-        CHECK (status_at_cutoff IN ('pending', 'in_progress', 'completed', 'failed', 'expired')),
+        CHECK (status_at_cutoff IN ('pending', 'in_progress', 'publishing_entitlement', 'completed', 'failed', 'expired')),
     ADD CONSTRAINT content_lock_deletion_task_snapshot_identity_all_or_none
         CHECK (
             (creator IS NULL AND bundle_id IS NULL AND pubky_lock_resource IS NULL
@@ -34,25 +33,21 @@ ALTER TABLE content_lock_deletion_task_snapshot
     ADD CONSTRAINT content_lock_deletion_task_snapshot_admission_shape_valid
         CHECK (
             (paykit_admission_required IS NULL
-             AND payment_in_hours IS NULL
              AND invoice_created_at IS NULL
              AND payment_deadline IS NULL)
             OR
             (paykit_admission_required = FALSE
-             AND payment_in_hours IS NULL
              AND invoice_created_at IS NULL
              AND payment_deadline IS NULL)
             OR
             (paykit_admission_required = TRUE
-             AND payment_in_hours IS NULL
              AND invoice_created_at IS NULL
              AND payment_deadline IS NULL)
             OR
             (paykit_admission_required = TRUE
-             AND payment_in_hours > 0
              AND invoice_created_at IS NOT NULL
              AND payment_deadline IS NOT NULL
-             AND invoice_created_at <= payment_deadline)
+             AND invoice_created_at < payment_deadline)
         ),
     ADD CONSTRAINT content_lock_deletion_task_snapshot_resolution_valid
         CHECK (

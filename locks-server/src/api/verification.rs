@@ -149,14 +149,17 @@ async fn maybe_prepare_paykit_submission(
             submitted_proof_bundle: submitted.clone(),
         })
         .await;
-    if let Err(error) = validation {
-        if let Some(existing) = submit_use_case.find_existing(submitted).await? {
-            return Ok(PreparedSubmission {
-                existing: Some(existing),
-            });
+    let validation = match validation {
+        Ok(validation) => validation,
+        Err(error) => {
+            if let Some(existing) = submit_use_case.find_existing(submitted).await? {
+                return Ok(PreparedSubmission {
+                    existing: Some(existing),
+                });
+            }
+            return Err(error.into());
         }
-        return Err(error.into());
-    }
+    };
     let paykit = state.paykit_http_client().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::PaykitNotConfigured,
@@ -170,6 +173,7 @@ async fn maybe_prepare_paykit_submission(
                 submitted_proof_bundle: submitted.clone(),
             },
             state.invoice_admissions().as_ref(),
+            validation.payment_in,
         )
         .await?;
     Ok(PreparedSubmission {

@@ -115,7 +115,7 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
 }
 
 #[tokio::test]
-async fn manual_completion_hides_legacy_paykit_admission_without_authoritative_window() {
+async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window() {
     let Some(database) = TestDatabase::create().await else {
         return;
     };
@@ -129,20 +129,13 @@ async fn manual_completion_hides_legacy_paykit_admission_without_authoritative_w
         started_at: None,
         completed_at: None,
         failure_message: None,
+        terminal_reason: None,
+        entitlement_to_publish: None,
     };
     PostgresVerificationTaskRepository::new(database.pool().clone())
         .insert_verification_task(task.clone())
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO paykit_task_admissions
-             (verification_task_id, ready, ready_at)
-         VALUES ($1::uuid, TRUE, now())",
-    )
-    .bind(task.task_id.to_string())
-    .execute(database.pool())
-    .await
-    .unwrap();
 
     let response = router(app_state(database.pool().clone()))
         .oneshot(json_request(

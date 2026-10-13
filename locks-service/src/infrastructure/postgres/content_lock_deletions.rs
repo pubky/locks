@@ -124,6 +124,23 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         );
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &job.creator, &job.lock_id).await?;
+        let entitlement_publication_in_progress = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM verification_tasks
+                WHERE creator = $1
+                  AND submitted_proof_bundle->>'pubky_lock_resource' = $2
+                  AND (status = 'publishing_entitlement'
+                       OR entitlement_publication_claim_token IS NOT NULL)
+            )",
+        )
+        .bind(job.creator.to_string())
+        .bind(&lock_resource)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if entitlement_publication_in_progress {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let deletion_cutoff_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts
              WHERE creator = $1 AND lock_id = $2)
@@ -160,8 +177,21 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .map_err(map_insert_error)?;
         sqlx::query(
             "INSERT INTO content_lock_deletion_task_snapshot
-                 (deletion_job_id, verification_task_id)
-             SELECT $1, task_id
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, criterion_id, status_at_cutoff,
+                  paykit_admission_required)
+             SELECT $1, task_id, creator, bundle_id,
+                    submitted_proof_bundle->>'pubky_lock_resource',
+                    (SELECT proof->>'criterion_id'
+                     FROM jsonb_array_elements(submitted_proof_bundle->'proofs') AS proof
+                     WHERE proof->>'verifier_type' = 'paykit-payment'
+                     LIMIT 1),
+                    status,
+                    EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(submitted_proof_bundle->'proofs') AS proof
+                        WHERE proof->>'verifier_type' = 'paykit-payment'
+                    )
              FROM verification_tasks
              WHERE creator = $2
                AND submitted_proof_bundle->>'pubky_lock_resource' = $3",
@@ -172,6 +202,61 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE verification_tasks AS task
+             SET status = CASE
+                     WHEN task.status IN ('pending', 'in_progress') THEN 'pending'
+                     ELSE task.status
+                 END,
+                 started_at = CASE
+                     WHEN task.status IN ('pending', 'in_progress') THEN NULL
+                     ELSE task.started_at
+                 END,
+                 claimed_by = CASE
+                     WHEN task.invoice_admission_phase = 'invoice_pending' THEN task.claimed_by
+                     ELSE NULL
+                 END,
+                 claim_token = CASE
+                     WHEN task.invoice_admission_phase = 'invoice_pending' THEN task.claim_token
+                     ELSE NULL
+                 END,
+                 claim_expires_at = CASE
+                     WHEN task.invoice_admission_phase = 'invoice_pending' THEN task.claim_expires_at
+                     ELSE NULL
+                 END,
+                 next_attempt_at = CASE
+                     WHEN task.invoice_admission_phase = 'invoice_pending' THEN task.next_attempt_at
+                     ELSE NULL
+                 END,
+                 last_attempt_error = CASE
+                     WHEN task.invoice_admission_phase = 'invoice_pending' THEN task.last_attempt_error
+                     ELSE NULL
+                 END,
+                 deletion_job_id = $1, updated_at = $2
+             FROM content_lock_deletion_task_snapshot AS snapshot
+             WHERE snapshot.deletion_job_id = $1
+               AND snapshot.verification_task_id = task.task_id",
+        )
+        .bind(job.job_id)
+        .bind(job.deletion_started_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let publication_won_race = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM verification_tasks
+                WHERE deletion_job_id = $1
+                  AND (status = 'publishing_entitlement'
+                       OR entitlement_publication_claim_token IS NOT NULL)
+            )",
+        )
+        .bind(job.job_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if publication_won_race {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         transaction.commit().await.map_err(storage_error)
     }
 
@@ -277,27 +362,55 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             });
         }
         if next_phase == ContentLockDeletionPhase::StartPaymentDrain {
-            let has_pending_invoice_admission = sqlx::query_scalar::<_, bool>(
+            let has_unready_invoice_admission = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (
                     SELECT 1
                     FROM content_lock_deletion_task_snapshot AS snapshot
                     JOIN verification_tasks AS task
                       ON task.task_id = snapshot.verification_task_id
                     WHERE snapshot.deletion_job_id = $1
-                      AND task.invoice_admission_phase = 'invoice_pending'
+                      AND snapshot.paykit_admission_required = TRUE
+                      AND (task.invoice_admission_phase <> 'ready'
+                           OR task.invoice_created_at IS NULL
+                           OR task.payment_deadline IS NULL
+                           OR task.payment_deadline <= task.invoice_created_at)
                 )",
             )
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-            if has_pending_invoice_admission {
+            if has_unready_invoice_admission {
                 return Err(ApplicationError::InvalidContentLockDeletionState {
                     message:
-                        "payment drain cannot start while snapshotted invoice admissions are pending"
+                        "payment drain cannot start while snapshotted invoice admissions are unready"
                             .to_owned(),
                 });
             }
+            sqlx::query(
+                "UPDATE content_lock_deletion_task_snapshot AS snapshot
+                 SET invoice_created_at = task.invoice_created_at,
+                     payment_deadline = task.payment_deadline,
+                     resolved_status = CASE
+                         WHEN snapshot.status_at_cutoff IN ('completed', 'failed', 'expired')
+                         THEN snapshot.status_at_cutoff
+                         ELSE NULL
+                     END,
+                     resolved_at = CASE
+                         WHEN snapshot.status_at_cutoff IN ('completed', 'failed', 'expired')
+                         THEN $2
+                         ELSE NULL
+                     END
+                 FROM verification_tasks AS task
+                 WHERE snapshot.deletion_job_id = $1
+                   AND snapshot.paykit_admission_required = TRUE
+                   AND task.task_id = snapshot.verification_task_id",
+            )
+            .bind(job_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
         }
         let sql = format!(
             "UPDATE content_lock_deletion_jobs
@@ -692,10 +805,13 @@ mod tests {
             errors::ApplicationError,
             models::{
                 ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-                ContentLockDeletionState, PrepareForceDeletionResult, VerificationTaskRecord,
-                VerificationTaskStatus,
+                ContentLockDeletionState, InvoiceAdmissionIntentV1, PrepareForceDeletionResult,
+                VerificationTaskRecord, VerificationTaskStatus,
             },
-            ports::{ContentLockDeletionRepository, VerificationTaskRepository},
+            ports::{
+                ContentLockDeletionRepository, InvoiceAdmissionRepository,
+                VerificationTaskRepository,
+            },
         },
         infrastructure::postgres::{PostgresVerificationTaskRepository, testing::TestDatabase},
     };
@@ -872,113 +988,43 @@ mod tests {
         database.cleanup().await;
     }
 
-    #[cfg(any())]
     #[tokio::test]
-    async fn durable_paykit_reservation_commits_before_deletion_and_is_snapshotted() {
-        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
-
+    async fn deletion_preserves_live_invoice_admission_claim_until_window_is_persisted() {
         let database = TestDatabase::create().await;
         let lock = content_lock();
-        let task = verification_task(&lock, BundleId::from_bytes([3; 16]));
-        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let admission = admissions.reserve(task.clone()).await.unwrap();
-        assert!(admission.requires_paykit);
-
-        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
-        repository
-            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
+        let task = paykit_verification_task(&lock, BundleId::from_bytes([3; 16]));
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        tasks
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
             .await
             .unwrap();
-
-        let snapshotted = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                SELECT 1 FROM content_lock_deletion_task_snapshot
-                WHERE verification_task_id = $1
-            )",
-        )
-        .bind(task.task_id.as_uuid())
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
-        assert!(snapshotted);
-
-        database.cleanup().await;
-    }
-
-    #[cfg(any())]
-    #[tokio::test]
-    async fn deletion_first_rejects_durable_paykit_reservation_before_external_work() {
-        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
-
-        let database = TestDatabase::create().await;
-        let lock = content_lock();
-        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
-        repository
-            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap())
+        let admission_claim = tasks
+            .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
             .await
+            .unwrap()
             .unwrap();
 
-        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let mut external_calls = 0;
-        let result = admissions
-            .reserve(verification_task(&lock, BundleId::from_bytes([4; 16])))
-            .await;
-        if result.is_ok() {
-            external_calls += 1;
-        }
-        assert!(matches!(
-            result,
-            Err(ApplicationError::ContentLockDeletionInProgress)
-        ));
-        assert_eq!(external_calls, 0);
-
-        database.cleanup().await;
-    }
-
-    #[cfg(any())]
-    #[tokio::test]
-    async fn payment_drain_phase_waits_for_every_snapshotted_paykit_reservation() {
-        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
-
-        let database = TestDatabase::create().await;
-        let lock = content_lock();
-        let task = verification_task(&lock, BundleId::from_bytes([6; 16]));
-        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let admission = admissions.reserve(task).await.unwrap();
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
-        repository
-            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let ready = tasks
+            .mark_invoice_admission_ready(
+                &task.task_id,
+                "invoice-worker",
+                &admission_claim.claim_token,
+                NOW,
+                NOW,
+                NOW + time::Duration::hours(24),
+            )
             .await
             .unwrap();
+        assert!(ready.is_some());
+
         let claim = repository
             .claim_next("worker", NOW, NOW + time::Duration::seconds(60))
             .await
             .unwrap()
             .unwrap();
-
-        let blocked = repository
-            .advance_phase(
-                claim.job.job_id,
-                "worker",
-                claim.claim_token,
-                NOW,
-                ContentLockDeletionPhase::StartPaymentDrain,
-            )
-            .await;
-        assert!(matches!(
-            blocked,
-            Err(ApplicationError::InvalidContentLockDeletionState { message })
-                if message == "payment drain cannot start before reserved Paykit admissions are ready"
-        ));
-        let still_running = repository
-            .get_job(&claim.job.creator, &claim.job.lock_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(still_running.state, ContentLockDeletionState::Running);
-        assert_eq!(still_running.phase, ContentLockDeletionPhase::Withdraw);
-
-        admissions.mark_ready(&admission.task).await.unwrap();
         let advanced = repository
             .advance_phase(
                 claim.job.job_id,
@@ -992,42 +1038,42 @@ mod tests {
             .unwrap();
         assert_eq!(advanced.phase, ContentLockDeletionPhase::StartPaymentDrain);
 
+        let window: (time::OffsetDateTime, time::OffsetDateTime) = sqlx::query_as(
+            "SELECT invoice_created_at, payment_deadline
+             FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1 AND verification_task_id = $2",
+        )
+        .bind(job.job_id)
+        .bind(task.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(window, (NOW, NOW + time::Duration::hours(24)));
+
         database.cleanup().await;
     }
 
-    #[cfg(any())]
     #[tokio::test]
-    async fn paykit_admission_insert_failure_rolls_back_verification_task() {
-        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
-
+    async fn deletion_preserves_unclaimed_invoice_admission_retry_schedule() {
         let database = TestDatabase::create().await;
-        sqlx::query(
-            "CREATE FUNCTION reject_paykit_admission() RETURNS trigger AS $$
-             BEGIN
-                 RAISE EXCEPTION 'injected admission failure';
-             END;
-             $$ LANGUAGE plpgsql",
-        )
-        .execute(database.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TRIGGER reject_paykit_admission
-             BEFORE INSERT ON paykit_task_admissions
-             FOR EACH ROW EXECUTE FUNCTION reject_paykit_admission()",
-        )
-        .execute(database.pool())
-        .await
-        .unwrap();
-
-        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let task = verification_task(&content_lock(), BundleId::from_bytes([5; 16]));
-        assert!(admissions.reserve(task).await.is_err());
-        let task_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM verification_tasks")
-            .fetch_one(database.pool())
+        let lock = content_lock();
+        let task = paykit_verification_task(&lock, BundleId::from_bytes([4; 16]));
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        tasks
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
             .await
             .unwrap();
-        assert_eq!(task_count, 0);
+        PostgresContentLockDeletionRepository::new(database.pool().clone())
+            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
+            .await
+            .unwrap();
+
+        let claim = tasks
+            .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.admission.task.task_id, task.task_id);
 
         database.cleanup().await;
     }
@@ -1342,6 +1388,29 @@ mod tests {
             failure_message: None,
             terminal_reason: None,
             entitlement_to_publish: None,
+        }
+    }
+
+    fn paykit_verification_task(lock: &ContentLock, bundle_id: BundleId) -> VerificationTaskRecord {
+        let mut task = verification_task(lock, bundle_id);
+        task.submitted_proof_bundle.reader_public_key = Some(lock.creator.clone());
+        task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+        task.submitted_proof_bundle.proofs[0].payload = serde_json::json!({});
+        task
+    }
+
+    fn invoice_intent(task: &VerificationTaskRecord) -> InvoiceAdmissionIntentV1 {
+        InvoiceAdmissionIntentV1 {
+            version: crate::application::models::INVOICE_ADMISSION_INTENT_VERSION,
+            creator: task.creator.clone(),
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            reader: task
+                .submitted_proof_bundle
+                .reader_public_key
+                .clone()
+                .unwrap(),
+            payment_in: 24,
         }
     }
 

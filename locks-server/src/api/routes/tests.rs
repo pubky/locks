@@ -1185,6 +1185,8 @@ async fn in_memory_invoice_ready_task_becomes_claimable_for_verification() {
             "invoice-worker",
             &admission_claim.claim_token,
             now,
+            now,
+            now + time::Duration::hours(24),
         )
         .await
         .unwrap()

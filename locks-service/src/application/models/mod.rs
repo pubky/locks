@@ -61,6 +61,7 @@ mod tests {
                 "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
             )
             .unwrap(),
+            payment_in: 24,
         };
 
         assert_eq!(
@@ -72,7 +73,8 @@ mod tests {
                 "lock_resource": format!(
                     "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
                 ),
-                "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+                "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+                "payment_in": 24
             })
         );
         assert_eq!(
@@ -89,7 +91,8 @@ mod tests {
             "lock_resource": format!(
                 "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ),
-            "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky"
+            "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            "payment_in": 24
         })).is_err());
         assert_eq!(
             InvoiceAdmissionPhase::InvoicePending.as_str(),

@@ -17,6 +17,8 @@ pub struct InvoiceAdmissionIntentV1 {
     pub bundle_id: BundleId,
     pub lock_resource: PubkyLockResource,
     pub reader: CreatorPubky,
+    /// Canonical whole-hour payment window committed before invoice creation.
+    pub payment_in: u64,
 }
 
 impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
@@ -32,6 +34,7 @@ impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
             bundle_id: BundleId,
             lock_resource: PubkyLockResource,
             reader: CreatorPubky,
+            payment_in: u64,
         }
 
         let stored = StoredIntent::deserialize(deserializer)?;
@@ -41,7 +44,7 @@ impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
                 stored.version
             )));
         }
-        if stored.lock_resource.creator() != &stored.creator {
+        if stored.lock_resource.creator() != &stored.creator || stored.payment_in == 0 {
             return Err(serde::de::Error::custom(
                 "invoice admission creator does not match lock resource",
             ));
@@ -52,6 +55,7 @@ impl<'de> serde::Deserialize<'de> for InvoiceAdmissionIntentV1 {
             bundle_id: stored.bundle_id,
             lock_resource: stored.lock_resource,
             reader: stored.reader,
+            payment_in: stored.payment_in,
         })
     }
 }
@@ -94,6 +98,9 @@ pub struct InvoiceAdmissionRecord {
     pub next_attempt_at: Option<OffsetDateTime>,
     pub attempt_count: u32,
     pub retry_reason: Option<InvoiceAdmissionRetryReason>,
+    /// Paykit-authoritative immutable invoice window. Both fields are absent while pending.
+    pub invoice_created_at: Option<OffsetDateTime>,
+    pub payment_deadline: Option<OffsetDateTime>,
 }
 
 /// Claimed invoice admission carrying exact lease-incarnation fencing token.
