@@ -69,7 +69,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
         .unwrap();
     assert_eq!(shell_response.status(), StatusCode::OK);
     let shell_html = response_text(shell_response).await;
-    assert!(shell_html.contains("pubkyauth://fake-secret-flow-url"));
+    assert!(shell_html.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert_no_secret_text_material(&shell_html);
     let flow_id = extract_flow_id_from_shell(&shell_html);
 
@@ -134,7 +134,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
     assert_eq!(status["auth_kind"], "legacy_cookie");
     assert_eq!(
         status["granted_scopes"],
-        json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+        json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
     );
     assert_no_secret_material(&status);
 
@@ -147,7 +147,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
     let guarded_resource = guarded_json["guarded_resource"].clone();
     assert_eq!(
         guarded_resource["path"],
-        "/priv/locks.app/content/acquired.txt"
+        "/priv/app.locks/content/acquired.txt"
     );
     assert_no_secret_material(&guarded_json);
 
@@ -175,7 +175,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
 
     let operations = storage.operations();
     assert!(operations.iter().any(|operation| {
-        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/locks.app/content/acquired.txt text/plain"
+        operation == "put_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/acquired.txt text/plain"
     }));
     assert!(operations.iter().any(|operation| {
         operation == &format!("put_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {content_lock_path}")
@@ -192,10 +192,10 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         assert_eq!(
             requested_scopes,
-            ["/pub/locks.app/:rw", "/priv/locks.app/:rw"]
+            ["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
         Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://fake-secret-flow-url",
+            "pubkyauth://signin?secret=fake-secret-flow-url",
         ))
     }
 
@@ -205,7 +205,7 @@ impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
     ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
         assert_eq!(
             authorization_url.expose_url(),
-            "pubkyauth://fake-secret-flow-url"
+            "pubkyauth://signin?secret=fake-secret-flow-url"
         );
         Ok(LegacyCreatorConnectFlowApproval {
             creator: creator(),

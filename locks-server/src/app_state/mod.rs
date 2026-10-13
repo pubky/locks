@@ -20,10 +20,11 @@ use locks_service::{
             AccessCredentialStore, Clock, ContentLockDeletionRepository,
             ContentLockOwnershipRepository, ContentLockRepository, CreatorAuthorityManager,
             CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
-            FrontendSessionCodeStore, FrontendSessionStore, GuardedResourceRepository,
-            LegacyCreatorConnectFlowClient, LockServicePointerRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
+            GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
+            LockServicePointerRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
+        use_cases::start_creator_connect_flow::default_requested_scopes,
     },
     infrastructure::{
         memory::{
@@ -41,9 +42,11 @@ use locks_service::{
             PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
-            AuthorizingPubkyHomeserverStorageClient, LegacyCookieCreatorAuthorityManager,
+            AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
+            GrantSessionCache, LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys,
             PubkyBytesResource, PubkyContentLockRepository, PubkyEntitlementRepository,
-            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionRevalidator,
+            PubkyGrantCreatorConnectFlowClient, PubkyHomeserverStorageClient,
+            PubkyLegacyCookieSessionImporter, PubkyLegacyCookieSessionRevalidator,
             PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
             PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
@@ -72,7 +75,9 @@ use crate::app_state::pubky_clients::{
     build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
 };
 pub use crate::app_state::readiness::RuntimeStorageKind;
-use crate::config::LockServerRuntimeConfig;
+use crate::config::{
+    CreatorAuthorityAcquisitionMethod, LockServerRuntimeConfig, load_lock_server_signing_keypair,
+};
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::{
     InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
@@ -158,6 +163,80 @@ impl PubkyHomeserverStorageClient for UnavailablePubkyHomeserverStorageClient {
     }
 }
 
+type CreatorAuthRuntime<S> = (
+    Arc<dyn CreatorAuthorityManager>,
+    Arc<dyn LegacyCreatorConnectFlowClient>,
+    Option<Arc<dyn GrantCreatorConnectFlowClient>>,
+    Option<Arc<GrantSessionCache<S, PubkyLegacyCookieSessionImporter>>>,
+);
+
+fn creator_auth_runtime<S>(
+    config: &LockServerRuntimeConfig,
+    store: S,
+    http: &pubky::PubkyHttpClient,
+) -> CreatorAuthRuntime<S>
+where
+    S: CreatorAuthorityStore + Clone + 'static,
+{
+    match config.creator_authority_acquisition.method {
+        CreatorAuthorityAcquisitionMethod::LegacyConnect => {
+            let manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
+                store,
+                PubkyLegacyCookieSessionRevalidator::new(http.clone()),
+            ));
+            let legacy: Arc<dyn LegacyCreatorConnectFlowClient> =
+                if config.creator_authority_acquisition.enabled {
+                    let pubky = build_pubky_client(&config.pubky);
+                    match pubky_auth_relay_for_network(config.pubky.network) {
+                        Some(relay) => Arc::new(
+                            PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, relay),
+                        ),
+                        None => Arc::new(PubkyLegacyCreatorConnectFlowClient::new(pubky)),
+                    }
+                } else {
+                    Arc::new(DisabledLegacyCreatorConnectFlowClient)
+                };
+            (manager, legacy, None, None)
+        }
+        CreatorAuthorityAcquisitionMethod::GrantConnect => {
+            let grant = config
+                .creator_authority_acquisition
+                .grant_connect
+                .as_ref()
+                .expect("grant-connect method requires grant_connect config");
+            let keypair = load_lock_server_signing_keypair(&config.credentials)
+                .expect("grant-connect requires keypair-seed Lock Server secret");
+            let keys = LockServerGrantPopKeys::from_lock_server_seed(keypair.secret());
+            let client_id =
+                pubky::ClientId::new(&grant.client_id).expect("validated grant-connect client_id");
+            let importer = PubkyLegacyCookieSessionImporter::new(http.clone()).with_grant_policy(
+                keys.clone(),
+                client_id.clone(),
+                default_requested_scopes(),
+            );
+            let session_cache = Arc::new(GrantSessionCache::new(store.clone(), importer, 256));
+            let manager = Arc::new(GrantCreatorAuthorityManager::new(
+                store,
+                Arc::clone(&session_cache),
+            ));
+            let grant_client = config.creator_authority_acquisition.enabled.then(|| {
+                Arc::new(PubkyGrantCreatorConnectFlowClient::new(
+                    http.clone(),
+                    pubky_auth_relay_for_network(config.pubky.network),
+                    client_id,
+                    keys.clone(),
+                )) as Arc<dyn GrantCreatorConnectFlowClient>
+            });
+            (
+                manager,
+                Arc::new(DisabledLegacyCreatorConnectFlowClient),
+                grant_client,
+                Some(session_cache),
+            )
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: LockServerRuntimeConfig,
@@ -168,6 +247,7 @@ pub struct AppState {
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
     content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
     content_lock_deletions: Arc<dyn ContentLockDeletionRepository>,
+    invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     entitlements: Arc<dyn EntitlementRepository>,
@@ -178,6 +258,7 @@ pub struct AppState {
     frontend_sessions: Arc<dyn FrontendSessionStore>,
     creator_authority_manager: Arc<dyn CreatorAuthorityManager>,
     legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient>,
+    grant_creator_connect_flow_client: Option<Arc<dyn GrantCreatorConnectFlowClient>>,
     dev_static_verifier: Arc<DevStaticVerifier>,
     paykit_payment_verifier: Option<Arc<PaykitPaymentVerifier<Arc<PaykitHttpClient>>>>,
     task_ids: Arc<OsRandomTaskIdGenerator>,
@@ -233,6 +314,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -250,6 +333,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -259,6 +343,7 @@ impl AppState {
             frontend_sessions: Arc::new(InMemoryFrontendSessionStore::new()),
             creator_authority_manager,
             legacy_creator_connect_flow_client: Arc::new(DisabledLegacyCreatorConnectFlowClient),
+            grant_creator_connect_flow_client: None,
         };
 
         Self::new_with_private_runtime_storage(
@@ -283,6 +368,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -299,6 +386,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -308,6 +396,7 @@ impl AppState {
             frontend_sessions: Arc::new(InMemoryFrontendSessionStore::new()),
             creator_authority_manager,
             legacy_creator_connect_flow_client: Arc::new(DisabledLegacyCreatorConnectFlowClient),
+            grant_creator_connect_flow_client: None,
         };
 
         Self::new_with_private_runtime_storage(
@@ -332,6 +421,8 @@ impl AppState {
                 vec![],
                 verification_tasks.clone(),
             ));
+        verification_tasks
+            .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -365,6 +456,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -374,6 +466,7 @@ impl AppState {
             frontend_sessions: Arc::new(InMemoryFrontendSessionStore::new()),
             creator_authority_manager,
             legacy_creator_connect_flow_client: Arc::new(DisabledLegacyCreatorConnectFlowClient),
+            grant_creator_connect_flow_client: None,
         };
 
         Self::new_with_private_runtime_storage(
@@ -398,30 +491,23 @@ impl AppState {
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let pubky_http_client = build_pubky_http_client(&config.pubky);
-        let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
-            Arc::new(LegacyCookieCreatorAuthorityManager::new(
-                creator_authority_store.clone(),
-                PubkyLegacyCookieSessionRevalidator::new(pubky_http_client.clone()),
-            ));
-        let creator_repositories =
-            CreatorRepositoryAdapters::pubky_homeserver(creator_authority_store, pubky_http_client);
-        let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
-            if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(&config.pubky);
-                match pubky_auth_relay_for_network(config.pubky.network) {
-                    Some(auth_relay) => Arc::new(
-                        PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
-                    ),
-                    None => Arc::new(PubkyLegacyCreatorConnectFlowClient::new(pubky)),
-                }
-            } else {
-                Arc::new(DisabledLegacyCreatorConnectFlowClient)
-            };
+        let (
+            creator_authority_manager,
+            legacy_creator_connect_flow_client,
+            grant_creator_connect_flow_client,
+            grant_session_cache,
+        ) = creator_auth_runtime(&config, creator_authority_store.clone(), &pubky_http_client);
+        let creator_repositories = CreatorRepositoryAdapters::pubky_homeserver(
+            creator_authority_store,
+            pubky_http_client,
+            grant_session_cache,
+        );
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
                 pool.clone(),
             )),
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -431,6 +517,7 @@ impl AppState {
             frontend_sessions: Arc::new(PostgresFrontendSessionStore::new(pool.clone())),
             creator_authority_manager,
             legacy_creator_connect_flow_client,
+            grant_creator_connect_flow_client,
         };
 
         Self::new_with_private_runtime_storage(
@@ -459,23 +546,12 @@ impl AppState {
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let pubky_http_client = build_pubky_http_client(&config.pubky);
-        let creator_authority_manager: Arc<dyn CreatorAuthorityManager> =
-            Arc::new(LegacyCookieCreatorAuthorityManager::new(
-                creator_authority_store,
-                PubkyLegacyCookieSessionRevalidator::new(pubky_http_client),
-            ));
-        let legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient> =
-            if config.creator_authority_acquisition.enabled {
-                let pubky = build_pubky_client(&config.pubky);
-                match pubky_auth_relay_for_network(config.pubky.network) {
-                    Some(auth_relay) => Arc::new(
-                        PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(pubky, auth_relay),
-                    ),
-                    None => Arc::new(PubkyLegacyCreatorConnectFlowClient::new(pubky)),
-                }
-            } else {
-                Arc::new(DisabledLegacyCreatorConnectFlowClient)
-            };
+        let (
+            creator_authority_manager,
+            legacy_creator_connect_flow_client,
+            grant_creator_connect_flow_client,
+            _grant_session_cache,
+        ) = creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
         let creator_repositories = CreatorRepositoryAdapters::new(
             content_locks,
             guarded_resources,
@@ -486,6 +562,7 @@ impl AppState {
             content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
                 pool.clone(),
             )),
+            invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
             access_credentials,
@@ -495,6 +572,7 @@ impl AppState {
             frontend_sessions: Arc::new(PostgresFrontendSessionStore::new(pool.clone())),
             creator_authority_manager,
             legacy_creator_connect_flow_client,
+            grant_creator_connect_flow_client,
         };
 
         Self::new_with_private_runtime_storage(
@@ -565,6 +643,7 @@ impl AppState {
             lock_service_pointers: creator_repositories.lock_service_pointers,
             content_lock_ownership: private_runtime.content_lock_ownership,
             content_lock_deletions,
+            invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
             entitlements: creator_repositories.entitlements,
@@ -575,6 +654,7 @@ impl AppState {
             frontend_sessions: private_runtime.frontend_sessions,
             creator_authority_manager: private_runtime.creator_authority_manager,
             legacy_creator_connect_flow_client: private_runtime.legacy_creator_connect_flow_client,
+            grant_creator_connect_flow_client: private_runtime.grant_creator_connect_flow_client,
             dev_static_verifier: Arc::new(DevStaticVerifier),
             paykit_payment_verifier,
             task_ids: Arc::new(OsRandomTaskIdGenerator),
@@ -629,6 +709,10 @@ impl AppState {
         &self.verification_tasks
     }
 
+    pub fn invoice_admissions(&self) -> &Arc<dyn InvoiceAdmissionRepository> {
+        &self.invoice_admissions
+    }
+
     pub fn verification_task_claimer(&self) -> &Arc<dyn VerificationTaskClaimer> {
         &self.verification_task_claimer
     }
@@ -663,6 +747,12 @@ impl AppState {
 
     pub fn legacy_creator_connect_flow_client(&self) -> &Arc<dyn LegacyCreatorConnectFlowClient> {
         &self.legacy_creator_connect_flow_client
+    }
+
+    pub fn grant_creator_connect_flow_client(
+        &self,
+    ) -> Option<&Arc<dyn GrantCreatorConnectFlowClient>> {
+        self.grant_creator_connect_flow_client.as_ref()
     }
 
     pub fn dev_static_verifier(&self) -> &Arc<DevStaticVerifier> {
@@ -711,6 +801,15 @@ impl AppState {
         client: Arc<dyn LegacyCreatorConnectFlowClient>,
     ) -> Self {
         self.legacy_creator_connect_flow_client = client;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_grant_creator_connect_flow_client(
+        mut self,
+        client: Arc<dyn GrantCreatorConnectFlowClient>,
+    ) -> Self {
+        self.grant_creator_connect_flow_client = Some(client);
         self
     }
 

@@ -245,7 +245,7 @@ fn content_lock() -> ContentLock {
         creator: CreatorPubky::from_str(CREATOR).unwrap(),
         primary_resource: Some(
             GuardedResource::new(
-                "/priv/locks.app/content/post.json".to_owned(),
+                "/priv/app.locks/content/post.json".to_owned(),
                 GuardedResourceHash::from_bytes([7; 32]),
                 "application/json".to_owned(),
                 42,

@@ -17,14 +17,15 @@ use locks_server::config::{
     FilesystemLockServerIdentityProvider, LockServerIdentityProvider, PaykitConfig,
 };
 use locks_server::testing::TestServerApp;
-use locks_server::worker::{VerificationWorker, WorkerTick};
+use locks_server::worker::{
+    InvoiceAdmissionWorker, InvoiceWorkerTick, OsFullJitter, VerificationWorker, WorkerTick,
+};
 use locks_service::application::models::FrontendSessionToken;
-use locks_service::application::ports::CriterionVerifier;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
-use locks_service::infrastructure::memory::verification_task_claims::InMemoryVerificationTaskClaimer;
+
 use serde_json::json;
 use support::creator_publishing_client::{LocalCreatorPublishingClient, response_bytes};
 use time::Duration;
@@ -62,7 +63,7 @@ async fn creator_publishing_http_flow_registers_locks_verifies_and_proxy_reads_g
         .await
         .unwrap();
     assert_eq!(pointer_json["creator"], creator().to_string());
-    assert_eq!(pointer_json["path"], "/pub/locks.app/config.json");
+    assert_eq!(pointer_json["path"], "/pub/app.locks/config.json");
     assert_eq!(
         pointer_json["lock_service_pointer"]["default_lock_server"],
         "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
@@ -76,7 +77,7 @@ async fn creator_publishing_http_flow_registers_locks_verifies_and_proxy_reads_g
     assert_eq!(guarded_json["creator"], creator().to_string());
     assert_eq!(
         guarded_resource["path"],
-        "/priv/locks.app/content/creator-e2e.txt"
+        "/priv/app.locks/content/creator-e2e.txt"
     );
     assert_eq!(guarded_resource["content_type"], "text/plain");
     assert_eq!(guarded_resource["size"], GUARDED_BYTES.len() as u64);
@@ -469,8 +470,21 @@ async fn creator_publishing_http_rejects_ambiguous_paykit_payment_policies() {
 }
 
 #[tokio::test]
-async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_and_proxy_reads() {
-    let fake_paykit = FakePaykitServer::start().await;
+async fn creator_publishing_http_bitcoin_checkout_unlocks_each_supported_denomination() {
+    for asset in ["BTC", "USD", "USDT"] {
+        paykit_checkout(asset, false).await;
+    }
+}
+
+#[tokio::test]
+async fn creator_publishing_http_usdt_checkout_unlocks_each_supported_denomination() {
+    for asset in ["BTC", "USD", "USDT"] {
+        paykit_checkout(asset, true).await;
+    }
+}
+
+async fn paykit_checkout(asset: &str, use_usdt: bool) {
+    let fake_paykit = FakePaykitServer::start(use_usdt).await;
     let temp_dir = tempfile::tempdir().unwrap();
     let secret_path = temp_dir.path().join("lock-server.keypair-seed");
     let public_key = FilesystemLockServerIdentityProvider
@@ -481,7 +495,7 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     config.credentials.lock_server_public_key = public_key;
     config.paykit = Some(PaykitConfig {
         server_url: fake_paykit.server_url.clone(),
-        minimum_confirmations: 0,
+        minimum_confirmations: if use_usdt { 6 } else { 0 },
     });
     let state = AppState::new_empty_in_memory_with_creator_repositories(
         config,
@@ -517,7 +531,7 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
                 "params": {
                     "recipient_pubky": creator().to_string(),
                     "amount": "50000",
-                    "asset": "BTC",
+                    "asset": asset,
                     "payment_in": 24
                 }
             }]),
@@ -533,6 +547,15 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
             .expect("content_lock_path is string"),
     )
     .unwrap();
+    assert_eq!(
+        content_lock_json["content_lock"]["criteria"][0]["params"],
+        json!({
+            "recipient_pubky": creator().to_string(),
+            "amount": "50000",
+            "asset": asset,
+            "payment_in": 24,
+        })
+    );
     let submitted = paykit_submitted_proof_bundle_for(content_lock_path);
     let lock_resource = submitted.pubky_lock_resource.to_string();
 
@@ -556,8 +579,33 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
 
     let submit_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
     assert_eq!(submit_json["status"], "pending");
+    let submitted_at = time::OffsetDateTime::parse(
+        submit_json["submitted_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let admission_deadline_at = time::OffsetDateTime::parse(
+        submit_json["admission_deadline_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(admission_deadline_at, submitted_at + Duration::minutes(10));
     assert!(submit_json.get("connection_state").is_none());
     assert!(submit_json.get("task_id").is_none());
+    let jitter = OsFullJitter;
+    let invoice_worker = InvoiceAdmissionWorker::from_state(
+        test_app.state(),
+        test_app
+            .state()
+            .paykit_http_client()
+            .expect("Paykit client is configured")
+            .as_ref(),
+        &jitter,
+    );
+    assert!(matches!(
+        invoice_worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Ready(_)
+    ));
     fake_paykit.assert_invoice_created(&lock_resource).await;
     fake_paykit.assert_invoice_count(1).await;
 
@@ -569,7 +617,9 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     fake_paykit.assert_connection_status_checked().await;
 
     let replay_json = client.submit_proof_bundle(submitted.clone()).await.unwrap();
-    assert_eq!(replay_json, submit_json);
+    let mut expected_replay_json = submit_json;
+    expected_replay_json["admission_deadline_at"] = serde_json::Value::Null;
+    assert_eq!(replay_json, expected_replay_json);
     fake_paykit.assert_invoice_count(1).await;
 
     let mut conflicting = submitted;
@@ -582,36 +632,14 @@ async fn creator_publishing_http_paykit_payment_flow_creates_invoice_verifies_an
     assert_eq!(conflict.body["error"]["code"], "task_state_conflict");
     fake_paykit.assert_invoice_count(1).await;
 
-    let task = test_app
-        .state()
-        .verification_tasks()
-        .get_verification_task_by_handle(&creator(), &bundle_id())
-        .await
-        .unwrap()
-        .expect("submitted task exists");
-    let claimer = InMemoryVerificationTaskClaimer::new(vec![task]);
-    let worker = VerificationWorker::new(
-        test_app.state().verification_tasks().as_ref(),
-        &claimer,
-        test_app.state().content_locks().as_ref(),
-        test_app.state().entitlements().as_ref(),
-        test_app.state().dev_static_verifier().as_ref(),
-        test_app
-            .state()
-            .paykit_payment_verifier()
-            .map(|verifier| verifier.as_ref() as &dyn CriterionVerifier),
-        true,
-        test_app.state().clock().as_ref(),
-        test_app
-            .state()
-            .config()
-            .credentials
-            .lock_server_public_key
-            .clone(),
-        "paykit-e2e-worker".to_owned(),
-        std::time::Duration::from_millis(10),
-        60,
+    // Invoice creation and acceptance alone must never issue an access credential.
+    assert!(
+        client
+            .issue_access_credential(creator(), BUNDLE_ID)
+            .await
+            .is_err()
     );
+    let worker = VerificationWorker::from_state(test_app.state());
     assert!(matches!(
         worker.run_once().await.unwrap(),
         WorkerTick::Completed(_)
@@ -806,6 +834,7 @@ struct FakePaykitServer {
 
 #[derive(Debug, Default)]
 struct FakePaykitState {
+    use_usdt: bool,
     invoice_body: Option<serde_json::Value>,
     invoice_signature: Option<String>,
     invoice_count: usize,
@@ -816,12 +845,15 @@ struct FakePaykitState {
 }
 
 impl FakePaykitServer {
-    async fn start() -> Self {
-        let state = Arc::new(Mutex::new(FakePaykitState::default()));
+    async fn start(use_usdt: bool) -> Self {
+        let state = Arc::new(Mutex::new(FakePaykitState {
+            use_usdt,
+            ..Default::default()
+        }));
         let app = Router::new()
             .route("/invoices", post(fake_invoice_handler))
             .route("/connections/status", post(fake_connection_status_handler))
-            .route("/transactions/status", post(fake_status_handler))
+            .route("/payment-requests/status", post(fake_status_handler))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_url = format!("http://{}", listener.local_addr().unwrap());
@@ -900,14 +932,17 @@ async fn fake_invoice_handler(
     State(state): State<Arc<Mutex<FakePaykitState>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> impl axum::response::IntoResponse {
     let mut state = state.lock().await;
     state.invoice_count += 1;
     state.invoice_body = Some(serde_json::from_slice(&body).unwrap());
     state.invoice_signature = headers
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
-    StatusCode::NO_CONTENT
+    Json(json!({
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z"
+    }))
 }
 
 async fn fake_connection_status_handler(
@@ -934,9 +969,16 @@ async fn fake_status_handler(
         .get("X-Paykit-Signature")
         .map(|value| value.to_str().unwrap().to_owned());
     Json(json!({
-        "status": "detected",
-        "confirmations": 0,
-        "amount_matched": true,
+        "request_state": "accepted",
+        "payment_state": if state.use_usdt { "confirmed" } else { "detected" },
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z",
+        "bitcoin": if state.use_usdt { serde_json::Value::Null } else {
+            json!({ "confirmations": 0, "amount_matched": true, "paid_on_time": true })
+        },
+        "usdt_arbitrum": if state.use_usdt {
+            json!({ "confirmations": 1, "amount_matched": true, "paid_on_time": true, "finalized": false })
+        } else { serde_json::Value::Null },
     }))
 }
 

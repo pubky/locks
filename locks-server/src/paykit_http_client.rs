@@ -1,17 +1,21 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky};
+use locks_core::lock_policy::PaykitPaymentAsset;
 use locks_service::infrastructure::verifiers::paykit_payment::{
-    PaykitPaymentStatus, PaykitPaymentStatusClient, PaykitPaymentStatusError,
-    PaykitPaymentStatusKind,
+    PaykitPaymentObservation, PaykitPaymentRequestState as ServicePaymentRequestState,
+    PaykitPaymentState as ServicePaymentState, PaykitPaymentStatus, PaykitPaymentStatusClient,
+    PaykitPaymentStatusError,
 };
 use pubky_common::crypto::Keypair;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::{
     LockServerCredentialsConfig, LockServerSigningKeyError, PAYKIT_CONNECT_TIMEOUT_SECONDS,
@@ -19,7 +23,13 @@ use crate::config::{
 };
 
 const SIGNATURE_HEADER: &str = "X-Paykit-Signature";
+const REQUEST_ID_HEADER: &str = "X-Request-ID";
+const SIGNATURE_DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
+const INVOICE_BODY_LIMIT: usize = 1_024;
+const INVOICE_ERROR_BODY_LIMIT: usize = 1_024;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
+const PAYMENT_STATUS_BODY_LIMIT: usize = 2_048;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaykitClientError {
@@ -35,10 +45,35 @@ pub enum PaykitClientError {
     Serialize(serde_json::Error),
     #[error("Paykit request failed: {0}")]
     Http(reqwest::Error),
+    #[error("Paykit invoice request transport failed")]
+    InvoiceTransport {
+        request_id: Uuid,
+        elapsed_ms: u64,
+        timeout: bool,
+        connect: bool,
+    },
+    #[error("Paykit invoice response was invalid: {0}")]
+    InvalidInvoiceResponse(reqwest::Error),
+    #[error("Paykit invoice response JSON was invalid: {0}")]
+    InvalidInvoiceJson(serde_json::Error),
+    #[error("Paykit invoice response exceeded the allowed size")]
+    InvoiceBodyTooLarge,
+    #[error("Paykit invoice response timestamp was invalid: {0}")]
+    InvalidInvoiceTimestamp(time::error::Parse),
+    #[error("Paykit invoice response timestamps were invalid")]
+    InvalidInvoiceTimestamps,
     #[error("Paykit {operation} returned non-success status {status}")]
     NonSuccess {
         operation: &'static str,
         status: StatusCode,
+    },
+    #[error("Paykit invoice creation returned non-success status {status}")]
+    InvoiceNonSuccess {
+        request_id: Uuid,
+        elapsed_ms: u64,
+        status: StatusCode,
+        error_code: Option<&'static str>,
+        retry_after_seconds: Option<u64>,
     },
     #[error("Paykit connection-status response was invalid: {0}")]
     InvalidConnectionStatusResponse(reqwest::Error),
@@ -48,22 +83,41 @@ pub enum PaykitClientError {
     ConnectionStatusBodyTooLarge,
     #[error("Paykit status response was invalid: {0}")]
     InvalidStatusResponse(reqwest::Error),
+    #[error("Paykit payment-status response body was invalid: {0}")]
+    InvalidPaymentStatusResponse(reqwest::Error),
+    #[error("Paykit payment-status response JSON was invalid: {0}")]
+    InvalidPaymentStatusJson(serde_json::Error),
+    #[error("Paykit payment-status response exceeded the allowed size")]
+    StatusBodyTooLarge,
+    #[error("Paykit payment-status timestamps were invalid")]
+    InvalidStatusTimestamps,
 }
 
 impl PaykitClientError {
     pub(crate) fn is_timeout(&self) -> bool {
         match self {
             Self::Http(source)
+            | Self::InvalidInvoiceResponse(source)
             | Self::InvalidConnectionStatusResponse(source)
+            | Self::InvalidPaymentStatusResponse(source)
             | Self::InvalidStatusResponse(source) => source.is_timeout(),
+            Self::InvoiceTransport { timeout, .. } => *timeout,
             Self::InvalidServerUrl
             | Self::SigningSeedRead(_)
             | Self::InvalidSigningSeed
             | Self::PublicKeyMismatch
             | Self::Serialize(_)
+            | Self::InvalidInvoiceJson(_)
+            | Self::InvalidInvoiceTimestamp(_)
+            | Self::InvalidInvoiceTimestamps
+            | Self::InvoiceBodyTooLarge
             | Self::InvalidConnectionStatusJson(_)
             | Self::ConnectionStatusBodyTooLarge
-            | Self::NonSuccess { .. } => false,
+            | Self::InvalidPaymentStatusJson(_)
+            | Self::StatusBodyTooLarge
+            | Self::InvalidStatusTimestamps
+            | Self::NonSuccess { .. }
+            | Self::InvoiceNonSuccess { .. } => false,
         }
     }
 }
@@ -80,6 +134,22 @@ pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
     pub reader: String,
+}
+
+#[async_trait]
+pub trait PaykitInvoiceCreator: Send + Sync {
+    async fn create_invoice(
+        &self,
+        request_id: Uuid,
+        request: &PaykitInvoiceRequest,
+    ) -> Result<(), PaykitClientError>;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaykitInvoiceResponse {
+    invoice_created_at: String,
+    payment_deadline: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +183,7 @@ pub struct PaykitStatusRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaykitSetupStatusRequest {
     pub creator: CreatorPubky,
+    pub asset: PaykitPaymentAsset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,22 +213,59 @@ pub trait PaykitSetupStatusProvider: Send + Sync {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PaykitTransactionStatusKind {
-    Undetected,
-    Detected,
-    Confirmed,
+#[serde(rename_all = "snake_case")]
+pub enum PaykitPaymentRequestState {
+    Proposed,
+    ProposalExpired,
+    Accepted,
+    Rejected,
+    Canceled,
+    ProofSubmitted,
+    ActiveRecurring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct PaykitTransactionStatus {
-    pub status: PaykitTransactionStatusKind,
+#[serde(rename_all = "snake_case")]
+pub enum PaykitPaymentState {
+    Undetected,
+    Detected,
+    Confirmed,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitPaymentRequestStatus {
+    pub request_state: PaykitPaymentRequestState,
+    pub payment_state: PaykitPaymentState,
+    #[serde(with = "time::serde::rfc3339")]
+    pub invoice_created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub payment_deadline: OffsetDateTime,
+    pub bitcoin: Option<PaykitBitcoinPaymentStatus>,
+    pub usdt_arbitrum: Option<PaykitUsdtPaymentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitBitcoinPaymentStatus {
     pub confirmations: u32,
     pub amount_matched: bool,
+    pub paid_on_time: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaykitUsdtPaymentStatus {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+    pub finalized: bool,
 }
 
 impl PaykitHttpClient {
@@ -211,18 +319,75 @@ impl PaykitHttpClient {
 
     pub async fn create_invoice(
         &self,
+        request_id: Uuid,
         request: &PaykitInvoiceRequest,
     ) -> Result<(), PaykitClientError> {
-        let response = self.signed_post("invoices", request).await?;
+        let started = Instant::now();
+        let response = match self
+            .signed_post_with_request_id("invoices", request, Some(request_id))
+            .await
+        {
+            Ok(response) => response,
+            Err(PaykitClientError::Http(source)) => {
+                return Err(PaykitClientError::InvoiceTransport {
+                    request_id,
+                    elapsed_ms: elapsed_millis(started),
+                    timeout: source.is_timeout(),
+                    connect: source.is_connect(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(PaykitClientError::NonSuccess {
-                operation: "invoice creation",
-                status: response.status(),
-            })
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let retry_after_seconds =
+                safe_retry_after_seconds(response.headers().get(reqwest::header::RETRY_AFTER));
+            let error_code = read_invoice_error_code(response).await;
+            return Err(PaykitClientError::InvoiceNonSuccess {
+                request_id,
+                elapsed_ms: elapsed_millis(started),
+                status,
+                error_code,
+                retry_after_seconds,
+            });
         }
+
+        let mut response = response;
+        if response
+            .content_length()
+            .is_some_and(|length| length > INVOICE_BODY_LIMIT as u64)
+        {
+            return Err(PaykitClientError::InvoiceBodyTooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(PaykitClientError::InvalidInvoiceResponse)?
+        {
+            if body.len().saturating_add(chunk.len()) > INVOICE_BODY_LIMIT {
+                return Err(PaykitClientError::InvoiceBodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response: PaykitInvoiceResponse =
+            serde_json::from_slice(&body).map_err(PaykitClientError::InvalidInvoiceJson)?;
+        let invoice_created_at = OffsetDateTime::parse(&response.invoice_created_at, &Rfc3339)
+            .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        let payment_deadline = OffsetDateTime::parse(&response.payment_deadline, &Rfc3339)
+            .map_err(PaykitClientError::InvalidInvoiceTimestamp)?;
+        if payment_deadline <= invoice_created_at {
+            return Err(PaykitClientError::InvalidInvoiceTimestamps);
+        }
+        tracing::info!(
+            operation = "invoice creation",
+            %request_id,
+            status = StatusCode::OK.as_u16(),
+            elapsed_ms = elapsed_millis(started),
+            "Paykit request completed"
+        );
+        Ok(())
     }
 
     pub async fn connection_status(
@@ -241,23 +406,20 @@ impl PaykitHttpClient {
         parse_connection_status_response(response).await
     }
 
-    pub async fn transaction_status(
+    pub async fn payment_request_status(
         &self,
         request: &PaykitStatusRequest,
-    ) -> Result<PaykitTransactionStatus, PaykitClientError> {
-        let response = self.signed_post("transactions/status", request).await?;
+    ) -> Result<PaykitPaymentRequestStatus, PaykitClientError> {
+        let response = self.signed_post("payment-requests/status", request).await?;
 
-        if !response.status().is_success() {
+        if response.status() != StatusCode::OK {
             return Err(PaykitClientError::NonSuccess {
-                operation: "transaction status",
+                operation: "payment request status",
                 status: response.status(),
             });
         }
 
-        response
-            .json::<PaykitTransactionStatus>()
-            .await
-            .map_err(PaykitClientError::InvalidStatusResponse)
+        parse_payment_request_status_response(response).await
     }
 
     pub async fn setup_status(
@@ -300,15 +462,97 @@ impl PaykitHttpClient {
         path: &str,
         request: &T,
     ) -> Result<reqwest::Response, PaykitClientError> {
+        self.signed_post_with_request_id(path, request, None).await
+    }
+
+    async fn signed_post_with_request_id<T: Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+        request_id: Option<Uuid>,
+    ) -> Result<reqwest::Response, PaykitClientError> {
         let body = canonical_body_bytes(request)?;
-        self.http
-            .post(self.endpoint(path))
+        let endpoint = self.endpoint(path);
+        let signature = sign_request(&self.signing_keypair, "POST", endpoint.path(), &body);
+        let mut request_builder = self
+            .http
+            .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(SIGNATURE_HEADER, sign_body(&self.signing_keypair, &body))
-            .body(body)
+            .header(SIGNATURE_HEADER, signature)
+            .body(body);
+        if let Some(request_id) = request_id {
+            request_builder = request_builder.header(REQUEST_ID_HEADER, request_id.to_string());
+        }
+        request_builder
             .send()
             .await
             .map_err(PaykitClientError::Http)
+    }
+}
+
+#[async_trait]
+impl PaykitInvoiceCreator for PaykitHttpClient {
+    async fn create_invoice(
+        &self,
+        request_id: Uuid,
+        request: &PaykitInvoiceRequest,
+    ) -> Result<(), PaykitClientError> {
+        PaykitHttpClient::create_invoice(self, request_id, request).await
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn safe_retry_after_seconds(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+    value?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.min(MAX_RETRY_AFTER_SECONDS))
+}
+
+async fn read_invoice_error_code(mut response: reqwest::Response) -> Option<&'static str> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > INVOICE_ERROR_BODY_LIMIT as u64)
+    {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > INVOICE_ERROR_BODY_LIMIT {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    invoice_error_code(&body)
+}
+
+fn invoice_error_code(body: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.get("code")?.as_str()?;
+    match code {
+        "invalid_request" => Some("invalid_request"),
+        "invalid_signature" => Some("invalid_signature"),
+        "payload_too_large" => Some("payload_too_large"),
+        "rate_limited" => Some("rate_limited"),
+        "creator_session_invalid" => Some("creator_session_invalid"),
+        "creator_session_unavailable" => Some("creator_session_unavailable"),
+        "dependency_unavailable" => Some("dependency_unavailable"),
+        "dependency_timeout" => Some("dependency_timeout"),
+        "invoice_conflict" => Some("invoice_conflict"),
+        "reader_setup_pending" => Some("reader_setup_pending"),
+        "reader_registry_unavailable" => Some("reader_registry_unavailable"),
+        "reader_registry_malformed" => Some("reader_registry_malformed"),
+        "reader_not_payable" => Some("reader_not_payable"),
+        "internal_error" => Some("internal_error"),
+        "lock_not_found" => Some("lock_not_found"),
+        "lock_resource_unavailable" => Some("lock_resource_unavailable"),
+        _ => None,
     }
 }
 
@@ -349,14 +593,44 @@ async fn parse_connection_status_response(
     serde_json::from_slice(&body).map_err(PaykitClientError::InvalidConnectionStatusJson)
 }
 
+async fn parse_payment_request_status_response(
+    mut response: reqwest::Response,
+) -> Result<PaykitPaymentRequestStatus, PaykitClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > PAYMENT_STATUS_BODY_LIMIT as u64)
+    {
+        return Err(PaykitClientError::StatusBodyTooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(PaykitClientError::InvalidPaymentStatusResponse)?
+    {
+        if body.len().saturating_add(chunk.len()) > PAYMENT_STATUS_BODY_LIMIT {
+            return Err(PaykitClientError::StatusBodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let status: PaykitPaymentRequestStatus =
+        serde_json::from_slice(&body).map_err(PaykitClientError::InvalidPaymentStatusJson)?;
+    if status.payment_deadline <= status.invoice_created_at {
+        return Err(PaykitClientError::InvalidStatusTimestamps);
+    }
+    Ok(status)
+}
+
 #[async_trait]
 impl PaykitPaymentStatusClient for PaykitHttpClient {
-    async fn transaction_status(
+    async fn payment_request_status(
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<PaykitPaymentStatus, PaykitPaymentStatusError> {
-        let status = PaykitHttpClient::transaction_status(
+        let status = PaykitHttpClient::payment_request_status(
             self,
             &PaykitStatusRequest {
                 creator: creator.to_string(),
@@ -364,16 +638,59 @@ impl PaykitPaymentStatusClient for PaykitHttpClient {
             },
         )
         .await
-        .map_err(|_| PaykitPaymentStatusError)?;
+        .map_err(|error| match error {
+            PaykitClientError::NonSuccess {
+                status: StatusCode::CONFLICT,
+                ..
+            } => PaykitPaymentStatusError::Conflict,
+            PaykitClientError::InvalidStatusResponse(_) => {
+                PaykitPaymentStatusError::InvalidResponse
+            }
+            PaykitClientError::InvalidPaymentStatusResponse(_) => {
+                PaykitPaymentStatusError::Unavailable
+            }
+            PaykitClientError::InvalidPaymentStatusJson(_)
+            | PaykitClientError::StatusBodyTooLarge
+            | PaykitClientError::InvalidStatusTimestamps => {
+                PaykitPaymentStatusError::InvalidResponse
+            }
+            _ => PaykitPaymentStatusError::Unavailable,
+        })?;
 
         Ok(PaykitPaymentStatus {
-            status: match status.status {
-                PaykitTransactionStatusKind::Undetected => PaykitPaymentStatusKind::Undetected,
-                PaykitTransactionStatusKind::Detected => PaykitPaymentStatusKind::Detected,
-                PaykitTransactionStatusKind::Confirmed => PaykitPaymentStatusKind::Confirmed,
+            request_state: match status.request_state {
+                PaykitPaymentRequestState::Proposed => ServicePaymentRequestState::Proposed,
+                PaykitPaymentRequestState::ProposalExpired => {
+                    ServicePaymentRequestState::ProposalExpired
+                }
+                PaykitPaymentRequestState::Accepted => ServicePaymentRequestState::Accepted,
+                PaykitPaymentRequestState::Rejected => ServicePaymentRequestState::Rejected,
+                PaykitPaymentRequestState::Canceled => ServicePaymentRequestState::Canceled,
+                PaykitPaymentRequestState::ProofSubmitted => {
+                    ServicePaymentRequestState::ProofSubmitted
+                }
+                PaykitPaymentRequestState::ActiveRecurring => {
+                    ServicePaymentRequestState::ActiveRecurring
+                }
             },
-            confirmations: status.confirmations,
-            amount_matched: status.amount_matched,
+            payment_state: match status.payment_state {
+                PaykitPaymentState::Undetected => ServicePaymentState::Undetected,
+                PaykitPaymentState::Detected => ServicePaymentState::Detected,
+                PaykitPaymentState::Confirmed => ServicePaymentState::Confirmed,
+                PaykitPaymentState::Expired => ServicePaymentState::Expired,
+            },
+            bitcoin: status.bitcoin.map(|payment| PaykitPaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
+            usdt_arbitrum: status
+                .usdt_arbitrum
+                .map(|payment| PaykitPaymentObservation {
+                    confirmations: payment.confirmations,
+                    amount_matched: payment.amount_matched,
+                    paid_on_time: payment.paid_on_time,
+                }),
         })
     }
 }
@@ -383,11 +700,13 @@ impl PaykitSetupStatusProvider for PaykitHttpClient {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
         PaykitHttpClient::setup_status(
             self,
             &PaykitSetupStatusRequest {
                 creator: creator.clone(),
+                asset,
             },
         )
         .await
@@ -419,8 +738,25 @@ fn canonical_body_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, PaykitClient
     serde_json_canonicalizer::to_vec(value).map_err(PaykitClientError::Serialize)
 }
 
-fn sign_body(keypair: &Keypair, body: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(keypair.sign(body).to_bytes())
+fn request_signature_preimage(method: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let method = method.to_ascii_uppercase();
+    let mut preimage =
+        Vec::with_capacity(SIGNATURE_DOMAIN.len() + method.len() + 1 + path.len() + 1 + body.len());
+    preimage.extend_from_slice(SIGNATURE_DOMAIN);
+    preimage.extend_from_slice(method.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(path.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(body);
+    preimage
+}
+
+fn sign_request(keypair: &Keypair, method: &str, path: &str, body: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(
+        keypair
+            .sign(&request_signature_preimage(method, path, body))
+            .to_bytes(),
+    )
 }
 
 fn parse_server_url(value: &str) -> Result<Url, PaykitClientError> {
@@ -455,6 +791,7 @@ mod tests {
     use locks_core::ids::LockServerPubky;
     use serde_json::json;
     use tempfile::tempdir;
+    use time::macros::datetime;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -462,7 +799,7 @@ mod tests {
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
-    const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/1111111111111111111111111111111111111111111111111111.json";
+    const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/1111111111111111111111111111111111111111111111111111.json";
     const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 
     #[test]
@@ -478,15 +815,17 @@ mod tests {
     }
 
     #[test]
-    fn invoice_signature_is_base64url_no_pad_ed25519_over_canonical_body() {
+    fn invoice_signature_is_base64url_no_pad_ed25519_over_versioned_request_preimage() {
         let keypair = Keypair::from_secret(&[9_u8; 32]);
         let body = canonical_body_bytes(&invoice_request()).unwrap();
 
-        let signature = sign_body(&keypair, &body);
+        let signature = sign_request(&keypair, "POST", "/invoices", &body);
 
+        let mut preimage = b"paykit-http-signature-v1\0POST\0/invoices\0".to_vec();
+        preimage.extend_from_slice(&body);
         assert_eq!(
             signature,
-            URL_SAFE_NO_PAD.encode(keypair.sign(&body).to_bytes())
+            URL_SAFE_NO_PAD.encode(keypair.sign(&preimage).to_bytes())
         );
         assert!(!signature.contains('='));
     }
@@ -505,8 +844,8 @@ mod tests {
             "https://paykit.example/invoices"
         );
         assert_eq!(
-            client.endpoint("transactions/status").as_str(),
-            "https://paykit.example/transactions/status"
+            client.endpoint("payment-requests/status").as_str(),
+            "https://paykit.example/payment-requests/status"
         );
         assert_eq!(
             client.endpoint("connections/status").as_str(),
@@ -565,14 +904,164 @@ mod tests {
             PaykitHttpClient::from_parts(&server_url, reqwest::Client::new(), keypair.clone())
                 .unwrap();
         let expected_body = canonical_body_bytes(&invoice_request()).unwrap();
-        let expected_signature = sign_body(&keypair, &expected_body);
+        let expected_signature = sign_request(&keypair, "POST", "/invoices", &expected_body);
 
-        client.create_invoice(&invoice_request()).await.unwrap();
+        let request_id = Uuid::parse_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap();
+        client
+            .create_invoice(request_id, &invoice_request())
+            .await
+            .unwrap();
 
         let request = captured.single();
         assert_eq!(request.path, "/invoices");
         assert_eq!(request.body, expected_body);
         assert_eq!(request.signature, Some(expected_signature));
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some(request_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn invoice_error_code_parser_allows_only_known_codes() {
+        for code in [
+            "invalid_request",
+            "invalid_signature",
+            "payload_too_large",
+            "rate_limited",
+            "creator_session_invalid",
+            "creator_session_unavailable",
+            "dependency_unavailable",
+            "dependency_timeout",
+            "invoice_conflict",
+            "reader_setup_pending",
+            "reader_registry_unavailable",
+            "reader_registry_malformed",
+            "reader_not_payable",
+            "internal_error",
+            "lock_not_found",
+            "lock_resource_unavailable",
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"secret"}}}}"#);
+            assert_eq!(invoice_error_code(body.as_bytes()), Some(code));
+        }
+
+        for body in [
+            br#"{"error":{"code":"attacker-controlled"}}"#.as_slice(),
+            br#"{"error":{"code":42}}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+            br#"{}"#.as_slice(),
+        ] {
+            assert_eq!(invoice_error_code(body), None);
+        }
+        let bounded = reqwest::header::HeaderValue::from_static("60");
+        let clamped = reqwest::header::HeaderValue::from_static("61");
+        let arbitrary = reqwest::header::HeaderValue::from_static("secret-value");
+        assert_eq!(safe_retry_after_seconds(Some(&bounded)), Some(60));
+        assert_eq!(safe_retry_after_seconds(Some(&clamped)), Some(60));
+        assert_eq!(safe_retry_after_seconds(Some(&arbitrary)), None);
+    }
+
+    #[tokio::test]
+    async fn invoice_non_success_diagnostics_are_bounded_and_redacted() {
+        let secret = "do-not-log-payment-payload";
+        let body = Box::leak(
+            format!(
+                r#"{{"error":{{"code":"attacker-{secret}","message":"{secret}"}},"padding":"{}"}}"#,
+                "x".repeat(INVOICE_ERROR_BODY_LIMIT)
+            )
+            .into_boxed_str(),
+        );
+        let server_url = spawn_configured_invoice_server(StatusCode::BAD_GATEWAY, body).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:?} {error}");
+
+        assert!(matches!(
+            error,
+            PaykitClientError::InvoiceNonSuccess {
+                status: StatusCode::BAD_GATEWAY,
+                error_code: None,
+                ..
+            }
+        ));
+        assert!(!rendered.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn create_invoice_requires_exact_200_with_closed_timestamp_body() {
+        for (status, body) in [
+            (StatusCode::NO_CONTENT, ""),
+            (StatusCode::OK, "{}"),
+            (
+                StatusCode::OK,
+                r#"{"invoice_created_at":"not-a-time","payment_deadline":"2026-09-25T12:00:00Z"}"#,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"invoice_created_at":"2026-09-25T11:00:00Z","payment_deadline":"2026-09-25T12:00:00Z","extra":true}"#,
+            ),
+        ] {
+            let server_url = spawn_configured_invoice_server(status, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(
+                client
+                    .create_invoice(Uuid::new_v4(), &invoice_request())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_equal_or_reversed_timestamps() {
+        for payment_deadline in ["2026-09-25T11:00:00Z", "2026-09-25T10:59:59Z"] {
+            let body = Box::leak(
+                format!(
+                    "{{\"invoice_created_at\":\"2026-09-25T11:00:00Z\",\"payment_deadline\":\"{payment_deadline}\"}}"
+                )
+                .into_boxed_str(),
+            );
+            let server_url = spawn_configured_invoice_server(StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                client
+                    .create_invoice(Uuid::new_v4(), &invoice_request())
+                    .await,
+                Err(PaykitClientError::InvalidInvoiceTimestamps)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_oversized_content_length_body() {
+        assert_oversized_invoice_body_is_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn create_invoice_rejects_oversized_chunked_body() {
+        assert_oversized_invoice_body_is_rejected(true).await;
     }
 
     #[tokio::test]
@@ -711,7 +1200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_status_posts_signed_composite_identity_and_parses_status_response() {
+    async fn payment_request_status_posts_signed_identity_and_parses_closed_projection() {
         let captured = CapturedRequests::default();
         let server_url = spawn_test_server(captured.clone()).await;
         let keypair = Keypair::from_secret(&[9_u8; 32]);
@@ -723,25 +1212,112 @@ mod tests {
             bundle_id: BUNDLE_ID.to_owned(),
         };
         let expected_body = canonical_body_bytes(&status_request).unwrap();
-        let expected_signature = sign_body(&keypair, &expected_body);
+        let expected_signature =
+            sign_request(&keypair, "POST", "/payment-requests/status", &expected_body);
 
-        let status = client.transaction_status(&status_request).await.unwrap();
+        let status = client
+            .payment_request_status(&status_request)
+            .await
+            .unwrap();
 
         assert_eq!(
             status,
-            PaykitTransactionStatus {
-                status: PaykitTransactionStatusKind::Detected,
-                confirmations: 0,
-                amount_matched: true,
+            PaykitPaymentRequestStatus {
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Detected,
+                invoice_created_at: datetime!(2026-09-25 11:00:00 UTC),
+                payment_deadline: datetime!(2026-09-25 12:00:00 UTC),
+                bitcoin: Some(PaykitBitcoinPaymentStatus {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             }
         );
         let request = captured.single();
-        assert_eq!(request.path, "/transactions/status");
+        assert_eq!(request.path, "/payment-requests/status");
         assert_eq!(
             String::from_utf8(request.body).unwrap(),
             format!("{{\"bundle_id\":\"{BUNDLE_ID}\",\"creator\":\"{CREATOR}\"}}")
         );
         assert_eq!(request.signature, Some(expected_signature));
+    }
+
+    #[tokio::test]
+    async fn payment_request_status_preserves_independent_rail_observations() {
+        for aggregate in ["detected", "confirmed", "expired"] {
+            let body = json!({
+                "request_state": "accepted",
+                "payment_state": aggregate,
+                "invoice_created_at": "2026-09-25T11:00:00Z",
+                "payment_deadline": "2026-09-25T12:00:00Z",
+                "bitcoin": {"confirmations": 0, "amount_matched": true, "paid_on_time": false},
+                "usdt_arbitrum": {"confirmations": 1, "amount_matched": false, "paid_on_time": true, "finalized": false},
+            });
+            let server_url = spawn_configured_status_server(
+                StatusCode::OK,
+                Box::leak(body.to_string().into_boxed_str()),
+            )
+            .await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+            let status = PaykitPaymentStatusClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                status.bitcoin,
+                Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: false,
+                })
+            );
+            assert_eq!(
+                status.usdt_arbitrum,
+                Some(PaykitPaymentObservation {
+                    confirmations: 1,
+                    amount_matched: false,
+                    paid_on_time: true,
+                })
+            );
+            assert_eq!(
+                status.payment_state,
+                match aggregate {
+                    "detected" => ServicePaymentState::Detected,
+                    "confirmed" => ServicePaymentState::Confirmed,
+                    _ => ServicePaymentState::Expired,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn payment_request_status_rejects_invalid_bitcoin_observations() {
+        for bitcoin in [
+            json!({"confirmations": -1, "amount_matched": true, "paid_on_time": true}),
+            json!({"confirmations": 1, "amount_matched": true}),
+            json!({"confirmations": 1, "amount_matched": true, "paid_on_time": null}),
+            json!({"confirmations": 1, "amount_matched": true, "paid_on_time": true, "extra": true}),
+        ] {
+            let body = json!({
+                "request_state": "accepted",
+                "payment_state": "confirmed",
+                "invoice_created_at": "2026-09-25T11:00:00Z",
+                "payment_deadline": "2026-09-25T12:00:00Z",
+                "bitcoin": bitcoin,
+                "usdt_arbitrum": null,
+            });
+            assert!(serde_json::from_value::<PaykitPaymentRequestStatus>(body).is_err());
+        }
     }
 
     #[tokio::test]
@@ -754,13 +1330,52 @@ mod tests {
         )
         .unwrap();
 
-        let error = client.create_invoice(&invoice_request()).await.unwrap_err();
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
 
-        assert!(matches!(error, PaykitClientError::Http(error) if error.is_timeout()));
+        assert!(matches!(
+            error,
+            PaykitClientError::InvoiceTransport {
+                timeout: true,
+                connect: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn payment_status_accepts_server_contract_and_rejects_incomplete_observations() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/payment-request-status/dual-asset-confirmed.json"
+        ))
+        .unwrap();
+        let status: PaykitPaymentRequestStatus = serde_json::from_value(value.clone()).unwrap();
+        assert!(status.bitcoin.unwrap().paid_on_time);
+        assert!(!status.usdt_arbitrum.unwrap().paid_on_time);
+        for rail in ["bitcoin", "usdt_arbitrum"] {
+            for field in ["confirmations", "amount_matched", "paid_on_time"] {
+                let mut incomplete = value.clone();
+                incomplete[rail].as_object_mut().unwrap().remove(field);
+                assert!(
+                    serde_json::from_value::<PaykitPaymentRequestStatus>(incomplete).is_err(),
+                    "{rail}.{field} must be explicit"
+                );
+            }
+        }
+        for source in [
+            include_str!("../tests/fixtures/payment-request-status/canceled-confirmed.json"),
+            include_str!("../tests/fixtures/payment-request-status/rejected-confirmed.json"),
+            include_str!("../tests/fixtures/payment-request-status/proposal-expired.json"),
+            include_str!("../tests/fixtures/payment-request-status/payment-deadline-expired.json"),
+        ] {
+            serde_json::from_str::<PaykitPaymentRequestStatus>(source).unwrap();
+        }
     }
 
     #[tokio::test]
-    async fn transaction_status_times_out_when_paykit_does_not_respond() {
+    async fn payment_request_status_times_out_when_paykit_does_not_respond() {
         let server_url = spawn_hanging_test_server().await;
         let client = PaykitHttpClient::from_parts(
             &server_url,
@@ -770,7 +1385,7 @@ mod tests {
         .unwrap();
 
         let error = client
-            .transaction_status(&PaykitStatusRequest {
+            .payment_request_status(&PaykitStatusRequest {
                 creator: CREATOR.to_owned(),
                 bundle_id: BUNDLE_ID.to_owned(),
             })
@@ -781,12 +1396,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_not_found_and_invalid_success_body_use_retryable_client_error() {
-        for (status, body) in [
-            (axum::http::StatusCode::NOT_FOUND, "not found"),
-            (axum::http::StatusCode::OK, "not-json"),
+    async fn payment_request_status_response_body_timeout_is_retryable() {
+        let server_url = spawn_stalled_payment_status_body().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            bounded_http_client(Duration::from_secs(1), Duration::from_millis(500)).unwrap(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            PaykitPaymentStatusClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await,
+            Err(PaykitPaymentStatusError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_not_found_is_retryable_but_invalid_success_bodies_fail_closed() {
+        let server_url = spawn_configured_status_server(StatusCode::NOT_FOUND, "not found").await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            PaykitPaymentStatusClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await,
+            Err(PaykitPaymentStatusError::Unavailable)
+        );
+
+        for body in [
+            "not-json",
+            "{\"request_state\":\"future_state\",\"payment_state\":\"undetected\",\"invoice_created_at\":\"2026-09-25T11:00:00Z\",\"payment_deadline\":\"2026-09-25T12:00:00Z\",\"bitcoin\":null,\"usdt_arbitrum\":null}",
         ] {
-            let server_url = spawn_configured_status_server(status, body).await;
+            let server_url = spawn_configured_status_server(StatusCode::OK, body).await;
             let client = PaykitHttpClient::from_parts(
                 &server_url,
                 reqwest::Client::new(),
@@ -794,7 +1447,7 @@ mod tests {
             )
             .unwrap();
 
-            let error = PaykitPaymentStatusClient::transaction_status(
+            let error = PaykitPaymentStatusClient::payment_request_status(
                 &client,
                 &CreatorPubky::from_str(CREATOR).unwrap(),
                 &BundleId::from_str(BUNDLE_ID).unwrap(),
@@ -802,7 +1455,59 @@ mod tests {
             .await
             .unwrap_err();
 
-            assert_eq!(error, PaykitPaymentStatusError);
+            assert_eq!(error, PaykitPaymentStatusError::InvalidResponse);
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_request_status_rejects_equal_or_reversed_timestamps() {
+        for payment_deadline in ["2026-09-25T11:00:00Z", "2026-09-25T10:59:59Z"] {
+            let body = Box::leak(
+                format!(
+                    "{{\"request_state\":\"accepted\",\"payment_state\":\"undetected\",\"invoice_created_at\":\"2026-09-25T11:00:00Z\",\"payment_deadline\":\"{payment_deadline}\",\"bitcoin\":null,\"usdt_arbitrum\":null}}"
+                )
+                .into_boxed_str(),
+            );
+            let server_url = spawn_configured_status_server(StatusCode::OK, body).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                PaykitPaymentStatusClient::payment_request_status(
+                    &client,
+                    &CreatorPubky::from_str(CREATOR).unwrap(),
+                    &BundleId::from_str(BUNDLE_ID).unwrap(),
+                )
+                .await,
+                Err(PaykitPaymentStatusError::InvalidResponse)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_request_status_rejects_oversized_declared_and_chunked_bodies() {
+        for chunked in [false, true] {
+            let server_url = spawn_oversized_body(chunked, PAYMENT_STATUS_BODY_LIMIT).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                PaykitPaymentStatusClient::payment_request_status(
+                    &client,
+                    &CreatorPubky::from_str(CREATOR).unwrap(),
+                    &BundleId::from_str(BUNDLE_ID).unwrap(),
+                )
+                .await,
+                Err(PaykitPaymentStatusError::InvalidResponse)
+            );
         }
     }
 
@@ -833,13 +1538,14 @@ mod tests {
     struct CapturedRequest {
         path: String,
         signature: Option<String>,
+        request_id: Option<String>,
         body: Vec<u8>,
     }
 
     async fn spawn_test_server(captured: CapturedRequests) -> String {
         let app = Router::new()
             .route("/invoices", post(capture_invoice))
-            .route("/transactions/status", post(capture_status))
+            .route("/payment-requests/status", post(capture_status))
             .with_state(captured);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -852,7 +1558,7 @@ mod tests {
     async fn spawn_hanging_test_server() -> String {
         let app = Router::new()
             .route("/invoices", post(hang))
-            .route("/transactions/status", post(hang));
+            .route("/payment-requests/status", post(hang));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -893,8 +1599,24 @@ mod tests {
         format!("http://{address}")
     }
 
+    async fn spawn_stalled_payment_status_body() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 200\r\n\r\n{\"request_state\":\"accepted\",",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
     async fn assert_oversized_connection_status_body_is_rejected(chunked: bool) {
-        let server_url = spawn_oversized_connection_status_body(chunked).await;
+        let server_url = spawn_oversized_body(chunked, CONNECTION_STATUS_BODY_LIMIT).await;
         let client = PaykitHttpClient::from_parts(
             &server_url,
             bounded_http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
@@ -916,12 +1638,27 @@ mod tests {
         ));
     }
 
-    async fn spawn_oversized_connection_status_body(chunked: bool) -> String {
+    async fn assert_oversized_invoice_body_is_rejected(chunked: bool) {
+        let server_url = spawn_oversized_body(chunked, INVOICE_BODY_LIMIT).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let error = client
+            .create_invoice(Uuid::new_v4(), &invoice_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PaykitClientError::InvoiceBodyTooLarge));
+    }
+
+    async fn spawn_oversized_body(chunked: bool, limit: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let body = vec![b'x'; CONNECTION_STATUS_BODY_LIMIT + 1];
+            let body = vec![b'x'; limit + 1];
             if chunked {
                 socket
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n")
@@ -1015,7 +1752,7 @@ mod tests {
         body: &'static str,
     ) -> String {
         let app = Router::new()
-            .route("/transactions/status", post(configured_status))
+            .route("/payment-requests/status", post(configured_status))
             .with_state(ConfiguredStatusResponse { status, body });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1046,9 +1783,31 @@ mod tests {
             signature: headers
                 .get(SIGNATURE_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
-        axum::http::StatusCode::NO_CONTENT
+        Json(json!({
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "payment_deadline": "2026-09-25T12:00:00Z"
+        }))
+    }
+
+    async fn spawn_configured_invoice_server(status: StatusCode, body: &'static str) -> String {
+        async fn invoice(State(response): State<(StatusCode, &'static str)>) -> impl IntoResponse {
+            response
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/invoices", post(invoice))
+            .with_state((status, body));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     async fn capture_connection_status(
@@ -1061,6 +1820,9 @@ mod tests {
             signature: headers
                 .get(SIGNATURE_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
         Json(json!({ "state": state.state }))
@@ -1072,16 +1834,22 @@ mod tests {
         body: Bytes,
     ) -> impl IntoResponse {
         captured.push(CapturedRequest {
-            path: "/transactions/status".to_owned(),
+            path: "/payment-requests/status".to_owned(),
             signature: headers
                 .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: headers
+                .get(REQUEST_ID_HEADER)
                 .map(|value| value.to_str().unwrap().to_owned()),
             body: body.to_vec(),
         });
         Json(json!({
-            "status": "detected",
-            "confirmations": 0,
-            "amount_matched": true,
+            "request_state": "accepted",
+            "payment_state": "detected",
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "payment_deadline": "2026-09-25T12:00:00Z",
+            "bitcoin": {"confirmations": 0, "amount_matched": true, "paid_on_time": true},
+            "usdt_arbitrum": null,
         }))
     }
 }
@@ -1105,19 +1873,23 @@ mod setup_status_tests {
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
     #[test]
-    fn canonical_setup_status_body_and_signature_match_exact_contract() {
+    fn canonical_setup_status_body_and_request_preimage_signature_match_exact_contract() {
         let request = setup_status_request();
         let body = canonical_body_bytes(&request).unwrap();
         let keypair = Keypair::from_secret(&[9_u8; 32]);
-        let signature = sign_body(&keypair, &body);
+        let signature = sign_request(&keypair, "POST", "/setup/status", &body);
 
         assert_eq!(
             String::from_utf8(body.clone()).unwrap(),
-            format!("{{\"creator\":\"{CREATOR}\"}}")
+            format!("{{\"asset\":\"USDT\",\"creator\":\"{CREATOR}\"}}")
         );
         assert_eq!(
             signature,
-            URL_SAFE_NO_PAD.encode(keypair.sign(&body).to_bytes())
+            URL_SAFE_NO_PAD.encode(
+                keypair
+                    .sign(&request_signature_preimage("POST", "/setup/status", &body,))
+                    .to_bytes()
+            )
         );
         assert!(!signature.contains('='));
     }
@@ -1158,7 +1930,15 @@ mod setup_status_tests {
         let request = captured.single();
         assert_eq!(request.path, "/setup/status");
         assert_eq!(request.body, expected_body);
-        assert_eq!(request.signature, Some(sign_body(&keypair, &request.body)));
+        assert_eq!(
+            request.signature,
+            Some(sign_request(
+                &keypair,
+                "POST",
+                "/setup/status",
+                &request.body,
+            ))
+        );
     }
 
     #[tokio::test]
@@ -1256,6 +2036,7 @@ mod setup_status_tests {
 
     fn setup_status_request() -> PaykitSetupStatusRequest {
         PaykitSetupStatusRequest {
+            asset: PaykitPaymentAsset::Usdt,
             creator: CreatorPubky::from_str(CREATOR).unwrap(),
         }
     }

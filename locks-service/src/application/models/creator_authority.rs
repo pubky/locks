@@ -10,7 +10,7 @@ use crate::application::errors::ApplicationError;
 pub enum CreatorAuthorityAuthKind {
     /// Interim legacy cookie/session auth flow.
     LegacyCookie,
-    /// Future grant-based auth flow.
+    /// Grant + Proof-of-Possession auth flow. Stored secret is delegated restore state.
     Grant,
 }
 
@@ -110,6 +110,44 @@ impl fmt::Debug for LegacyCreatorConnectFlowApproval {
     }
 }
 
+/// Identifier for deterministic Lock-Server-held grant Proof-of-Possession key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GrantPopKeyId(String);
+
+impl GrantPopKeyId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn for_connect_flow(flow_id: &CreatorConnectFlowId) -> Self {
+        Self(format!("locks-connect-v1.{}", flow_id.as_str()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Validated delegated grant approval. Contains restore state, never PoP private key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrantCreatorConnectFlowApproval {
+    pub creator: CreatorPubky,
+    pub grant_state: CreatorAuthoritySecret,
+    pub granted_scopes: Vec<String>,
+    pub grant_expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for GrantCreatorConnectFlowApproval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrantCreatorConnectFlowApproval")
+            .field("creator", &self.creator)
+            .field("grant_state", &"<redacted>")
+            .field("granted_scopes", &self.granted_scopes)
+            .field("grant_expires_at", &self.grant_expires_at)
+            .finish()
+    }
+}
+
 /// Server-generated identifier for a pending creator connect flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreatorConnectFlowId(String);
@@ -139,6 +177,20 @@ impl CreatorConnectAuthorizationUrl {
     /// Exposes the raw URL for infrastructure code that resumes the flow.
     pub fn expose_url(&self) -> &str {
         &self.0
+    }
+
+    /// Derives persisted flow kind from Pubky authorization URL.
+    pub fn auth_kind(&self) -> Result<CreatorAuthorityAuthKind, ApplicationError> {
+        let url =
+            url::Url::parse(&self.0).map_err(|_| ApplicationError::CreatorAuthorityUnavailable)?;
+        if url.scheme() != "pubkyauth" {
+            return Err(ApplicationError::CreatorAuthorityUnavailable);
+        }
+        match url.host_str() {
+            Some("signin_grant") => Ok(CreatorAuthorityAuthKind::Grant),
+            Some("signin") => Ok(CreatorAuthorityAuthKind::LegacyCookie),
+            _ => Err(ApplicationError::CreatorAuthorityUnavailable),
+        }
     }
 }
 

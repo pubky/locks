@@ -310,7 +310,7 @@ mod tests {
         );
         let ownership = fixture
             .content_lock_ownership
-            .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+            .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
             .await
             .unwrap()
             .unwrap();
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
                 .await
                 .unwrap(),
             None
@@ -450,12 +450,12 @@ mod tests {
         assert!(matches!(
             second,
             Err(ApplicationError::ContentLockPathConflict { ref guarded_path })
-                if guarded_path == "/priv/locks.app/content/hello.txt"
+                if guarded_path == "/priv/app.locks/content/hello.txt"
         ));
         assert_eq!(fixture.content_locks_len().await, 1);
         let ownership = fixture
             .content_lock_ownership
-            .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+            .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
             .await
             .unwrap()
             .unwrap();
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
                 .await
                 .unwrap(),
             None
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
                 .await
                 .unwrap()
                 .unwrap()
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
                 .await
                 .unwrap()
                 .unwrap()
@@ -960,7 +960,7 @@ mod tests {
 
     fn registered_guarded_resource() -> GuardedResource {
         GuardedResource {
-            path: "/priv/locks.app/content/hello.txt".to_owned(),
+            path: "/priv/app.locks/content/hello.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes(*blake3::hash(b"guarded bytes").as_bytes()),
             content_type: "text/plain".to_owned(),
             size: 13,

@@ -15,7 +15,6 @@ pub mod errors;
 pub mod frontend_sessions;
 pub mod migrations;
 mod proof_admission;
-pub use proof_admission::PostgresPaykitTaskAdmissionRepository;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod verification_task_claims;

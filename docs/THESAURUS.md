@@ -67,7 +67,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Content Lock, Creator Publishing, Guarded Resource Registration, Lock ID
 
 ### Lock ID
-- **Definition**: Identifier for a content lock, encoded by the Rust `base32` crate as fixed-length 52-character Crockford base32 of the full 32-byte BLAKE3 lock hash with no prefix or checksum; canonical form is uppercase and used in `/pub/locks.app/<lock_id>.json` so changing the lock creates a new content lock file.
+- **Definition**: Identifier for a content lock, encoded by the Rust `base32` crate as fixed-length 52-character Crockford base32 of the full 32-byte BLAKE3 lock hash with no prefix or checksum; canonical form is uppercase and used in `/pub/app.locks/<lock_id>.json` so changing the lock creates a new content lock file.
 - **NOT**: A mutable arbitrary label or bearer secret.
 - **Synonyms to AVOID**: lock name, policy id, file id
 - **Related terms**: Content Lock, Lock Hash
@@ -80,13 +80,13 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 
 ### Pubky Lock Resource
 
-- **Definition**: Protocol-facing addressed Pubky resource for a public content lock, exactly `pubky<creator_pubky>/pub/locks.app/<lock_id>.json`, matching the preferred `PubkyResource` form from the `pubky` crate. It derives creator, content lock path, and Lock ID.
+- **Definition**: Protocol-facing addressed Pubky resource for a public content lock, exactly `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`, matching the preferred `PubkyResource` form from the `pubky` crate. It derives creator, content lock path, and Lock ID.
 - **NOT**: `pubky://...`, an HTTP(S) transport URL, a creator-relative path alone, or a guarded resource path.
 - **Synonyms to AVOID**: content lock URL, homeserver URL, lock URL
 - **Related terms**: Content Lock Path, Lock ID, Creator Pubky
 
 ### Content Lock Path
-- **Definition**: Canonical creator-homeserver-relative public path to a content lock file, exactly `/pub/locks.app/<lock_id>.json`; the embedded Lock ID must parse and match the content lock file hash before an entitlement is honored.
+- **Definition**: Canonical creator-homeserver-relative public path to a content lock file, exactly `/pub/app.locks/<lock_id>.json`; the embedded Lock ID must parse and match the content lock file hash before an entitlement is honored.
 - **NOT**: The content lock payload itself, a guarded path, full Pubky URL, homeserver URL, or another `/pub/...` path.
 - **Synonyms to AVOID**: lock path, lock file path, policy path
 - **Related terms**: Content Lock, Lock ID, Public Lock Path, Verified Proof Bundle
@@ -116,7 +116,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Guarded Content, Guarded Resource Hash, Guarded Resource Registration, Proxy Read
 
 ### Guarded Resource Registration
-- **Definition**: Authenticated creator publishing action exposed as `PUT /creator/priv-resources/content/<path>`; it stores or replaces current guarded bytes and metadata for the session-derived creator and canonical guarded path under `/priv/locks.app/content/`, then returns a guarded resource descriptor.
+- **Definition**: Authenticated creator publishing action exposed as `PUT /creator/priv-resources/content/<path>`; it stores or replaces current guarded bytes and metadata for the session-derived creator and canonical guarded path under `/priv/app.locks/content/`, then returns a guarded resource descriptor.
 - **NOT**: A creator authorization proof, public content lock, or viewer proxy-read.
 - **Synonyms to AVOID**: seed endpoint, locked resource upload
 - **Related terms**: Guarded Resource, Content Creator, Creator Publishing, Guarded Path
@@ -134,7 +134,7 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Guarded Resource, Lock Hash, Entitlement Record
 
 ### Lock Service Pointer
-- **Definition**: Creator-owned public configuration at `/pub/locks.app/config.json` that tells viewers which Lock Server to use by default when a content lock does not specify `lock_server.override`; authored through authenticated `POST /creator/lock-service-config`.
+- **Definition**: Creator-owned public configuration at `/pub/app.locks/config.json` that tells viewers which Lock Server to use by default when a content lock does not specify `lock_server.override`; authored through authenticated `POST /creator/lock-service-config`.
 - **NOT**: A PKDNS/Pkarr record, the per-lock Lock Server override itself, production creator authorization, or a content lock.
 - **Synonyms to AVOID**: service url, server config, migration pointer, _locks record
 - **Related terms**: Lock Server, Credible Exit, Creator Publishing
@@ -252,19 +252,19 @@ Repository/workspace structure, protocol payload ownership, and code-boundary la
 - **Related terms**: Criterion Verification Result, Lock Type
 
 ### Paykit Payment Verifier
-- **Definition**: Production-shaped payment verifier with public wire value `paykit-payment`; in v1 it must be the content lock's sole criterion and the sole lock-logic reference, creates invoices through configured Paykit Server during proof submission, and verifies payment status through worker-owned status checks.
+- **Definition**: Production-shaped payment verifier with public wire value `paykit-payment`; in v1 it must be the content lock's sole criterion and the sole lock-logic reference. Submission first persists a durable invoice-admission task; workers create the invoice through configured Paykit Server, then verify payment status after admission is ready.
 - **NOT**: The Paykit Server itself, wallet/xpub custody, a generic `payment` verifier, or the stale `paykit` verifier value.
 - **Synonyms to AVOID**: paykit verifier, payment verifier, paid lock verifier
 - **Related terms**: Verifier Type, Submitted Proof Bundle, Reader Public Key, Paykit Server
 
 ### Reader Public Key
-- **Definition**: Top-level `SubmittedProofBundle.reader_public_key` Pubky identity required for `paykit-payment` submissions; it must resolve through Pubky/PKARR/homeserver discovery before invoice creation.
+- **Definition**: Top-level `SubmittedProofBundle.reader_public_key` Pubky identity required for `paykit-payment` submissions and persisted in immutable invoice-admission intent. Paykit performs Reader wallet registry discovery when the durable worker requests invoice creation; setup and bounded malformed/oversized registry failures remain retryable until the original 10-minute admission deadline.
 - **NOT**: A proof payload field, content creator identity, access credential binding, or final non-transferability guarantee.
 - **Synonyms to AVOID**: reader, viewer key, payer key
 - **Related terms**: Submitted Proof Bundle, Paykit Payment Verifier, Content Viewer
 
 ### Paykit Server
-- **Definition**: Standalone payment service configured under Lock Server `[paykit]`; Locks calls `POST /invoices` and `POST /transactions/status` with Lock-Server-signed requests.
+- **Definition**: Standalone payment service configured under Lock Server `[paykit]`; Locks calls `POST /invoices`, `POST /payment-requests/status`, and `POST /connections/status` with Lock-Server-signed requests.
 - **NOT**: Lock Server private runtime state, Locks-owned access decision logic, or creator-owned Pubky data.
 - **Synonyms to AVOID**: payment backend, wallet server, invoice server
 - **Related terms**: Paykit Payment Verifier, Lock Server, Reader Public Key

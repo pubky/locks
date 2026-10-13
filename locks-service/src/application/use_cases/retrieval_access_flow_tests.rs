@@ -76,7 +76,7 @@ async fn retrieval_access_slice_submits_verifies_issues_validates_and_proxy_read
     guarded_resources
         .upsert_guarded_resource(GuardedResourceRecord {
             creator: creator(),
-            path: "/priv/locks.app/content/resource.txt".to_owned(),
+            path: "/priv/app.locks/content/resource.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes([7; 32]),
             content_type: "text/plain".to_owned(),
             size: 13,
@@ -178,12 +178,12 @@ async fn retrieval_access_slice_submits_verifies_issues_validates_and_proxy_read
     )
     .execute(ProxyReadGuardedResourceRequest {
         credential: issued.credential,
-        path: "/priv/locks.app/content/resource.txt".to_owned(),
+        path: "/priv/app.locks/content/resource.txt".to_owned(),
     })
     .await
     .unwrap();
 
-    assert_eq!(proxied.path, "/priv/locks.app/content/resource.txt");
+    assert_eq!(proxied.path, "/priv/app.locks/content/resource.txt");
     assert_eq!(proxied.bytes, b"guarded bytes".to_vec());
 }
 
@@ -192,7 +192,7 @@ fn content_lock_fixture() -> ContentLock {
         version: CONTENT_LOCK_VERSION,
         creator: creator(),
         primary_resource: Some(GuardedResource {
-            path: "/priv/locks.app/content/resource.txt".to_owned(),
+            path: "/priv/app.locks/content/resource.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes([7; 32]),
             content_type: "text/plain".to_owned(),
             size: 13,

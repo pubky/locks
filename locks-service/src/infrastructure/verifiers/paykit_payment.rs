@@ -1,33 +1,59 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::VerifierType;
-use locks_core::verification::CriterionVerificationResult;
 use std::sync::Arc;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::CriterionVerificationRequest;
+use crate::application::models::{
+    CriterionVerificationOutcome, CriterionVerificationRequest, VerificationTerminalReason,
+};
 use crate::application::ports::CriterionVerifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaykitPaymentStatusKind {
+pub enum PaykitPaymentRequestState {
+    Proposed,
+    ProposalExpired,
+    Accepted,
+    Rejected,
+    Canceled,
+    ProofSubmitted,
+    ActiveRecurring,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaykitPaymentState {
     Undetected,
     Detected,
     Confirmed,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaykitPaymentStatus {
-    pub status: PaykitPaymentStatusKind,
+    pub request_state: PaykitPaymentRequestState,
+    pub payment_state: PaykitPaymentState,
+    pub bitcoin: Option<PaykitPaymentObservation>,
+    pub usdt_arbitrum: Option<PaykitPaymentObservation>,
+}
+
+/// Current payment evidence verified by the Paykit server for one payment rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaykitPaymentObservation {
     pub confirmations: u32,
     pub amount_matched: bool,
+    pub paid_on_time: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaykitPaymentStatusError;
+pub enum PaykitPaymentStatusError {
+    Unavailable,
+    Conflict,
+    InvalidResponse,
+}
 
 #[async_trait]
 pub trait PaykitPaymentStatusClient: Send + Sync {
-    async fn transaction_status(
+    async fn payment_request_status(
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
@@ -39,12 +65,12 @@ impl<C> PaykitPaymentStatusClient for Arc<C>
 where
     C: PaykitPaymentStatusClient + ?Sized,
 {
-    async fn transaction_status(
+    async fn payment_request_status(
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<PaykitPaymentStatus, PaykitPaymentStatusError> {
-        (**self).transaction_status(creator, bundle_id).await
+        (**self).payment_request_status(creator, bundle_id).await
     }
 }
 
@@ -71,33 +97,98 @@ where
     async fn verify(
         &self,
         request: CriterionVerificationRequest,
-    ) -> Result<CriterionVerificationResult, ApplicationError> {
-        let status = self
+    ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+        let status = match self
             .client
-            .transaction_status(&request.creator, &request.bundle_id)
+            .payment_request_status(&request.creator, &request.bundle_id)
             .await
-            .map_err(|_| ApplicationError::VerificationPending)?;
-        if !payment_status_satisfies(status, self.minimum_confirmations) {
-            return Err(ApplicationError::VerificationPending);
-        }
-        Ok(CriterionVerificationResult {
-            criterion_id: request.criterion.criterion_id,
-            satisfied: true,
-            verified_at: request.verified_at,
-            verified_by: request.verified_by,
-            verifier_type: VerifierType::PaykitPayment,
-        })
+        {
+            Ok(status) => Some(status),
+            Err(PaykitPaymentStatusError::Conflict) => {
+                return Err(ApplicationError::PaykitPaymentStatusConflict);
+            }
+            Err(PaykitPaymentStatusError::InvalidResponse) => {
+                return Err(ApplicationError::PaykitPaymentStatusInvalidResponse);
+            }
+            Err(PaykitPaymentStatusError::Unavailable) => None,
+        };
+        Ok(payment_status_decision(
+            status,
+            self.minimum_confirmations,
+            request,
+        ))
     }
 }
 
-fn payment_status_satisfies(status: PaykitPaymentStatus, minimum_confirmations: u32) -> bool {
-    if !status.amount_matched {
-        return false;
+fn payment_status_decision(
+    status: Option<PaykitPaymentStatus>,
+    minimum_confirmations: u32,
+    request: CriterionVerificationRequest,
+) -> CriterionVerificationOutcome {
+    let Some(status) = status else {
+        return CriterionVerificationOutcome::Pending;
+    };
+    let terminal_reason = match status.request_state {
+        PaykitPaymentRequestState::Rejected => {
+            Some(VerificationTerminalReason::PaymentRequestRejected)
+        }
+        PaykitPaymentRequestState::Canceled => {
+            Some(VerificationTerminalReason::PaymentRequestCanceled)
+        }
+        PaykitPaymentRequestState::ProposalExpired => {
+            Some(VerificationTerminalReason::ProposalExpired)
+        }
+        PaykitPaymentRequestState::Accepted
+        | PaykitPaymentRequestState::ProofSubmitted
+        | PaykitPaymentRequestState::ActiveRecurring
+            if status.payment_state == PaykitPaymentState::Expired =>
+        {
+            Some(VerificationTerminalReason::PaymentDeadlineExpired)
+        }
+        _ => None,
+    };
+    if let Some(reason) = terminal_reason {
+        return CriterionVerificationOutcome::TerminalUnsatisfied(reason);
     }
-    match (minimum_confirmations, status.status) {
-        (0, PaykitPaymentStatusKind::Detected | PaykitPaymentStatusKind::Confirmed) => true,
-        (required, PaykitPaymentStatusKind::Confirmed) => status.confirmations >= required,
-        _ => false,
+    // Each rail must independently cover the full invoice within its payment window.
+    // Arbitrum inclusion is sufficient; Bitcoin keeps the operator's confirmation policy.
+    let bitcoin_paid = status.bitcoin.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations >= minimum_confirmations
+            && matches!(
+                (minimum_confirmations, status.payment_state),
+                (
+                    0,
+                    PaykitPaymentState::Detected | PaykitPaymentState::Confirmed
+                ) | (_, PaykitPaymentState::Confirmed)
+            )
+    });
+    let usdt_paid = status.usdt_arbitrum.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations > 0
+            && status.payment_state == PaykitPaymentState::Confirmed
+    });
+    let satisfied = (bitcoin_paid || usdt_paid)
+        && matches!(
+            status.request_state,
+            PaykitPaymentRequestState::Accepted
+                | PaykitPaymentRequestState::ProofSubmitted
+                | PaykitPaymentRequestState::ActiveRecurring
+        );
+    if satisfied {
+        CriterionVerificationOutcome::Satisfied(
+            locks_core::verification::CriterionVerificationResult {
+                criterion_id: request.criterion.criterion_id,
+                satisfied: true,
+                verified_at: request.verified_at,
+                verified_by: request.verified_by,
+                verifier_type: VerifierType::PaykitPayment,
+            },
+        )
+    } else {
+        CriterionVerificationOutcome::Pending
     }
 }
 
@@ -115,28 +206,105 @@ mod tests {
     use locks_core::verification::Proof;
 
     use super::{
+        PaykitPaymentObservation, PaykitPaymentRequestState, PaykitPaymentState,
         PaykitPaymentStatus, PaykitPaymentStatusClient, PaykitPaymentStatusError,
-        PaykitPaymentStatusKind, PaykitPaymentVerifier,
+        PaykitPaymentVerifier,
     };
     use crate::application::errors::ApplicationError;
-    use crate::application::models::CriterionVerificationRequest;
+    use crate::application::models::{
+        CriterionVerificationOutcome, CriterionVerificationRequest, VerificationTerminalReason,
+    };
     use crate::application::ports::CriterionVerifier;
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
     #[tokio::test]
+    async fn terminal_request_state_wins_over_confirmed_payment_evidence() {
+        for (request_state, reason) in [
+            (
+                PaykitPaymentRequestState::Rejected,
+                VerificationTerminalReason::PaymentRequestRejected,
+            ),
+            (
+                PaykitPaymentRequestState::Canceled,
+                VerificationTerminalReason::PaymentRequestCanceled,
+            ),
+            (
+                PaykitPaymentRequestState::ProposalExpired,
+                VerificationTerminalReason::ProposalExpired,
+            ),
+        ] {
+            let verifier = verifier(
+                PaykitPaymentStatus {
+                    request_state,
+                    payment_state: PaykitPaymentState::Confirmed,
+                    bitcoin: Some(PaykitPaymentObservation {
+                        confirmations: 6,
+                        amount_matched: true,
+                        paid_on_time: true,
+                    }),
+                    usdt_arbitrum: Some(PaykitPaymentObservation {
+                        confirmations: 1,
+                        amount_matched: true,
+                        paid_on_time: true,
+                    }),
+                },
+                1,
+            );
+
+            assert_eq!(
+                verifier.verify(request()).await.unwrap(),
+                CriterionVerificationOutcome::TerminalUnsatisfied(reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_expired_payment_is_terminal_without_using_local_time() {
+        let verifier = verifier(
+            PaykitPaymentStatus {
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Expired,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 6,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
+            },
+            1,
+        );
+
+        assert_eq!(
+            verifier.verify(request()).await.unwrap(),
+            CriterionVerificationOutcome::TerminalUnsatisfied(
+                VerificationTerminalReason::PaymentDeadlineExpired
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn zero_confirmations_detected_amount_matched_satisfies_payment() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Detected,
-                confirmations: 0,
-                amount_matched: true,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Detected,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             0,
         );
 
-        let result = verifier.verify(request()).await.unwrap();
+        let CriterionVerificationOutcome::Satisfied(result) =
+            verifier.verify(request()).await.unwrap()
+        else {
+            panic!("detected matched payment should satisfy");
+        };
 
         assert_eq!(result.criterion_id, "criterion-1");
         assert!(result.satisfied);
@@ -151,16 +319,21 @@ mod tests {
     async fn zero_confirmations_undetected_stays_pending() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Undetected,
-                confirmations: 0,
-                amount_matched: true,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Undetected,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             0,
         );
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Ok(CriterionVerificationOutcome::Pending)
         );
     }
 
@@ -168,16 +341,21 @@ mod tests {
     async fn confirmations_required_detected_stays_pending() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Detected,
-                confirmations: 3,
-                amount_matched: true,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Detected,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 3,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Ok(CriterionVerificationOutcome::Pending)
         );
     }
 
@@ -185,16 +363,21 @@ mod tests {
     async fn confirmed_below_required_confirmations_stays_pending() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Confirmed,
-                confirmations: 0,
-                amount_matched: true,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Confirmed,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Ok(CriterionVerificationOutcome::Pending)
         );
     }
 
@@ -202,31 +385,94 @@ mod tests {
     async fn confirmed_at_required_confirmations_satisfies_payment() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Confirmed,
-                confirmations: 1,
-                amount_matched: true,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Confirmed,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 1,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
 
-        assert!(verifier.verify(request()).await.unwrap().satisfied);
+        assert!(matches!(
+            verifier.verify(request()).await.unwrap(),
+            CriterionVerificationOutcome::Satisfied(result) if result.satisfied
+        ));
     }
 
     #[tokio::test]
     async fn amount_mismatch_stays_pending_even_when_confirmed() {
         let verifier = verifier(
             PaykitPaymentStatus {
-                status: PaykitPaymentStatusKind::Confirmed,
-                confirmations: 6,
-                amount_matched: false,
+                request_state: PaykitPaymentRequestState::Accepted,
+                payment_state: PaykitPaymentState::Confirmed,
+                bitcoin: Some(PaykitPaymentObservation {
+                    confirmations: 6,
+                    amount_matched: false,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             },
             1,
         );
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Ok(CriterionVerificationOutcome::Pending)
         );
+    }
+
+    #[tokio::test]
+    async fn each_rail_requires_its_own_full_on_time_payment() {
+        let full = PaykitPaymentObservation {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: true,
+        };
+        let partial = PaykitPaymentObservation {
+            amount_matched: false,
+            ..full
+        };
+        let late = PaykitPaymentObservation {
+            paid_on_time: false,
+            ..full
+        };
+        let unmined = PaykitPaymentObservation {
+            confirmations: 0,
+            ..full
+        };
+        for (bitcoin, usdt_arbitrum, satisfied) in [
+            (None, Some(full), true),
+            (Some(late), Some(full), true),
+            (Some(partial), Some(full), true),
+            (Some(full), None, false), // one BTC confirmation is below this operator's threshold
+            (None, Some(unmined), false),
+            (None, Some(late), false),
+            (Some(partial), Some(partial), false),
+            (Some(late), Some(late), false),
+            (None, None, false), // missing/reorged observations cannot grant access
+        ] {
+            let outcome = verifier(
+                PaykitPaymentStatus {
+                    request_state: PaykitPaymentRequestState::ProofSubmitted,
+                    payment_state: PaykitPaymentState::Confirmed,
+                    bitcoin,
+                    usdt_arbitrum,
+                },
+                6,
+            )
+            .verify(request())
+            .await
+            .unwrap();
+            assert_eq!(
+                matches!(outcome, CriterionVerificationOutcome::Satisfied(_)),
+                satisfied,
+                "bitcoin={bitcoin:?}, usdt_arbitrum={usdt_arbitrum:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -235,7 +481,33 @@ mod tests {
 
         assert_eq!(
             verifier.verify(request()).await,
-            Err(ApplicationError::VerificationPending)
+            Ok(CriterionVerificationOutcome::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_conflict_is_preserved_as_operator_visible_error() {
+        let verifier = PaykitPaymentVerifier::new(
+            FakeStatusClient::error_with(PaykitPaymentStatusError::Conflict),
+            0,
+        );
+
+        assert_eq!(
+            verifier.verify(request()).await,
+            Err(ApplicationError::PaykitPaymentStatusConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_status_response_fails_closed() {
+        let verifier = PaykitPaymentVerifier::new(
+            FakeStatusClient::error_with(PaykitPaymentStatusError::InvalidResponse),
+            0,
+        );
+
+        assert_eq!(
+            verifier.verify(request()).await,
+            Err(ApplicationError::PaykitPaymentStatusInvalidResponse)
         );
     }
 
@@ -297,8 +569,12 @@ mod tests {
         }
 
         fn error() -> Self {
+            Self::error_with(PaykitPaymentStatusError::Unavailable)
+        }
+
+        fn error_with(error: PaykitPaymentStatusError) -> Self {
             Self {
-                response: Err(PaykitPaymentStatusError),
+                response: Err(error),
                 requested_handles: Mutex::new(Vec::new()),
             }
         }
@@ -310,7 +586,7 @@ mod tests {
 
     #[async_trait]
     impl PaykitPaymentStatusClient for FakeStatusClient {
-        async fn transaction_status(
+        async fn payment_request_status(
             &self,
             creator: &CreatorPubky,
             bundle_id: &BundleId,

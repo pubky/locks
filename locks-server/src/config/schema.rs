@@ -9,6 +9,7 @@ use super::defaults::DEFAULT_CREATOR_AUTHORITY_KEY_ENV;
 
 pub const PAYKIT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const PAYKIT_REQUEST_TIMEOUT_SECONDS: u64 = 20;
+pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockServerRuntimeConfig {
@@ -123,10 +124,17 @@ pub struct CreatorAuthorityAcquisitionConfig {
     pub frontend_session_ttl_seconds: u64,
     pub frontend_session_code_ttl_seconds: u64,
     pub legacy_connect: LegacyConnectAcquisitionConfig,
+    pub grant_connect: Option<GrantConnectAcquisitionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyConnectAcquisitionConfig {
+    pub allowed_return_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantConnectAcquisitionConfig {
+    pub client_id: String,
     pub allowed_return_origins: Vec<String>,
 }
 
@@ -140,6 +148,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
             legacy_connect: LegacyConnectAcquisitionConfig {
                 allowed_return_origins: Vec::new(),
             },
+            grant_connect: None,
         }
     }
 }
@@ -148,6 +157,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum CreatorAuthorityAcquisitionMethod {
     LegacyConnect,
+    GrantConnect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +184,7 @@ pub struct DatabaseConfig {
 pub struct WorkerConfig {
     pub enabled: bool,
     pub poll_interval_ms: u64,
+    pub paykit_payment_retry_interval_seconds: std::num::NonZeroU64,
     pub claim_timeout_seconds: u64,
     pub worker_id: String,
 }
@@ -185,6 +196,7 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitsConfig {
+    pub trusted_proxy_hops: usize,
     pub verification_submission: VerificationSubmissionRateLimitConfig,
     pub paykit_connection_state_lookup: PaykitConnectionStateLookupRateLimitConfig,
 }
@@ -324,6 +336,10 @@ pub enum ConfigError {
     InvalidDatabaseMaxConnections,
     #[error("worker.poll_interval_ms must be greater than zero")]
     InvalidWorkerPollInterval,
+    #[error("worker.paykit_payment_retry_interval_seconds must be greater than zero")]
+    InvalidPaykitPaymentRetryInterval,
+    #[error("rate_limits.trusted_proxy_hops must not exceed {max}")]
+    InvalidTrustedProxyHops { max: usize },
     #[error(
         "rate_limits.verification_submission.max_requests must be greater than zero when enabled"
     )]
@@ -365,6 +381,18 @@ pub enum ConfigError {
     )]
     InvalidCreatorAuthorityAllowedReturnOrigin(String),
     #[error(
+        "grant-connect requires a hostname client_id without scheme, path, query, or fragment: {0}"
+    )]
+    InvalidGrantConnectClientId(String),
+    #[error(
+        "creator_authority_acquisition.method = grant-connect requires [creator_authority_acquisition.grant_connect]"
+    )]
+    MissingGrantConnectConfig,
+    #[error(
+        "creator_authority_acquisition.method = grant-connect requires creator_authority_acquisition.grant_connect.allowed_return_origins to contain at least one origin"
+    )]
+    EmptyGrantConnectAllowedReturnOrigins,
+    #[error(
         "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
@@ -380,6 +408,10 @@ pub enum ConfigError {
         "paykit requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
     )]
     InvalidPaykitSigningSeed,
+    #[error(
+        "grant-connect requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
+    )]
+    InvalidGrantSigningSeed,
     #[error(
         "worker.claim_timeout_seconds must exceed the {request_timeout_seconds}-second Paykit request timeout when Paykit and the in-process worker are enabled"
     )]

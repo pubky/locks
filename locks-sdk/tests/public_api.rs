@@ -60,10 +60,15 @@ fn crate_root_exports_foundation_sdk_types() {
             "submitted_at": "2026-06-01T12:00:00Z",
             "started_at": null,
             "completed_at": null,
-            "failure_message": null
+            "failure_message": null,
+            "status_message": "Reader wallet setup needed"
         }))
         .unwrap();
     assert_eq!(lifecycle.status, VerificationTaskStatus::Pending);
+    assert_eq!(
+        lifecycle.status_message.as_deref(),
+        Some("Reader wallet setup needed")
+    );
 
     let issued: AccessCredentialResponse =
         ViewerLocks::parse_access_credential_response(serde_json::json!({
@@ -93,18 +98,18 @@ fn crate_root_exports_foundation_sdk_types() {
     .unwrap();
     assert_eq!(
         creator_pointer_url.as_str(),
-        "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/config.json"
+        "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/config.json"
     );
 
     let content_lock_resource = PubkyLockResource::from_str(
-        "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+        "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
     )
     .unwrap();
     assert_eq!(
         content_lock_resource_url(&content_lock_resource)
             .unwrap()
             .as_str(),
-        "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+        "https://_pubky.tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
     );
     let _selector: fn(
         &locks_core::lock_policy::ContentLock,

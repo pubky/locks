@@ -1,12 +1,72 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use locks_core::lock_policy::VerifierType;
-use locks_core::verification::CriterionVerificationResult;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    ClaimedVerificationTask, CriterionVerificationRequest, VerificationTaskRecord,
+    ClaimedInvoiceAdmission, ClaimedVerificationTask, CriterionVerificationOutcome,
+    CriterionVerificationRequest, InvoiceAdmissionIntentV1, InvoiceAdmissionRecord,
+    InvoiceAdmissionRetryReason, VerificationTaskRecord,
 };
+
+/// Persistence boundary for durable work that must exist before Paykit invoice creation.
+#[async_trait]
+pub trait InvoiceAdmissionRepository: Send + Sync {
+    /// Atomically inserts an invoice-pending task with a storage-owned ten-minute deadline.
+    /// Exact replays return existing state; changed submissions under the same handle conflict.
+    async fn insert_invoice_pending_task(
+        &self,
+        task: VerificationTaskRecord,
+        intent: InvoiceAdmissionIntentV1,
+    ) -> Result<InvoiceAdmissionRecord, ApplicationError>;
+
+    /// Loads invoice-admission state by internal task ID.
+    async fn get_invoice_admission(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
+
+    /// Claims one due invoice admission with a fresh token.
+    /// Expired admissions remain claimable so workers can terminalize them without outbound I/O.
+    async fn claim_next_invoice_admission(
+        &self,
+        worker_id: &str,
+        now: time::OffsetDateTime,
+        claim_ttl: time::Duration,
+    ) -> Result<Option<ClaimedInvoiceAdmission>, ApplicationError>;
+
+    /// Marks invoice admission ready only for the exact live lease incarnation.
+    /// The admission deadline is deliberately not re-checked: a claim taken before the deadline
+    /// may finish after it, and Paykit has already committed the invoice by then.
+    async fn mark_invoice_admission_ready(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
+
+    /// Returns exact live lease to durable due state without resetting attempts.
+    async fn schedule_invoice_admission_retry(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        retry_after: time::Duration,
+        retry_reason: Option<InvoiceAdmissionRetryReason>,
+    ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
+
+    /// Terminalizes admission only for exact live lease incarnation.
+    async fn mark_invoice_admission_failed(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        failure_message: &str,
+    ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
+}
 
 /// Repository for asynchronous verification task state.
 #[async_trait]
@@ -110,11 +170,11 @@ pub trait VerificationTaskIdGenerator: Send + Sync {
 /// Adapter boundary for criterion-specific verification logic.
 #[async_trait]
 pub trait CriterionVerifier: Send + Sync {
-    /// Verifies one criterion/proof pair and returns minimal criterion-level evidence.
+    /// Verifies one criterion/proof pair and returns a closed lifecycle decision.
     async fn verify(
         &self,
         request: CriterionVerificationRequest,
-    ) -> Result<CriterionVerificationResult, ApplicationError>;
+    ) -> Result<CriterionVerificationOutcome, ApplicationError>;
 }
 
 /// Registry that dispatches protocol verifier types to concrete verifier adapters.

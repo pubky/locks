@@ -14,6 +14,14 @@ pub(crate) struct TestDatabase {
 
 impl TestDatabase {
     pub(crate) async fn create() -> Self {
+        let database = Self::create_unmigrated().await;
+        run_migrations(database.pool())
+            .await
+            .expect("run migrations in isolated test schema");
+        database
+    }
+
+    pub(crate) async fn create_unmigrated() -> Self {
         let database_url = test_database_url();
         let schema_name = unique_schema_name();
         let mut admin_connection = PgConnection::connect(&database_url)
@@ -22,9 +30,6 @@ impl TestDatabase {
 
         create_schema(&mut admin_connection, &schema_name).await;
         let pool = isolated_schema_pool(&database_url, &schema_name).await;
-        run_migrations(&pool)
-            .await
-            .expect("run migrations in isolated test schema");
 
         Self { pool, schema_name }
     }

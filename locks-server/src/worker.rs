@@ -13,7 +13,10 @@ use tracing::{debug, error, info};
 
 use crate::app_state::AppState;
 
-const PENDING_VERIFICATION_RETRY_DELAY_SECONDS: i64 = 30;
+mod invoice;
+pub use invoice::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, OsFullJitter};
+
+const NON_PAYKIT_PENDING_VERIFICATION_RETRY_DELAY_SECONDS: i64 = 30;
 
 /// Result of one worker polling attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,7 @@ pub struct VerificationWorker<'a> {
     verified_by: LockServerPubky,
     worker_id: String,
     poll_interval: std::time::Duration,
+    paykit_payment_retry_interval_seconds: u64,
     claim_timeout_seconds: u64,
 }
 
@@ -54,6 +58,7 @@ impl<'a> VerificationWorker<'a> {
         verified_by: LockServerPubky,
         worker_id: String,
         poll_interval: std::time::Duration,
+        paykit_payment_retry_interval_seconds: u64,
         claim_timeout_seconds: u64,
     ) -> Self {
         Self {
@@ -68,6 +73,7 @@ impl<'a> VerificationWorker<'a> {
             verified_by,
             worker_id,
             poll_interval,
+            paykit_payment_retry_interval_seconds,
             claim_timeout_seconds,
         }
     }
@@ -91,6 +97,11 @@ impl<'a> VerificationWorker<'a> {
             state.config().credentials.lock_server_public_key.clone(),
             state.config().worker.worker_id.clone(),
             std::time::Duration::from_millis(state.config().worker.poll_interval_ms),
+            state
+                .config()
+                .worker
+                .paykit_payment_retry_interval_seconds
+                .get(),
             state.config().worker.claim_timeout_seconds,
         )
     }
@@ -108,6 +119,9 @@ impl<'a> VerificationWorker<'a> {
 
         let task_id = claim.task.task_id;
         let claim_token = claim.claim_token;
+        let is_paykit_payment = claim.task.submitted_proof_bundle.proofs.len() == 1
+            && claim.task.submitted_proof_bundle.proofs[0].verifier_type
+                == locks_core::lock_policy::VerifierType::PaykitPayment;
         debug!(%task_id, worker_id = %self.worker_id, "claimed verification task");
         let mut verifiers = StaticCriterionVerifierRegistry::new();
         if self.allow_dev_static_verifier {
@@ -138,9 +152,23 @@ impl<'a> VerificationWorker<'a> {
                 info!(%task_id, status = ?completed.status, "completed verification task");
                 Ok(WorkerTick::Completed(task_id))
             }
-            Err(ApplicationError::VerificationPending) => {
+            Err(
+                error @ (ApplicationError::VerificationPending
+                | ApplicationError::PaykitPaymentStatusConflict),
+            ) => {
+                if matches!(error, ApplicationError::PaykitPaymentStatusConflict) {
+                    error!(
+                        %task_id,
+                        worker_id = %self.worker_id,
+                        "paykit payment status conflict; scheduling retry"
+                    );
+                }
                 let retry_scheduled_at = self.clock.now();
-                let next_attempt_at = retry_scheduled_at + retry_delay();
+                let next_attempt_at = retry_scheduled_at
+                    + retry_delay(
+                        is_paykit_payment,
+                        self.paykit_payment_retry_interval_seconds,
+                    );
                 let Some(_) = self
                     .claimer
                     .schedule_verification_task_retry(
@@ -214,9 +242,20 @@ fn claim_timeout(seconds: u64) -> time::Duration {
     time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
 
-fn retry_delay() -> time::Duration {
-    time::Duration::seconds(PENDING_VERIFICATION_RETRY_DELAY_SECONDS)
+fn retry_delay(
+    is_paykit_payment: bool,
+    paykit_payment_retry_interval_seconds: u64,
+) -> time::Duration {
+    if is_paykit_payment {
+        return time::Duration::seconds(
+            i64::try_from(paykit_payment_retry_interval_seconds).unwrap_or(i64::MAX),
+        );
+    }
+    time::Duration::seconds(NON_PAYKIT_PENDING_VERIFICATION_RETRY_DELAY_SECONDS)
 }
+
+#[cfg(test)]
+mod invoice_tests;
 
 #[cfg(test)]
 mod tests {
@@ -232,15 +271,15 @@ mod tests {
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
         LockServerConfig, VerifierType,
     };
-    use locks_core::verification::{
-        CriterionVerificationResult, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
-    };
+    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
     use locks_service::application::errors::ApplicationError;
     use locks_service::application::models::{
-        CriterionVerificationRequest, VerificationTaskRecord, VerificationTaskStatus,
+        CriterionVerificationOutcome, CriterionVerificationRequest, VerificationTaskRecord,
+        VerificationTaskStatus,
     };
     use locks_service::application::ports::{
-        ContentLockRepository, CriterionVerifier, EntitlementRepository, VerificationTaskRepository,
+        Clock, ContentLockRepository, CriterionVerifier, EntitlementRepository,
+        VerificationTaskClaimer, VerificationTaskRepository,
     };
     use locks_service::infrastructure::memory::{
         content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
@@ -251,7 +290,7 @@ mod tests {
     use time::macros::datetime;
     use tokio::sync::watch;
 
-    use crate::app_state::{AppState, SystemClock};
+    use crate::app_state::AppState;
     use crate::config::{
         ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
         LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
@@ -332,6 +371,141 @@ mod tests {
         assert_eq!(stored.status, VerificationTaskStatus::Pending);
         assert_eq!(stored.failure_message, None);
         assert_eq!(worker.run_once().await.unwrap(), WorkerTick::Idle);
+        assert!(
+            fixture
+                .claimer
+                .claim_next_verification_task(
+                    "other-worker",
+                    submitted_at() + time::Duration::seconds(29),
+                    submitted_at() + time::Duration::seconds(89),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .claimer
+                .claim_next_verification_task(
+                    "other-worker",
+                    submitted_at() + time::Duration::seconds(30),
+                    submitted_at() + time::Duration::seconds(90),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_schedules_paykit_pending_retry_at_configured_interval() {
+        let fixture = WorkerFixture::new(paykit_content_lock()).await;
+        fixture.seed_task().await;
+        let verifier = RetryOnceVerifier::default();
+        let worker = fixture.worker_with_paykit_verifier(&verifier, 3);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::RetryScheduled(task_id())
+        );
+        assert!(
+            fixture
+                .claimer
+                .claim_next_verification_task(
+                    "other-worker",
+                    submitted_at() + time::Duration::seconds(2),
+                    submitted_at() + time::Duration::seconds(62),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .claimer
+                .claim_next_verification_task(
+                    "other-worker",
+                    submitted_at() + time::Duration::seconds(3),
+                    submitted_at() + time::Duration::seconds(63),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_schedules_operator_visible_paykit_conflict_without_terminalizing() {
+        let fixture = WorkerFixture::new(paykit_content_lock()).await;
+        fixture.seed_task().await;
+        let verifier = ConflictVerifier;
+        let worker = fixture.worker_with_paykit_verifier(&verifier, 3);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::RetryScheduled(task_id())
+        );
+        let stored = fixture
+            .tasks
+            .get_verification_task(&task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::Pending);
+        assert_eq!(stored.completed_at, None);
+        assert_eq!(stored.failure_message, None);
+        assert!(
+            fixture
+                .entitlements
+                .get_verified_proof_bundle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .claimer
+                .claim_next_verification_task(
+                    "other-worker",
+                    submitted_at() + time::Duration::seconds(3),
+                    submitted_at() + time::Duration::seconds(63),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_fails_closed_on_invalid_paykit_status_response() {
+        let fixture = WorkerFixture::new(content_lock(true)).await;
+        fixture.seed_task().await;
+        let verifier = InvalidPaykitStatusVerifier;
+        let worker = fixture.worker_with_verifier(&verifier);
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            WorkerTick::Failed(task_id())
+        );
+        let stored = fixture
+            .tasks
+            .get_verification_task(&task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::Failed);
+        assert_eq!(
+            stored.failure_message,
+            Some("verification failed".to_owned())
+        );
+        assert!(
+            fixture
+                .entitlements
+                .get_verified_proof_bundle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -393,7 +567,8 @@ mod tests {
 
     #[test]
     fn pending_verification_retry_is_independent_of_queue_polling() {
-        assert_eq!(retry_delay(), time::Duration::seconds(30));
+        assert_eq!(retry_delay(false, 3), time::Duration::seconds(30));
+        assert_eq!(retry_delay(true, 3), time::Duration::seconds(3));
     }
 
     #[tokio::test]
@@ -415,7 +590,7 @@ mod tests {
         content_locks: InMemoryContentLockRepository,
         entitlements: InMemoryEntitlementRepository,
         verifier: DevStaticVerifier,
-        clock: SystemClock,
+        clock: FixedClock,
     }
 
     impl WorkerFixture {
@@ -431,7 +606,7 @@ mod tests {
                 content_locks: InMemoryContentLockRepository::new(),
                 entitlements: InMemoryEntitlementRepository::new(),
                 verifier: DevStaticVerifier,
-                clock: SystemClock,
+                clock: FixedClock(submitted_at()),
             }
         }
 
@@ -448,7 +623,7 @@ mod tests {
                 content_locks: InMemoryContentLockRepository::new(),
                 entitlements: InMemoryEntitlementRepository::new(),
                 verifier: DevStaticVerifier,
-                clock: SystemClock,
+                clock: FixedClock(submitted_at()),
             };
             fixture.seed_content_lock(content_lock).await;
             fixture
@@ -477,6 +652,32 @@ mod tests {
                 .unwrap(),
                 "test-worker".to_owned(),
                 std::time::Duration::from_millis(10),
+                3,
+                60,
+            )
+        }
+
+        fn worker_with_paykit_verifier<'a>(
+            &'a self,
+            verifier: &'a dyn CriterionVerifier,
+            retry_interval_seconds: u64,
+        ) -> VerificationWorker<'a> {
+            VerificationWorker::new(
+                self.tasks.as_ref(),
+                &self.claimer,
+                &self.content_locks,
+                &self.entitlements,
+                &self.verifier,
+                Some(verifier),
+                true,
+                &self.clock,
+                LockServerPubky::from_str(
+                    "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                )
+                .unwrap(),
+                "test-worker".to_owned(),
+                std::time::Duration::from_millis(10),
+                retry_interval_seconds,
                 60,
             )
         }
@@ -497,6 +698,7 @@ mod tests {
                 .unwrap(),
                 "test-worker".to_owned(),
                 std::time::Duration::from_millis(10),
+                3,
                 60,
             )
         }
@@ -524,6 +726,14 @@ mod tests {
         }
     }
 
+    struct FixedClock(time::OffsetDateTime);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> time::OffsetDateTime {
+            self.0
+        }
+    }
+
     #[derive(Default)]
     struct RetryOnceVerifier {
         returned_pending: AtomicBool,
@@ -534,11 +744,35 @@ mod tests {
         async fn verify(
             &self,
             request: CriterionVerificationRequest,
-        ) -> Result<CriterionVerificationResult, ApplicationError> {
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
             if !self.returned_pending.swap(true, Ordering::SeqCst) {
-                return Err(ApplicationError::VerificationPending);
+                return Ok(CriterionVerificationOutcome::Pending);
             }
             DevStaticVerifier.verify(request).await
+        }
+    }
+
+    struct ConflictVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for ConflictVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Err(ApplicationError::PaykitPaymentStatusConflict)
+        }
+    }
+
+    struct InvalidPaykitStatusVerifier;
+
+    #[async_trait]
+    impl CriterionVerifier for InvalidPaykitStatusVerifier {
+        async fn verify(
+            &self,
+            _request: CriterionVerificationRequest,
+        ) -> Result<CriterionVerificationOutcome, ApplicationError> {
+            Err(ApplicationError::PaykitPaymentStatusInvalidResponse)
         }
     }
 
@@ -552,6 +786,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 
@@ -569,7 +805,7 @@ mod tests {
             reader_public_key: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
-                verifier_type: VerifierType::DevStatic,
+                verifier_type: content_lock.criteria[0].verifier_type,
                 payload,
             }],
         }
@@ -579,12 +815,23 @@ mod tests {
         content_lock_with_payload(serde_json::json!({ "satisfied": satisfied }))
     }
 
+    fn paykit_content_lock() -> ContentLock {
+        let mut content_lock = content_lock(true);
+        content_lock.criteria[0].verifier_type = VerifierType::PaykitPayment;
+        content_lock.criteria[0].params = serde_json::json!({
+            "recipient_pubky": creator().to_string(),
+            "amount": "50000",
+            "asset": "BTC"
+        });
+        content_lock
+    }
+
     fn content_lock_with_payload(params: serde_json::Value) -> ContentLock {
         ContentLock {
             version: CONTENT_LOCK_VERSION,
             creator: creator(),
             primary_resource: Some(GuardedResource {
-                path: "/priv/locks.app/content/hello.txt".to_owned(),
+                path: "/priv/app.locks/content/hello.txt".to_owned(),
                 hash: GuardedResourceHash::from_bytes([7; 32]),
                 content_type: "text/plain".to_owned(),
                 size: 13,
@@ -627,6 +874,7 @@ mod tests {
             worker: WorkerConfig {
                 enabled: true,
                 poll_interval_ms: 10,
+                paykit_payment_retry_interval_seconds: std::num::NonZeroU64::new(3).unwrap(),
                 claim_timeout_seconds: 60,
                 worker_id: "test-worker".to_owned(),
             },

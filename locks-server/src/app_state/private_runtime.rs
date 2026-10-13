@@ -13,8 +13,8 @@ use locks_service::application::{
     ports::{
         AccessCredentialStore, ContentLockOwnershipRepository, CreatorAuthorityManager,
         CreatorAuthorityStore, CreatorConnectFlowStore, FrontendSessionCodeStore,
-        FrontendSessionStore, LegacyCreatorConnectFlowClient, VerificationTaskClaimer,
-        VerificationTaskRepository,
+        FrontendSessionStore, GrantCreatorConnectFlowClient, InvoiceAdmissionRepository,
+        LegacyCreatorConnectFlowClient, VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
 use time::OffsetDateTime;
@@ -23,6 +23,7 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub(super) struct PrivateRuntimeAdapters {
     pub(super) content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
+    pub(super) invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     pub(super) verification_tasks: Arc<dyn VerificationTaskRepository>,
     pub(super) verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     pub(super) access_credentials: Arc<dyn AccessCredentialStore>,
@@ -32,6 +33,7 @@ pub(super) struct PrivateRuntimeAdapters {
     pub(super) frontend_sessions: Arc<dyn FrontendSessionStore>,
     pub(super) creator_authority_manager: Arc<dyn CreatorAuthorityManager>,
     pub(super) legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient>,
+    pub(super) grant_creator_connect_flow_client: Option<Arc<dyn GrantCreatorConnectFlowClient>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +113,21 @@ impl CreatorConnectFlowStore for InMemoryCreatorConnectFlowStore {
     ) -> Result<(), ApplicationError> {
         self.records.write().await.remove(flow_id);
         Ok(())
+    }
+
+    async fn consume_pending_creator_connect_flow(
+        &self,
+        flow_id: &CreatorConnectFlowId,
+        now: OffsetDateTime,
+    ) -> Result<Option<PendingCreatorConnectFlowRecord>, ApplicationError> {
+        let mut records = self.records.write().await;
+        if records
+            .get(flow_id)
+            .is_none_or(|record| record.is_expired_at(now))
+        {
+            return Ok(None);
+        }
+        Ok(records.remove(flow_id))
     }
 }
 

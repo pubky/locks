@@ -6,12 +6,23 @@ use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initial
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{home_dir_from_env, parse_config_arg};
 use locks_server::storage::build_runtime_state;
-use locks_server::worker::VerificationWorker;
+use locks_server::worker::{InvoiceAdmissionWorker, OsFullJitter, VerificationWorker};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+const SENSITIVE_PUBKY_LOG_DIRECTIVES: &[&str] = &[
+    "pkarr=off",
+    "pubky::actors::auth::relay::auth_relay_listener=off",
+    "pubky::actors::auth::relay::http_relay_inbox_channel=off",
+    "pubky::actors::auth::relay::http_relay_link_channel=off",
+    "pubky::actors::auth::cookie::credential=off",
+    "pubky::actors::pkdns=off",
+    "pubky::client::http_targets::native=off",
+    "tower_http::trace=off",
+];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -25,14 +36,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = build_runtime_state(config).await?;
     let worker_enabled = state.config().worker.enabled;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let worker_handle = if worker_enabled {
+    let verification_worker_handle = if worker_enabled {
         let worker_state = state.clone();
+        let worker_shutdown = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             let worker = VerificationWorker::from_state(&worker_state);
-            if let Err(error) = worker.run_until_shutdown(shutdown_rx).await {
+            if let Err(error) = worker.run_until_shutdown(worker_shutdown).await {
                 error!(%error, "verification worker stopped with error");
             }
         }))
+    } else {
+        None
+    };
+    let invoice_worker_handle = if worker_enabled {
+        state.paykit_http_client().cloned().map(|paykit| {
+            let worker_state = state.clone();
+            tokio::spawn(async move {
+                let jitter = OsFullJitter;
+                let worker =
+                    InvoiceAdmissionWorker::from_state(&worker_state, paykit.as_ref(), &jitter);
+                if let Err(error) = worker.run_until_shutdown(shutdown_rx).await {
+                    error!(%error, "invoice admission worker stopped with error");
+                }
+            })
+        })
     } else {
         None
     };
@@ -47,7 +74,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     let _ = shutdown_tx.send(true);
-    if let Some(worker_handle) = worker_handle {
+    if let Some(worker_handle) = verification_worker_handle {
+        worker_handle.await?;
+    }
+    if let Some(worker_handle) = invoice_worker_handle {
         worker_handle.await?;
     }
     Ok(())
@@ -62,5 +92,33 @@ async fn shutdown_signal() {
 fn init_tracing(configured_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(configured_level));
+    let filter = with_sensitive_pubky_logs_disabled(filter);
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn with_sensitive_pubky_logs_disabled(filter: EnvFilter) -> EnvFilter {
+    SENSITIVE_PUBKY_LOG_DIRECTIVES
+        .iter()
+        .fold(filter, |filter, directive| {
+            filter.add_directive(
+                directive
+                    .parse()
+                    .expect("hard-coded Pubky log directive must be valid"),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SENSITIVE_PUBKY_LOG_DIRECTIVES, with_sensitive_pubky_logs_disabled};
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn pubky_auth_identifier_logs_stay_disabled_with_trace_base_filter() {
+        let filter = with_sensitive_pubky_logs_disabled(EnvFilter::new("trace")).to_string();
+
+        for directive in SENSITIVE_PUBKY_LOG_DIRECTIVES {
+            assert!(filter.contains(directive));
+        }
+    }
 }

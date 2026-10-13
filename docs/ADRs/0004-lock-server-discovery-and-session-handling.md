@@ -14,7 +14,7 @@ The design considered whether Lock Server discovery should use creator-owned pub
 The default Lock Server pointer stays in creator-owned public config:
 
 ```text
-/pub/locks.app/config.json
+/pub/app.locks/config.json
 ```
 
 It can be overridden by a Lock Server location specified in a concrete content lock using this nested field shape:
@@ -27,7 +27,7 @@ It can be overridden by a Lock Server location specified in a concrete content l
 }
 ```
 
-Absence of `lock_server.override` means viewers use the default Lock Server pointer from `/pub/locks.app/config.json`.
+Absence of `lock_server.override` means viewers use the default Lock Server pointer from `/pub/app.locks/config.json`.
 
 Because all serialized content lock payload fields participate in the lock hash, changing `lock_server.override` creates a new Lock ID.
 

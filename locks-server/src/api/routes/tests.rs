@@ -6,28 +6,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::post;
+use axum::{Json, Router};
 use locks_core::ids::{
     BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockId, LockServerPubky,
     PubkyLockResource,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    LockServerConfig, PaykitPaymentAsset, VerifierType,
 };
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     ContentLockDeletionFailureCode, ContentLockDeletionState, CreatorAuthorityAuthKind,
     CreatorAuthorityRecord, CreatorAuthoritySecret, CreatorConnectAuthorizationUrl,
-    CreatorConnectFlowId, FrontendSessionRecord, FrontendSessionToken, GuardedResourceRecord,
-    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    CreatorConnectFlowId, FrontendSessionRecord, FrontendSessionToken,
+    GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
+    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
 };
-use locks_service::application::ports::{Clock, LegacyCreatorConnectFlowClient};
+use locks_service::application::ports::{
+    Clock, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
+};
 use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -49,14 +52,16 @@ use crate::api::dtos::{
 use crate::app_state::{AppState, ReaderPubkyResolver};
 use crate::config::{
     ContentLocksConfig, CreatorAuthorityAcquisitionConfig, CreatorAuthorityAcquisitionMethod,
-    DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig,
-    PaykitConnectionStateLookupRateLimitConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    DatabaseConfig, GrantConnectAcquisitionConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
+    VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 use crate::paykit_http_client::{
     PaykitHttpClient, PaykitSetupStatusKind, PaykitSetupStatusProvider,
     PaykitSetupStatusProviderError,
 };
+use crate::worker::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick};
 
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
@@ -85,6 +90,7 @@ impl ReaderPubkyResolver for AlwaysResolvesReader {
 struct RecordingPaykitSetupStatusProvider {
     result: Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError>,
     creators: Mutex<Vec<CreatorPubky>>,
+    assets: Mutex<Vec<PaykitPaymentAsset>>,
 }
 
 impl RecordingPaykitSetupStatusProvider {
@@ -92,6 +98,7 @@ impl RecordingPaykitSetupStatusProvider {
         Self {
             result: Ok(status),
             creators: Mutex::new(Vec::new()),
+            assets: Mutex::new(Vec::new()),
         }
     }
 
@@ -99,6 +106,7 @@ impl RecordingPaykitSetupStatusProvider {
         Self {
             result: Err(error),
             creators: Mutex::new(Vec::new()),
+            assets: Mutex::new(Vec::new()),
         }
     }
 
@@ -112,8 +120,10 @@ impl PaykitSetupStatusProvider for RecordingPaykitSetupStatusProvider {
     async fn setup_status(
         &self,
         creator: &CreatorPubky,
+        asset: PaykitPaymentAsset,
     ) -> Result<PaykitSetupStatusKind, PaykitSetupStatusProviderError> {
         self.creators.lock().unwrap().push(creator.clone());
+        self.assets.lock().unwrap().push(asset);
         self.result
     }
 }
@@ -1063,7 +1073,7 @@ async fn post_proof_bundles_rejects_paykit_payment_when_paykit_is_not_configured
 }
 
 #[tokio::test]
-async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_invoice() {
+async fn post_proof_bundles_persists_pending_without_inline_paykit_invoice() {
     let calls = Arc::new(AtomicUsize::new(0));
     let paykit_url = spawn_counting_paykit_invoice(Arc::clone(&calls)).await;
     let paykit = Arc::new(
@@ -1084,8 +1094,8 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
     let state = test_state()
         .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
         .with_paykit_http_client(Some(paykit));
-    seed_content_lock(&state, content_lock).await;
-    let app = router(state);
+    seed_content_lock(&state, content_lock.clone()).await;
+    let app = router(state.clone());
 
     let first = app
         .clone()
@@ -1098,6 +1108,24 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert!(response_json(first).await.get("connection_state").is_none());
+
+    let premature_completion = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-completions",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(premature_completion.status(), StatusCode::CONFLICT);
+
+    let mut changed_content_lock = content_lock;
+    changed_content_lock.created_at += time::Duration::seconds(1);
+    seed_content_lock(&state, changed_content_lock).await;
 
     let replay = app
         .oneshot(json_request(
@@ -1114,7 +1142,228 @@ async fn post_proof_bundles_replay_returns_lifecycle_without_replaying_paykit_in
             .get("connection_state")
             .is_none()
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn in_memory_invoice_ready_task_becomes_claimable_for_verification() {
+    let paykit_url = spawn_counting_paykit_invoice(Arc::new(AtomicUsize::new(0))).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = state.clock().now();
+    let admission_claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("invoice-worker", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .invoice_admissions()
+        .mark_invoice_admission_ready(
+            &task.task_id,
+            "invoice-worker",
+            &admission_claim.claim_token,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let verification_claim = state
+        .verification_task_claimer()
+        .claim_next_verification_task("verification-worker", now, now + time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .expect("ready invoice task must enter verification worker queue");
+    assert_eq!(verification_claim.task.task_id, task.task_id);
+}
+
+#[tokio::test]
+async fn verification_task_lookup_projects_reader_wallet_setup_needed_without_entitlement() {
+    let paykit_url = spawn_counting_paykit_invoice(Arc::new(AtomicUsize::new(0))).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let mut content_lock = content_lock(true);
+    content_lock.criteria[0].verifier_type = VerifierType::PaykitPayment;
+    content_lock.criteria[0].params = json!({
+        "recipient_pubky": creator().to_string(),
+        "amount": "50000",
+        "asset": "BTC",
+        "payment_in": 24
+    });
+    let mut bundle = submitted_proof_bundle_for(&content_lock);
+    bundle.reader_public_key = Some(other_creator());
+    bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+    bundle.proofs[0].payload = json!({});
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let task = state
+        .verification_tasks()
+        .get_verification_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = state.clock().now();
+    let claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("worker-a", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .invoice_admissions()
+        .schedule_invoice_admission_retry(
+            &task.task_id,
+            "worker-a",
+            &claim.claim_token,
+            now,
+            time::Duration::ZERO,
+            Some(InvoiceAdmissionRetryReason::ReaderWalletSetupNeeded),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let second_claim = state
+        .invoice_admissions()
+        .claim_next_invoice_admission("worker-b", now, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = state
+        .invoice_admissions()
+        .schedule_invoice_admission_retry(
+            &task.task_id,
+            "worker-b",
+            &second_claim.claim_token,
+            now,
+            time::Duration::seconds(2),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(replay).await["status_message"],
+        "Reader wallet setup needed"
+    );
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["status_message"], "Reader wallet setup needed");
+    assert_eq!(
+        body["admission_deadline_at"],
+        admission
+            .admission_deadline_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
+    assert!(body.get("entitlement_to_publish").is_none());
+}
+
+#[tokio::test]
+async fn reader_not_payable_worker_failure_is_visible_through_http_lookup() {
+    let paykit_url = spawn_paykit_invoice_error(
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "reader_not_payable", "message": "not payable"}}),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state().with_paykit_http_client(Some(paykit.clone()));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+
+    let jitter = ZeroInvoiceJitter;
+    let worker = InvoiceAdmissionWorker::from_state(&state, paykit.as_ref(), &jitter);
+    assert!(matches!(
+        worker.run_once().await.unwrap(),
+        InvoiceWorkerTick::Failed(_)
+    ));
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["failure_message"], "reader is not payable");
+    assert_eq!(body["admission_deadline_at"], Value::Null);
 }
 
 #[tokio::test]
@@ -1219,6 +1468,70 @@ async fn paykit_connection_state_lookup_rejects_fixed_window_excess_before_outbo
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_error_response(rejected, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_rate_limit_shares_proxy_peer_without_trusted_hops() {
+    let (first, second, calls) = paykit_lookups_from_two_clients_through_proxy(0).await;
+
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn paykit_connection_state_lookup_rate_limit_keys_forwarded_client_with_trusted_hop() {
+    let (first, second, calls) = paykit_lookups_from_two_clients_through_proxy(1).await;
+
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::OK);
+    assert_eq!(calls, 2);
+}
+
+async fn paykit_lookups_from_two_clients_through_proxy(
+    trusted_proxy_hops: usize,
+) -> (StatusCode, StatusCode, usize) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let paykit_url = spawn_counting_paykit_connection_status(Arc::clone(&calls)).await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test(&paykit_url, Keypair::from_secret(&[9_u8; 32])).unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state_with_paykit_lookup_proxy_hops(1, trusted_proxy_hops)
+        .with_reader_pubky_resolver(Arc::new(AlwaysResolvesReader))
+        .with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+    let lookup = |forwarded_for: &str| {
+        json_request_through_proxy(
+            "POST",
+            "/paykit-connection-state-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+            forwarded_for,
+        )
+    };
+
+    let first = app.clone().oneshot(lookup("203.0.113.10")).await.unwrap();
+    let second = app.oneshot(lookup("203.0.113.20")).await.unwrap();
+
+    (
+        first.status(),
+        second.status(),
+        calls.load(Ordering::SeqCst),
+    )
 }
 
 #[tokio::test]
@@ -1389,7 +1702,7 @@ async fn paykit_connection_state_lookup_maps_invalid_paykit_response_to_bad_gate
 
 #[tokio::test]
 async fn paykit_connection_state_lookup_maps_response_body_timeout_to_gateway_timeout() {
-    let paykit_url = spawn_invoice_then_stalled_connection_status_body().await;
+    let paykit_url = spawn_stalled_connection_status_body().await;
     let paykit = Arc::new(
         PaykitHttpClient::new_for_test_with_timeout(
             &paykit_url,
@@ -1646,6 +1959,82 @@ async fn post_proof_bundles_rate_limit_is_per_client_address() {
         .unwrap();
 
     assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_proof_bundles_rate_limit_shares_proxy_peer_without_trusted_hops() {
+    let app = router(test_state_with_rate_limit_and_proxy_hops(1, 0));
+
+    let first = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+            "203.0.113.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1X"
+                ) }),
+            "203.0.113.20",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(second, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
+}
+
+#[tokio::test]
+async fn post_proof_bundles_rate_limit_keys_forwarded_client_with_trusted_hop() {
+    let app = router(test_state_with_rate_limit_and_proxy_hops(1, 1));
+
+    let first = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+            "203.0.113.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let other_client = app
+        .clone()
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1X"
+                ) }),
+            "203.0.113.20",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_client.status(), StatusCode::OK);
+
+    let spoofed = app
+        .oneshot(json_request_through_proxy(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle_with_bundle_id(
+                    "000G40R40M30E209185GR38E1Y"
+                ) }),
+            "198.51.100.7, 203.0.113.10",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(spoofed, StatusCode::TOO_MANY_REQUESTS, "rate_limited").await;
 }
 
 #[tokio::test]
@@ -2120,7 +2509,7 @@ async fn authenticated_creator_content_lock_over_max_resources_returns_invalid_r
     seed_frontend_session(&state, "frontend-session-secret", creator()).await;
     let mut request = creator_content_lock_request(registered_guarded_resource_json());
     request["secondary_resources"] = json!({
-        "/priv/locks.app/content/secondary.txt": {
+        "/priv/app.locks/content/secondary.txt": {
             "hash": registered_guarded_resource_json()["hash"].clone(),
             "content_type": "text/plain",
             "size": 1
@@ -2544,7 +2933,7 @@ async fn paykit_setup_status_route_derives_creator_and_projects_all_statuses() {
         let response = router(state)
             .oneshot(auth_request(
                 "GET",
-                "/creator/paykit/setup-status",
+                "/creator/paykit/setup-status?asset=USD",
                 "Bearer frontend-session-token",
             ))
             .await
@@ -2554,6 +2943,10 @@ async fn paykit_setup_status_route_derives_creator_and_projects_all_statuses() {
         let body = response_json(response).await;
         assert_eq!(body, json!({ "status": wire_status }));
         assert_eq!(provider.creators(), vec![creator()]);
+        assert_eq!(
+            *provider.assets.lock().unwrap(),
+            vec![PaykitPaymentAsset::Usd]
+        );
     }
 }
 
@@ -2568,7 +2961,7 @@ async fn paykit_setup_status_route_uses_creator_from_the_presented_session() {
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer other-session-token",
         ))
         .await
@@ -2585,7 +2978,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer frontend-session-token",
         ))
         .await
@@ -2609,7 +3002,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
         let response = router(state)
             .oneshot(auth_request(
                 "GET",
-                "/creator/paykit/setup-status",
+                "/creator/paykit/setup-status?asset=USD",
                 "Bearer frontend-session-token",
             ))
             .await
@@ -2624,7 +3017,7 @@ async fn paykit_setup_status_route_projects_missing_config_and_upstream_failures
 }
 
 #[tokio::test]
-async fn paykit_setup_status_route_rejects_query_and_body_after_authentication() {
+async fn paykit_setup_status_route_rejects_invalid_asset_creator_and_body_after_authentication() {
     let provider = Arc::new(RecordingPaykitSetupStatusProvider::status(
         PaykitSetupStatusKind::Ready,
     ));
@@ -2635,12 +3028,27 @@ async fn paykit_setup_status_route_rejects_query_and_body_after_authentication()
     for request in [
         auth_request(
             "GET",
+            "/creator/paykit/setup-status",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
+            "/creator/paykit/setup-status?asset=ETH",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
+            "/creator/paykit/setup-status?asset=USD&asset=USDT",
+            "Bearer frontend-session-token",
+        ),
+        auth_request(
+            "GET",
             &format!("/creator/paykit/setup-status?creator={}", other_creator()),
             "Bearer frontend-session-token",
         ),
         Request::builder()
             .method("GET")
-            .uri("/creator/paykit/setup-status")
+            .uri("/creator/paykit/setup-status?asset=USD")
             .header(header::AUTHORIZATION, "Bearer frontend-session-token")
             .body(Body::from("{}"))
             .unwrap(),
@@ -2659,8 +3067,8 @@ async fn paykit_setup_status_route_rejects_query_and_body_after_authentication()
 async fn paykit_setup_status_route_preserves_frontend_session_auth_errors() {
     for authorization in [None, Some("Basic token"), Some("Bearer missing-token")] {
         let request = match authorization {
-            Some(value) => auth_request("GET", "/creator/paykit/setup-status", value),
-            None => empty_request("GET", "/creator/paykit/setup-status"),
+            Some(value) => auth_request("GET", "/creator/paykit/setup-status?asset=USD", value),
+            None => empty_request("GET", "/creator/paykit/setup-status?asset=USD"),
         };
         let response = router(test_state()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -2675,7 +3083,7 @@ async fn paykit_setup_status_route_preserves_frontend_session_auth_errors() {
     let response = router(state)
         .oneshot(auth_request(
             "GET",
-            "/creator/paykit/setup-status",
+            "/creator/paykit/setup-status?asset=USD",
             "Bearer expired-token",
         ))
         .await
@@ -2696,7 +3104,7 @@ async fn paykit_setup_status_route_authenticates_before_reading_an_oversized_bod
     .oneshot(
         Request::builder()
             .method("GET")
-            .uri("/creator/paykit/setup-status")
+            .uri("/creator/paykit/setup-status?asset=USD")
             .body(Body::from(vec![0_u8; 2 * 1024 * 1024 + 1]))
             .unwrap(),
     )
@@ -2966,7 +3374,7 @@ async fn creator_publishing_contract_fixtures_create_content_lock() {
     let lock_id = body["lock_id"].as_str().unwrap();
     assert_eq!(
         body["content_lock_path"],
-        format!("/pub/locks.app/{lock_id}.json")
+        format!("/pub/app.locks/{lock_id}.json")
     );
     assert_eq!(
         body["content_lock"]["version"],
@@ -3099,7 +3507,7 @@ async fn creator_guarded_resources_registers_resource_when_enabled() {
     );
     assert_eq!(
         body["guarded_resource"]["path"],
-        "/priv/locks.app/content/example.txt"
+        "/priv/app.locks/content/example.txt"
     );
     assert_eq!(body["guarded_resource"]["content_type"], "text/plain");
     assert_eq!(body["guarded_resource"]["size"], 13);
@@ -3109,7 +3517,7 @@ async fn creator_guarded_resources_registers_resource_when_enabled() {
 
     let stored = state
         .guarded_resources()
-        .get_current_guarded_resource(&creator(), "/priv/locks.app/content/example.txt")
+        .get_current_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
         .await
         .unwrap()
         .unwrap();
@@ -3242,7 +3650,7 @@ async fn creator_content_locks_create_lock_for_registered_guarded_resource() {
     let body = response_json(response).await;
     let lock_id = body["lock_id"].as_str().unwrap();
     let path = body["content_lock_path"].as_str().unwrap();
-    assert!(path.starts_with("/pub/locks.app/"));
+    assert!(path.starts_with("/pub/app.locks/"));
     assert!(path.ends_with(".json"));
     assert!(path.contains(lock_id));
     assert_eq!(
@@ -3463,7 +3871,7 @@ async fn creator_authority_status_route_returns_authorized_status_without_secret
     assert_eq!(body["auth_kind"], "legacy_cookie");
     assert_eq!(
         body["granted_scopes"],
-        json!(["/pub/locks.app/:rw", "/priv/locks.app/:rw"])
+        json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
     );
     assert_eq!(body["session_expires_at"], Value::Null);
     assert!(!body.to_string().contains("creator-authority-secret"));
@@ -3621,7 +4029,7 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
     );
     let body = String::from_utf8(response_bytes(response).await).unwrap();
     assert!(body.contains("Enable Locks"));
-    assert!(body.contains("pubkyauth://fake-secret-flow-url"));
+    assert!(body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert!(body.contains("data-testid=\"pubky-auth-qr\""));
     assert!(body.contains("<svg"));
     assert!(body.contains("aria-label=\"Pubky authorization QR code\""));
@@ -3635,6 +4043,98 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
     assert!(!body.contains("frontend_session_token"));
     assert!(!body.contains("one-time-code"));
     assert_eq!(client.start_call_count(), 1);
+}
+
+#[tokio::test]
+async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow() {
+    let grant = Arc::new(FakeGrantConnectFlowClient);
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(grant);
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains("pubkyauth://signin_grant?secret=fake-grant"));
+    assert!(!body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
+}
+
+#[tokio::test]
+async fn grant_connect_shell_rejects_origin_allowed_only_for_legacy_connect() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config
+        .creator_authority_acquisition
+        .legacy_connect
+        .allowed_return_origins = vec!["https://legacy.example".to_owned()];
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Flegacy.example%2Fcallback&state=opaque-state",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+}
+
+#[tokio::test]
+async fn grant_connect_postmessage_completion_returns_only_state_and_code() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    seed_pending_grant_creator_connect_flow(
+        &state,
+        "grant-flow-postmessage",
+        "https://pubky.app/locks/connected",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "POST",
+            "/connect/grant-flow-postmessage/complete?delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["state"], "opaque-state");
+    assert!(body["code"].as_str().is_some_and(|code| !code.is_empty()));
+    assert_eq!(body.as_object().unwrap().len(), 2);
 }
 
 #[test]
@@ -3769,8 +4269,9 @@ async fn raw_creator_connect_flow_routes_are_never_mounted() {
         frontend_session_ttl_seconds: 86_400,
         frontend_session_code_ttl_seconds: 120,
         legacy_connect: crate::config::LegacyConnectAcquisitionConfig {
-            allowed_return_origins: Vec::new(),
+            allowed_return_origins: vec!["https://pubky.app".to_owned()],
         },
+        grant_connect: None,
     };
     let app = router(AppState::new_empty_in_memory(config));
 
@@ -3834,7 +4335,7 @@ async fn creator_lock_service_config_sets_pointer_when_enabled() {
         body["creator"],
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
-    assert_eq!(body["path"], "/pub/locks.app/config.json");
+    assert_eq!(body["path"], "/pub/app.locks/config.json");
     assert_eq!(body["lock_service_pointer"]["version"], 1);
     assert_eq!(
         body["lock_service_pointer"]["default_lock_server"],
@@ -3948,6 +4449,42 @@ fn test_state_with_rate_limit(enabled: bool, max_requests: u32, window_seconds: 
     AppState::new_empty_in_memory(config)
 }
 
+fn test_state_with_rate_limit_and_proxy_hops(
+    max_requests: u32,
+    trusted_proxy_hops: usize,
+) -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits = RateLimitsConfig {
+        trusted_proxy_hops,
+        verification_submission: VerificationSubmissionRateLimitConfig {
+            enabled: true,
+            max_requests,
+            window_seconds: 60,
+        },
+        ..RateLimitsConfig::default()
+    };
+    AppState::new_empty_in_memory(config)
+}
+
+fn test_state_with_paykit_lookup_proxy_hops(
+    max_requests: u32,
+    trusted_proxy_hops: usize,
+) -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.rate_limits.trusted_proxy_hops = trusted_proxy_hops;
+    config
+        .rate_limits
+        .paykit_connection_state_lookup
+        .max_requests = max_requests;
+    AppState::new_empty_in_memory_with_creator_repositories(
+        config,
+        Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+}
+
 fn test_state_with_paykit_lookup_admission(
     max_requests: u32,
     window_seconds: u64,
@@ -4058,6 +4595,7 @@ fn test_config(
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,
+            paykit_payment_retry_interval_seconds: std::num::NonZeroU64::new(3).unwrap(),
             claim_timeout_seconds: 60,
             worker_id: "test-worker".to_owned(),
         },
@@ -4135,10 +4673,17 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
     }
 }
 
+fn invoice_created_response() -> impl axum::response::IntoResponse {
+    Json(json!({
+        "invoice_created_at": "2026-09-25T11:00:00Z",
+        "payment_deadline": "2026-09-25T12:00:00Z"
+    }))
+}
+
 async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
-    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+    async fn invoice(State(calls): State<Arc<AtomicUsize>>) -> impl axum::response::IntoResponse {
         calls.fetch_add(1, Ordering::SeqCst);
-        StatusCode::NO_CONTENT
+        invoice_created_response()
     }
 
     let app = Router::new()
@@ -4152,9 +4697,27 @@ async fn spawn_counting_paykit_invoice(calls: Arc<AtomicUsize>) -> String {
     format!("http://{address}")
 }
 
+async fn spawn_paykit_invoice_error(status: StatusCode, body: Value) -> String {
+    async fn invoice(
+        State((status, body)): State<(StatusCode, Value)>,
+    ) -> impl axum::response::IntoResponse {
+        (status, Json(body))
+    }
+
+    let app = Router::new()
+        .route("/invoices", post(invoice))
+        .with_state((status, body));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}")
+}
+
 async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
     async fn invoice() -> impl axum::response::IntoResponse {
-        StatusCode::NO_CONTENT
+        invoice_created_response()
     }
     async fn connection_status(
         State(body): State<&'static str>,
@@ -4175,8 +4738,8 @@ async fn spawn_paykit_connection_status_body(body: &'static str) -> String {
 }
 
 async fn spawn_counting_paykit_connection_status(calls: Arc<AtomicUsize>) -> String {
-    async fn invoice() -> StatusCode {
-        StatusCode::NO_CONTENT
+    async fn invoice() -> impl axum::response::IntoResponse {
+        invoice_created_response()
     }
     async fn connection_status(
         State(calls): State<Arc<AtomicUsize>>,
@@ -4209,8 +4772,8 @@ async fn spawn_blocking_paykit_connection_status(
     started: Arc<Semaphore>,
     release: Arc<Notify>,
 ) -> String {
-    async fn invoice() -> StatusCode {
-        StatusCode::NO_CONTENT
+    async fn invoice() -> impl axum::response::IntoResponse {
+        invoice_created_response()
     }
     async fn connection_status(
         State(state): State<BlockingPaykitStatusState>,
@@ -4239,17 +4802,10 @@ async fn spawn_blocking_paykit_connection_status(
     format!("http://{address}")
 }
 
-async fn spawn_invoice_then_stalled_connection_status_body() -> String {
+async fn spawn_stalled_connection_status_body() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut invoice_socket, _) = listener.accept().await.unwrap();
-        invoice_socket
-            .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        drop(invoice_socket);
-
         let (mut connection_status_socket, _) = listener.accept().await.unwrap();
         connection_status_socket
             .write_all(
@@ -4441,7 +4997,7 @@ fn content_lock_for_creator(creator: CreatorPubky, satisfied: bool) -> ContentLo
         version: CONTENT_LOCK_VERSION,
         creator,
         primary_resource: Some(GuardedResource {
-            path: "/priv/locks.app/content/hello.txt".to_owned(),
+            path: "/priv/app.locks/content/hello.txt".to_owned(),
             hash: GuardedResourceHash::from_bytes([7; 32]),
             content_type: "text/plain".to_owned(),
             size: 13,
@@ -4513,8 +5069,8 @@ async fn seed_creator_authority(state: &AppState) {
             creator: creator(),
             auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
             granted_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             secret: CreatorAuthoritySecret::new("creator-authority-secret"),
             session_expires_at: None,
@@ -4538,11 +5094,38 @@ async fn seed_pending_creator_connect_flow(
             return_to: return_to.to_owned(),
             state: opaque_state.to_owned(),
             authorization_url: CreatorConnectAuthorizationUrl::new(
-                "pubkyauth://fake-secret-flow-url",
+                "pubkyauth://signin?secret=fake-secret-flow-url",
             ),
             requested_scopes: vec![
-                "/pub/locks.app/:rw".to_owned(),
-                "/priv/locks.app/:rw".to_owned(),
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
+            ],
+            created_at: now,
+            expires_at: now + time::Duration::minutes(5),
+        })
+        .await
+        .unwrap();
+}
+
+async fn seed_pending_grant_creator_connect_flow(
+    state: &AppState,
+    flow_id: &str,
+    return_to: &str,
+    opaque_state: &str,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    state
+        .creator_connect_flows()
+        .insert_pending_creator_connect_flow(PendingCreatorConnectFlowRecord {
+            flow_id: CreatorConnectFlowId::new(flow_id),
+            return_to: return_to.to_owned(),
+            state: opaque_state.to_owned(),
+            authorization_url: CreatorConnectAuthorizationUrl::new(
+                "pubkyauth://signin_grant?secret=fake-grant",
+            ),
+            requested_scopes: vec![
+                "/pub/app.locks/:rw".to_owned(),
+                "/priv/app.locks/:rw".to_owned(),
             ],
             created_at: now,
             expires_at: now + time::Duration::minutes(5),
@@ -4556,6 +5139,14 @@ struct FixedClock(time::OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> time::OffsetDateTime {
         self.0
+    }
+}
+
+struct ZeroInvoiceJitter;
+
+impl InvoiceRetryJitter for ZeroInvoiceJitter {
+    fn delay(&self, _attempt_count: u32) -> time::Duration {
+        time::Duration::ZERO
     }
 }
 
@@ -4578,7 +5169,7 @@ impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
         Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://fake-secret-flow-url",
+            "pubkyauth://signin?secret=fake-secret-flow-url",
         ))
     }
 
@@ -4593,6 +5184,54 @@ impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
     }
 }
 
+struct PanicLegacyConnectFlowClient;
+
+#[async_trait]
+impl LegacyCreatorConnectFlowClient for PanicLegacyConnectFlowClient {
+    async fn start_legacy_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        panic!("grant-connect mode must not start legacy cookie flow")
+    }
+
+    async fn await_legacy_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
+        panic!("grant-connect mode must not await legacy cookie flow")
+    }
+}
+
+struct FakeGrantConnectFlowClient;
+
+#[async_trait]
+impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
+    async fn start_grant_creator_connect_flow(
+        &self,
+        _requested_scopes: &[String],
+        _pop_key_id: &GrantPopKeyId,
+    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
+        Ok(CreatorConnectAuthorizationUrl::new(
+            "pubkyauth://signin_grant?secret=fake-grant",
+        ))
+    }
+
+    async fn await_grant_creator_connect_flow_approval(
+        &self,
+        _authorization_url: &CreatorConnectAuthorizationUrl,
+        _pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+        Ok(GrantCreatorConnectFlowApproval {
+            creator: creator(),
+            grant_state: CreatorAuthoritySecret::new("delegated-grant-state"),
+            granted_scopes: requested_scopes.to_vec(),
+            grant_expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        })
+    }
+}
+
 fn handle_request() -> Value {
     json!({ "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy", "bundle_id": BUNDLE_ID })
 }
@@ -4600,7 +5239,7 @@ fn handle_request() -> Value {
 fn legacy_json_guarded_resource_payload() -> Value {
     json!({
         "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
-        "path": "/priv/locks.app/content/example.txt",
+        "path": "/priv/app.locks/content/example.txt",
         "content_type": "text/plain",
         "content_base64": "Z3VhcmRlZCBieXRlcw==",
     })
@@ -4608,7 +5247,7 @@ fn legacy_json_guarded_resource_payload() -> Value {
 
 fn registered_guarded_resource_json() -> Value {
     serde_json::to_value(GuardedResource {
-        path: "/priv/locks.app/content/example.txt".to_owned(),
+        path: "/priv/app.locks/content/example.txt".to_owned(),
         hash: GuardedResourceHash::from_bytes([7; 32]),
         content_type: "text/plain".to_owned(),
         size: 13,
@@ -4701,6 +5340,19 @@ fn json_request_with_client_address(
         IpAddr::V4(Ipv4Addr::from(ip_octets)),
         12345,
     )));
+    request
+}
+
+fn json_request_through_proxy(
+    method: &str,
+    uri: &str,
+    body: Value,
+    forwarded_for: &str,
+) -> Request<Body> {
+    let mut request = json_request_with_client_address(method, uri, body, [10, 0, 0, 1]);
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", forwarded_for.parse().unwrap());
     request
 }
 

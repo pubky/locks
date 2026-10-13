@@ -35,10 +35,10 @@ The Lock Server has one non-production route family and one authenticated creato
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.
   - Returns only `ready`, `setup_required`, or `unavailable`.
-- Hosted legacy creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
+- Hosted creator connect/session routes: `GET /connect`, `POST /connect/{flow_id}/complete`, `POST /frontend-sessions`, `DELETE /frontend-sessions/current`
   - Mount when explicit `[creator_authority_acquisition].enabled = true`.
   - `DELETE /frontend-sessions/current` requires `Authorization: Bearer <frontend_session_token>` and revokes the current frontend session.
-  - `GET /connect` validates `return_to` against `[creator_authority_acquisition].allowed_return_origins` before starting a legacy flow.
+  - `GET /connect` validates `return_to` against the selected method's `allowed_return_origins` before starting a flow.
   - `POST /connect/{flow_id}/complete` completes the Lock-Server-owned flow, revalidates the stored `return_to`, and redirects with only `state` and one-time `code`.
 
 When gated routes are disabled, they are not mounted and return `404 Not Found`.
@@ -62,7 +62,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
 | `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
-| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. A new or unready `paykit-payment` lifecycle identity requires `[paykit]` runtime config; an exact ready replay does not. | No bearer secrets, invoice data, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `409 content_lock_deletion_in_progress`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `422 reader_pubky_unresolvable`, `429 rate_limited`, `502 paykit_invoice_creation_failed` |
+| `POST /proof-bundles` | `200` JSON lifecycle | Public viewer route. New `paykit-payment` submissions durably persist one pending invoice-admission task before any Reader/Paykit I/O; exact persisted replay returns same lifecycle. | No bearer secrets, invoice data, connection state, or raw proof material in response. | `400 invalid_request`, `409 task_state_conflict`, `409 content_lock_deletion_in_progress`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `429 rate_limited` |
 | `POST /verification-task-lookups` | `200` JSON lifecycle | Public viewer route. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found` |
 | `POST /paykit-connection-state-lookups` | `200` JSON Paykit-local connection state | Public viewer route bound to an existing `paykit-payment` task handle. | No arbitrary peer/path input, invoice data, payment status, or raw proof material. | `400 invalid_request`, `404 verification_task_not_found`, `422 not_paykit_payment`, `422 paykit_not_configured`, `429 rate_limited`, `502 paykit_connection_state_unavailable`, `504 paykit_connection_state_timeout` |
 | `POST /verification-task-completions` | `200` JSON lifecycle | Dev-only completion gate. | No bearer secrets in response. | `400 invalid_request`, `404 verification_task_not_found`, `409 task_state_conflict`, `404` when route gated off |
@@ -113,10 +113,9 @@ Stable error codes and statuses mirror `locks-server/src/api/errors.rs` tests:
 | `unsupported_verifier_type` | 422 | Proof references a verifier unavailable in the current runtime. |
 | `paykit_not_configured` | 422 | A `paykit-payment` proof was submitted to a Lock Server without a `[paykit]` runtime section. |
 | `not_paykit_payment` | 422 | Connection state was requested for a verification task that is not Paykit-backed. |
-| `reader_pubky_unresolvable` | 422 | A `paykit-payment` proof had a syntactically valid `reader_public_key` that could not be resolved to a Pubky homeserver/PKARR record before invoice creation. |
 | `rate_limited` | 429 | Submission or Paykit connection-state lookup exceeded configured admission limits. |
 | `payload_too_large` | 413 | Raw guarded-resource upload exceeded `[content_locks].max_resource_bytes`. |
-| `paykit_invoice_creation_failed` | 502 | Lock Server could not create or replay the Paykit invoice; no verification task is publicly admitted or worker-claimable. |
+
 | `paykit_connection_state_unavailable` | 502 | Paykit connection-state lookup failed or returned an invalid response. |
 | `paykit_connection_state_timeout` | 504 | Paykit connection-state lookup exceeded its whole-request deadline. |
 | `internal_error` | 500 | Unexpected server-side failure. |
@@ -143,30 +142,30 @@ The SDK should verify all three fields:
 
 The endpoint is public, always mounted, CORS-enabled, and must not return secrets or runtime storage details.
 
-## Legacy creator connect/session routes
+## Creator connect/session routes
 
-These routes are the current legacy-connect implementation of the Creator Authority Acquisition protocol.
+These routes implement Creator Authority Acquisition using the explicitly configured method. Production deployments should use `method = "grant-connect"`; this emits exactly one `signin_grant` QR/deeplink and never starts or falls back to cookie auth. `method = "legacy-connect"` remains an explicit compatibility mode.
 
-The hosted browser routes are mounted when `[creator_authority_acquisition].enabled = true` and `method = "legacy-connect"`:
+The hosted browser routes are mounted when `[creator_authority_acquisition].enabled = true`:
 
 - `GET /connect`
 - `POST /connect/{flow_id}/complete`
 - `POST /frontend-sessions`
 - `DELETE /frontend-sessions/current`
 
-The protocol proves the backend flow: the Lock Server owns the legacy Pubky auth flow, stores creator-granted homeserver authority as private runtime state, returns a one-time frontend code through the hosted shell callback, and exchanges that code for a Locks-local frontend session token. Authenticated Pubky-backed creator publishing routes consume those Locks-local frontend session tokens. ADR 0019 chooses a Lock-Server-hosted redirect/popup page as the human-facing legacy-connect shell. pubky.app-native QR/deeplink rendering is not allowed for legacy-connect because the legacy Pubky authorization URL is secret-bearing and must stay on the Lock Server origin.
+In grant mode, the Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, exact requested capability set, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and exact required scopes, including after a Postgres-backed restart. Restore uses the homeserver stored at approval time, so a creator who moves homeserver must reconnect. The persisted authorization URL identifies whether each pending flow is `signin` or `signin_grant`; changing acquisition method while a flow is pending therefore fails closed instead of completing it through the other mechanism. Legacy records fail closed in grant mode and require creator reconnection. Both methods preserve the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
 
 ### `GET /connect`
 
-Starts the human-facing Lock-Server-hosted legacy-connect shell.
+Starts the human-facing Lock-Server-hosted connect shell using the selected acquisition method.
 
 ```http
 GET /connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state
 ```
 
-`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition].allowed_return_origins`, unless the operator explicitly configured wildcard mode with `allowed_return_origins = ["*"]`. The Lock Server validates this before starting the Pubky auth flow.
+`return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition.grant_connect].allowed_return_origins` in grant mode or `[creator_authority_acquisition.legacy_connect].allowed_return_origins` in legacy mode. Grant mode requires at least one grant-specific origin and does not fall back to legacy or top-level origins. Outside production, an explicit wildcard may admit the concrete `return_to` origin. The Lock Server validates this before starting Pubky auth.
 
-Success returns `200 text/html; charset=utf-8`. The HTML intentionally contains the secret-bearing Pubky authorization QR SVG, deeplink, and raw fallback text, but only on the Lock Server origin.
+Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and a touch-device deeplink button on the Lock Server origin. In grant mode its URL host is `signin_grant`; no cookie-auth URL is generated.
 
 The HTML form posts back to:
 
@@ -176,12 +175,14 @@ POST /connect/{flow_id}/complete
 
 ### `POST /connect/{flow_id}/complete`
 
-Completes the pending Lock-Server-owned legacy auth flow, stores creator authority, issues a one-time frontend-session code, revalidates the stored `return_to`, and redirects back to pubky.app:
+Completes the pending Lock-Server-owned auth flow, stores creator authority, issues a one-time frontend-session code, revalidates the stored `return_to`, and redirects back to pubky.app:
 
 ```http
 303 See Other
 Location: https://pubky.app/locks/callback?state=opaque-state&code=<one-time-code>
 ```
+
+Approval/retrieval errors leave the pending flow available for bounded client retry. After approval succeeds, completion atomically consumes the pending flow before the creator-authority and one-time-code stores are updated, preventing concurrent completion from issuing two codes. Those final two writes are not one cross-store transaction: a storage failure after flow consumption can require a new connect flow and can leave already-validated creator authority stored without a frontend code. It cannot make unvalidated authority usable.
 
 The callback URL carries only `state` and `code`. It must not contain `authorization_url`, `pubkyauth`, creator-authority session material, or frontend session tokens. pubky.app then calls `POST /frontend-sessions` with the code and state.
 
@@ -255,7 +256,7 @@ Authorized response:
   "creator": "pubkycreator123",
   "authorized": true,
   "auth_kind": "legacy_cookie",
-  "granted_scopes": ["/pub/locks.app/:rw", "/priv/locks.app/:rw"],
+  "granted_scopes": ["/pub/app.locks/:rw", "/priv/app.locks/:rw"],
   "session_expires_at": null
 }
 ```
@@ -275,11 +276,11 @@ Returns whether the authenticated Creator already has usable authority configure
 Server. Creator identity comes only from the Locks frontend session.
 
 ```http
-GET /creator/paykit/setup-status
+GET /creator/paykit/setup-status?asset=USD
 Authorization: Bearer <frontend_session_token>
 ```
 
-The request has no query parameters and no body. Success is always a closed one-field object:
+The required `asset` query parameter is `BTC`, `USD`, or `USDT`, matching the invoice denomination. Other query fields and a request body are rejected. Readiness covers authority and a receiving method usable for that denomination; USDT address sharing remains optional for Bitcoin-only creators. Success is always a closed one-field object:
 
 ```json
 {"status":"ready"}
@@ -312,7 +313,7 @@ Creator publishing routes always use Pubky homeserver-backed repositories. Calle
 
 Response-shape fixture: `locks-server/tests/fixtures/creator_publishing/register_guarded_resource_response_shape.json`
 
-Registers or replaces the current guarded resource bytes for the authenticated creator and decoded relative content path. The server reconstructs the canonical private guarded resource path as `/priv/locks.app/content/<path>`. With Pubky-backed repositories, it writes bytes to the creator homeserver under that path.
+Registers or replaces the current guarded resource bytes for the authenticated creator and decoded relative content path. The server reconstructs the canonical private guarded resource path as `/priv/app.locks/content/<path>`. With Pubky-backed repositories, it writes bytes to the creator homeserver under that path.
 
 #### Request
 
@@ -329,7 +330,7 @@ The request body is raw resource bytes, not JSON. `Content-Type` is required and
 Path rules:
 
 - MUST be non-empty after percent-decoding.
-- MUST be relative to `/priv/locks.app/content/`; callers supply only the relative path, not the full private path.
+- MUST be relative to `/priv/app.locks/content/`; callers supply only the relative path, not the full private path.
 - MAY contain nested slash-separated segments.
 - MUST NOT start with `/`.
 - MUST NOT contain `..` traversal segments, including encoded traversal.
@@ -344,7 +345,7 @@ Upload size is limited by `[content_locks].max_resource_bytes` and defaults to 1
 {
   "creator": "pubkycreator123",
   "guarded_resource": {
-    "path": "/priv/locks.app/content/example.txt",
+    "path": "/priv/app.locks/content/example.txt",
     "hash": "<guarded_resource_hash>",
     "content_type": "text/plain",
     "size": 13
@@ -402,7 +403,7 @@ Creates or replaces a content lock from a resource set. A content lock may conta
 - `primary_resource`: optional full [`GuardedResource`](#success-response) descriptor.
 - `secondary_resources`: optional map keyed by full canonical private path. Values contain `hash`, `content_type`, and `size` only.
 
-At least one resource is required. If a primary resource is present, its path must not also appear in `secondary_resources`. `secondary_resources` keys are full canonical private paths such as `/priv/locks.app/content/attachments/a.txt`.
+At least one resource is required. If a primary resource is present, its path must not also appear in `secondary_resources`. `secondary_resources` keys are full canonical private paths such as `/priv/app.locks/content/attachments/a.txt`.
 
 With Pubky-backed repositories, this writes the public content lock JSON to the creator homeserver under its derived `content_lock_path`. Before external publication, Locks persists an opaque per-lock publication intent under the same PostgreSQL fence used by graceful deletion and force-receipt establishment. Deletion cannot start while that intent exists; force therefore cannot report permanent deletion and then lose a race to a late Pubky write. After an upsert error, Locks reads the canonical path: an exact expected lock is reconciled as published, proven absence permits reservation compensation, and a mismatched payload or failed read retains both ownership and intent for fail-closed operator reconciliation. The intent is removed only after path ownership is durably marked published or safely compensated. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
@@ -426,13 +427,13 @@ Every referenced guarded resource must currently exist for the same creator/path
 ```json
 {
   "primary_resource": {
-    "path": "/priv/locks.app/content/post.json",
+    "path": "/priv/app.locks/content/post.json",
     "hash": "<primary_hash>",
     "content_type": "application/json",
     "size": 123
   },
   "secondary_resources": {
-    "/priv/locks.app/content/attachments/a.txt": {
+    "/priv/app.locks/content/attachments/a.txt": {
       "hash": "<attachment_hash>",
       "content_type": "text/plain",
       "size": 13
@@ -463,18 +464,18 @@ Every referenced guarded resource must currently exist for the same creator/path
 ```json
 {
   "lock_id": "<lock_id>",
-  "content_lock_path": "/pub/locks.app/<lock_id>.json",
+  "content_lock_path": "/pub/app.locks/<lock_id>.json",
   "content_lock": {
     "version": 1,
     "creator": "pubkycreator123",
     "primary_resource": {
-      "path": "/priv/locks.app/content/post.json",
+      "path": "/priv/app.locks/content/post.json",
       "hash": "<primary_hash>",
       "content_type": "application/json",
       "size": 123
     },
     "secondary_resources": {
-      "/priv/locks.app/content/attachments/a.txt": {
+      "/priv/app.locks/content/attachments/a.txt": {
         "hash": "<attachment_hash>",
         "content_type": "text/plain",
         "size": 13
@@ -521,9 +522,9 @@ Fixtures:
 - Request: `locks-server/tests/fixtures/creator_publishing/set_lock_service_config_request.json`
 - Response shape: `locks-server/tests/fixtures/creator_publishing/set_lock_service_config_response_shape.json`
 
-Stores or replaces the creator's default Lock Service Pointer for the canonical Pubky path `/pub/locks.app/config.json`.
+Stores or replaces the creator's default Lock Service Pointer for the canonical Pubky path `/pub/app.locks/config.json`.
 
-With Pubky-backed repositories, this writes the pointer JSON to the creator homeserver at `/pub/locks.app/config.json`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
+With Pubky-backed repositories, this writes the pointer JSON to the creator homeserver at `/pub/app.locks/config.json`. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
 Content lock creation does not require a Lock Service Pointer. A content lock may carry `lock_server.override`; future viewer discovery can use the pointer when no override exists.
 
@@ -540,7 +541,7 @@ Content lock creation does not require a Lock Service Pointer. A content lock ma
 ```json
 {
   "creator": "pubkycreator123",
-  "path": "/pub/locks.app/config.json",
+  "path": "/pub/app.locks/config.json",
   "lock_service_pointer": {
     "version": 1,
     "default_lock_server": "pubkyserver123",
@@ -573,7 +574,7 @@ Request envelope:
   "submitted_proof_bundle": {
     "version": 1,
     "bundle_id": "<bundle_id>",
-    "pubky_lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
+    "pubky_lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
     "reader_public_key": "pubky<reader>",
     "proofs": [
       {
@@ -590,17 +591,23 @@ Success response returns lifecycle metadata only. It does not return connection 
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting and validates the closed proof shape before checking the permanent lifecycle identity `{ creator, bundle_id }`. With PostgreSQL runtime storage, exact persisted binding is classified before mutable lock lookup or reader discovery. An exact ready replay returns the existing lifecycle without calling Paykit; an exact unready replay requires `[paykit]` and repeats the idempotent invoice request from the persisted submission fields; changed submitted proof material returns `409 task_state_conflict`. Only a genuinely new identity loads and validates the current canonical content lock, verifies its lock identity and payment policy (including recipient/creator equality), resolves `reader_public_key` through Pubky/PKARR/homeserver discovery, and requires `[paykit]`. Locks then atomically persists a hidden, unclaimable admission reservation before calling `POST /invoices`; Paykit success makes that task publicly visible and worker-claimable. The signed Paykit invoice body is exactly:
+Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
+
+A claimed background worker sends the persisted body below to Paykit `POST /invoices`, using the task UUID as stable `X-Request-ID` for exact Paykit replay after an ambiguous response or process restart:
 
 ```json
 {
   "bundle_id": "<bundle_id>",
-  "lock_resource": "pubky<creator>/pub/locks.app/<lock_id>.json",
+  "lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
   "reader": "pubky<reader>"
 }
 ```
 
-Any 2xx Paykit invoice response is accepted and its body is ignored. With PostgreSQL runtime storage, Locks first commits an internal, unclaimable admission reservation serialized against deletion start. It calls Paykit only after that commit, then makes the task publicly visible and worker-claimable after Paykit accepts the invoice. Durable handle replay is classified before consulting the mutable public lock or reader discovery: exact ready replay returns the persisted lifecycle, exact unready replay resumes the same idempotent Paykit request from persisted fields, and changed replay conflicts. Graceful deletion snapshots these reservations and cannot start the Paykit drain until every snapshotted reservation is ready, so Paykit has durably created every pre-cutoff invoice before its drain fence activates. Paykit invoice `409 Conflict` maps to `409 task_state_conflict`. Other invoice failures return `502 paykit_invoice_creation_failed`; the internal reservation remains hidden and unclaimable for exact retry.
+Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks validates the response, marks invoice admission ready with the exact live claim token, then leaves existing payment-status/outbox processing unchanged. No entitlement can be issued before admission is ready.
+
+Transport errors, typed Reader setup/registry failures (including malformed or oversized registry data), `429`, and every `5xx` response schedule durable full-jitter retry (2-second initial cap, then exponential caps through 60 seconds) without extending the DB-owned 10-minute admission deadline. Numeric `Retry-After` is clamped to 60 seconds. `409 reader_not_payable` maps to `reader is not payable`; `409 invoice_conflict` maps to `paykit invoice conflict`; any other `409` and other terminal Paykit admission errors map to `paykit invoice admission failed`. A status-only `409` (no typed code, such as Paykit `creator_session_invalid`) is a terminal creator-side failure: it is not retried, and the purchase ends on the first attempt. `400` remains terminal. Deadline expiry maps to `invoice admission deadline exceeded`; it bounds when new Paykit attempts start, so a claim taken before the deadline is not cut off by it. If Paykit's `200` for such a claim arrives after the deadline but while the claim lease is still live, the admission still becomes ready, because Paykit has already created the invoice and durably queued its delivery to the Reader's wallet. A late `200` whose lease was lost, or whose claim token was superseded, is dropped. These four messages are the closed invoice-admission failure vocabulary; every failure is worker-owned and issues no entitlement.
+
+Task insertion and deletion start serialize on one per-lock database fence. If task insertion commits first, deletion snapshots it; if deletion commits first, a genuinely new task returns `409 content_lock_deletion_in_progress`. Exact pre-cutoff replay remains available after tombstoning. A deletion job cannot start Paykit draining while any snapshotted task remains `invoice_pending`.
 
 ### `POST /paykit-connection-state-lookups`
 
@@ -616,13 +623,19 @@ This lookup is independent from verification lifecycle. `connected` does not mea
 
 Locks limits this public outbound proxy independently from proof submission. Default admission is 60 requests per 60 seconds for each `(client IP, creator, bundle_id)` plus 16 concurrent outbound Paykit status requests process-wide. Fixed-window rejection includes `Retry-After`; either limit returns `429 rate_limited` before another Paykit request is sent.
 
-Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /transactions/status` with `X-Paykit-Signature` over those exact canonical body bytes. Valid response statuses are `undetected`, `detected`, and `confirmed`. Transport failures, timeouts, every non-2xx response (including `404` and authentication/authorization failures), and malformed success bodies are durably rescheduled as pending and are not retried again before the worker poll interval elapses. V1 has no terminal Paykit payment-failure status.
+Paykit status verification is worker-owned. The Lock Server sends canonical JSON `{ "creator": "pubky...", "bundle_id": "..." }` to `POST /payment-requests/status`. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body`; body-only signatures are unsupported. The closed response keeps `request_state` (`proposed`, `proposal_expired`, `accepted`, `rejected`, `canceled`, `proof_submitted`, `active_recurring`) separate from `payment_state` (`undetected`, `detected`, `confirmed`, `expired`) and includes `invoice_created_at`, `payment_deadline`, and nullable `bitcoin` and `usdt_arbitrum` observations. Each observation contains `confirmations`, `amount_matched`, and `paid_on_time`; USDT also reports `finalized`. Amount and timing must qualify on the same rail. Bitcoin uses the configured confirmation threshold; USDT unlocks after verified successful Arbitrum inclusion, without waiting for `finalized`. No raw transaction hash or payer claim can grant access. Locks validates timestamp syntax and strict ordering but never infers expiry from its local clock.
+
+Rejected, canceled, proposal-expired, and payment-expired attempts return lifecycle `status: "expired"` with `terminal_reason` equal to `payment_request_rejected`, `payment_request_canceled`, `proposal_expired`, or `payment_deadline_expired`. Such responses have `failure_message: null`, issue no entitlement, and are not retried. Transport failures, timeouts, response-body read failures, and every non-`200` response remain no-entitlement and retryable; `409 Conflict` is preserved as an operator-visible conflict. A `200` response with malformed JSON, missing or unknown fields, an unknown state, an oversized body, or invalid or misordered timestamps is a permanent contract failure: the worker transitions the attempt to `failed` with a viewer-safe `failure_message` and no entitlement. `failed` remains distinct from payment-lifecycle `expired`, but both are terminal for that Bundle ID; another attempt requires a new Bundle ID.
 
 Rate limiting, when enabled, returns `429 rate_limited` with the stable error envelope.
 
 ### `POST /verification-task-lookups`
 
 Looks up lifecycle metadata by public handle `{ creator, bundle_id }` using a JSON body. Bundle ID is bearer-secret-like, so it is not placed in URL paths or query strings.
+
+Lifecycle responses include nullable `status_message` and `admission_deadline_at`. While invoice admission is pending, `admission_deadline_at` exposes the persisted DB-owned RFC 3339 cutoff; clients may use it to distinguish ordinary progress from an overdue/stalled worker, but must keep polling because only the worker may persist terminal failure. It becomes `null` after admission reaches ready or failed. Compare against a server-synchronized clock: DB time owns enforcement, so host/browser clock skew can make a local countdown approximate.
+
+While invoice admission is durably retrying `reader_setup_pending` or malformed/oversized Reader registry data, `status_message` is `"Reader wallet setup needed"`; clients should show that safe message and continue polling the existing task. Once observed, this reason remains sticky across unrelated transient retries until admission becomes ready or failed. Other states use `null`. Neither projection implies entitlement, invoice readiness, worker execution, or synthetic failure.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
 
@@ -654,7 +667,7 @@ Response includes the raw credential exactly once. Polling routes never return c
 
 ### `GET /priv-resources/content/<path>`
 
-Proxy-reads one guarded resource from the content lock authorized by a bearer credential. The `<path>` segment is the same relative path used for upload; the server reconstructs `/priv/locks.app/content/<path>` and verifies that path is in the credential's content lock resource set before reading bytes.
+Proxy-reads one guarded resource from the content lock authorized by a bearer credential. The `<path>` segment is the same relative path used for upload; the server reconstructs `/priv/app.locks/content/<path>` and verifies that path is in the credential's content lock resource set before reading bytes.
 
 Credentials are accepted only through:
 

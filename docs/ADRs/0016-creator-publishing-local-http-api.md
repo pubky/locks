@@ -22,7 +22,7 @@ POST /creator/content-locks
 POST /creator/lock-service-config
 ```
 
-`POST /creator/priv-resources` and `POST /creator/content-locks` form the two-step guarded-resource/content-lock publishing flow. `POST /creator/lock-service-config` stores the creator default Lock Service Pointer whose canonical future Pubky path is `/pub/locks.app/config.json`.
+`POST /creator/priv-resources` and `POST /creator/content-locks` form the two-step guarded-resource/content-lock publishing flow. `POST /creator/lock-service-config` stores the creator default Lock Service Pointer whose canonical future Pubky path is `/pub/app.locks/config.json`.
 
 These routes are mounted only in dev/test runtime when an explicit creator-publishing flag is enabled. Production mode must refuse to expose them. The routes are unauthenticated in the local skeleton; do not add fake shared-secret auth or admin tokens. Real creator authorization remains a future Pubky capability/session concern.
 
@@ -32,7 +32,7 @@ These routes are mounted only in dev/test runtime when an explicit creator-publi
 
 ```json
 {
-  "path": "/priv/locks.app/content/example.txt",
+  "path": "/priv/app.locks/content/example.txt",
   "hash": "<guarded_resource_hash>",
   "content_type": "text/plain",
   "size": 5
@@ -47,7 +47,7 @@ These routes are mounted only in dev/test runtime when an explicit creator-publi
 
 `POST /creator/content-locks` creates a content lock for an already-registered guarded resource. The local use case verifies the referenced guarded resource currently exists for the creator and that path, hash, content type, and size match before storing the content lock. Content lock identity remains derived from canonical JSON: identical content lock creation is idempotent, while changed content creates a different lock ID and content lock path.
 
-`/pub/locks.app/config.json` is the creator-owned default Locks config path, represented locally by a Locks-native `LockServicePointer` spec object. The local `POST /creator/lock-service-config` route stores the creator default Lock Server pointer. Content lock creation does not require this config to exist: content locks may use `lock_server.override`; when no override is present, viewer discovery depends on the creator's Lock Service Pointer.
+`/pub/app.locks/config.json` is the creator-owned default Locks config path, represented locally by a Locks-native `LockServicePointer` spec object. The local `POST /creator/lock-service-config` route stores the creator default Lock Server pointer. Content lock creation does not require this config to exist: content locks may use `lock_server.override`; when no override is present, viewer discovery depends on the creator's Lock Service Pointer.
 
 Proxy-read returns raw guarded resource bytes and uses the stored guarded resource `content_type` for the HTTP `Content-Type` header. Successful proxy-read remains a byte response, not JSON/base64.
 
@@ -65,7 +65,7 @@ Proxy-read returns raw guarded resource bytes and uses the stored guarded resour
 ## Deferred
 
 - Real creator authentication/authorization through Pubky capability grants.
-- Pubky-backed writes under `/priv/locks.app/content/` and `/pub/locks.app/`.
+- Pubky-backed writes under `/priv/app.locks/content/` and `/pub/app.locks/`.
 - Multipart or streaming uploads.
 - Range requests and content disposition.
 - Separate published `pubky-lock-specs` crate or npm/WASM package.

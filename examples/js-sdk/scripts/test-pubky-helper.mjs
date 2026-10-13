@@ -14,7 +14,8 @@ const homeserver = { id: 'homeserver' };
       return expectedSession;
     },
     pkdns: {
-      publishHomeserverForce: async (...args) => calls.push(['publish', ...args]),
+      publishHomeserverIfStale: async (...args) => calls.push(['publish', ...args]),
+      free: () => calls.push(['free']),
     },
     signinCookieBlocking: async () => {
       calls.push(['signin']);
@@ -35,7 +36,8 @@ const homeserver = { id: 'homeserver' };
       throw new Error('HTTP 409 Conflict');
     },
     pkdns: {
-      publishHomeserverForce: async (...args) => calls.push(['publish', ...args]),
+      publishHomeserverIfStale: async (...args) => calls.push(['publish', ...args]),
+      free: () => calls.push(['free']),
     },
     signinCookieBlocking: async () => {
       calls.push(['signin']);
@@ -47,6 +49,7 @@ const homeserver = { id: 'homeserver' };
   assert.deepEqual(calls, [
     ['signup', homeserver, null],
     ['publish', homeserver],
+    ['free'],
     ['signin'],
   ]);
 }

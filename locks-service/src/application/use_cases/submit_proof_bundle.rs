@@ -1,8 +1,13 @@
 use locks_core::verification::SubmittedProofBundle;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
-use crate::application::ports::{Clock, VerificationTaskIdGenerator, VerificationTaskRepository};
+use crate::application::models::{
+    INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, VerificationTaskRecord,
+    VerificationTaskStatus,
+};
+use crate::application::ports::{
+    Clock, InvoiceAdmissionRepository, VerificationTaskIdGenerator, VerificationTaskRepository,
+};
 use crate::application::use_cases::get_verification_task::VerificationTaskLifecycleView;
 
 /// Request to create a server-owned verification task from submitted proof material.
@@ -70,7 +75,22 @@ impl<'a> SubmitProofBundleUseCase<'a> {
         if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
             return Ok(existing);
         }
-        let task = self.prepare_task(submitted_proof_bundle).await?;
+        let creator = submitted_proof_bundle.pubky_lock_resource.creator().clone();
+
+        let task_id = self.task_ids.generate_task_id().await?;
+        let submitted_at = self.clock.now();
+        let task = VerificationTaskRecord {
+            task_id,
+            creator,
+            submitted_proof_bundle,
+            status: VerificationTaskStatus::Pending,
+            submitted_at,
+            started_at: None,
+            completed_at: None,
+            failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        };
 
         match self.tasks.insert_verification_task(task.clone()).await {
             Ok(()) => Ok(VerificationTaskLifecycleView::from(task)),
@@ -97,21 +117,46 @@ impl<'a> SubmitProofBundleUseCase<'a> {
         }
     }
 
-    /// Builds a new pending task without persisting it.
-    pub async fn prepare_task(
+    /// Creates or finds a durable Paykit invoice-admission task.
+    pub async fn execute_invoice_pending(
         &self,
-        submitted_proof_bundle: SubmittedProofBundle,
-    ) -> Result<VerificationTaskRecord, ApplicationError> {
-        Ok(VerificationTaskRecord {
+        request: SubmitProofBundleRequest,
+        admissions: &dyn InvoiceAdmissionRepository,
+    ) -> Result<SubmittedVerificationTask, ApplicationError> {
+        let submitted_proof_bundle = request.submitted_proof_bundle;
+        if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
+            return Ok(existing);
+        }
+        let creator = submitted_proof_bundle.pubky_lock_resource.creator().clone();
+        let reader = submitted_proof_bundle
+            .reader_public_key
+            .clone()
+            .ok_or(ApplicationError::InvalidPaykitPaymentSubmission)?;
+        let task = VerificationTaskRecord {
             task_id: self.task_ids.generate_task_id().await?,
-            creator: submitted_proof_bundle.pubky_lock_resource.creator().clone(),
-            submitted_proof_bundle,
-            status: VerificationTaskStatus::Pending,
+            creator: creator.clone(),
             submitted_at: self.clock.now(),
+            submitted_proof_bundle: submitted_proof_bundle.clone(),
+            status: VerificationTaskStatus::Pending,
             started_at: None,
             completed_at: None,
             failure_message: None,
-        })
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        };
+        let admission = admissions
+            .insert_invoice_pending_task(
+                task,
+                InvoiceAdmissionIntentV1 {
+                    version: INVOICE_ADMISSION_INTENT_VERSION,
+                    creator,
+                    bundle_id: submitted_proof_bundle.bundle_id,
+                    lock_resource: submitted_proof_bundle.pubky_lock_resource,
+                    reader,
+                },
+            )
+            .await?;
+        Ok(VerificationTaskLifecycleView::from(admission.task))
     }
 }
 
@@ -130,6 +175,7 @@ mod tests {
     use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 
     use super::*;
+    use crate::application::models::VerificationTerminalReason;
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
@@ -200,6 +246,52 @@ mod tests {
         assert_eq!(task_ids.generate_count(), 0);
         assert_eq!(tasks.insert_count(), 0);
         assert_eq!(tasks.update_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_attempt_requires_fresh_bundle_id_to_create_new_lifecycle() {
+        let existing = verification_task_with_bundle(submitted_proof_bundle())
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap()
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                datetime!(2026-05-29 12:02:00 UTC),
+            )
+            .unwrap();
+        let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+        let tasks = CapturingTaskRepository::with_existing(existing);
+        let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+        let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+
+        let same_attempt = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: submitted_proof_bundle(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(same_attempt.status, VerificationTaskStatus::Expired);
+        assert_eq!(task_ids.generate_count(), 0);
+        assert_eq!(tasks.insert_count(), 0);
+
+        let fresh_bundle_id = BundleId::from_bytes([1; 16]);
+        let mut fresh_submission = submitted_proof_bundle();
+        fresh_submission.bundle_id = fresh_bundle_id.clone();
+
+        let result = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: fresh_submission,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.bundle_id, fresh_bundle_id);
+        assert_eq!(result.status, VerificationTaskStatus::Pending);
+        assert_eq!(task_ids.generate_count(), 1);
+        assert_eq!(tasks.insert_count(), 1);
     }
 
     #[tokio::test]
@@ -288,7 +380,7 @@ mod tests {
             version: SUBMITTED_PROOF_BUNDLE_VERSION,
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/{LOCK_ID}.json"
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
             ))
             .unwrap(),
             reader_public_key: None,
@@ -312,6 +404,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
         }
     }
 

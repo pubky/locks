@@ -5,10 +5,12 @@ use sqlx::PgPool;
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedVerificationTask, VerificationTaskRecord, VerificationTaskStatus,
+    VerificationTerminalReason,
 };
 use crate::application::ports::VerificationTaskClaimer;
 use crate::infrastructure::postgres::verification_tasks::{
     VERIFICATION_TASK_ROW_COLUMNS, VerificationTaskRow, row_to_task, status_to_database,
+    verified_proof_bundle_to_json,
 };
 
 /// Postgres-backed worker lease claimer for verification tasks.
@@ -36,9 +38,9 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
         let sql = format!(
             "UPDATE verification_tasks
             SET
-                status = 'in_progress',
+                status = CASE WHEN status = 'pending' THEN 'in_progress' ELSE status END,
                 claimed_by = $1,
-                claim_expires_at = $2,
+                claim_expires_at = clock_timestamp() + ($2 - $3),
                 claim_token = $4,
                 next_attempt_at = NULL,
                 started_at = COALESCE(started_at, $3),
@@ -48,15 +50,12 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                 SELECT task_id
                 FROM verification_tasks
                 WHERE ((status = 'pending'
-                        AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
-                       OR (status = 'in_progress' AND claim_expires_at < $3))
-                  AND NOT EXISTS (
-                      SELECT 1 FROM paykit_task_admissions
-                      WHERE verification_task_id = verification_tasks.task_id
-                        AND ready = FALSE
-                  )
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
+                       OR (status IN ('in_progress', 'publishing_entitlement')
+                           AND claim_expires_at <= clock_timestamp()))
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
+                  AND invoice_admission_phase = 'ready'
                 ORDER BY submitted_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -95,14 +94,14 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                 claimed_by = NULL,
                 claim_token = NULL,
                 claim_expires_at = NULL,
-                next_attempt_at = $5,
+                next_attempt_at = clock_timestamp() + ($5 - $4),
                 last_attempt_error = NULL,
                 updated_at = $4
             WHERE task_id = $1::uuid
               AND status = 'in_progress'
               AND claimed_by = $2
               AND claim_token = $3
-              AND claim_expires_at >= $4
+              AND claim_expires_at > clock_timestamp()
             RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -127,31 +126,46 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
         if !matches!(
             task.status,
-            VerificationTaskStatus::Completed
+            VerificationTaskStatus::PublishingEntitlement
+                | VerificationTaskStatus::Completed
                 | VerificationTaskStatus::Failed
                 | VerificationTaskStatus::Expired
         ) {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "claimed task transition must be terminal".to_owned(),
+                message: "claimed task transition must publish or terminalize".to_owned(),
             });
         }
+        let expected_status = match task.status {
+            VerificationTaskStatus::PublishingEntitlement => "in_progress",
+            VerificationTaskStatus::Completed => "publishing_entitlement",
+            VerificationTaskStatus::Failed | VerificationTaskStatus::Expired => "in_progress",
+            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress => unreachable!(),
+        };
+        let entitlement_to_publish = task
+            .entitlement_to_publish
+            .as_ref()
+            .map(verified_proof_bundle_to_json)
+            .transpose()?;
+        let retain_claim = task.status == VerificationTaskStatus::PublishingEntitlement;
         let sql = format!(
             "UPDATE verification_tasks
              SET status = $5,
                  started_at = $6,
                  completed_at = $7,
                  failure_message = $8,
-                 claimed_by = NULL,
-                 claim_token = NULL,
-                 claim_expires_at = NULL,
+                 terminal_reason = $9,
+                 entitlement_to_publish = $10,
+                 claimed_by = CASE WHEN $11 THEN claimed_by ELSE NULL END,
+                 claim_token = CASE WHEN $11 THEN claim_token ELSE NULL END,
+                 claim_expires_at = CASE WHEN $11 THEN claim_expires_at ELSE NULL END,
                  next_attempt_at = NULL,
                  last_attempt_error = NULL,
                  updated_at = $4
              WHERE task_id = $1::uuid
-               AND status = 'in_progress'
+               AND status = $12
                AND claimed_by = $2
                AND claim_token = $3
-               AND claim_expires_at >= $4
+               AND claim_expires_at > clock_timestamp()
              RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -163,6 +177,10 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
             .bind(task.started_at)
             .bind(task.completed_at)
             .bind(task.failure_message)
+            .bind(task.terminal_reason.map(VerificationTerminalReason::as_str))
+            .bind(entitlement_to_publish)
+            .bind(retain_claim)
+            .bind(expected_status)
             .fetch_optional(&self.pool)
             .await
             .map_err(storage_error)?;
@@ -186,11 +204,19 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+        VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+    };
 
     use super::PostgresVerificationTaskClaimer;
-    use crate::application::models::{VerificationTaskRecord, VerificationTaskStatus};
-    use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
+    use crate::application::models::{
+        INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, VerificationTaskRecord,
+        VerificationTaskStatus, VerificationTerminalReason,
+    };
+    use crate::application::ports::{
+        InvoiceAdmissionRepository, VerificationTaskClaimer, VerificationTaskRepository,
+    };
     use crate::infrastructure::postgres::testing::TestDatabase;
     use crate::infrastructure::postgres::verification_tasks::PostgresVerificationTaskRepository;
 
@@ -236,46 +262,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paykit_reservation_is_not_claimable_until_marked_ready() {
-        use crate::infrastructure::postgres::PostgresPaykitTaskAdmissionRepository;
-
+    async fn invoice_pending_task_is_claimable_only_for_invoice_admission() {
         let database = TestDatabase::create().await;
-        let claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
-        let admissions = PostgresPaykitTaskAdmissionRepository::new(database.pool().clone());
-        let pending = task(
-            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d15",
+        let repository = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let verification_claimer = PostgresVerificationTaskClaimer::new(database.pool().clone());
+        let mut pending = task(
+            "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",
             VerificationTaskStatus::Pending,
             datetime!(2026-05-29 12:00:00 UTC),
         );
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        pending.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+        let intent = InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: pending.creator.clone(),
+            bundle_id: pending.submitted_proof_bundle.bundle_id.clone(),
+            lock_resource: pending.submitted_proof_bundle.pubky_lock_resource.clone(),
+            reader,
+        };
+        repository
+            .insert_invoice_pending_task(pending.clone(), intent)
+            .await
+            .unwrap();
 
-        let first = admissions.reserve(pending.clone()).await.unwrap();
-        assert!(first.requires_paykit);
-        assert!(
-            claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let replay = admissions.reserve(pending.clone()).await.unwrap();
-        assert!(replay.requires_paykit);
-        assert_eq!(replay.task, pending);
-
-        admissions.mark_ready(&pending).await.unwrap();
-        let ready_replay = admissions.reserve(pending.clone()).await.unwrap();
-        assert!(!ready_replay.requires_paykit);
-        assert_eq!(ready_replay.task, pending);
         assert_eq!(
-            claimer
-                .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
+            verification_claimer
+                .claim_next_verification_task("verification-worker", NOW, CLAIM_EXPIRES_AT)
                 .await
-                .unwrap()
-                .unwrap()
-                .task
-                .task_id,
-            pending.task_id
+                .unwrap(),
+            None
         );
+        let admission = repository
+            .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .expect("invoice-pending task is eligible for admission work");
+        assert_eq!(admission.admission.task.task_id, pending.task_id);
 
         database.cleanup().await;
     }
@@ -429,6 +453,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        mark_claim_expired(database.pool(), &pending.task_id).await;
         let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
         let second = claimer
             .claim_next_verification_task(
@@ -481,12 +506,16 @@ mod tests {
             VerificationTaskStatus::Pending,
             datetime!(2026-05-29 12:00:00 UTC),
         );
-        repository.insert_verification_task(pending).await.unwrap();
+        repository
+            .insert_verification_task(pending.clone())
+            .await
+            .unwrap();
         let first = claimer
             .claim_next_verification_task("worker-a", NOW, CLAIM_EXPIRES_AT)
             .await
             .unwrap()
             .unwrap();
+        mark_claim_expired(database.pool(), &pending.task_id).await;
         let reclaimed_at = CLAIM_EXPIRES_AT + time::Duration::milliseconds(1);
         let second = claimer
             .claim_next_verification_task(
@@ -497,14 +526,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let completed = second
+        let publishing = second
             .task
             .clone()
-            .transition_to(
-                VerificationTaskStatus::Completed,
-                reclaimed_at + time::Duration::seconds(1),
-                None,
-            )
+            .begin_entitlement_publication(entitlement_for(&second.task))
+            .unwrap();
+        let completed = publishing
+            .complete_entitlement_publication(reclaimed_at + time::Duration::seconds(1))
             .unwrap();
         let failed = second
             .task
@@ -515,12 +543,20 @@ mod tests {
                 Some("stale failure".to_owned()),
             )
             .unwrap();
+        let expired = second
+            .task
+            .clone()
+            .expire(
+                VerificationTerminalReason::PaymentRequestRejected,
+                reclaimed_at + time::Duration::seconds(1),
+            )
+            .unwrap();
 
-        for terminal in [completed.clone(), failed] {
+        for stale_transition in [publishing.clone(), completed.clone(), failed, expired] {
             assert_eq!(
                 claimer
                     .persist_claimed_verification_task_transition(
-                        terminal,
+                        stale_transition,
                         "worker-a",
                         &first.claim_token,
                         reclaimed_at,
@@ -530,6 +566,19 @@ mod tests {
                 None
             );
         }
+        assert_eq!(
+            claimer
+                .persist_claimed_verification_task_transition(
+                    publishing,
+                    "worker-a",
+                    &second.claim_token,
+                    reclaimed_at,
+                )
+                .await
+                .unwrap()
+                .map(|task| task.status),
+            Some(VerificationTaskStatus::PublishingEntitlement)
+        );
         assert_eq!(
             claimer
                 .persist_claimed_verification_task_transition(
@@ -580,6 +629,7 @@ mod tests {
                 .unwrap(),
             None
         );
+        mark_claim_expired(database.pool(), &pending.task_id).await;
         assert_eq!(
             claimer
                 .schedule_verification_task_retry(
@@ -593,6 +643,7 @@ mod tests {
                 .unwrap(),
             None
         );
+        mark_claim_active(database.pool(), &pending.task_id).await;
         let scheduled = claimer
             .schedule_verification_task_retry(
                 &pending.task_id,
@@ -620,6 +671,15 @@ mod tests {
                 .unwrap(),
             None
         );
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET next_attempt_at = clock_timestamp() - INTERVAL '1 millisecond'
+             WHERE task_id = $1::uuid",
+        )
+        .bind(pending.task_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
         assert!(
             claimer
                 .claim_next_verification_task(
@@ -647,11 +707,13 @@ mod tests {
     async fn mark_claim_expired(pool: &sqlx::PgPool, task_id: &TaskId) {
         sqlx::query(
             "UPDATE verification_tasks
-            SET claimed_by = 'worker-a', claim_expires_at = $2
+            SET claimed_by = 'worker-a',
+                claim_token = COALESCE(claim_token, $2),
+                claim_expires_at = clock_timestamp() - INTERVAL '1 millisecond'
             WHERE task_id = $1::uuid",
         )
         .bind(task_id.to_string())
-        .bind(datetime!(2026-05-29 12:05:00 UTC))
+        .bind(uuid::Uuid::new_v4())
         .execute(pool)
         .await
         .expect("mark claim expired");
@@ -660,11 +722,13 @@ mod tests {
     async fn mark_claim_active(pool: &sqlx::PgPool, task_id: &TaskId) {
         sqlx::query(
             "UPDATE verification_tasks
-            SET claimed_by = 'worker-a', claim_expires_at = $2
+            SET claimed_by = 'worker-a',
+                claim_token = COALESCE(claim_token, $2),
+                claim_expires_at = clock_timestamp() + INTERVAL '5 minutes'
             WHERE task_id = $1::uuid",
         )
         .bind(task_id.to_string())
-        .bind(datetime!(2026-05-29 12:11:00 UTC))
+        .bind(uuid::Uuid::new_v4())
         .execute(pool)
         .await
         .expect("mark claim active");
@@ -677,11 +741,9 @@ mod tests {
             .unwrap();
         match status {
             VerificationTaskStatus::Completed => in_progress
-                .transition_to(
-                    VerificationTaskStatus::Completed,
-                    datetime!(2026-05-29 12:01:00 UTC),
-                    None,
-                )
+                .begin_entitlement_publication(entitlement_for(&in_progress))
+                .unwrap()
+                .complete_entitlement_publication(datetime!(2026-05-29 12:01:00 UTC))
                 .unwrap(),
             VerificationTaskStatus::Failed => in_progress
                 .transition_to(
@@ -690,16 +752,15 @@ mod tests {
                     Some("failed".to_owned()),
                 )
                 .unwrap(),
-            VerificationTaskStatus::Expired => {
-                task(task_id, VerificationTaskStatus::Pending, started_at)
-                    .transition_to(
-                        VerificationTaskStatus::Expired,
-                        datetime!(2026-05-29 12:01:00 UTC),
-                        None,
-                    )
-                    .unwrap()
-            }
-            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress => unreachable!(),
+            VerificationTaskStatus::Expired => in_progress
+                .expire(
+                    VerificationTerminalReason::PaymentRequestRejected,
+                    datetime!(2026-05-29 12:01:00 UTC),
+                )
+                .unwrap(),
+            VerificationTaskStatus::Pending
+            | VerificationTaskStatus::InProgress
+            | VerificationTaskStatus::PublishingEntitlement => unreachable!(),
         }
     }
 
@@ -715,7 +776,7 @@ mod tests {
                 version: SUBMITTED_PROOF_BUNDLE_VERSION,
                 bundle_id: BundleId::from_str(bundle_id_for_task_id(task_id)).unwrap(),
                 pubky_lock_resource: PubkyLockResource::from_str(&format!(
-                    "{}/pub/locks.app/{LOCK_ID}.json",
+                    "{}/pub/app.locks/{LOCK_ID}.json",
                     creator_for_task_id(task_id)
                 ))
                 .unwrap(),
@@ -731,6 +792,18 @@ mod tests {
             started_at: None,
             completed_at: None,
             failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        }
+    }
+
+    fn entitlement_for(task: &VerificationTaskRecord) -> VerifiedProofBundle {
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            pubky_lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
         }
     }
 

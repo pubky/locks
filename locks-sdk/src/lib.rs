@@ -10,7 +10,7 @@ pub mod viewer;
 pub use client::LocksClient;
 pub use creator::{
     CreateContentLockRequest, CreatorLocks, DeleteContentLockMode, DeleteContentLockRequest,
-    DeleteGuardedResourceRequest, PaykitSetupStatus, PaykitSetupStatusKind,
+    DeleteGuardedResourceRequest, PaykitPaymentAsset, PaykitSetupStatus, PaykitSetupStatusKind,
     RegisterGuardedResourceRequest, SdkRequest, SdkRequestBody, SetLockServicePointerRequest,
 };
 pub use discovery::{
@@ -23,5 +23,6 @@ pub use session::LocksSession;
 pub use viewer::{
     AccessCredentialResponse, PaykitConnectionState, PaykitConnectionStateResponse,
     ReadLockedResourceRequest, SdkViewerRequest, VerificationTaskHandleRequest,
-    VerificationTaskLifecycleResponse, VerificationTaskStatus, ViewerLocks,
+    VerificationTaskLifecycleResponse, VerificationTaskStatus, VerificationTerminalReason,
+    ViewerLocks,
 };
