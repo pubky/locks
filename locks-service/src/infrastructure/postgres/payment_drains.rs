@@ -879,7 +879,6 @@ mod tests {
                 .unwrap(),
             None
         );
-
         database.cleanup().await;
     }
 

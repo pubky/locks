@@ -1289,9 +1289,7 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
+            Err(ApplicationError::ContentLockDeletionInProgress)
         );
 
         let admitted_after = verification_task(&lock, BundleId::from_bytes([2; 16]));

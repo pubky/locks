@@ -25,7 +25,9 @@ use locks_server::config::{
     LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
     RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
-use locks_server::worker::{VerificationWorker, WorkerTick};
+use locks_server::worker::{
+    InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, VerificationWorker, WorkerTick,
+};
 use locks_service::application::models::{
     AccessCredential, AccessCredentialLookupKey, ContentLockDeletionJob,
     ContentLockOwnershipStatus, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
@@ -51,6 +53,14 @@ use time::macros::datetime;
 use tower::ServiceExt;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+
+struct ZeroInvoiceRetryJitter;
+
+impl InvoiceRetryJitter for ZeroInvoiceRetryJitter {
+    fn delay(&self, _attempt_count: u32) -> time::Duration {
+        time::Duration::ZERO
+    }
+}
 
 #[tokio::test]
 async fn postgres_runtime_state_survives_app_state_recreation() {
@@ -116,7 +126,7 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
 }
 
 #[tokio::test]
-async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window() {
+async fn manual_completion_rejects_legacy_paykit_task_without_authoritative_window() {
     let Some(database) = TestDatabase::create().await else {
         return;
     };
@@ -138,7 +148,9 @@ async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window
         .await
         .unwrap();
 
-    let response = router(app_state(database.pool().clone()))
+    let state = app_state(database.pool().clone());
+    seed_content_lock(&state, paykit_content_lock()).await;
+    let response = router(state)
         .oneshot(json_request(
             "POST",
             "/verification-task-completions",
@@ -149,13 +161,13 @@ async fn manual_completion_hides_legacy_paykit_task_without_authoritative_window
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         response_json(response).await,
         json!({
             "error": {
-                "code": "verification_task_not_found",
-                "message": "verification task not found"
+                "code": "unsupported_verifier_type",
+                "message": "unsupported verifier type"
             }
         })
     );
@@ -318,7 +330,7 @@ async fn deletion_first_proof_submission_returns_409_without_calling_paykit() {
 }
 
 #[tokio::test]
-async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_resolution() {
+async fn ready_paykit_replay_ignores_tombstoned_lock_and_reader_resolution() {
     let Some(database) = TestDatabase::create().await else {
         return;
     };
@@ -379,7 +391,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
     let submitted = paykit_submission_for(&lock);
     seed_content_lock(&initial_state, lock.clone()).await;
 
-    let first = router(initial_state)
+    let first = router(initial_state.clone())
         .oneshot(json_request(
             "POST",
             "/proof-bundles",
@@ -387,7 +399,38 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
         ))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(response_json(first).await["status"], "pending");
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 0);
+
+    let zero_jitter = ZeroInvoiceRetryJitter;
+    let initial_paykit = initial_state.paykit_http_client().unwrap();
+    assert!(matches!(
+        InvoiceAdmissionWorker::from_state(&initial_state, initial_paykit.as_ref(), &zero_jitter)
+            .run_once()
+            .await
+            .unwrap(),
+        InvoiceWorkerTick::RetryScheduled(_)
+    ));
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 1);
+    sqlx::query(
+        "UPDATE verification_tasks
+         SET next_attempt_at = clock_timestamp() - INTERVAL '1 second'
+         WHERE bundle_id = $1",
+    )
+    .bind(BUNDLE_ID)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        InvoiceAdmissionWorker::from_state(&initial_state, initial_paykit.as_ref(), &zero_jitter)
+            .run_once()
+            .await
+            .unwrap(),
+        InvoiceWorkerTick::Ready(_)
+    ));
+    assert_eq!(invoice_calls.load(Ordering::SeqCst), 2);
+
     PostgresContentLockDeletionRepository::new(database.pool().clone())
         .insert_job(
             ContentLockDeletionJob::new(
