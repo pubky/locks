@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use locks_core::ids::CreatorPubky;
@@ -652,6 +655,39 @@ where
         }
         result
     }
+
+    async fn read_with_single_retry<T, F>(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        read: F,
+    ) -> Result<T, ApplicationError>
+    where
+        F: for<'a> Fn(
+            &'a dyn CreatorScopedPubkyStorage,
+            &'a str,
+        )
+            -> Pin<Box<dyn Future<Output = Result<T, ApplicationError>> + Send + 'a>>,
+    {
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let generation = acquired.generation;
+        let result = read(acquired.storage.as_ref(), path).await;
+        let retry = generation.is_some()
+            && matches!(result, Err(ApplicationError::CreatorAuthorityUnavailable));
+        let result = self.finish_operation(creator, generation, result).await;
+        if !retry {
+            return result;
+        }
+
+        // Read replay is bounded to one reacquisition. Until pubky/pubky#698
+        // adds typed provenance, this can also replay a grant-backed storage
+        // transport/5xx failure. The second result still invalidates only the
+        // generation that produced it.
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = read(acquired.storage.as_ref(), path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
+    }
 }
 
 #[async_trait]
@@ -676,10 +712,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<serde_json::Value>, ApplicationError> {
-        let acquired = self.provider.storage_for_creator(creator).await?;
-        let result = acquired.storage.get_json_value(path).await;
-        self.finish_operation(creator, acquired.generation, result)
-            .await
+        self.read_with_single_retry(creator, path, |storage, path| {
+            Box::pin(storage.get_json_value(path))
+        })
+        .await
     }
 
     async fn put_bytes_as_creator(
@@ -700,10 +736,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
-        let acquired = self.provider.storage_for_creator(creator).await?;
-        let result = acquired.storage.get_bytes(path).await;
-        self.finish_operation(creator, acquired.generation, result)
-            .await
+        self.read_with_single_retry(creator, path, |storage, path| {
+            Box::pin(storage.get_bytes(path))
+        })
+        .await
     }
 
     async fn get_metadata_as_creator(
@@ -711,10 +747,10 @@ where
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
-        let acquired = self.provider.storage_for_creator(creator).await?;
-        let result = acquired.storage.get_metadata(path).await;
-        self.finish_operation(creator, acquired.generation, result)
-            .await
+        self.read_with_single_retry(creator, path, |storage, path| {
+            Box::pin(storage.get_metadata(path))
+        })
+        .await
     }
 
     async fn delete_as_creator(
@@ -929,6 +965,7 @@ fn is_private_locks_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1311,11 +1348,225 @@ mod tests {
                 .await,
             Err(ApplicationError::CreatorAuthorityUnavailable)
         );
-        assert_eq!(*provider.operations.lock().unwrap(), 6);
+        assert_eq!(*provider.operations.lock().unwrap(), 9);
         assert_eq!(
             *provider.invalidations.lock().unwrap(),
-            vec![(creator(), 7); 6]
+            vec![(creator(), 7); 9]
         );
+    }
+
+    #[tokio::test]
+    async fn cached_grant_reads_retry_once_with_reacquired_storage() {
+        let json_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let json_client = ProviderBackedPubkyHomeserverStorageClient::new(json_provider.clone());
+        assert_eq!(
+            json_client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await
+                .unwrap(),
+            Some(json!({"version": 1}))
+        );
+        json_provider.assert_counts(2, 2, &[1]);
+
+        let bytes_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let bytes_client = ProviderBackedPubkyHomeserverStorageClient::new(bytes_provider.clone());
+        assert_eq!(
+            bytes_client
+                .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"restored"
+        );
+        bytes_provider.assert_counts(2, 2, &[1]);
+
+        let metadata_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let metadata_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(metadata_provider.clone());
+        assert_eq!(
+            metadata_client
+                .get_metadata_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .content_length,
+            Some(8)
+        );
+        metadata_provider.assert_counts(2, 2, &[1]);
+    }
+
+    #[tokio::test]
+    async fn cached_grant_read_retries_at_most_once_and_invalidates_each_failed_generation() {
+        let provider = RetryTestProvider::cached([
+            Err(ApplicationError::CreatorAuthorityUnavailable),
+            Err(ApplicationError::CreatorAuthorityUnavailable),
+            Ok(()),
+        ]);
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        provider.assert_counts(2, 2, &[1, 2]);
+    }
+
+    #[tokio::test]
+    async fn read_retry_excludes_non_authority_errors_legacy_storage_and_reacquisition_failures() {
+        let acquisition_provider = RetryTestProvider::cached([Ok(())]);
+        acquisition_provider.fail_acquisition(1);
+        let acquisition_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(acquisition_provider.clone());
+        assert_eq!(
+            acquisition_client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        acquisition_provider.assert_counts(1, 0, &[]);
+
+        let storage_error_provider = RetryTestProvider::cached([
+            Err(ApplicationError::Storage {
+                message: "closed test error".to_owned(),
+            }),
+            Ok(()),
+        ]);
+        let storage_error_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(storage_error_provider.clone());
+        assert!(matches!(
+            storage_error_client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await,
+            Err(ApplicationError::Storage { .. })
+        ));
+        storage_error_provider.assert_counts(1, 1, &[]);
+
+        let missing_provider = RetryTestProvider::cached_missing();
+        let missing_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(missing_provider.clone());
+        assert_eq!(
+            missing_client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/missing.json")
+                .await
+                .unwrap(),
+            None
+        );
+        missing_provider.assert_counts(1, 1, &[]);
+
+        let legacy_provider = RetryTestProvider::uncached([
+            Err(ApplicationError::CreatorAuthorityUnavailable),
+            Ok(()),
+        ]);
+        let legacy_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(legacy_provider.clone());
+        assert_eq!(
+            legacy_client
+                .get_bytes_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        legacy_provider.assert_counts(1, 1, &[]);
+
+        let reacquisition_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        reacquisition_provider.fail_acquisition(2);
+        let reacquisition_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(reacquisition_provider.clone());
+        assert_eq!(
+            reacquisition_client
+                .get_metadata_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        reacquisition_provider.assert_counts(2, 1, &[1]);
+    }
+
+    #[tokio::test]
+    async fn stale_read_failure_preserves_replacement_generation_and_retry_singleflight() {
+        let provider = StaleGenerationProvider::new();
+        let client = Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(
+            provider.clone(),
+        ));
+        let delayed = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                    .await
+            })
+        };
+        provider.first_read_started.notified().await;
+
+        assert_eq!(
+            client
+                .get_json_value_as_creator(&creator(), "/pub/app.locks/config.json")
+                .await
+                .unwrap(),
+            Some(json!({"generation": 2}))
+        );
+        provider.release_first_read.notify_one();
+        assert_eq!(
+            delayed.await.unwrap().unwrap(),
+            Some(json!({"generation": 2}))
+        );
+
+        assert_eq!(provider.current_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.replacements.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.acquisitions.load(Ordering::SeqCst), 4);
+        assert_eq!(provider.operations.load(Ordering::SeqCst), 4);
+        assert_eq!(*provider.invalidations.lock().unwrap(), vec![1, 1]);
+    }
+
+    #[tokio::test]
+    async fn mutations_invalidate_cached_generation_without_retrying() {
+        let json_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let json_client = ProviderBackedPubkyHomeserverStorageClient::new(json_provider.clone());
+        assert_eq!(
+            json_client
+                .put_json_value_as_creator(
+                    &creator(),
+                    "/pub/app.locks/config.json",
+                    json!({"version": 1}),
+                )
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        json_provider.assert_counts(1, 1, &[1]);
+
+        let put_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let put_client = ProviderBackedPubkyHomeserverStorageClient::new(put_provider.clone());
+        assert_eq!(
+            put_client
+                .put_bytes_as_creator(
+                    &creator(),
+                    "/priv/app.locks/content/example.txt",
+                    b"secret".to_vec(),
+                    "text/plain",
+                )
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        put_provider.assert_counts(1, 1, &[1]);
+
+        let delete_provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let delete_client =
+            ProviderBackedPubkyHomeserverStorageClient::new(delete_provider.clone());
+        assert_eq!(
+            delete_client
+                .delete_as_creator(&creator(), "/priv/app.locks/content/example.txt")
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        delete_provider.assert_counts(1, 1, &[1]);
     }
 
     #[tokio::test]
@@ -1651,6 +1902,279 @@ mod tests {
         async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
             self.record_operation();
             Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StaleGenerationProvider {
+        current_generation: Arc<AtomicUsize>,
+        replacements: Arc<AtomicUsize>,
+        acquisitions: Arc<AtomicUsize>,
+        operations: Arc<AtomicUsize>,
+        generation_one_reads: Arc<AtomicUsize>,
+        invalidations: Arc<Mutex<Vec<u64>>>,
+        first_read_started: Arc<tokio::sync::Notify>,
+        release_first_read: Arc<tokio::sync::Notify>,
+    }
+
+    impl StaleGenerationProvider {
+        fn new() -> Self {
+            Self {
+                current_generation: Arc::new(AtomicUsize::new(1)),
+                replacements: Arc::new(AtomicUsize::new(0)),
+                acquisitions: Arc::new(AtomicUsize::new(0)),
+                operations: Arc::new(AtomicUsize::new(0)),
+                generation_one_reads: Arc::new(AtomicUsize::new(0)),
+                invalidations: Arc::new(Mutex::new(Vec::new())),
+                first_read_started: Arc::new(tokio::sync::Notify::new()),
+                release_first_read: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for StaleGenerationProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            self.acquisitions.fetch_add(1, Ordering::SeqCst);
+            let generation = match self.current_generation.compare_exchange(
+                0,
+                2,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.replacements.fetch_add(1, Ordering::SeqCst);
+                    2
+                }
+                Err(generation) => generation,
+            };
+            Ok(AcquiredCreatorScopedPubkyStorage::cached(
+                Box::new(StaleGenerationStorage {
+                    generation,
+                    operations: Arc::clone(&self.operations),
+                    generation_one_reads: Arc::clone(&self.generation_one_reads),
+                    first_read_started: Arc::clone(&self.first_read_started),
+                    release_first_read: Arc::clone(&self.release_first_read),
+                }),
+                generation as u64,
+            ))
+        }
+
+        async fn invalidate_creator_session(&self, _creator: &CreatorPubky, generation: u64) {
+            self.invalidations.lock().unwrap().push(generation);
+            let _ = self.current_generation.compare_exchange(
+                generation as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaleGenerationStorage {
+        generation: usize,
+        operations: Arc<AtomicUsize>,
+        generation_one_reads: Arc<AtomicUsize>,
+        first_read_started: Arc<tokio::sync::Notify>,
+        release_first_read: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for StaleGenerationStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("read-only concurrency test")
+        }
+
+        async fn get_json_value(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            if self.generation == 1 {
+                if self.generation_one_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.first_read_started.notify_one();
+                    self.release_first_read.notified().await;
+                }
+                return Err(ApplicationError::CreatorAuthorityUnavailable);
+            }
+            Ok(Some(json!({"generation": self.generation})))
+        }
+
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("read-only concurrency test")
+        }
+
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            unimplemented!("read-only concurrency test")
+        }
+
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            unimplemented!("read-only concurrency test")
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            unimplemented!("read-only concurrency test")
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryTestState {
+        cached: bool,
+        missing: bool,
+        acquisitions: usize,
+        operations: usize,
+        invalidations: Vec<u64>,
+        fail_acquisition: Option<usize>,
+        results: VecDeque<Result<(), ApplicationError>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RetryTestProvider {
+        state: Arc<Mutex<RetryTestState>>,
+    }
+
+    impl RetryTestProvider {
+        fn cached(results: impl IntoIterator<Item = Result<(), ApplicationError>>) -> Self {
+            Self::new(true, results)
+        }
+
+        fn uncached(results: impl IntoIterator<Item = Result<(), ApplicationError>>) -> Self {
+            Self::new(false, results)
+        }
+
+        fn cached_missing() -> Self {
+            let provider = Self::new(true, [Ok(())]);
+            provider.state.lock().unwrap().missing = true;
+            provider
+        }
+
+        fn new(
+            cached: bool,
+            results: impl IntoIterator<Item = Result<(), ApplicationError>>,
+        ) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(RetryTestState {
+                    cached,
+                    missing: false,
+                    acquisitions: 0,
+                    operations: 0,
+                    invalidations: Vec::new(),
+                    fail_acquisition: None,
+                    results: results.into_iter().collect(),
+                })),
+            }
+        }
+
+        fn fail_acquisition(&self, acquisition: usize) {
+            self.state.lock().unwrap().fail_acquisition = Some(acquisition);
+        }
+
+        fn assert_counts(&self, acquisitions: usize, operations: usize, invalidations: &[u64]) {
+            let state = self.state.lock().unwrap();
+            assert_eq!(state.acquisitions, acquisitions);
+            assert_eq!(state.operations, operations);
+            assert_eq!(state.invalidations, invalidations);
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorageProvider for RetryTestProvider {
+        async fn storage_for_creator(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<AcquiredCreatorScopedPubkyStorage, ApplicationError> {
+            let mut state = self.state.lock().unwrap();
+            state.acquisitions += 1;
+            let acquisition = state.acquisitions;
+            if state.fail_acquisition == Some(acquisition) {
+                return Err(ApplicationError::CreatorAuthorityUnavailable);
+            }
+            let storage = Box::new(RetryTestStorage {
+                state: Arc::clone(&self.state),
+            });
+            Ok(if state.cached {
+                AcquiredCreatorScopedPubkyStorage::cached(storage, acquisition as u64)
+            } else {
+                AcquiredCreatorScopedPubkyStorage::uncached(storage)
+            })
+        }
+
+        async fn invalidate_creator_session(&self, _creator: &CreatorPubky, generation: u64) {
+            self.state.lock().unwrap().invalidations.push(generation);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryTestStorage {
+        state: Arc<Mutex<RetryTestState>>,
+    }
+
+    impl RetryTestStorage {
+        fn result(&self) -> Result<(), ApplicationError> {
+            let mut state = self.state.lock().unwrap();
+            state.operations += 1;
+            state.results.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl CreatorScopedPubkyStorage for RetryTestStorage {
+        async fn put_json_value(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ApplicationError> {
+            self.result()
+        }
+
+        async fn get_json_value(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, ApplicationError> {
+            let missing = self.state.lock().unwrap().missing;
+            self.result()
+                .map(|_| (!missing).then(|| json!({"version": 1})))
+        }
+
+        async fn put_bytes(&self, _: &str, _: Vec<u8>, _: &str) -> Result<(), ApplicationError> {
+            self.result()
+        }
+
+        async fn get_bytes(&self, _: &str) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            self.result().map(|_| {
+                Some(PubkyBytesResource {
+                    bytes: b"restored".to_vec(),
+                    content_type: Some("text/plain".to_owned()),
+                })
+            })
+        }
+
+        async fn get_metadata(
+            &self,
+            _: &str,
+        ) -> Result<Option<PubkyResourceMetadata>, ApplicationError> {
+            self.result().map(|_| {
+                Some(PubkyResourceMetadata {
+                    content_length: Some(8),
+                    content_type: Some("text/plain".to_owned()),
+                    content_hash: Some(*blake3::hash(b"restored").as_bytes()),
+                })
+            })
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), ApplicationError> {
+            self.result()
         }
     }
 

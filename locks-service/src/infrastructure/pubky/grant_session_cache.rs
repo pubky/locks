@@ -491,6 +491,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_reacquisitions_after_invalidation_share_one_grant_exchange() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = RecordingImporter::successful(Duration::from_millis(30));
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+        let stale = cache.session_for_creator(&creator_a()).await.unwrap();
+        cache
+            .invalidate_generation(&creator_a(), stale.generation)
+            .await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            tasks.push(tokio::spawn(async move {
+                cache.session_for_creator(&creator_a()).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(importer.calls(), 2);
+    }
+
+    #[tokio::test]
     async fn authority_and_storage_share_one_cached_grant_session() {
         let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
         let importer = RecordingImporter::successful(Duration::from_millis(30));
