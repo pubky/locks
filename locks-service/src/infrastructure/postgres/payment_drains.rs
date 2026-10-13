@@ -1251,13 +1251,12 @@ mod tests {
             "INSERT INTO content_lock_deletion_task_snapshot
                  (deletion_job_id, verification_task_id, creator, bundle_id,
                   pubky_lock_resource, criterion_id, status_at_cutoff,
-                  paykit_admission_required, payment_in_hours,
-                  invoice_created_at, payment_deadline)
+                  paykit_admission_required, invoice_created_at, payment_deadline)
              VALUES ($1, $2,
                      'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
                      '000G40R40M30E209185GR38E1W',
                      'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json',
-                     'payment', 'pending', TRUE, 1, $3, $4)",
+                     'payment', 'pending', TRUE, $3, $4)",
         )
         .bind(job_id)
         .bind(task_id)

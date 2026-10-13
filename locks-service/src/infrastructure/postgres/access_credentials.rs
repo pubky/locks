@@ -1130,10 +1130,14 @@ mod tests {
     use uuid::Uuid;
 
     use locks_core::{
-        ids::{BundleId, CreatorPubky, GuardedResourceHash, LockId},
+        ids::{BundleId, CreatorPubky, GuardedResourceHash, LockId, PubkyLockResource},
         lock_policy::{
             AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
             LockServerConfig,
+        },
+        verification::{
+            EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
+            VerifiedProofBundle,
         },
     };
 
@@ -1809,17 +1813,29 @@ mod tests {
     ) {
         let task_id = Uuid::new_v4();
         let now = datetime!(2026-05-29 12:00:00 UTC);
+        let entitlement = VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: BundleId::from_str(bundle_id).unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+                creator()
+            ))
+            .unwrap(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        };
         sqlx::query(
             "INSERT INTO verification_tasks (
                 task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id,
-                deletion_job_id
-             ) VALUES ($1, 'completed', '{}'::jsonb, $2, $3, $4, $5)",
+                deletion_job_id, started_at, completed_at, entitlement_to_publish
+             ) VALUES ($1, 'completed', '{}'::jsonb, $2, $3, $4, $5, $2, $2, $6)",
         )
         .bind(task_id)
         .bind(now)
         .bind(creator().to_string())
         .bind(bundle_id)
         .bind(job_id)
+        .bind(serde_json::to_value(entitlement).unwrap())
         .execute(pool)
         .await
         .unwrap();
@@ -1856,7 +1872,7 @@ mod tests {
             creator: creator(),
             primary_resource: Some(
                 GuardedResource::new(
-                    "/priv/locks.app/content/post.json".to_owned(),
+                    "/priv/app.locks/content/post.json".to_owned(),
                     GuardedResourceHash::from_bytes([7; 32]),
                     "application/json".to_owned(),
                     42,

@@ -1801,7 +1801,10 @@ mod tests {
         let bundle_id = BundleId::from_bytes([91; 16]);
         let mut task = verification_task(&lock, bundle_id.clone());
         task.status = VerificationTaskStatus::Completed;
+        task.started_at = Some(NOW);
+        task.completed_at = Some(NOW);
         task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+        task.entitlement_to_publish = Some(entitlement(&task));
         tasks.insert_verification_task(task).await.unwrap();
         let lookup_key = AccessCredentialLookupKey::derive(&AccessCredential::new("pre-fence"));
         let expires_at = NOW + time::Duration::hours(1);
@@ -1896,9 +1899,7 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
+            Err(ApplicationError::ContentLockDeletionInProgress)
         );
 
         let admitted_after = verification_task(&lock, BundleId::from_bytes([2; 16]));
@@ -2592,7 +2593,7 @@ mod tests {
         let ordinary_completed = ordinary_claim
             .task
             .clone()
-            .transition_to(VerificationTaskStatus::PublishingEntitlement, NOW, None)
+            .begin_entitlement_publication(entitlement(&ordinary_claim.task))
             .unwrap();
         assert!(
             ordinary
@@ -3019,7 +3020,7 @@ mod tests {
         let publishing = claim
             .task
             .clone()
-            .transition_to(VerificationTaskStatus::PublishingEntitlement, NOW, None)
+            .begin_entitlement_publication(entitlement(&claim.task))
             .unwrap();
         assert!(
             ordinary
@@ -3058,8 +3059,7 @@ mod tests {
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let entitlements = InMemoryEntitlementRepository::new();
         let lock = content_lock();
-        let mut task = verification_task(&lock, BundleId::from_bytes([11; 16]));
-        task.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
+        let task = paykit_verification_task(&lock, BundleId::from_bytes([11; 16]));
         tasks
             .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
             .await
@@ -3839,6 +3839,7 @@ mod tests {
         task.status = VerificationTaskStatus::Completed;
         task.started_at = Some(NOW);
         task.completed_at = Some(NOW);
+        task.entitlement_to_publish = Some(entitlement(&task));
         tasks.insert_verification_task(task).await.unwrap();
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
@@ -4549,6 +4550,16 @@ mod tests {
                 .clone()
                 .unwrap(),
             payment_in: 24,
+        }
+    }
+
+    fn entitlement(task: &VerificationTaskRecord) -> VerifiedProofBundle {
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            pubky_lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
         }
     }
 
