@@ -1392,8 +1392,9 @@ mod tests {
             LockServerConfig, VerifierType,
         },
         verification::{
-            EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
-            VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+            CriterionVerificationResult, EntitlementLifetime, Proof,
+            SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, VERIFIED_PROOF_BUNDLE_VERSION,
+            VerificationResult, VerifiedProofBundle,
         },
     };
     use time::macros::datetime;
@@ -3196,7 +3197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_paykit_aggregate_waits_for_locks_confirmation_and_local_terminal_state() {
+    async fn persisted_payment_publication_replays_without_fresh_paykit_status() {
         let database = TestDatabase::create().await;
         let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let drains = PostgresPaymentDrainRepository::new(database.pool().clone());
@@ -3295,6 +3296,7 @@ mod tests {
                 confirmations: 0,
                 amount_matched: true,
             }),
+            status_calls: AtomicUsize::new(0),
         };
         let clock = FixedClock(NOW);
         let use_case = DrainLockPaymentsUseCase::new(
@@ -3321,13 +3323,47 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-
-        {
-            let mut status = paykit.status.lock().unwrap();
-            status.payment_state = PaymentState::Confirmed;
-            status.confirmations = 6;
-        }
+        assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 1);
+        let obligation = drains
+            .list_obligations(job.job_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let entitlement = VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: obligation.bundle_id,
+            pubky_lock_resource: obligation.lock_resource,
+            verification_result: VerificationResult {
+                criteria: vec![CriterionVerificationResult {
+                    criterion_id: obligation.criterion_id,
+                    satisfied: true,
+                    verified_at: NOW,
+                    verified_by: LockServerPubky::from_str(
+                        "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                    )
+                    .unwrap(),
+                    verifier_type: VerifierType::PaykitPayment,
+                }],
+            },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        };
+        assert!(
+            drains
+                .begin_entitlement_publication(
+                    job.job_id,
+                    "deletion",
+                    claim.claim_token,
+                    &task.task_id,
+                    &entitlement,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(use_case.execute_claimed(claim, "deletion").await.unwrap());
+        assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 1);
         assert!(drains.all_obligations_terminal(job.job_id).await.unwrap());
         assert!(
             entitlements
@@ -3360,6 +3396,7 @@ mod tests {
     struct MutablePaymentDrainClient {
         summary: PaymentDrainSummary,
         status: Mutex<PaymentRequestStatus>,
+        status_calls: AtomicUsize,
     }
 
     #[tokio::test]
@@ -4299,6 +4336,7 @@ mod tests {
             _creator: &CreatorPubky,
             _bundle_id: &BundleId,
         ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(*self.status.lock().unwrap()))
         }
     }

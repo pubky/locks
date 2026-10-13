@@ -256,6 +256,67 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             ) {
                 continue;
             }
+            if obligation.status == VerificationTaskStatus::PublishingEntitlement {
+                let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
+                    ApplicationError::InvalidVerificationTaskState {
+                        message: "publishing payment task is missing entitlement payload"
+                            .to_owned(),
+                    }
+                })?;
+                let publication_token = match self
+                    .drains
+                    .begin_entitlement_publication(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &obligation.task_id,
+                        &entitlement,
+                    )
+                    .await
+                {
+                    Ok(Some(token)) => {
+                        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                        token
+                    }
+                    Ok(None) => return Ok(false),
+                    Err(error) => {
+                        observe_unavailable(
+                            evidence,
+                            DeletionDependencySource::PaymentDrainRepository,
+                        );
+                        return Err(error);
+                    }
+                };
+                persist_entitlement(self.entitlements, entitlement, evidence).await?;
+                match self
+                    .drains
+                    .persist_terminal_obligation(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &obligation.task_id,
+                        PaymentDrainTerminalTransition {
+                            status: VerificationTaskStatus::Completed,
+                            entitlement_publication_token: Some(publication_token),
+                            terminal_reason: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository)
+                    }
+                    Ok(false) => return Ok(false),
+                    Err(error) => {
+                        observe_unavailable(
+                            evidence,
+                            DeletionDependencySource::PaymentDrainRepository,
+                        );
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
             let status = match self
                 .paykit
                 .payment_request_status(&obligation.creator, &obligation.bundle_id)
