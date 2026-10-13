@@ -1378,7 +1378,7 @@ mod tests {
         str::FromStr,
         sync::{
             Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -3296,6 +3296,8 @@ mod tests {
                 confirmations: 0,
                 amount_matched: true,
             }),
+            fail_calls: AtomicBool::new(false),
+            lookup_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
         };
         let clock = FixedClock(NOW);
@@ -3323,6 +3325,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(paykit.lookup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 1);
         let obligation = drains
             .list_obligations(job.job_id)
@@ -3362,8 +3365,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        paykit.lookup_calls.store(0, Ordering::SeqCst);
+        paykit.status_calls.store(0, Ordering::SeqCst);
+        paykit.fail_calls.store(true, Ordering::SeqCst);
         assert!(use_case.execute_claimed(claim, "deletion").await.unwrap());
-        assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(paykit.lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 0);
         assert!(drains.all_obligations_terminal(job.job_id).await.unwrap());
         assert!(
             entitlements
@@ -3396,6 +3403,8 @@ mod tests {
     struct MutablePaymentDrainClient {
         summary: PaymentDrainSummary,
         status: Mutex<PaymentRequestStatus>,
+        fail_calls: AtomicBool,
+        lookup_calls: AtomicUsize,
         status_calls: AtomicUsize,
     }
 
@@ -4328,6 +4337,10 @@ mod tests {
             &self,
             _lock_resource: &PubkyLockResource,
         ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_calls.load(Ordering::SeqCst) {
+                return Err(PaymentDrainClientError::Transport);
+            }
             Ok(Some(self.summary.clone()))
         }
 
@@ -4337,6 +4350,9 @@ mod tests {
             _bundle_id: &BundleId,
         ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_calls.load(Ordering::SeqCst) {
+                return Err(PaymentDrainClientError::Transport);
+            }
             Ok(Some(*self.status.lock().unwrap()))
         }
     }

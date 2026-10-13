@@ -189,6 +189,99 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         worker_id: &str,
         evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
+        let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
+            Ok(Some(persisted)) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                persisted
+            }
+            Ok(None) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(ApplicationError::InvalidContentLockDeletionState {
+                    message: "payment drain cleanup token is missing".to_owned(),
+                });
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        };
+        let obligations = match self.drains.list_obligations(claim.job.job_id).await {
+            Ok(obligations) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                obligations
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        };
+        let mut replayed_publication = false;
+        for obligation in obligations
+            .iter()
+            .filter(|obligation| obligation.status == VerificationTaskStatus::PublishingEntitlement)
+        {
+            replayed_publication = true;
+            let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
+                ApplicationError::InvalidVerificationTaskState {
+                    message: "publishing payment task is missing entitlement payload".to_owned(),
+                }
+            })?;
+            let publication_token = match self
+                .drains
+                .begin_entitlement_publication(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    &obligation.task_id,
+                    &entitlement,
+                )
+                .await
+            {
+                Ok(Some(token)) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    token
+                }
+                Ok(None) => return Ok(false),
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(error);
+                }
+            };
+            persist_entitlement(self.entitlements, entitlement, evidence).await?;
+            match self
+                .drains
+                .persist_terminal_obligation(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    &obligation.task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: Some(publication_token),
+                        terminal_reason: None,
+                    },
+                )
+                .await
+            {
+                Ok(true) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository)
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(error);
+                }
+            }
+        }
+        if replayed_publication {
+            if persisted.status != PaymentDrainStatus::Completed {
+                return Ok(false);
+            }
+            return self
+                .finish_completed_drain(claim, worker_id, evidence)
+                .await;
+        }
+
         let lock_resource = lock_resource(&claim);
         let summary = match self.paykit.lookup_payment_drain(&lock_resource).await {
             Ok(Some(summary)) => {
@@ -206,22 +299,6 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Err(map_client_error(error));
             }
         };
-        let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
-            Ok(Some(persisted)) => {
-                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                persisted
-            }
-            Ok(None) => {
-                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Err(ApplicationError::InvalidContentLockDeletionState {
-                    message: "payment drain cleanup token is missing".to_owned(),
-                });
-            }
-            Err(error) => {
-                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Err(error);
-            }
-        };
         validate_aggregate_progress(&persisted, &summary)?;
         let _now = self.clock.now();
         match self
@@ -237,16 +314,6 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             }
         }
 
-        let obligations = match self.drains.list_obligations(claim.job.job_id).await {
-            Ok(obligations) => {
-                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                obligations
-            }
-            Err(error) => {
-                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Err(error);
-            }
-        };
         for obligation in obligations {
             if matches!(
                 obligation.status,
@@ -254,67 +321,6 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     | VerificationTaskStatus::Expired
                     | VerificationTaskStatus::Failed
             ) {
-                continue;
-            }
-            if obligation.status == VerificationTaskStatus::PublishingEntitlement {
-                let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
-                    ApplicationError::InvalidVerificationTaskState {
-                        message: "publishing payment task is missing entitlement payload"
-                            .to_owned(),
-                    }
-                })?;
-                let publication_token = match self
-                    .drains
-                    .begin_entitlement_publication(
-                        claim.job.job_id,
-                        worker_id,
-                        claim.claim_token,
-                        &obligation.task_id,
-                        &entitlement,
-                    )
-                    .await
-                {
-                    Ok(Some(token)) => {
-                        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                        token
-                    }
-                    Ok(None) => return Ok(false),
-                    Err(error) => {
-                        observe_unavailable(
-                            evidence,
-                            DeletionDependencySource::PaymentDrainRepository,
-                        );
-                        return Err(error);
-                    }
-                };
-                persist_entitlement(self.entitlements, entitlement, evidence).await?;
-                match self
-                    .drains
-                    .persist_terminal_obligation(
-                        claim.job.job_id,
-                        worker_id,
-                        claim.claim_token,
-                        &obligation.task_id,
-                        PaymentDrainTerminalTransition {
-                            status: VerificationTaskStatus::Completed,
-                            entitlement_publication_token: Some(publication_token),
-                            terminal_reason: None,
-                        },
-                    )
-                    .await
-                {
-                    Ok(true) => {
-                        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository)
-                    }
-                    Ok(false) => return Ok(false),
-                    Err(error) => {
-                        observe_unavailable(
-                            evidence,
-                            DeletionDependencySource::PaymentDrainRepository,
-                        );
-                        return Err(error);
-                    }
-                }
                 continue;
             }
             let status = match self
@@ -426,6 +432,16 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         if summary.status != PaymentDrainStatus::Completed {
             return Ok(false);
         }
+        self.finish_completed_drain(claim, worker_id, evidence)
+            .await
+    }
+
+    async fn finish_completed_drain(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
         match self.drains.all_obligations_terminal(claim.job.job_id).await {
             Ok(true) => observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository),
             Ok(false) => {
