@@ -9,6 +9,7 @@ use crate::application::models::{
     ClaimedVerificationTask, InvoiceAdmissionPhase, VerificationTaskRecord, VerificationTaskStatus,
 };
 use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
+use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
 /// In-memory verification task claimer used to model worker lease semantics.
 #[derive(Default)]
@@ -46,6 +47,15 @@ impl InMemoryVerificationTaskClaimer {
             ),
             task_repository: None,
         }
+    }
+
+    /// Creates a claimer sharing deletion ownership with related repositories.
+    pub fn with_deletion_fence(
+        records: Vec<VerificationTaskRecord>,
+        deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        let _ = deletion_fence;
+        Self::new(records)
     }
 
     /// Creates a claimer whose lifecycle transitions are mirrored to the task repository.

@@ -257,6 +257,7 @@ impl From<ApplicationError> for ApiError {
                 Self::new(ApiErrorCode::RateLimited, "rate limit exceeded")
             }
             ApplicationError::Storage { .. }
+            | ApplicationError::FinalCredentialSecret { .. }
             | ApplicationError::InvalidContentLockDeletionState { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }
@@ -541,7 +542,7 @@ mod tests {
     #[test]
     fn content_lock_path_conflict_maps_to_409_stable_envelope() {
         let api_error = ApiError::from(ApplicationError::ContentLockPathConflict {
-            guarded_path: "/priv/locks.app/content/already-owned.txt".to_owned(),
+            guarded_path: "/priv/app.locks/content/already-owned.txt".to_owned(),
         });
 
         assert_eq!(api_error.status_code(), StatusCode::CONFLICT);

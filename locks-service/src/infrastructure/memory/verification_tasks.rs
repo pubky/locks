@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{RwLock as SyncRwLock, Weak};
+use std::sync::{Arc, RwLock as SyncRwLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::lock_policy::VerifierType;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -14,12 +15,16 @@ use crate::application::models::{
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
 use crate::infrastructure::memory::verification_task_claims::InMemoryVerificationTaskClaimer;
+use crate::infrastructure::memory::verification_task_deletion_fence::{
+    InMemoryVerificationTaskDeletionFence, InMemoryVerificationTaskFenceRecord,
+};
 
 /// In-memory verification task repository.
 #[derive(Debug, Default)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
     invoice_admissions: RwLock<HashMap<TaskId, MemoryInvoiceAdmission>>,
+    deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     verification_task_claimer: SyncRwLock<Option<Weak<InMemoryVerificationTaskClaimer>>>,
 }
 
@@ -35,6 +40,16 @@ impl InMemoryVerificationTaskRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a repository sharing lock-admission serialization with deletion and credentials.
+    pub fn with_deletion_fence(deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>) -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            invoice_admissions: RwLock::new(HashMap::new()),
+            deletion_fence,
+            verification_task_claimer: SyncRwLock::new(None),
+        }
     }
 
     /// Connects tasks created here to the paired in-memory verification claimer.
@@ -57,6 +72,16 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let lock_id = task
+            .submitted_proof_bundle
+            .pubky_lock_resource
+            .lock_id()
+            .clone();
+        let _admission_guard = self
+            .deletion_fence
+            .acquire_lock_admission(&task.creator, &lock_id)
+            .await;
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if records.contains_key(&task.task_id)
             || records.values().any(|existing| {
@@ -69,8 +94,25 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 record: "verification_task",
             });
         }
+        fence_records.insert(
+            task.task_id,
+            InMemoryVerificationTaskFenceRecord {
+                creator: task.creator.clone(),
+                lock_id,
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                paykit_admission_required: task
+                    .submitted_proof_bundle
+                    .proofs
+                    .iter()
+                    .any(|proof| proof.verifier_type == VerifierType::PaykitPayment),
+                status: task.status,
+                entitlement_publication_claim_token: None,
+                deletion_job_id: None,
+            },
+        );
         records.insert(task.task_id, task.clone());
         drop(records);
+        drop(fence_records);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::Ready)
@@ -83,11 +125,24 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let lock_id = task
+            .submitted_proof_bundle
+            .pubky_lock_resource
+            .lock_id()
+            .clone();
+        let _admission_guard = self
+            .deletion_fence
+            .acquire_lock_admission(&task.creator, &lock_id)
+            .await;
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if !records.contains_key(&task.task_id) {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
+        }
+        if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
+            fence_record.status = task.status;
         }
         records.insert(task.task_id, task);
         Ok(())
@@ -117,8 +172,28 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
     }
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
-        self.records.write().await.remove(task_id);
-        self.invoice_admissions.write().await.remove(task_id);
+        let task = self.records.read().await.get(task_id).cloned();
+        let _admission_guard = if let Some(task) = task.as_ref() {
+            Some(
+                self.deletion_fence
+                    .acquire_lock_admission(
+                        &task.creator,
+                        task.submitted_proof_bundle.pubky_lock_resource.lock_id(),
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+        let mut fence_records = self.deletion_fence.records.write().await;
+        let mut records = self.records.write().await;
+        let mut admissions = self.invoice_admissions.write().await;
+        fence_records.remove(task_id);
+        records.remove(task_id);
+        admissions.remove(task_id);
+        drop(admissions);
+        drop(records);
+        drop(fence_records);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer.remove_task(task_id).await;
         }
@@ -134,13 +209,23 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         intent: InvoiceAdmissionIntentV1,
     ) -> Result<InvoiceAdmissionRecord, ApplicationError> {
         validate_invoice_admission_inputs(&task, &intent)?;
+        let lock_id = task
+            .submitted_proof_bundle
+            .pubky_lock_resource
+            .lock_id()
+            .clone();
+        let _admission_guard = self
+            .deletion_fence
+            .acquire_lock_admission(&task.creator, &lock_id)
+            .await;
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
+        let mut admissions = self.invoice_admissions.write().await;
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
                 && existing.submitted_proof_bundle.bundle_id
                     == task.submitted_proof_bundle.bundle_id
         }) {
-            let admissions = self.invoice_admissions.read().await;
             return match admissions.get(&existing.task_id).map(|state| &state.record) {
                 Some(admission)
                     if existing.submitted_proof_bundle == task.submitted_proof_bundle
@@ -168,7 +253,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             invoice_created_at: None,
             payment_deadline: None,
         };
-        self.invoice_admissions.write().await.insert(
+        admissions.insert(
             task.task_id,
             MemoryInvoiceAdmission {
                 record: admission.clone(),
@@ -177,8 +262,22 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 claim_expires_at: None,
             },
         );
+        fence_records.insert(
+            task.task_id,
+            InMemoryVerificationTaskFenceRecord {
+                creator: task.creator.clone(),
+                lock_id,
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                paykit_admission_required: true,
+                status: task.status,
+                entitlement_publication_claim_token: None,
+                deletion_job_id: None,
+            },
+        );
         records.insert(task.task_id, task.clone());
+        drop(admissions);
         drop(records);
+        drop(fence_records);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::InvoicePending)
@@ -325,6 +424,18 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         if message.is_empty() {
             return Err(ApplicationError::InvalidVerificationTaskFailureMessage);
         }
+        let task = self.records.read().await.get(task_id).cloned();
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let _admission_guard = self
+            .deletion_fence
+            .acquire_lock_admission(
+                &task.creator,
+                task.submitted_proof_bundle.pubky_lock_resource.lock_id(),
+            )
+            .await;
+        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
@@ -346,6 +457,9 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claim_token = None;
         state.claim_expires_at = None;
         records.insert(*task_id, state.record.task.clone());
+        if let Some(fence_record) = fence_records.get_mut(task_id) {
+            fence_record.status = VerificationTaskStatus::Failed;
+        }
         Ok(Some(state.record.clone()))
     }
 }

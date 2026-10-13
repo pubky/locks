@@ -17,7 +17,10 @@ use crate::application::{
     },
     ports::ContentLockDeletionRepository,
 };
-use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
+use crate::infrastructure::memory::{
+    access_credentials::InMemoryAccessCredentialStore,
+    verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
+};
 
 type JobKey = (CreatorPubky, LockId);
 
@@ -36,11 +39,15 @@ pub struct InMemoryContentLockDeletionRepository {
     force_receipts: RwLock<HashSet<JobKey>>,
     publication_intents: RwLock<HashMap<JobKey, Uuid>>,
     verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    access_credentials: Arc<InMemoryAccessCredentialStore>,
 }
 
 impl Default for InMemoryContentLockDeletionRepository {
     fn default() -> Self {
-        Self::with_verification_task_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+        Self::with_access_credentials_and_verification_task_fence(
+            Arc::new(InMemoryAccessCredentialStore::new()),
+            Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+        )
     }
 }
 
@@ -52,11 +59,22 @@ impl InMemoryContentLockDeletionRepository {
     pub fn with_verification_task_fence(
         verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     ) -> Self {
+        Self::with_access_credentials_and_verification_task_fence(
+            Arc::new(InMemoryAccessCredentialStore::new()),
+            verification_task_fence,
+        )
+    }
+
+    pub fn with_access_credentials_and_verification_task_fence(
+        access_credentials: Arc<InMemoryAccessCredentialStore>,
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
         Self {
             jobs: RwLock::new(HashMap::new()),
             force_receipts: RwLock::new(HashSet::new()),
             publication_intents: RwLock::new(HashMap::new()),
             verification_task_fence,
+            access_credentials,
         }
     }
 }
@@ -127,10 +145,15 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .contains_key(&(creator.clone(), lock_id.clone())))
     }
 
-    async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
+    async fn insert_job(&self, mut job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
         job.validate_frozen_identity()?;
         job.validate_state(false)?;
         let key = (job.creator.clone(), job.lock_id.clone());
+        let _admission = self
+            .verification_task_fence
+            .acquire_lock_admission(&job.creator, &job.lock_id)
+            .await;
+        job.deletion_started_at = self.verification_task_fence.authoritative_cutoff();
         let mut verification_tasks = self.verification_task_fence.records.write().await;
         let intents = self.publication_intents.read().await;
         let mut jobs = self.jobs.write().await;
@@ -149,6 +172,17 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 (task.creator == job.creator && task.lock_id == job.lock_id).then_some(*task_id)
             })
             .collect::<Vec<_>>();
+        let snapshot_bundles = matching_task_ids
+            .iter()
+            .filter_map(|task_id| {
+                verification_tasks.get(task_id).map(|task| {
+                    (
+                        task.bundle_id.clone(),
+                        (*task_id, task.paykit_admission_required, task.status),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
         if matching_task_ids.iter().any(|task_id| {
             verification_tasks
                 .get(task_id)
@@ -156,6 +190,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         }) {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
+        self.access_credentials
+            .register_deletion(&job, &snapshot_bundles)
+            .await?;
         for task_id in matching_task_ids {
             if let Some(task) = verification_tasks.get_mut(&task_id) {
                 task.deletion_job_id = Some(job.job_id);
@@ -217,6 +254,14 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         stored.claimed_by = Some(worker_id.to_owned());
         stored.claim_token = Some(claim_token);
         stored.claim_expires_at = Some(claim_expires_at);
+        self.access_credentials
+            .synchronize_job(
+                &stored.job,
+                stored.claimed_by.as_deref(),
+                stored.claim_token,
+                stored.claim_expires_at,
+            )
+            .await;
         Ok(Some(ClaimedContentLockDeletionJob {
             job: stored.job.clone(),
             claim_token,
@@ -241,6 +286,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         stored.job.state = ContentLockDeletionState::Queued;
         stored.job.next_attempt_at = Some(next_attempt_at);
         clear_claim(stored);
+        self.access_credentials
+            .synchronize_job(&stored.job, None, None, None)
+            .await;
         Ok(Some(stored.job.clone()))
     }
 
@@ -264,12 +312,18 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 message: "deletion phase must advance to its immediate successor".to_owned(),
             });
         }
+        self.access_credentials
+            .check_phase_advance(job_id, stored.job.phase, next_phase, now)
+            .await?;
         stored.job.phase = next_phase;
         stored.job.state = ContentLockDeletionState::Queued;
         stored.job.attempt_count = 0;
         stored.job.next_attempt_at = None;
         stored.job.failure_code = None;
         clear_claim(stored);
+        self.access_credentials
+            .synchronize_job(&stored.job, None, None, None)
+            .await;
         Ok(Some(stored.job.clone()))
     }
 
@@ -288,6 +342,11 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         else {
             return Ok(None);
         };
+        if failure_code.is_none() {
+            self.access_credentials
+                .check_successful_finish(job_id, stored.job.phase, now)
+                .await?;
+        }
         stored.job.state = if failure_code.is_some() {
             ContentLockDeletionState::Failed
         } else {
@@ -296,6 +355,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         stored.job.failure_code = failure_code;
         stored.job.next_attempt_at = None;
         clear_claim(stored);
+        self.access_credentials
+            .synchronize_job(&stored.job, None, None, None)
+            .await;
         Ok(Some(stored.job.clone()))
     }
 
@@ -320,6 +382,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             stored.job.failure_code = None;
             clear_claim(stored);
         }
+        self.access_credentials
+            .synchronize_job(&stored.job, None, None, None)
+            .await;
         Ok(Some(stored.job.clone()))
     }
 
@@ -360,13 +425,22 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 stored.job.state = ContentLockDeletionState::Queued;
                 stored.job.next_attempt_at = None;
                 clear_claim(stored);
+                self.access_credentials
+                    .synchronize_job(&stored.job, None, None, None)
+                    .await;
                 return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
             }
             let job = stored.job.clone();
+            self.access_credentials
+                .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
+                .await;
             jobs.remove(&key);
             receipts.insert(key);
             return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
         }
+        self.access_credentials
+            .block_key_and_disable_job(creator, lock_id, None)
+            .await;
         receipts.insert(key);
         Ok(PrepareForceDeletionResult::Synchronous(None))
     }

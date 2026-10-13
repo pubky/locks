@@ -10,9 +10,9 @@ mod validation;
 pub use loading::{load_existing_config_from_path, load_or_initialize_config, resolve_config_path};
 pub use schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, GrantConnectAcquisitionConfig,
-    LegacyConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, MAX_TRUSTED_PROXY_HOPS, PAYKIT_CONNECT_TIMEOUT_SECONDS,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig,
+    GrantConnectAcquisitionConfig, LegacyConnectAcquisitionConfig, LockServerCredentialsConfig,
+    LockServerRuntimeConfig, LoggingConfig, MAX_TRUSTED_PROXY_HOPS, PAYKIT_CONNECT_TIMEOUT_SECONDS,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
     PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
     RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,

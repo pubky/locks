@@ -1,7 +1,11 @@
 use std::fmt;
 
-use locks_core::ids::{BundleId, CreatorPubky};
+use locks_core::{
+    ids::{BundleId, CreatorPubky},
+    lock_policy::GuardedResource,
+};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
 
@@ -34,6 +38,60 @@ impl fmt::Debug for AccessCredential {
             .field(&"<redacted>")
             .finish()
     }
+}
+
+/// Versioned encrypted bearer envelope persisted for exact final-credential replay.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedFinalCredential(String);
+
+impl EncryptedFinalCredential {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EncryptedFinalCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("EncryptedFinalCredential")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+/// Immutable identity bound into final-credential AEAD associated data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalCredentialContext {
+    pub deletion_job_id: Uuid,
+    pub creator: CreatorPubky,
+    pub bundle_id: BundleId,
+}
+
+/// A deletion credential returned only after its encrypted bearer is durable.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IssuedDeletionCredential {
+    pub credential: AccessCredential,
+    pub expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for IssuedDeletionCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedDeletionCredential")
+            .field("credential", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Frozen-manifest authorization prepared before guarded-resource I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionReadAuthorization {
+    pub claim_token: Option<Uuid>,
+    pub creator: CreatorPubky,
+    pub resource: GuardedResource,
 }
 
 /// Non-bearer lookup key derived from an access credential.
