@@ -3197,7 +3197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_payment_publication_replays_without_fresh_paykit_status() {
+    async fn completed_payment_drain_retry_finishes_without_fresh_paykit_calls() {
         let database = TestDatabase::create().await;
         let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let drains = PostgresPaymentDrainRepository::new(database.pool().clone());
@@ -3368,7 +3368,35 @@ mod tests {
         paykit.lookup_calls.store(0, Ordering::SeqCst);
         paykit.status_calls.store(0, Ordering::SeqCst);
         paykit.fail_calls.store(true, Ordering::SeqCst);
-        assert!(use_case.execute_claimed(claim, "deletion").await.unwrap());
+
+        sqlx::query(
+            "CREATE FUNCTION fail_payment_drain_phase_advance() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF OLD.phase = 'drain_payments'
+                    AND NEW.phase = 'drain_existing_credentials' THEN
+                     RAISE EXCEPTION 'injected payment drain phase advance failure';
+                 END IF;
+                 RETURN NEW;
+             END
+             $$",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_payment_drain_phase_advance
+             BEFORE UPDATE OF phase ON content_lock_deletion_jobs
+             FOR EACH ROW EXECUTE FUNCTION fail_payment_drain_phase_advance()",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            use_case.execute_claimed(claim.clone(), "deletion").await,
+            Err(ApplicationError::Storage { .. })
+        ));
         assert_eq!(paykit.lookup_calls.load(Ordering::SeqCst), 0);
         assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 0);
         assert!(drains.all_obligations_terminal(job.job_id).await.unwrap());
@@ -3379,6 +3407,28 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(
+            deletions
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            ContentLockDeletionPhase::DrainPayments
+        );
+
+        sqlx::query("DROP TRIGGER fail_payment_drain_phase_advance ON content_lock_deletion_jobs")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION fail_payment_drain_phase_advance()")
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        assert!(use_case.execute_claimed(claim, "deletion").await.unwrap());
+        assert_eq!(paykit.lookup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(paykit.status_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             deletions
                 .get_job(&job.creator, &job.lock_id)
