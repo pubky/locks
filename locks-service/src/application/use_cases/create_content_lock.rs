@@ -216,6 +216,12 @@ mod tests {
         let fixture = Fixture::seeded().await;
         let use_case = fixture.use_case();
         let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
 
         let result = use_case.execute(request.clone()).await.unwrap();
 
@@ -250,7 +256,7 @@ mod tests {
         );
         let ownership = fixture
             .content_lock_ownership
-            .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+            .get_path_ownership(&creator(), &guarded_path)
             .await
             .unwrap()
             .unwrap();
@@ -345,6 +351,12 @@ mod tests {
         let fixture = Fixture::seeded().await;
         let use_case = fixture.use_case();
         let first_request = content_lock_request(registered_guarded_resource());
+        let guarded_path = first_request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
         let mut second_request = first_request.clone();
         second_request.criteria[0].params = json!({ "satisfied": false });
 
@@ -353,13 +365,13 @@ mod tests {
 
         assert!(matches!(
             second,
-            Err(ApplicationError::ContentLockPathConflict { ref guarded_path })
-                if guarded_path == "/priv/locks.app/content/hello.txt"
+            Err(ApplicationError::ContentLockPathConflict { guarded_path: ref conflicting_path })
+                if conflicting_path == &guarded_path
         ));
         assert_eq!(fixture.content_locks_len().await, 1);
         let ownership = fixture
             .content_lock_ownership
-            .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+            .get_path_ownership(&creator(), &guarded_path)
             .await
             .unwrap()
             .unwrap();
@@ -426,10 +438,15 @@ mod tests {
             &fixture.guarded_resources,
             &fixture.clock,
         );
+        let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
 
-        let result = use_case
-            .execute(content_lock_request(registered_guarded_resource()))
-            .await;
+        let result = use_case.execute(request).await;
 
         assert!(matches!(
             result,
@@ -438,7 +455,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/locks.app/content/hello.txt")
+                .get_path_ownership(&creator(), &guarded_path)
                 .await
                 .unwrap(),
             None
