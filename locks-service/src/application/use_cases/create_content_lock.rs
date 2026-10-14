@@ -215,55 +215,16 @@ impl<'a> CreateContentLockUseCase<'a> {
             return Err(error);
         }
 
-        if let Err(error) = self
-            .content_locks
+        // Any returned external-write error is ambiguous: an identical payload may predate this
+        // attempt, while this PUT may still commit later. `?` deliberately retains reservation
+        // and intent so deletion stays fenced until completion is proved out of band.
+        self.content_locks
             .upsert_content_lock(
                 request.creator.clone(),
                 content_lock_path.clone(),
                 content_lock.clone(),
             )
-            .await
-        {
-            match self
-                .content_locks
-                .get_content_lock(&request.creator, &content_lock_path)
-                .await
-            {
-                Ok(Some(published)) if published == content_lock => {
-                    if self
-                        .content_lock_deletions
-                        .mark_publication_written(&request.creator, &lock_id, publication_token)
-                        .await
-                        .is_ok_and(|marked| marked)
-                        && self
-                            .content_lock_ownership
-                            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
-                            .await
-                            .is_ok()
-                    {
-                        let _ = self
-                            .content_lock_deletions
-                            .finish_publication(&request.creator, &lock_id, publication_token)
-                            .await;
-                    }
-                }
-                Ok(None) => {
-                    if self
-                        .content_lock_ownership
-                        .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
-                        .await
-                        .is_ok()
-                    {
-                        let _ = self
-                            .content_lock_deletions
-                            .abandon_publication(&request.creator, &lock_id, publication_token)
-                            .await;
-                    }
-                }
-                Ok(Some(_)) | Err(_) => {}
-            }
-            return Err(error);
-        }
+            .await?;
 
         if !self
             .content_lock_deletions
@@ -738,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_failure_compensates_reserved_path_ownership() {
+    async fn publication_failure_retains_reserved_path_ownership_and_intent() {
         let fixture = Fixture::seeded().await;
         let use_case = CreateContentLockUseCase::new(
             &FailingContentLockRepository,
@@ -761,18 +722,24 @@ mod tests {
             result,
             Err(ApplicationError::Storage { ref message }) if message == "publication failed"
         ));
-        assert_eq!(
+        let ownership = fixture
+            .content_lock_ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ownership.status, ContentLockOwnershipStatus::Reserved);
+        assert!(
             fixture
-                .content_lock_ownership
-                .get_path_ownership(&creator(), &guarded_path)
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &ownership.lock_id)
                 .await
-                .unwrap(),
-            None
+                .unwrap()
         );
     }
 
     #[tokio::test]
-    async fn ambiguous_publication_error_reconciles_committed_lock_without_releasing_ownership() {
+    async fn ambiguous_publication_error_retains_fence_despite_exact_readback() {
         let fixture = Fixture::seeded().await;
         let content_locks = AmbiguousContentLockRepository::default();
         let use_case = CreateContentLockUseCase::new(
@@ -818,10 +785,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            ContentLockOwnershipStatus::Published
+            ContentLockOwnershipStatus::Reserved
         );
         assert!(
-            !fixture
+            fixture
                 .content_lock_deletions
                 .publication_in_progress(&creator(), &lock_id)
                 .await
@@ -1160,10 +1127,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_memory_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
+    async fn failed_memory_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
         let fixture = Fixture::seeded().await;
 
-        assert_active_publisher_keeps_retry_and_force_fenced(
+        assert_failed_publisher_keeps_retry_and_force_fenced(
             &fixture.content_lock_deletions,
             &fixture.content_lock_ownership,
             &fixture.guarded_resources,
@@ -1173,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_postgres_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
+    async fn failed_postgres_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
         let database = TestDatabase::create().await;
         let content_lock_deletions =
             PostgresContentLockDeletionRepository::new(database.pool().clone());
@@ -1194,7 +1161,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_active_publisher_keeps_retry_and_force_fenced(
+        assert_failed_publisher_keeps_retry_and_force_fenced(
             &content_lock_deletions,
             &content_lock_ownership,
             &guarded_resources,
@@ -1204,7 +1171,7 @@ mod tests {
         database.cleanup().await;
     }
 
-    async fn assert_active_publisher_keeps_retry_and_force_fenced(
+    async fn assert_failed_publisher_keeps_retry_and_force_fenced(
         content_lock_deletions: &dyn ContentLockDeletionRepository,
         content_lock_ownership: &dyn ContentLockOwnershipRepository,
         guarded_resources: &dyn GuardedResourceRepository,
@@ -1233,41 +1200,47 @@ mod tests {
             )
             .await
             .unwrap();
-        let blocking_content_locks = BlockingUpsertContentLockRepository {
+        let delayed_content_locks = DelayedFailedUpsertContentLockRepository {
             inner: &stored_content_locks,
-            upsert_started: Notify::new(),
-            release_upsert: Notify::new(),
+            pending_write: Mutex::new(None),
         };
         let use_case = CreateContentLockUseCase::new(
-            &blocking_content_locks,
+            &delayed_content_locks,
             content_lock_deletions,
             content_lock_ownership,
             guarded_resources,
             clock,
         );
 
-        let original = use_case.execute(request.clone());
-        let race = async {
-            blocking_content_locks.upsert_started.notified().await;
-            let retry = use_case.execute(request).await;
-            let force = content_lock_deletions
-                .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+        let original = use_case.execute(request.clone()).await;
+
+        assert!(matches!(
+            original,
+            Err(ApplicationError::Storage { ref message })
+                if message == "publication response lost"
+        ));
+        assert!(delayed_content_locks.has_pending_write());
+        assert_eq!(
+            content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
                 .await
-                .unwrap();
-            if matches!(force, PrepareForceDeletionResult::Synchronous(_)) {
-                stored_content_locks
-                    .delete_content_lock(&creator(), &content_lock_path)
-                    .await
-                    .unwrap();
-                content_lock_deletions
-                    .complete_force_deletion(&creator(), &lock_id, clock.now())
-                    .await
-                    .unwrap();
-            }
-            blocking_content_locks.release_upsert.notify_one();
-            (retry, force)
-        };
-        let (original, (retry, force)) = tokio::join!(original, race);
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Reserved
+        );
+        assert!(
+            content_lock_deletions
+                .publication_in_progress(&creator(), &lock_id)
+                .await
+                .unwrap()
+        );
+
+        let retry = use_case.execute(request).await;
+        let force = content_lock_deletions
+            .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+            .await
+            .unwrap();
 
         assert!(matches!(
             retry,
@@ -1281,31 +1254,26 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(original.unwrap().content_lock, content_lock);
-
-        assert!(matches!(
+        delayed_content_locks.land_delayed_write().await;
+        assert_eq!(
             content_lock_deletions
                 .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(_)
-        ));
-        stored_content_locks
-            .delete_content_lock(&creator(), &content_lock_path)
-            .await
-            .unwrap();
+            PrepareForceDeletionResult::PublicationInProgress
+        );
         assert!(
-            content_lock_deletions
-                .complete_force_deletion(&creator(), &lock_id, clock.now())
+            !content_lock_deletions
+                .has_force_receipt(&creator(), &lock_id)
                 .await
                 .unwrap()
         );
-        assert!(
+        assert_eq!(
             stored_content_locks
                 .get_content_lock(&creator(), &content_lock_path)
                 .await
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            Some(content_lock)
         );
     }
 
@@ -1632,25 +1600,37 @@ mod tests {
         }
     }
 
-    struct BlockingUpsertContentLockRepository<'a> {
+    struct DelayedFailedUpsertContentLockRepository<'a> {
         inner: &'a dyn ContentLockRepository,
-        upsert_started: Notify,
-        release_upsert: Notify,
+        pending_write: Mutex<Option<(CreatorPubky, ContentLockPath, ContentLock)>>,
+    }
+
+    impl DelayedFailedUpsertContentLockRepository<'_> {
+        fn has_pending_write(&self) -> bool {
+            self.pending_write.lock().unwrap().is_some()
+        }
+
+        async fn land_delayed_write(&self) {
+            let (creator, path, content_lock) = self.pending_write.lock().unwrap().take().unwrap();
+            self.inner
+                .upsert_content_lock(creator, path, content_lock)
+                .await
+                .unwrap();
+        }
     }
 
     #[async_trait]
-    impl ContentLockRepository for BlockingUpsertContentLockRepository<'_> {
+    impl ContentLockRepository for DelayedFailedUpsertContentLockRepository<'_> {
         async fn upsert_content_lock(
             &self,
             creator: CreatorPubky,
             path: ContentLockPath,
             content_lock: ContentLock,
         ) -> Result<(), ApplicationError> {
-            self.upsert_started.notify_one();
-            self.release_upsert.notified().await;
-            self.inner
-                .upsert_content_lock(creator, path, content_lock)
-                .await
+            *self.pending_write.lock().unwrap() = Some((creator, path, content_lock));
+            Err(ApplicationError::Storage {
+                message: "publication response lost".to_owned(),
+            })
         }
 
         async fn get_content_lock(
