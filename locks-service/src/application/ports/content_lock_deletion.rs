@@ -27,6 +27,14 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<(), ApplicationError>;
 
+    /// Records that the exact token-owned external write has returned before local finalization.
+    async fn mark_publication_written(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
     /// Finalizes the exact publication reservation after external publication and ownership commit.
     async fn finish_publication(
         &self,
@@ -43,9 +51,8 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Clears a retained intent only from the early exact-published replay path, after exact
-    /// canonical bytes and the complete published ownership set establish that no publisher is
-    /// still before its external write.
+    /// Clears a retained write-complete intent from the early exact-published replay path, after
+    /// exact canonical bytes and the complete published ownership set match.
     async fn reconcile_publication(
         &self,
         creator: &CreatorPubky,

@@ -365,8 +365,9 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
     let repository = InMemoryContentLockDeletionRepository::new();
     let lock = content_lock();
     let lock_id = lock.lock_id().unwrap();
+    let publication_token = Uuid::new_v4();
     repository
-        .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+        .begin_publication(&lock.creator, &lock_id, publication_token)
         .await
         .unwrap();
 
@@ -399,6 +400,12 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
     assert!(
         repository
             .publication_in_progress(&lock.creator, &lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .mark_publication_written(&lock.creator, &lock_id, publication_token)
             .await
             .unwrap()
     );

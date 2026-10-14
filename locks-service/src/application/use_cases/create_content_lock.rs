@@ -139,9 +139,8 @@ impl<'a> CreateContentLockUseCase<'a> {
             }
         })?;
         if already_published {
-            // Exact canonical readback plus a complete published ownership set proves that no
-            // publisher can still be before its PUT. A retained post-PUT intent may therefore be
-            // reconciled, but an exact replay must never open a new intent or publish again.
+            // Reconciliation additionally requires the token owner to have durably recorded that
+            // its external write returned. An exact replay never opens a new intent or republishes.
             self.content_lock_deletions
                 .reconcile_publication(&request.creator, &lock_id, &content_lock, &guarded_paths)
                 .await?;
@@ -232,10 +231,15 @@ impl<'a> CreateContentLockUseCase<'a> {
             {
                 Ok(Some(published)) if published == content_lock => {
                     if self
-                        .content_lock_ownership
-                        .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                        .content_lock_deletions
+                        .mark_publication_written(&request.creator, &lock_id, publication_token)
                         .await
-                        .is_ok()
+                        .is_ok_and(|marked| marked)
+                        && self
+                            .content_lock_ownership
+                            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                            .await
+                            .is_ok()
                     {
                         let _ = self
                             .content_lock_deletions
@@ -259,6 +263,16 @@ impl<'a> CreateContentLockUseCase<'a> {
                 Ok(Some(_)) | Err(_) => {}
             }
             return Err(error);
+        }
+
+        if !self
+            .content_lock_deletions
+            .mark_publication_written(&request.creator, &lock_id, publication_token)
+            .await?
+        {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication write completion was not committed".to_owned(),
+            });
         }
 
         self.content_lock_ownership
@@ -820,11 +834,19 @@ mod tests {
         let fixture = Fixture::seeded().await;
         let request = content_lock_request(registered_guarded_resource());
         let created = fixture.use_case().execute(request.clone()).await.unwrap();
+        let retained_token = Uuid::new_v4();
         fixture
             .content_lock_deletions
-            .begin_publication(&creator(), &created.lock_id, Uuid::new_v4())
+            .begin_publication(&creator(), &created.lock_id, retained_token)
             .await
             .unwrap();
+        assert!(
+            fixture
+                .content_lock_deletions
+                .mark_publication_written(&creator(), &created.lock_id, retained_token)
+                .await
+                .unwrap()
+        );
 
         let replayed = fixture.use_case().execute(request).await.unwrap();
 
@@ -1135,6 +1157,156 @@ mod tests {
             ContentLockOwnershipStatus::Published
         );
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn active_memory_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
+        let fixture = Fixture::seeded().await;
+
+        assert_active_publisher_keeps_retry_and_force_fenced(
+            &fixture.content_lock_deletions,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_postgres_publisher_keeps_retry_and_force_fenced_from_old_exact_bytes() {
+        let database = TestDatabase::create().await;
+        let content_lock_deletions =
+            PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let content_lock_ownership =
+            PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        let guarded_resources = InMemoryGuardedResourceRepository::new();
+        let clock = MutableClock::new(datetime!(2026-06-03 12:00:00 UTC));
+        let guarded_resource = registered_guarded_resource();
+        guarded_resources
+            .upsert_guarded_resource(GuardedResourceRecord {
+                creator: creator(),
+                path: guarded_resource.path.clone(),
+                hash: guarded_resource.hash,
+                content_type: guarded_resource.content_type.clone(),
+                size: guarded_resource.size,
+                bytes: b"guarded bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        assert_active_publisher_keeps_retry_and_force_fenced(
+            &content_lock_deletions,
+            &content_lock_ownership,
+            &guarded_resources,
+            &clock,
+        )
+        .await;
+        database.cleanup().await;
+    }
+
+    async fn assert_active_publisher_keeps_retry_and_force_fenced(
+        content_lock_deletions: &dyn ContentLockDeletionRepository,
+        content_lock_ownership: &dyn ContentLockOwnershipRepository,
+        guarded_resources: &dyn GuardedResourceRepository,
+        clock: &dyn Clock,
+    ) {
+        let stored_content_locks = InMemoryContentLockRepository::new();
+        let request = content_lock_request(registered_guarded_resource());
+        let content_lock = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: request.creator.clone(),
+            primary_resource: request.primary_resource.clone(),
+            secondary_resources: request.secondary_resources.clone(),
+            criteria: request.criteria.clone(),
+            lock_logic: request.lock_logic.clone(),
+            access_policy: request.access_policy.clone(),
+            lock_server: request.lock_server.clone(),
+            created_at: clock.now(),
+        };
+        let lock_id = content_lock.lock_id().unwrap();
+        let content_lock_path = content_lock.content_lock_path().unwrap();
+        stored_content_locks
+            .upsert_content_lock(
+                request.creator.clone(),
+                content_lock_path.clone(),
+                content_lock.clone(),
+            )
+            .await
+            .unwrap();
+        let blocking_content_locks = BlockingUpsertContentLockRepository {
+            inner: &stored_content_locks,
+            upsert_started: Notify::new(),
+            release_upsert: Notify::new(),
+        };
+        let use_case = CreateContentLockUseCase::new(
+            &blocking_content_locks,
+            content_lock_deletions,
+            content_lock_ownership,
+            guarded_resources,
+            clock,
+        );
+
+        let original = use_case.execute(request.clone());
+        let race = async {
+            blocking_content_locks.upsert_started.notified().await;
+            let retry = use_case.execute(request).await;
+            let force = content_lock_deletions
+                .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+                .await
+                .unwrap();
+            if matches!(force, PrepareForceDeletionResult::Synchronous(_)) {
+                stored_content_locks
+                    .delete_content_lock(&creator(), &content_lock_path)
+                    .await
+                    .unwrap();
+                content_lock_deletions
+                    .complete_force_deletion(&creator(), &lock_id, clock.now())
+                    .await
+                    .unwrap();
+            }
+            blocking_content_locks.release_upsert.notify_one();
+            (retry, force)
+        };
+        let (original, (retry, force)) = tokio::join!(original, race);
+
+        assert!(matches!(
+            retry,
+            Err(ApplicationError::Storage { ref message })
+                if message == "content lock publication reconciliation was not committed"
+        ));
+        assert_eq!(force, PrepareForceDeletionResult::PublicationInProgress);
+        assert!(
+            !content_lock_deletions
+                .has_force_receipt(&creator(), &lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(original.unwrap().content_lock, content_lock);
+
+        assert!(matches!(
+            content_lock_deletions
+                .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(_)
+        ));
+        stored_content_locks
+            .delete_content_lock(&creator(), &content_lock_path)
+            .await
+            .unwrap();
+        assert!(
+            content_lock_deletions
+                .complete_force_deletion(&creator(), &lock_id, clock.now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            stored_content_locks
+                .get_content_lock(&creator(), &content_lock_path)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1449,6 +1621,44 @@ mod tests {
             self.snapshot_taken.notify_one();
             self.release_read.notified().await;
             Ok(content_lock)
+        }
+
+        async fn delete_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            self.inner.delete_content_lock(creator, path).await
+        }
+    }
+
+    struct BlockingUpsertContentLockRepository<'a> {
+        inner: &'a dyn ContentLockRepository,
+        upsert_started: Notify,
+        release_upsert: Notify,
+    }
+
+    #[async_trait]
+    impl ContentLockRepository for BlockingUpsertContentLockRepository<'_> {
+        async fn upsert_content_lock(
+            &self,
+            creator: CreatorPubky,
+            path: ContentLockPath,
+            content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            self.upsert_started.notify_one();
+            self.release_upsert.notified().await;
+            self.inner
+                .upsert_content_lock(creator, path, content_lock)
+                .await
+        }
+
+        async fn get_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            self.inner.get_content_lock(creator, path).await
         }
 
         async fn delete_content_lock(

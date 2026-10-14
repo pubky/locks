@@ -95,6 +95,29 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
     }
 
+    async fn mark_publication_written(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let result = sqlx::query(
+            "UPDATE content_lock_publication_intents
+             SET external_write_completed_at = COALESCE(external_write_completed_at, clock_timestamp())
+             WHERE creator = $1 AND lock_id = $2 AND publication_token = $3",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(publication_token)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn abandon_publication(
         &self,
         creator: &CreatorPubky,
@@ -125,6 +148,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM content_lock_publication_intents
                 WHERE creator = $1 AND lock_id = $2
+                  AND external_write_completed_at IS NOT NULL
             )",
         )
         .bind(creator.to_string())
@@ -155,7 +179,9 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             return Ok(false);
         }
         let result = sqlx::query(
-            "DELETE FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2",
+            "DELETE FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2
+               AND external_write_completed_at IS NOT NULL",
         )
         .bind(creator.to_string())
         .bind(lock_id.to_string())
@@ -1064,10 +1090,17 @@ mod tests {
             .reserve_paths(&lock.creator, &paths, &lock_id)
             .await
             .unwrap();
+        let publication_token = Uuid::new_v4();
         publications
-            .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+            .begin_publication(&lock.creator, &lock_id, publication_token)
             .await
             .unwrap();
+        assert!(
+            publications
+                .mark_publication_written(&lock.creator, &lock_id, publication_token)
+                .await
+                .unwrap()
+        );
         ownership
             .mark_paths_published(&lock.creator, &paths, &lock_id)
             .await
@@ -1086,10 +1119,25 @@ mod tests {
             )
             .await
             .unwrap();
+        let unrelated_publication_token = Uuid::new_v4();
         publications
-            .begin_publication(&unrelated_lock.creator, &unrelated_lock_id, Uuid::new_v4())
+            .begin_publication(
+                &unrelated_lock.creator,
+                &unrelated_lock_id,
+                unrelated_publication_token,
+            )
             .await
             .unwrap();
+        assert!(
+            publications
+                .mark_publication_written(
+                    &unrelated_lock.creator,
+                    &unrelated_lock_id,
+                    unrelated_publication_token,
+                )
+                .await
+                .unwrap()
+        );
         ownership
             .mark_paths_published(
                 &unrelated_lock.creator,
@@ -1164,14 +1212,25 @@ mod tests {
             )
             .await
             .unwrap();
+        let ownership_race_publication_token = Uuid::new_v4();
         publications
             .begin_publication(
                 &ownership_race_lock.creator,
                 &ownership_race_lock_id,
-                Uuid::new_v4(),
+                ownership_race_publication_token,
             )
             .await
             .unwrap();
+        assert!(
+            publications
+                .mark_publication_written(
+                    &ownership_race_lock.creator,
+                    &ownership_race_lock_id,
+                    ownership_race_publication_token,
+                )
+                .await
+                .unwrap()
+        );
         ownership
             .mark_paths_published(
                 &ownership_race_lock.creator,

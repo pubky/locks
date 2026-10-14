@@ -27,12 +27,18 @@ struct StoredJob {
     claim_expires_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PublicationIntent {
+    token: Uuid,
+    write_completed: bool,
+}
+
 /// In-memory deletion repository with the same lease-fencing semantics as PostgreSQL.
 #[derive(Debug, Default)]
 pub struct InMemoryContentLockDeletionRepository {
     jobs: RwLock<HashMap<JobKey, StoredJob>>,
     force_receipts: RwLock<HashMap<JobKey, ForceDeletionReceipt>>,
-    publication_intents: RwLock<HashMap<JobKey, Uuid>>,
+    publication_intents: RwLock<HashMap<JobKey, PublicationIntent>>,
 }
 
 impl InMemoryContentLockDeletionRepository {
@@ -61,8 +67,31 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 guarded_path: "content lock publication in progress".to_owned(),
             });
         }
-        intents.insert(key, publication_token);
+        intents.insert(
+            key,
+            PublicationIntent {
+                token: publication_token,
+                write_completed: false,
+            },
+        );
         Ok(())
+    }
+
+    async fn mark_publication_written(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut intents = self.publication_intents.write().await;
+        let Some(intent) = intents.get_mut(&(creator.clone(), lock_id.clone())) else {
+            return Ok(false);
+        };
+        if intent.token != publication_token {
+            return Ok(false);
+        }
+        intent.write_completed = true;
+        Ok(true)
     }
 
     async fn finish_publication(
@@ -110,12 +139,16 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         ) {
             return Ok(false);
         }
-        Ok(self
-            .publication_intents
-            .write()
-            .await
-            .remove(&(creator.clone(), lock_id.clone()))
-            .is_some())
+        let key = (creator.clone(), lock_id.clone());
+        let mut intents = self.publication_intents.write().await;
+        if !intents
+            .get(&key)
+            .is_some_and(|intent| intent.write_completed)
+        {
+            return Ok(false);
+        }
+        intents.remove(&key);
+        Ok(true)
     }
 
     async fn publication_in_progress(
@@ -400,14 +433,17 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
 }
 
 async fn remove_publication_intent(
-    intents: &RwLock<HashMap<JobKey, Uuid>>,
+    intents: &RwLock<HashMap<JobKey, PublicationIntent>>,
     creator: &CreatorPubky,
     lock_id: &LockId,
     publication_token: Uuid,
 ) -> Result<bool, ApplicationError> {
     let key = (creator.clone(), lock_id.clone());
     let mut intents = intents.write().await;
-    if intents.get(&key) != Some(&publication_token) {
+    if intents
+        .get(&key)
+        .is_none_or(|intent| intent.token != publication_token)
+    {
         return Ok(false);
     }
     intents.remove(&key);
