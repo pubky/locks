@@ -33,6 +33,7 @@ use locks_service::{
             content_lock_deletions::InMemoryContentLockDeletionRepository,
             content_lock_ownership::InMemoryContentLockOwnershipRepository,
             verification_task_claims::InMemoryVerificationTaskClaimer,
+            verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
             verification_tasks::InMemoryVerificationTaskRepository,
         },
         postgres::{
@@ -312,12 +313,20 @@ impl std::fmt::Debug for AppState {
 
 impl AppState {
     pub fn new_empty_in_memory(config: LockServerRuntimeConfig) -> Self {
-        let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::new());
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_deletion_fence =
+            Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let verification_tasks = Arc::new(
+            InMemoryVerificationTaskRepository::with_verification_task_fence(Arc::clone(
+                &verification_task_deletion_fence,
+            )),
+        );
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
@@ -337,6 +346,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            verification_task_deletion_fence: Some(verification_task_deletion_fence),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -366,12 +376,20 @@ impl AppState {
         lock_service_pointers: Arc<dyn LockServicePointerRepository>,
         entitlements: Arc<dyn EntitlementRepository>,
     ) -> Self {
-        let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::new());
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_deletion_fence =
+            Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let verification_tasks = Arc::new(
+            InMemoryVerificationTaskRepository::with_verification_task_fence(Arc::clone(
+                &verification_task_deletion_fence,
+            )),
+        );
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
@@ -390,6 +408,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            verification_task_deletion_fence: Some(verification_task_deletion_fence),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -419,12 +438,20 @@ impl AppState {
     where
         S: PubkyHomeserverStorageClient + Clone + 'static,
     {
-        let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::new());
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_deletion_fence =
+            Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let verification_tasks = Arc::new(
+            InMemoryVerificationTaskRepository::with_verification_task_fence(Arc::clone(
+                &verification_task_deletion_fence,
+            )),
+        );
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(InMemoryAccessCredentialStore::new());
@@ -460,6 +487,7 @@ impl AppState {
 
         let private_runtime = PrivateRuntimeAdapters {
             content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            verification_task_deletion_fence: Some(verification_task_deletion_fence),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -511,6 +539,7 @@ impl AppState {
             content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
                 pool.clone(),
             )),
+            verification_task_deletion_fence: None,
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -566,6 +595,7 @@ impl AppState {
             content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
                 pool.clone(),
             )),
+            verification_task_deletion_fence: None,
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -632,7 +662,15 @@ impl AppState {
         let content_lock_deletions: Arc<dyn ContentLockDeletionRepository> =
             match postgres_pool.as_ref() {
                 Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
-                None => Arc::new(InMemoryContentLockDeletionRepository::new()),
+                None => Arc::new(
+                    InMemoryContentLockDeletionRepository::with_verification_task_fence(
+                        private_runtime
+                            .verification_task_deletion_fence
+                            .as_ref()
+                            .cloned()
+                            .expect("in-memory runtime must share verification deletion fence"),
+                    ),
+                ),
             };
         let payment_drains = postgres_pool.as_ref().map(|pool| {
             Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))

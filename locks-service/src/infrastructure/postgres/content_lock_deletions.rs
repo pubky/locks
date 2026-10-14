@@ -853,11 +853,6 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-            sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
-                .bind(job.job_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
             transaction.commit().await.map_err(storage_error)?;
             return Ok(PrepareForceDeletionResult::Synchronous(
                 row_to_force_receipt(receipt)?,
@@ -2022,13 +2017,13 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            reopened_after_force
-                .get_job(&job.creator, &job.lock_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let retained_job = reopened_after_force
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_job.job_id, job.job_id);
+        assert_eq!(retained_job.state, ContentLockDeletionState::Failed);
         assert!(
             reopened_after_force
                 .complete_force_deletion(&job.creator, &job.lock_id, NOW)
@@ -2393,7 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_of_terminal_job_deletes_job_and_clears_task_ownership() {
+    async fn force_of_terminal_job_retains_job_and_task_ownership() {
         let database = TestDatabase::create().await;
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
@@ -2431,7 +2426,9 @@ mod tests {
                 .get_job(&job.creator, &job.lock_id)
                 .await
                 .unwrap()
-                .is_none()
+                .is_some_and(|stored| {
+                    stored.job_id == job.job_id && stored.state == ContentLockDeletionState::Failed
+                })
         );
         let owner: Option<Uuid> =
             sqlx::query_scalar("SELECT deletion_job_id FROM verification_tasks WHERE task_id = $1")
@@ -2439,7 +2436,7 @@ mod tests {
                 .fetch_one(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(owner, None);
+        assert_eq!(owner, Some(job.job_id));
         database.cleanup().await;
     }
 

@@ -63,7 +63,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM content_lock_deletion_jobs
                 WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-                  AND claim_token = $3 AND claim_expires_at >= $4
+                  AND claim_token = $3 AND claim_expires_at > clock_timestamp()
                   AND phase = 'start_payment_drain' AND force_requested_at IS NULL
             )",
         )
@@ -162,7 +162,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
              FROM content_lock_deletion_jobs AS deletion
              WHERE deletion.job_id = $1 AND deletion.state = 'running'
                AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $4 AND deletion.phase = 'drain_payments'
+               AND deletion.claim_expires_at > clock_timestamp()
+               AND deletion.phase = 'drain_payments'
                AND deletion.force_requested_at IS NULL
                AND drain.deletion_job_id = deletion.job_id
                AND drain.cleanup_token = $8
@@ -229,7 +230,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM content_lock_deletion_jobs
                 WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-                  AND claim_token = $3 AND claim_expires_at >= $4
+                  AND claim_token = $3 AND claim_expires_at > clock_timestamp()
                   AND phase = 'drain_payments' AND force_requested_at IS NULL
                 FOR UPDATE
             )",
@@ -257,7 +258,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                   content_lock_deletion_task_snapshot AS snapshot
              WHERE deletion.job_id = $1 AND deletion.state = 'running'
                AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $4 AND deletion.phase = 'drain_payments'
+               AND deletion.claim_expires_at > clock_timestamp()
+               AND deletion.phase = 'drain_payments'
                AND deletion.force_requested_at IS NULL
                AND snapshot.deletion_job_id = deletion.job_id
                AND snapshot.verification_task_id = task.task_id
@@ -327,7 +329,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                       content_lock_deletion_task_snapshot AS snapshot
                  WHERE deletion.job_id = $1 AND deletion.state = 'running'
                    AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-                   AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
+                   AND deletion.claim_expires_at > clock_timestamp()
+                   AND deletion.phase = 'drain_payments'
                    AND deletion.force_requested_at IS NULL
                    AND snapshot.deletion_job_id = deletion.job_id
                    AND snapshot.verification_task_id = task.task_id
@@ -359,7 +362,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                       content_lock_deletion_task_snapshot AS snapshot
                  WHERE deletion.job_id = $1 AND deletion.state = 'running'
                    AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-                   AND deletion.claim_expires_at >= $5 AND deletion.phase = 'drain_payments'
+                   AND deletion.claim_expires_at > clock_timestamp()
+                   AND deletion.phase = 'drain_payments'
                    AND deletion.force_requested_at IS NULL
                    AND snapshot.deletion_job_id = deletion.job_id
                    AND snapshot.verification_task_id = task.task_id
@@ -640,6 +644,67 @@ mod tests {
         assert!(
             !repository
                 .reconcile_payment_drain(job_id, "worker", Uuid::new_v4(), now, &divergent)
+                .await
+                .unwrap()
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn store_and_reconcile_use_postgres_time_for_live_claim_with_skewed_app_clock() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, 'creator', 'lock', '{}'::jsonb, $2,
+                     'running', 'start_payment_drain', 'worker', $3,
+                     clock_timestamp() + INTERVAL '5 minutes')",
+        )
+        .bind(job_id)
+        .bind(now)
+        .bind(claim_token)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let token = PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([11_u8; 32])).unwrap();
+        let active = PaymentDrainSummary {
+            status: PaymentDrainStatus::Active,
+            accepted_count: 1,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            cleanup_token: token.clone(),
+        };
+        let skewed_now = now + time::Duration::days(1);
+        assert!(
+            repository
+                .store_payment_drain(job_id, "worker", claim_token, skewed_now, &active)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs SET phase = 'drain_payments' WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let completed = PaymentDrainSummary {
+            status: PaymentDrainStatus::Completed,
+            accepted_count: 0,
+            terminal_count: 1,
+            cancellation_enqueued_count: 0,
+            cleanup_token: token,
+        };
+        assert!(
+            repository
+                .reconcile_payment_drain(job_id, "worker", claim_token, skewed_now, &completed)
                 .await
                 .unwrap()
         );

@@ -17,12 +17,14 @@ use locks_service::application::{
         LegacyCreatorConnectFlowClient, VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
+use locks_service::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub(super) struct PrivateRuntimeAdapters {
     pub(super) content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
+    pub(super) verification_task_deletion_fence: Option<Arc<InMemoryVerificationTaskDeletionFence>>,
     pub(super) invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     pub(super) verification_tasks: Arc<dyn VerificationTaskRepository>,
     pub(super) verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
