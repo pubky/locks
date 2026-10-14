@@ -24,9 +24,9 @@
 
 1. `paykit-payment` criterion params gain required `payment_in`.
 2. `payment_in` is a nonzero JSON `u64` integer measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. There is no product maximum beyond checked duration/timestamp representation.
-3. Locks includes `payment_in` in the signed invoice request. Paykit independently reads the canonical lock and rejects a mismatch before side effects.
+3. Locks includes the persisted `payment_in` from the validated canonical criterion in the signed invoice request. Paykit independently reads the canonical lock and rejects a mismatch before side effects.
 4. Paykit commits `invoice_created_at` and `payment_deadline = checked(invoice_created_at + payment_in hours)` atomically with invoice creation. Exact replay returns the original timestamps.
-5. Locks persists the returned timestamps before admitting the verification task. Retry never restarts the payment window.
+5. Locks validates the returned timestamps before marking invoice admission ready. Paykit remains authoritative for the timestamps and returns them on later status reads; exact invoice replay never restarts the payment window.
 6. Paykit sets Payment Request `proposal_expires_at` to `payment_deadline`, but the field remains proposal-only. Locks and Paykit Server enforce the post-acceptance deadline as application state.
 7. Payment is timely when Paykit’s durable `first_amount_matched_observed_at <= payment_deadline`. An earlier underpayment does not lend its timestamp to a later qualifying output. Polling latency is accepted.
 8. At the deadline, undetected and underpaid invoices expire and stop active observation. A timely amount-matched payment may continue confirmation observation after the deadline without a second timeout.
@@ -92,7 +92,7 @@
 | Contract/state | Owner |
 | --- | --- |
 | `payment_in` criterion schema and validation | Locks Core |
-| Signed invoice request producer and response persistence | Locks Server/Service |
+| Signed invoice request producer and response validation | Locks Server |
 | `invoice_created_at`, `payment_deadline`, proposal expiry | Paykit Server |
 | Payment Request acceptance/rejection/cancellation projection | Paykit Server |
 | Bitcoin first-observation and confirmations | Paykit Server |
@@ -121,7 +121,7 @@ POST /invoices
 }
 ```
 
-Success changes from ignored-body 2xx to closed JSON:
+Success is exactly `200 OK` with closed JSON:
 
 ```json
 {
@@ -130,7 +130,7 @@ Success changes from ignored-body 2xx to closed JSON:
 }
 ```
 
-Paykit compares request `payment_in` with canonical criterion `payment_in`. Exact replay returns the original response.
+Paykit compares request `payment_in` with canonical criterion `payment_in` before side effects. Exact replay returns the original response.
 
 ### Lock-wide drain
 
@@ -335,22 +335,20 @@ cargo test --workspace --no-run
 
 ### Task 3: Upgrade the Locks-to-Paykit invoice boundary
 
-**Objective:** Send `payment_in`, require the closed timestamp response, and durably bind it to the verification task before admission.
+**Objective:** Send persisted `payment_in` from a durable worker intent, require the closed timestamp response, and validate it before invoice admission becomes ready.
 
 **Files:**
 - Modify: `locks-server/src/paykit_http_client.rs`
-- Modify: `locks-service/src/application/models/verification.rs`
-- Modify: `locks-service/src/application/ports/verification.rs`
-- Modify: verification task PostgreSQL/memory adapters and migration
-- Modify: `locks-service/src/application/use_cases/submit_proof_bundle.rs`
+- Modify: `locks-server/src/worker/invoice.rs`
+- Modify: invoice-admission repositories and migration
 - Test: `locks-server/src/api/routes/tests.rs`
 - Test: `locks-e2e/tests/postgres_runtime.rs`
 
 **Dependency gate:** Implement only after the Paykit Server invoice-response slice is reviewed and committed.
 
-**RED:** Test canonical signed request body, strict timestamp response decoding, checked ordering (`created <= deadline`), exact task replay preserving timestamps, and rollback/no-task on invoice rejection.
+**RED:** Test canonical signed request body including `payment_in`, canonical lock/request mismatch rejection with no Paykit side effects, stable task UUID `X-Request-ID`, exact `200` handling, strict timestamp response decoding, checked ordering (`created < deadline`), durable retry, terminal failure, and claim-fenced ready transition.
 
-**GREEN:** Persist immutable invoice timestamps with the task in the same local transaction that admits it. Do not recompute on retry.
+**GREEN:** Persist the pending task and immutable invoice intent, including `payment_in` copied from the validated canonical criterion, before outbound I/O. Let the claimed worker send that persisted value to Paykit, validate its closed response, then mark admission ready with the exact live claim token. Paykit retains authoritative invoice timestamps; worker retry reuses the same intent and request ID.
 
 **Verify:** focused unit tests, PostgreSQL E2E, then `cargo test --workspace --no-run`.
 
@@ -389,7 +387,7 @@ cargo test --workspace --no-run
 
 **RED:** Concurrent tests prove task-first commit joins snapshot, deletion-first commit rejects a new Bundle, exact old replay succeeds, and conflicting replay remains rejected.
 
-**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. For Paykit-backed submissions, atomically persist a hidden, unclaimable admission reservation before the external invoice call; classify durable exact replay/conflict before mutable lock lookup or reader resolution, and resume an unready reservation from its persisted canonical fields. Paykit success makes it ready. This guarantees that deletion either snapshots the durable obligation or commits first and prevents any Paykit call. Do not permit transition to `start_payment_drain` while a snapshotted reservation is unready: Paykit's active drain accepts exact replay only for invoices already created before drain start. Do not hold a database transaction across HTTP, and do not use viewer timestamps or tombstone publication as the cutoff.
+**GREEN:** Use per-lock database serialization and one transaction for job persistence/task snapshot. For Paykit-backed submissions, atomically persist a publicly pollable pending verification task plus immutable invoice-admission intent before outbound I/O. Classify durable exact replay/conflict before mutable lock lookup; exact replay returns the existing lifecycle and never drives Paykit. A separately claimed worker creates or exactly replays the invoice and makes admission ready. This guarantees that deletion either snapshots the durable obligation or commits first and prevents any Paykit call. Do not permit transition to `start_payment_drain` while a snapshotted task remains `invoice_pending`: Paykit's active drain accepts exact replay only for invoices already created before drain start. Do not hold a database transaction across HTTP, and do not use viewer timestamps or tombstone publication as the cutoff.
 
 **Suggested commit:** `feat(service): enforce deletion admission cutoff`
 
