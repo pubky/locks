@@ -2033,10 +2033,15 @@ mod tests {
             let lookup_key = AccessCredentialLookupKey::derive(&AccessCredential::new(format!(
                 "concurrent-{iteration}"
             )));
+            let expires_at: time::OffsetDateTime =
+                sqlx::query_scalar("SELECT clock_timestamp() + INTERVAL '1 hour'")
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
             let record = AccessCredentialRecord {
                 creator: lock.creator.clone(),
                 bundle_id,
-                expires_at: datetime!(2026-08-12 06:00:00 UTC),
+                expires_at,
             };
             let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
 
