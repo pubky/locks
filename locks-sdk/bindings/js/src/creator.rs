@@ -91,6 +91,14 @@ impl DeleteContentLockOptions {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(typescript_custom_section)]
+const DELETE_CONTENT_LOCK_TYPESCRIPT: &str = r#"
+export interface Creator {
+  deleteContentLock(lock_id: string, options?: DeleteContentLockOptions | null): Promise<any>;
+}
+"#;
+
 #[derive(Debug, Clone, Default)]
 struct CreateContentLockRequestBuilderState {
     primary_resource: Option<serde_json::Value>,
@@ -298,6 +306,31 @@ fn secondary_descriptor_from_resource(
     }))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn delete_content_lock_mode_from_js(
+    options: Option<&wasm_bindgen::JsValue>,
+) -> crate::js_error::JsResult<Option<DeleteContentLockMode>> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let mode = js_sys::Reflect::get(options, &wasm_bindgen::JsValue::from_str("mode"))
+        .map_err(|_| crate::js_error::invalid_input("invalid delete content lock options"))?;
+    match mode.as_f64() {
+        Some(value) if value == DeleteContentLockMode::DefaultGraceful as u8 as f64 => {
+            Ok(Some(DeleteContentLockMode::DefaultGraceful))
+        }
+        Some(value) if value == DeleteContentLockMode::ExplicitGraceful as u8 as f64 => {
+            Ok(Some(DeleteContentLockMode::ExplicitGraceful))
+        }
+        Some(value) if value == DeleteContentLockMode::Force as u8 as f64 => {
+            Ok(Some(DeleteContentLockMode::Force))
+        }
+        _ => Err(crate::js_error::invalid_input(
+            "invalid delete content lock options",
+        )),
+    }
+}
+
 fn js_value_to_json(
     value: wasm_bindgen::JsValue,
     label: &str,
@@ -392,16 +425,17 @@ impl Creator {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen(js_name = deleteContentLock)]
+    #[wasm_bindgen(js_name = deleteContentLock, skip_typescript)]
     pub async fn delete_content_lock(
         &self,
         lock_id: String,
-        options: Option<DeleteContentLockOptions>,
+        options: Option<wasm_bindgen::JsValue>,
     ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let mode = delete_content_lock_mode_from_js(options.as_ref())?;
         let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
             .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
         let request = self
-            .build_delete_content_lock_request(&lock_id, options.as_ref())
+            .build_delete_content_lock_request_for_mode(&lock_id, mode)
             .map_err(crate::js_error::invalid_input)?
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
@@ -503,13 +537,26 @@ impl Creator {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn build_delete_content_lock_request(
         &self,
         lock_id: &str,
         options: Option<&DeleteContentLockOptions>,
     ) -> Result<JsAuthorizedRequestPlan, String> {
+        self.build_delete_content_lock_request_for_mode(
+            lock_id,
+            options.map(|options| options.mode),
+        )
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn build_delete_content_lock_request_for_mode(
+        &self,
+        lock_id: &str,
+        mode: Option<DeleteContentLockMode>,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
         let lock_id = LockId::from_str(lock_id).map_err(|err| format!("invalid lock id: {err}"))?;
-        let mode = match options.map(|options| options.mode) {
+        let mode = match mode {
             None | Some(DeleteContentLockMode::DefaultGraceful) => {
                 locks_sdk::DeleteContentLockMode::DefaultGraceful
             }
@@ -735,6 +782,21 @@ mod tests {
             status.path,
             format!("/creator/content-locks/{lock_id}/deletion")
         );
+        assert_eq!(status.body, JsRequestBody::Empty);
+
+        let reusable_force_options = DeleteContentLockOptions::new(DeleteContentLockMode::Force);
+        for _ in 0..2 {
+            let reused = creator
+                .build_delete_content_lock_request(
+                    &lock_id.to_string(),
+                    Some(&reusable_force_options),
+                )
+                .unwrap();
+            assert_eq!(
+                reused.path,
+                format!("/creator/content-locks/{lock_id}?force=true")
+            );
+        }
     }
 
     #[test]

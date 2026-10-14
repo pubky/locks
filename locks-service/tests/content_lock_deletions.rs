@@ -260,7 +260,7 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
 
     assert!(matches!(
         repository
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Active(_)
@@ -384,7 +384,7 @@ async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_lat
 
     assert!(matches!(
         deletions
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Active(_)
