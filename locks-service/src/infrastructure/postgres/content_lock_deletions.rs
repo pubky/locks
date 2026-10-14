@@ -2217,6 +2217,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         }
     }
 
