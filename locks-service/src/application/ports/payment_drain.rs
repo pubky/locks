@@ -104,14 +104,46 @@ impl PaymentState {
     }
 }
 
+/// Current payment evidence verified by Paykit for one payment rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentObservation {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+}
+
+/// Returns whether either rail independently satisfies Locks payment policy.
+pub fn payment_qualifies(
+    payment_state: PaymentState,
+    bitcoin: Option<PaymentObservation>,
+    usdt_arbitrum: Option<PaymentObservation>,
+    minimum_confirmations: u32,
+) -> bool {
+    bitcoin.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations >= minimum_confirmations
+            && matches!(
+                (minimum_confirmations, payment_state),
+                (0, PaymentState::Detected | PaymentState::Confirmed)
+                    | (_, PaymentState::Confirmed)
+            )
+    }) || usdt_arbitrum.is_some_and(|payment| {
+        payment.amount_matched
+            && payment.paid_on_time
+            && payment.confirmations > 0
+            && payment_state == PaymentState::Confirmed
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaymentRequestStatus {
     pub request_state: PaymentRequestState,
     pub payment_state: PaymentState,
     pub invoice_created_at: OffsetDateTime,
     pub payment_deadline: OffsetDateTime,
-    pub confirmations: u32,
-    pub amount_matched: bool,
+    pub bitcoin: Option<PaymentObservation>,
+    pub usdt_arbitrum: Option<PaymentObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

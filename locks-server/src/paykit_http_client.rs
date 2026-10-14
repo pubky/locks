@@ -7,7 +7,8 @@ use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::PaykitPaymentAsset;
 use locks_service::application::ports::{
     PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError, PaymentDrainStatus,
-    PaymentDrainSummary, PaymentRequestState, PaymentRequestStatus, PaymentState,
+    PaymentDrainSummary, PaymentObservation, PaymentRequestState, PaymentRequestStatus,
+    PaymentState,
 };
 use locks_service::infrastructure::verifiers::paykit_payment::{
     PaykitPaymentObservation, PaykitPaymentRequestState as ServicePaymentRequestState,
@@ -611,11 +612,6 @@ impl PaymentDrainClient for PaykitHttpClient {
             }
             _ => PaymentDrainClientError::Transport,
         })?;
-        let bitcoin = status.bitcoin.unwrap_or(PaykitBitcoinPaymentStatus {
-            confirmations: 0,
-            amount_matched: false,
-            paid_on_time: false,
-        });
         Ok(Some(PaymentRequestStatus {
             request_state: match status.request_state {
                 PaykitPaymentRequestState::Proposed => PaymentRequestState::Proposed,
@@ -634,8 +630,16 @@ impl PaymentDrainClient for PaykitHttpClient {
             },
             invoice_created_at: status.invoice_created_at,
             payment_deadline: status.payment_deadline,
-            confirmations: bitcoin.confirmations,
-            amount_matched: bitcoin.amount_matched && bitcoin.paid_on_time,
+            bitcoin: status.bitcoin.map(|payment| PaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
+            usdt_arbitrum: status.usdt_arbitrum.map(|payment| PaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
         }))
     }
 }
@@ -1464,6 +1468,58 @@ mod tests {
                     _ => ServicePaymentState::Expired,
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_drain_status_preserves_bitcoin_and_usdt_observations() {
+        for (bitcoin, usdt_arbitrum) in [
+            (
+                json!({"confirmations": 6, "amount_matched": true, "paid_on_time": true}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::Value::Null,
+                json!({"confirmations": 1, "amount_matched": true, "paid_on_time": true, "finalized": false}),
+            ),
+        ] {
+            let bitcoin_present = !bitcoin.is_null();
+            let usdt_present = !usdt_arbitrum.is_null();
+            let body = json!({
+                "request_state": "accepted",
+                "payment_state": "confirmed",
+                "invoice_created_at": "2026-09-25T11:00:00Z",
+                "payment_deadline": "2026-09-25T12:00:00Z",
+                "bitcoin": bitcoin,
+                "usdt_arbitrum": usdt_arbitrum,
+            });
+            let server_url = spawn_configured_status_server(
+                StatusCode::OK,
+                Box::leak(body.to_string().into_boxed_str()),
+            )
+            .await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            let status = PaymentDrainClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(status.bitcoin.is_some(), bitcoin_present);
+            assert_eq!(status.usdt_arbitrum.is_some(), usdt_present);
+            let observation = status.bitcoin.or(status.usdt_arbitrum).unwrap();
+            assert!(observation.amount_matched);
+            assert!(observation.paid_on_time);
+            assert!(observation.confirmations > 0);
         }
     }
 

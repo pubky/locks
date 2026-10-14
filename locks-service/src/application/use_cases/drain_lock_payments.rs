@@ -437,22 +437,16 @@ pub(crate) fn classify_payment_task(
         return Ok(Some((VerificationTaskStatus::Expired, Some(reason))));
     }
 
-    if status.request_state != PaymentRequestState::Accepted || !status.amount_matched {
+    if status.request_state != PaymentRequestState::Accepted {
         return Ok(None);
     }
-
-    if minimum_confirmations == 0
-        && matches!(
-            status.payment_state,
-            PaymentState::Detected | PaymentState::Confirmed
-        )
-    {
-        return Ok(Some((VerificationTaskStatus::Completed, None)));
-    }
-
-    Ok((status.payment_state == PaymentState::Confirmed
-        && status.confirmations >= minimum_confirmations)
-        .then_some((VerificationTaskStatus::Completed, None)))
+    Ok(crate::application::ports::payment_qualifies(
+        status.payment_state,
+        status.bitcoin,
+        status.usdt_arbitrum,
+        minimum_confirmations,
+    )
+    .then_some((VerificationTaskStatus::Completed, None)))
 }
 
 #[cfg(test)]
@@ -463,8 +457,8 @@ mod tests {
 
     use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
     use crate::application::ports::{
-        PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary, PaymentRequestState,
-        PaymentRequestStatus, PaymentState,
+        PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary, PaymentObservation,
+        PaymentRequestState, PaymentRequestStatus, PaymentState,
     };
 
     use super::{classify_payment_task, validate_aggregate_progress};
@@ -614,6 +608,53 @@ mod tests {
     }
 
     #[test]
+    fn each_payment_rail_uses_its_own_qualification_rules() {
+        let full = PaymentObservation {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: true,
+        };
+        let late = PaymentObservation {
+            paid_on_time: false,
+            ..full
+        };
+        let unconfirmed = PaymentObservation {
+            confirmations: 0,
+            ..full
+        };
+
+        for (bitcoin, usdt_arbitrum, expected) in [
+            (
+                Some(PaymentObservation {
+                    confirmations: 6,
+                    ..full
+                }),
+                None,
+                true,
+            ),
+            (Some(full), None, false),
+            (None, Some(full), true),
+            (Some(late), Some(full), true),
+            (None, Some(unconfirmed), false),
+            (None, Some(late), false),
+            (None, None, false),
+        ] {
+            let mut value = status(
+                PaymentRequestState::Accepted,
+                PaymentState::Confirmed,
+                0,
+                false,
+            );
+            value.bitcoin = bitcoin;
+            value.usdt_arbitrum = usdt_arbitrum;
+            assert_eq!(
+                classify_payment_task(value, 6),
+                Ok(expected.then_some((VerificationTaskStatus::Completed, None)))
+            );
+        }
+    }
+
+    #[test]
     fn timely_matched_payment_stays_pending_after_deadline_until_confirmed() {
         let mut value = status(
             PaymentRequestState::Accepted,
@@ -654,8 +695,12 @@ mod tests {
             payment_state,
             invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
             payment_deadline: datetime!(2026-08-13 10:00:00 UTC),
-            confirmations,
-            amount_matched,
+            bitcoin: Some(PaymentObservation {
+                confirmations,
+                amount_matched,
+                paid_on_time: true,
+            }),
+            usdt_arbitrum: None,
         }
     }
 }
