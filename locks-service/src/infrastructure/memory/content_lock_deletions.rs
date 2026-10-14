@@ -389,11 +389,11 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let key = (creator.clone(), lock_id.clone());
+        let mut verification_tasks = self.verification_task_fence.records.write().await;
         let intents = self.publication_intents.read().await;
         if intents.contains_key(&key) {
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
         }
-        let verification_tasks = self.verification_task_fence.records.read().await;
         if verification_tasks.values().any(|task| {
             task.creator == *creator
                 && task.lock_id == *lock_id
@@ -402,7 +402,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         }) {
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
         }
-        drop(verification_tasks);
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         if let Some(receipt) = receipts.get(&key) {
@@ -427,6 +426,13 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 completed_at: None,
             };
             receipts.insert(key, receipt.clone());
+            let terminal_job_id = stored.job.job_id;
+            jobs.remove(&(creator.clone(), lock_id.clone()));
+            for task in verification_tasks.values_mut() {
+                if task.deletion_job_id == Some(terminal_job_id) {
+                    task.deletion_job_id = None;
+                }
+            }
             return Ok(PrepareForceDeletionResult::Synchronous(receipt));
         }
         let receipt = ForceDeletionReceipt {
