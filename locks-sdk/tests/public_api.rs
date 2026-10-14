@@ -4,9 +4,10 @@ use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource
 use locks_sdk::{
     AccessCredentialResponse, CreatorLockServicePointer, DeleteContentLockMode,
     DeleteContentLockRequest, DeleteGuardedResourceRequest, LocksClient, LocksSession,
-    ReadLockedResourceRequest, RegisterGuardedResourceRequest, VerificationTaskHandleRequest,
-    VerificationTaskLifecycleResponse, VerificationTaskStatus, ViewerLocks,
-    content_lock_resource_url, creator_lock_service_pointer_url, lock_server_for_content_lock,
+    ReadLockedResourceRequest, RegisterGuardedResourceRequest, SdkRequestBody,
+    VerificationTaskHandleRequest, VerificationTaskLifecycleResponse, VerificationTaskStatus,
+    ViewerLocks, content_lock_resource_url, creator_lock_service_pointer_url,
+    lock_server_for_content_lock,
 };
 
 #[test]
@@ -165,4 +166,5 @@ fn creator_content_lock_deletion_requests_use_closed_routes_and_modes() {
         status.path,
         format!("/creator/content-locks/{lock_id}/deletion")
     );
+    assert_eq!(status.body, SdkRequestBody::Empty);
 }

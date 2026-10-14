@@ -8,6 +8,7 @@ use locks_core::lock_policy::{
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
+use crate::application::models::ContentLockOwnershipStatus;
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
     GuardedResourceRepository,
@@ -133,6 +134,35 @@ impl<'a> CreateContentLockUseCase<'a> {
         self.content_lock_ownership
             .reserve_paths(&request.creator, &guarded_paths, &lock_id)
             .await?;
+
+        if self
+            .content_lock_deletions
+            .publication_in_progress(&request.creator, &lock_id)
+            .await?
+            && self
+                .content_locks
+                .get_content_lock(&request.creator, &content_lock_path)
+                .await?
+                .as_ref()
+                == Some(&content_lock)
+        {
+            let mut ownership_matches = true;
+            for guarded_path in &guarded_paths {
+                ownership_matches &= self
+                    .content_lock_ownership
+                    .get_path_ownership(&request.creator, guarded_path)
+                    .await?
+                    .is_some_and(|ownership| {
+                        ownership.lock_id == lock_id
+                            && ownership.status == ContentLockOwnershipStatus::Published
+                    });
+            }
+            if ownership_matches {
+                self.content_lock_deletions
+                    .reconcile_publication(&request.creator, &lock_id)
+                    .await?;
+            }
+        }
 
         let publication_token = Uuid::new_v4();
         if let Err(error) = self
@@ -342,7 +372,12 @@ mod tests {
         let lock_id = content_lock.lock_id().unwrap();
         fixture
             .content_lock_deletions
-            .prepare_force_deletion(&request.creator, &lock_id, fixture.clock.now())
+            .prepare_force_deletion(
+                &request.creator,
+                &lock_id,
+                Some(&content_lock),
+                fixture.clock.now(),
+            )
             .await
             .unwrap();
 
@@ -618,6 +653,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_clears_retained_intent_only_after_publication_and_ownership_match() {
+        let fixture = Fixture::seeded().await;
+        let request = content_lock_request(registered_guarded_resource());
+        let created = fixture.use_case().execute(request.clone()).await.unwrap();
+        fixture
+            .content_lock_deletions
+            .begin_publication(&creator(), &created.lock_id, Uuid::new_v4())
+            .await
+            .unwrap();
+
+        let replayed = fixture.use_case().execute(request).await.unwrap();
+
+        assert_eq!(replayed, created);
+        assert!(
+            !fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &created.lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+    }
+
+    #[tokio::test]
     async fn unreconciled_publication_error_retains_reserved_ownership_and_deletion_fence() {
         let fixture = Fixture::seeded().await;
         let content_locks = UnreconciledContentLockRepository;
@@ -669,7 +737,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &lock_id, fixture.clock.now())
+                .prepare_force_deletion(&creator(), &lock_id, None, fixture.clock.now())
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -696,14 +764,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &created.lock_id, fixture.clock.now())
+                .prepare_force_deletion(
+                    &creator(),
+                    &created.lock_id,
+                    None,
+                    fixture.clock.now(),
+                )
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(None)
-        );
+            PrepareForceDeletionResult::Synchronous(receipt)
+                if receipt.frozen_content_lock.is_none() && receipt.completed_at.is_none()
+        ));
     }
 
     struct PublicationRaceProbe<'a> {
@@ -722,7 +796,7 @@ mod tests {
             let lock_id = content_lock.lock_id().unwrap();
             assert_eq!(
                 self.deletions
-                    .prepare_force_deletion(&creator, &lock_id, self.now)
+                    .prepare_force_deletion(&creator, &lock_id, None, self.now)
                     .await?,
                 PrepareForceDeletionResult::PublicationInProgress
             );

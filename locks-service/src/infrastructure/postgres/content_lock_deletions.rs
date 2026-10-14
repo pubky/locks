@@ -13,7 +13,8 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, ContentLockDeletionState, PrepareForceDeletionResult,
+        ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
+        PrepareForceDeletionResult,
     },
     ports::ContentLockDeletionRepository,
 };
@@ -37,6 +38,15 @@ struct DeletionJobRow {
     claimed_by: Option<String>,
     claim_token: Option<Uuid>,
     claim_expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, FromRow)]
+struct ForceDeletionReceiptRow {
+    creator: String,
+    lock_id: String,
+    forced_at: OffsetDateTime,
+    frozen_content_lock: Option<serde_json::Value>,
+    completed_at: Option<OffsetDateTime>,
 }
 
 /// PostgreSQL-backed durable deletion job queue and permanent force receipt store.
@@ -94,6 +104,25 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
     }
 
+    async fn reconcile_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let result = sqlx::query(
+            "DELETE FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn publication_in_progress(
         &self,
         creator: &CreatorPubky,
@@ -124,10 +153,8 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         );
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &job.creator, &job.lock_id).await?;
-        let deletion_cutoff_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts
-             WHERE creator = $1 AND lock_id = $2)
-             OR EXISTS (SELECT 1 FROM content_lock_publication_intents
+        let publication_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents
              WHERE creator = $1 AND lock_id = $2)",
         )
         .bind(job.creator.to_string())
@@ -135,7 +162,19 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .fetch_one(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        if deletion_cutoff_exists {
+        if publication_exists {
+            return Err(ApplicationError::ContentLockPublicationInProgress);
+        }
+        let receipt_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts
+             WHERE creator = $1 AND lock_id = $2)",
+        )
+        .bind(job.creator.to_string())
+        .bind(job.lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if receipt_exists {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
         sqlx::query(
@@ -410,6 +449,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        frozen_content_lock: Option<&ContentLock>,
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
@@ -422,6 +462,22 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         if publication_in_progress {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
+        }
+        let receipt = sqlx::query_as::<_, ForceDeletionReceiptRow>(
+            "SELECT creator, lock_id, forced_at, frozen_content_lock, completed_at
+             FROM content_lock_force_deletion_receipts
+             WHERE creator = $1 AND lock_id = $2 FOR UPDATE",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(receipt) = receipt {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(PrepareForceDeletionResult::Synchronous(
+                row_to_force_receipt(receipt)?,
+            ));
         }
         let sql = format!(
             "SELECT {ROW_COLUMNS} FROM content_lock_deletion_jobs
@@ -457,36 +513,84 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 transaction.commit().await.map_err(storage_error)?;
                 return Ok(PrepareForceDeletionResult::Active(row_to_job(active)?));
             }
-            sqlx::query(
-                "INSERT INTO content_lock_force_deletion_receipts (creator, lock_id, forced_at)
-                 VALUES ($1, $2, $3) ON CONFLICT (creator, lock_id) DO NOTHING",
+            let frozen = serde_json::to_value(&job.frozen_content_lock).map_err(storage_display)?;
+            let receipt = sqlx::query_as::<_, ForceDeletionReceiptRow>(
+                "INSERT INTO content_lock_force_deletion_receipts
+                     (creator, lock_id, forced_at, frozen_content_lock)
+                 VALUES ($1, $2, $3, $4)
+                 RETURNING creator, lock_id, forced_at, frozen_content_lock, completed_at",
             )
             .bind(creator.to_string())
             .bind(lock_id.to_string())
             .bind(forced_at)
-            .execute(&mut *transaction)
+            .bind(frozen)
+            .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-            sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
-                .bind(job.job_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(storage_error)?;
             transaction.commit().await.map_err(storage_error)?;
-            return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
+            return Ok(PrepareForceDeletionResult::Synchronous(
+                row_to_force_receipt(receipt)?,
+            ));
         }
-        sqlx::query(
-            "INSERT INTO content_lock_force_deletion_receipts (creator, lock_id, forced_at)
-             VALUES ($1, $2, $3) ON CONFLICT (creator, lock_id) DO NOTHING",
+        let frozen = frozen_content_lock
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(storage_display)?;
+        let receipt = sqlx::query_as::<_, ForceDeletionReceiptRow>(
+            "INSERT INTO content_lock_force_deletion_receipts
+                 (creator, lock_id, forced_at, frozen_content_lock)
+             VALUES ($1, $2, $3, $4)
+             RETURNING creator, lock_id, forced_at, frozen_content_lock, completed_at",
         )
         .bind(creator.to_string())
         .bind(lock_id.to_string())
         .bind(forced_at)
-        .execute(&mut *transaction)
+        .bind(frozen)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
-        Ok(PrepareForceDeletionResult::Synchronous(None))
+        Ok(PrepareForceDeletionResult::Synchronous(
+            row_to_force_receipt(receipt)?,
+        ))
+    }
+
+    async fn get_force_receipt(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError> {
+        sqlx::query_as::<_, ForceDeletionReceiptRow>(
+            "SELECT creator, lock_id, forced_at, frozen_content_lock, completed_at
+             FROM content_lock_force_deletion_receipts WHERE creator = $1 AND lock_id = $2",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(row_to_force_receipt)
+        .transpose()
+    }
+
+    async fn complete_force_deletion(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let result = sqlx::query(
+            "UPDATE content_lock_force_deletion_receipts
+             SET completed_at = COALESCE(completed_at, $3)
+             WHERE creator = $1 AND lock_id = $2",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(completed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn has_force_receipt(
@@ -560,6 +664,33 @@ fn fetch_optional_job(
     row: Option<DeletionJobRow>,
 ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
     row.map(row_to_job).transpose()
+}
+
+fn row_to_force_receipt(
+    row: ForceDeletionReceiptRow,
+) -> Result<ForceDeletionReceipt, ApplicationError> {
+    let creator = CreatorPubky::from_str(&row.creator).map_err(storage_display)?;
+    let lock_id = LockId::from_str(&row.lock_id).map_err(storage_display)?;
+    let frozen_content_lock = row
+        .frozen_content_lock
+        .map(serde_json::from_value::<ContentLock>)
+        .transpose()
+        .map_err(storage_display)?;
+    if let Some(content_lock) = &frozen_content_lock {
+        let actual_lock_id = content_lock.lock_id().map_err(storage_display)?;
+        if content_lock.creator != creator || actual_lock_id != lock_id {
+            return Err(invalid_state(
+                "force receipt frozen manifest identity mismatch",
+            ));
+        }
+    }
+    Ok(ForceDeletionReceipt {
+        creator,
+        lock_id,
+        frozen_content_lock,
+        forced_at: row.forced_at,
+        completed_at: row.completed_at,
+    })
 }
 
 fn row_to_job(row: DeletionJobRow) -> Result<ContentLockDeletionJob, ApplicationError> {
@@ -692,10 +823,14 @@ mod tests {
             errors::ApplicationError,
             models::{
                 ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-                ContentLockDeletionState, PrepareForceDeletionResult, VerificationTaskRecord,
+                ContentLockDeletionState, INVOICE_ADMISSION_INTENT_VERSION,
+                InvoiceAdmissionIntentV1, PrepareForceDeletionResult, VerificationTaskRecord,
                 VerificationTaskStatus,
             },
-            ports::{ContentLockDeletionRepository, VerificationTaskRepository},
+            ports::{
+                ContentLockDeletionRepository, InvoiceAdmissionRepository,
+                VerificationTaskRepository,
+            },
         },
         infrastructure::postgres::{PostgresVerificationTaskRepository, testing::TestDatabase},
     };
@@ -732,12 +867,73 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Err(ApplicationError::ContentLockDeletionInProgress)
+            Ok(())
+        );
+
+        let mut changed_replay = admitted_before.clone();
+        changed_replay.submitted_proof_bundle.proofs.clear();
+        assert_eq!(
+            tasks.insert_verification_task(changed_replay).await,
+            Err(ApplicationError::VerificationTaskConflict)
         );
 
         let admitted_after = verification_task(&lock, BundleId::from_bytes([2; 16]));
         assert_eq!(
             tasks.insert_verification_task(admitted_after).await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn exact_invoice_replay_precedes_cutoff_but_changed_or_new_admission_is_rejected() {
+        let database = TestDatabase::create().await;
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let mut admitted_before = verification_task(&lock, BundleId::from_bytes([3; 16]));
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        admitted_before.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+        let intent = invoice_intent(&admitted_before, reader);
+        let original = tasks
+            .insert_invoice_pending_task(admitted_before.clone(), intent.clone())
+            .await
+            .unwrap();
+        deletions
+            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tasks
+                .insert_invoice_pending_task(admitted_before.clone(), intent.clone())
+                .await
+                .unwrap(),
+            original
+        );
+        let mut changed_intent = intent;
+        changed_intent.reader =
+            CreatorPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+                .unwrap();
+        assert_eq!(
+            tasks
+                .insert_invoice_pending_task(admitted_before, changed_intent)
+                .await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+        let mut new_task = verification_task(&lock, BundleId::from_bytes([4; 16]));
+        let new_reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        new_task.submitted_proof_bundle.reader_public_key = Some(new_reader.clone());
+        let new_intent = invoice_intent(&new_task, new_reader);
+        assert_eq!(
+            tasks
+                .insert_invoice_pending_task(new_task, new_intent)
+                .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
 
@@ -790,13 +986,13 @@ mod tests {
 
             let (graceful, force) = tokio::join!(
                 repository.insert_job(job.clone()),
-                repository.prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                repository.prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
             );
             let persisted_job = repository
                 .get_job(&job.creator, &job.lock_id)
                 .await
                 .unwrap();
-            let receipt = repository
+            let receipt_exists = repository
                 .has_force_receipt(&job.creator, &job.lock_id)
                 .await
                 .unwrap();
@@ -806,14 +1002,16 @@ mod tests {
                     assert_eq!(active.job_id, job.job_id);
                     assert!(active.force_requested_at.is_some());
                     assert_eq!(persisted_job, Some(active));
-                    assert!(!receipt);
+                    assert!(!receipt_exists);
                 }
                 (
                     Err(ApplicationError::ContentLockDeletionInProgress),
-                    Ok(PrepareForceDeletionResult::Synchronous(None)),
+                    Ok(PrepareForceDeletionResult::Synchronous(receipt)),
                 ) => {
                     assert!(persisted_job.is_none());
-                    assert!(receipt);
+                    assert!(receipt_exists);
+                    assert!(receipt.frozen_content_lock.is_none());
+                    assert!(receipt.completed_at.is_none());
                 }
                 other => panic!("unexpected graceful/force race result: {other:?}"),
             }
@@ -836,7 +1034,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             repository
-                .prepare_force_deletion(&lock.creator, &lock_id, NOW)
+                .prepare_force_deletion(&lock.creator, &lock_id, None, NOW)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -853,13 +1051,14 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(
+        assert!(matches!(
             repository
-                .prepare_force_deletion(&lock.creator, &lock_id, NOW)
+                .prepare_force_deletion(&lock.creator, &lock_id, None, NOW)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(None)
-        );
+            PrepareForceDeletionResult::Synchronous(receipt)
+                if receipt.frozen_content_lock.is_none() && receipt.completed_at.is_none()
+        ));
         assert_eq!(
             repository
                 .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
@@ -994,17 +1193,19 @@ mod tests {
 
         assert!(matches!(
             reopened
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(Some(_))
+            PrepareForceDeletionResult::Synchronous(receipt)
+                if receipt.frozen_content_lock == Some(job.frozen_content_lock.clone())
         ));
         assert!(matches!(
             reopened
-                .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+                .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(None)
+            PrepareForceDeletionResult::Synchronous(receipt)
+                if receipt.frozen_content_lock == Some(job.frozen_content_lock.clone())
         ));
         assert!(
             reopened
@@ -1017,7 +1218,7 @@ mod tests {
                 .get_job(&job.creator, &job.lock_id)
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert!(
             reopened
@@ -1061,7 +1262,7 @@ mod tests {
             .unwrap();
 
         let escalated = repository
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
             .await
             .unwrap();
         let PrepareForceDeletionResult::Active(escalated) = escalated else {
@@ -1180,6 +1381,19 @@ mod tests {
             failure_message: None,
             terminal_reason: None,
             entitlement_to_publish: None,
+        }
+    }
+
+    fn invoice_intent(
+        task: &VerificationTaskRecord,
+        reader: CreatorPubky,
+    ) -> InvoiceAdmissionIntentV1 {
+        InvoiceAdmissionIntentV1 {
+            version: INVOICE_ADMISSION_INTENT_VERSION,
+            creator: task.creator.clone(),
+            bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+            lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+            reader,
         }
     }
 

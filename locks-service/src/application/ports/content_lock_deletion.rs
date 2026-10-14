@@ -7,7 +7,7 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, PrepareForceDeletionResult,
+        ContentLockDeletionPhase, ForceDeletionReceipt, PrepareForceDeletionResult,
     },
 };
 
@@ -36,6 +36,13 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
+    /// Clears an intent after caller verified exact public bytes and published ownership.
+    async fn reconcile_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
 
     /// Checks publication admission under the canonical per-lock fence.
@@ -101,8 +108,23 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        frozen_content_lock: Option<&locks_core::lock_policy::ContentLock>,
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError>;
+
+    async fn get_force_receipt(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError>;
+
+    /// Marks cleanup complete after public absence and all guarded-resource attempts.
+    async fn complete_force_deletion(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError>;
 
     async fn has_force_receipt(
         &self,

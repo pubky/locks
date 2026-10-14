@@ -226,7 +226,7 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
 
     assert!(matches!(
         repository
-            .prepare_force_deletion(&job.creator, &job.lock_id, NOW)
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Active(_)
@@ -237,6 +237,94 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn synchronous_force_receipt_retains_manifest_until_explicit_completion() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claimed = repository
+        .claim_next("worker-a", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    repository
+        .finish(
+            job.job_id,
+            "worker-a",
+            claimed.claim_token,
+            NOW,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let prepared = repository
+        .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+        .await
+        .unwrap();
+    let PrepareForceDeletionResult::Synchronous(receipt) = prepared else {
+        panic!("terminal job must become synchronous force");
+    };
+    assert_eq!(
+        receipt.frozen_content_lock,
+        Some(job.frozen_content_lock.clone())
+    );
+    assert!(receipt.completed_at.is_none());
+    assert!(
+        repository
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let reopened = repository
+        .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(reopened, PrepareForceDeletionResult::Synchronous(receipt));
+    assert!(
+        repository
+            .complete_force_deletion(&job.creator, &job.lock_id, NOW)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completed_at
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let lock = content_lock();
+    let lock_id = lock.lock_id().unwrap();
+    repository
+        .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+        .await
+        .unwrap();
+
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap();
+    assert_eq!(
+        repository.insert_job(job.clone()).await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockPublicationInProgress)
+    );
+    assert!(
+        repository
+            .reconcile_publication(&lock.creator, &lock_id)
+            .await
+            .unwrap()
+    );
+    repository.insert_job(job).await.unwrap();
 }
 
 fn content_lock() -> ContentLock {

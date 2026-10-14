@@ -73,8 +73,10 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
 pub trait VerificationTaskRepository: Send + Sync {
     /// Inserts a new verification task.
     ///
-    /// Returns `DuplicateRecord` if a task with the same Task ID or public
-    /// verification attempt handle (`creator`, `bundle_id`) already exists.
+    /// Exact replay of an existing public verification attempt handle
+    /// (`creator`, `bundle_id`) succeeds without replacing its lifecycle.
+    /// Changed payload for that handle returns `VerificationTaskConflict`;
+    /// reuse of a Task ID for another handle returns `DuplicateRecord`.
     /// PostgreSQL additionally returns `ContentLockDeletionInProgress` when the
     /// authoritative deletion cutoff already exists for a new Bundle ID.
     async fn insert_verification_task(

@@ -73,6 +73,9 @@ where
             .get_json_value_as_creator(creator, &path)
             .await?
             .is_some();
+        if !existed {
+            return Ok(false);
+        }
         self.client.delete_as_creator(creator, &path).await?;
         Ok(existed)
     }
@@ -182,6 +185,25 @@ mod tests {
                     "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
                 )
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_content_lock_skips_delete_when_canonical_path_is_already_absent() {
+        let requested_path = content_lock(900).content_lock_path().unwrap();
+        let repository = PubkyContentLockRepository::new(FakeStorageClient::default());
+
+        assert!(
+            !repository
+                .delete_content_lock(&creator(), &requested_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec![format!(
+                "get_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+            )]
         );
     }
 

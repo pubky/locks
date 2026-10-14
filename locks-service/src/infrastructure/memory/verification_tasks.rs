@@ -58,13 +58,18 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
         let mut records = self.records.write().await;
-        if records.contains_key(&task.task_id)
-            || records.values().any(|existing| {
-                existing.creator == task.creator
-                    && existing.submitted_proof_bundle.bundle_id
-                        == task.submitted_proof_bundle.bundle_id
-            })
-        {
+        if let Some(existing) = records.values().find(|existing| {
+            existing.creator == task.creator
+                && existing.submitted_proof_bundle.bundle_id
+                    == task.submitted_proof_bundle.bundle_id
+        }) {
+            return if existing.submitted_proof_bundle == task.submitted_proof_bundle {
+                Ok(())
+            } else {
+                Err(ApplicationError::VerificationTaskConflict)
+            };
+        }
+        if records.contains_key(&task.task_id) {
             return Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             });
@@ -404,12 +409,7 @@ mod tests {
         repo.insert_verification_task(pending.clone())
             .await
             .unwrap();
-        assert_eq!(
-            repo.insert_verification_task(pending).await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
-        );
+        assert_eq!(repo.insert_verification_task(pending).await, Ok(()));
 
         repo.update_verification_task(in_progress.clone())
             .await
@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_rejects_duplicate_public_handle_even_with_distinct_task_id() {
+    async fn insert_replays_exact_public_handle_and_rejects_changed_payload() {
         let repo = InMemoryVerificationTaskRepository::new();
         let original = task_with(
             TASK_ID,
@@ -499,10 +499,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            repo.insert_verification_task(duplicate_handle).await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
+            repo.insert_verification_task(duplicate_handle.clone())
+                .await,
+            Ok(())
+        );
+        let mut changed = duplicate_handle;
+        changed.submitted_proof_bundle.proofs.clear();
+        assert_eq!(
+            repo.insert_verification_task(changed).await,
+            Err(ApplicationError::VerificationTaskConflict)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(TASK_ID).unwrap())

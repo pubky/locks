@@ -27,6 +27,7 @@ use locks_service::application::models::{
     CreatorConnectFlowId, FrontendSessionRecord, FrontendSessionToken,
     GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
     InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    PrepareForceDeletionResult,
 };
 use locks_service::application::ports::{
     Clock, GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
@@ -455,6 +456,139 @@ async fn force_delete_removes_resources_and_lock_records_receipt_and_replays() {
     assert_eq!(
         response_json(status).await,
         json!({ "lock_id": lock_id, "status": "completed" })
+    );
+}
+
+#[tokio::test]
+async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_cleanup() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(
+                &creator(),
+                &lock_id,
+                Some(&content_lock),
+                state.clock().now(),
+            )
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
+    ));
+    let app = router(state.clone());
+
+    let status = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "GET",
+            &format!("/creator/content-locks/{lock_id}/deletion"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(status).await,
+        json!({ "lock_id": lock_id, "status": "queued" })
+    );
+
+    let retried = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(retried).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completed_at
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn graceful_delete_rejects_malformed_live_manifest_before_persisting_job() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+
+    let response = router(state.clone())
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn graceful_delete_rejects_live_manifest_over_configured_resource_limit() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 10_000_000,
+        max_resources: 0,
+        max_total_resource_bytes: 100_000_000,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+
+    let response = router(state.clone())
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
