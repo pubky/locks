@@ -787,12 +787,20 @@ fn storage_error(error: sqlx::Error) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::time::Duration as StdDuration;
 
     use sqlx::Row;
     use time::macros::datetime;
+    use tokio::time::{sleep, timeout};
+    use uuid::Uuid;
 
-    use locks_core::ids::{BundleId, CreatorPubky, LockId};
+    use locks_core::ids::{BundleId, CreatorPubky, GuardedResourceHash, LockId};
+    use locks_core::lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
+        LockServerConfig,
+    };
 
     use super::PostgresAccessCredentialStore;
     use crate::application::errors::ApplicationError;
@@ -945,6 +953,340 @@ mod tests {
         assert_eq!(count, 0);
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn prepare_samples_database_time_after_job_lock_wait_crosses_access_deadlines() {
+        let database = TestDatabase::create().await;
+        let store = PostgresAccessCredentialStore::new(database.pool().clone());
+        let fixture = insert_final_read_fixture(database.pool(), None).await;
+        let mut blocker = database.pool().begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET final_read_deadline = clock_timestamp() + INTERVAL '500 milliseconds'
+             WHERE job_id = $1",
+        )
+        .bind(fixture.job_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_access_drain_credentials
+             SET expires_at = clock_timestamp() + INTERVAL '500 milliseconds'
+             WHERE credential_id = $1",
+        )
+        .bind(fixture.credential_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+        let lookup_key = fixture.lookup_key.clone();
+        let path = fixture.path.clone();
+        let prepare = tokio::spawn(async move {
+            store
+                .prepare_deletion_read(
+                    &lookup_key,
+                    &path,
+                    datetime!(2000-01-01 00:00:00 UTC),
+                    datetime!(2000-01-01 00:00:30 UTC),
+                )
+                .await
+        });
+        wait_until_blocked_by(database.pool(), blocker_pid).await;
+        sleep(StdDuration::from_millis(650)).await;
+        blocker.commit().await.unwrap();
+
+        assert!(prepare.await.unwrap().unwrap().is_none());
+        assert_no_claim(database.pool(), fixture.credential_id).await;
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn prepare_bases_claim_expiry_on_the_post_lock_database_sample() {
+        let database = TestDatabase::create().await;
+        let store = PostgresAccessCredentialStore::new(database.pool().clone());
+        let fixture = insert_final_read_fixture(database.pool(), None).await;
+        let mut blocker = database.pool().begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(fixture.job_id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let lookup_key = fixture.lookup_key.clone();
+        let path = fixture.path.clone();
+        let prepare = tokio::spawn(async move {
+            store
+                .prepare_deletion_read(
+                    &lookup_key,
+                    &path,
+                    datetime!(2000-01-01 00:00:00 UTC),
+                    datetime!(2000-01-01 00:00:30 UTC),
+                )
+                .await
+        });
+        wait_until_blocked_by(database.pool(), blocker_pid).await;
+        let release_time: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        blocker.commit().await.unwrap();
+
+        assert!(prepare.await.unwrap().unwrap().is_some());
+        let claim_expiry: time::OffsetDateTime = sqlx::query_scalar(
+            "SELECT claim_expires_at
+             FROM content_lock_access_drain_reads WHERE credential_id = $1",
+        )
+        .bind(fixture.credential_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(claim_expiry >= release_time + time::Duration::seconds(29));
+        assert!(claim_expiry <= release_time + time::Duration::seconds(31));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn consume_samples_database_time_after_job_lock_wait_crosses_claim_expiry() {
+        let database = TestDatabase::create().await;
+        let claim_token = Uuid::new_v4();
+        let store = PostgresAccessCredentialStore::new(database.pool().clone());
+        let fixture = insert_final_read_fixture(database.pool(), Some(claim_token)).await;
+        let mut blocker = database.pool().begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(fixture.job_id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let lookup_key = fixture.lookup_key.clone();
+        let path = fixture.path.clone();
+        let consume = tokio::spawn(async move {
+            store
+                .consume_deletion_read(
+                    &lookup_key,
+                    &path,
+                    claim_token,
+                    datetime!(2000-01-01 00:00:00 UTC),
+                )
+                .await
+        });
+        wait_until_blocked_by(database.pool(), blocker_pid).await;
+        sleep(StdDuration::from_millis(650)).await;
+        blocker.commit().await.unwrap();
+
+        assert!(!consume.await.unwrap().unwrap());
+        let consumed_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
+            "SELECT consumed_at FROM content_lock_access_drain_reads WHERE credential_id = $1",
+        )
+        .bind(fixture.credential_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(consumed_at.is_none());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn matching_release_cleans_up_expired_claim_without_consuming_it() {
+        let database = TestDatabase::create().await;
+        let claim_token = Uuid::new_v4();
+        let store = PostgresAccessCredentialStore::new(database.pool().clone());
+        let fixture = insert_final_read_fixture(database.pool(), Some(claim_token)).await;
+        sleep(StdDuration::from_millis(650)).await;
+
+        assert!(
+            store
+                .release_deletion_read(
+                    &fixture.lookup_key,
+                    &fixture.path,
+                    claim_token,
+                    datetime!(2000-01-01 00:00:00 UTC),
+                )
+                .await
+                .unwrap()
+        );
+        assert_no_claim(database.pool(), fixture.credential_id).await;
+        let consumed_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
+            "SELECT consumed_at FROM content_lock_access_drain_reads WHERE credential_id = $1",
+        )
+        .bind(fixture.credential_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(consumed_at.is_none());
+        database.cleanup().await;
+    }
+
+    struct FinalReadFixture {
+        job_id: Uuid,
+        credential_id: Uuid,
+        lookup_key: AccessCredentialLookupKey,
+        path: String,
+    }
+
+    async fn insert_final_read_fixture(
+        pool: &sqlx::PgPool,
+        claim_token: Option<Uuid>,
+    ) -> FinalReadFixture {
+        let creator =
+            CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let lock_id =
+            LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+        let path = "/priv/app.locks/content/post.json".to_owned();
+        let frozen = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: creator.clone(),
+            primary_resource: Some(
+                GuardedResource::new(
+                    path.clone(),
+                    GuardedResourceHash::from_bytes([7; 32]),
+                    "application/json".to_owned(),
+                    42,
+                )
+                .unwrap(),
+            ),
+            secondary_resources: BTreeMap::new(),
+            criteria: vec![],
+            lock_logic: LockLogic::All { criteria: vec![] },
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig { override_: None },
+            created_at: datetime!(2026-08-12 04:00:00 UTC),
+        };
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs (
+                 job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                 phase, final_issuance_started_at, final_credential_issuance_deadline,
+                 final_read_deadline
+             ) VALUES (
+                 $1, $2, $3, $4, clock_timestamp() - INTERVAL '3 minutes',
+                 'drain_final_reads', clock_timestamp() - INTERVAL '2 minutes',
+                 clock_timestamp() - INTERVAL '1 minute',
+                 clock_timestamp() + INTERVAL '10 minutes'
+             )",
+        )
+        .bind(job_id)
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(serde_json::to_value(frozen).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+        let credential = AccessCredential::new(format!("final-read-{job_id}"));
+        let lookup_key = AccessCredentialLookupKey::derive(&credential);
+        sqlx::query(
+            "INSERT INTO access_credentials (
+                 lookup_key, creator, bundle_id, expires_at, deletion_job_id
+             ) VALUES ($1, $2, $3, clock_timestamp() + INTERVAL '10 minutes', $4)",
+        )
+        .bind(lookup_key.as_bytes().as_slice())
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let credential_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO content_lock_access_drain_credentials (
+                 credential_id, deletion_job_id, lookup_key, creator, bundle_id,
+                 credential_kind, encrypted_bearer, issued_at, expires_at
+             ) VALUES (
+                 $1, $2, $3, $4, $5, 'final', 'v1.xchacha20poly1305:test',
+                 clock_timestamp() - INTERVAL '1 minute',
+                 clock_timestamp() + INTERVAL '10 minutes'
+             )",
+        )
+        .bind(credential_id)
+        .bind(job_id)
+        .bind(lookup_key.as_bytes().as_slice())
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_access_drain_reads (
+                 credential_id, guarded_path, claim_token, claim_expires_at
+             ) VALUES (
+                 $1, $2, $3,
+                 CASE WHEN $3::uuid IS NULL THEN NULL
+                      ELSE clock_timestamp() + INTERVAL '500 milliseconds' END
+             )",
+        )
+        .bind(credential_id)
+        .bind(&path)
+        .bind(claim_token)
+        .execute(pool)
+        .await
+        .unwrap();
+        FinalReadFixture {
+            job_id,
+            credential_id,
+            lookup_key,
+            path,
+        }
+    }
+
+    async fn wait_until_blocked_by(pool: &sqlx::PgPool, blocker_pid: i32) {
+        timeout(StdDuration::from_secs(2), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE $1 = ANY(pg_blocking_pids(pid))
+                     )",
+                )
+                .bind(blocker_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("access operation must wait on the held database row lock");
+    }
+
+    async fn assert_no_claim(pool: &sqlx::PgPool, credential_id: Uuid) {
+        let row = sqlx::query(
+            "SELECT claim_token, claim_expires_at
+             FROM content_lock_access_drain_reads WHERE credential_id = $1",
+        )
+        .bind(credential_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            row.try_get::<Option<Uuid>, _>("claim_token")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            row.try_get::<Option<time::OffsetDateTime>, _>("claim_expires_at")
+                .unwrap()
+                .is_none()
+        );
     }
 
     async fn assert_stored_lookup_key_is_exact(
