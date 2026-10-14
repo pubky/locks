@@ -68,7 +68,7 @@ payment on one accepted method using Paykit's authenticated invoice status.
 3. compare any durable lifecycle under `{ creator, bundle_id }` before mutable Lock Resource lookup;
 4. return an exact persisted replay or reject changed submitted proof material with `409 task_state_conflict`;
 5. only for a genuinely new identity, load and validate the current canonical Lock Resource and payment policy;
-6. require configured Paykit and atomically persist a pending verification task plus immutable invoice-admission intent under the per-lock deletion/admission fence, before Reader homeserver or Paykit I/O;
+6. require configured Paykit and atomically persist a pending verification task plus immutable invoice-admission intent, including `payment_in` copied from the validated canonical criterion, under the per-lock deletion/admission fence before Reader homeserver or Paykit I/O;
 7. return the pending lifecycle immediately; and
 8. let a separately claimed invoice-admission worker create or idempotently replay the Paykit invoice, apply durable retry or terminal-failure policy, then mark successful admission ready so the verification worker may claim it.
 
@@ -82,13 +82,14 @@ For a claimed invoice-admission task, Locks sends RFC 8785 canonical JSON to `PO
 {
   "bundle_id": "<reader-generated bundle id>",
   "lock_resource": "pubky<creator>/<canonical lock path>.json",
-  "reader": "pubky<reader>"
+  "reader": "pubky<reader>",
+  "payment_in": 24
 }
 ```
 
 Locks signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body` with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`. Body-only signatures are not supported.
 
-The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact replay must return the original success without repeating mutable lookups, allocation, address creation, or delivery side effects. Success is exactly `200 OK` with a closed body containing RFC 3339 `invoice_created_at` and `payment_deadline`; Locks validates both timestamps and requires `payment_deadline > invoice_created_at` before marking admission ready. Transport failures, invalid or ambiguous success responses, typed Reader setup or registry failures, `429`, and `5xx` responses remain worker-owned durable retries within the DB-owned admission deadline. Paykit conflicts and other terminal admission errors make the pending lifecycle fail with a viewer-safe message; they are not synchronous `POST /proof-bundles` errors.
+The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Paykit independently reads the canonical lock and rejects a request whose `payment_in` differs from the canonical criterion before side effects. Exact replay must return the original success without repeating mutable lookups, allocation, address creation, or delivery side effects. Success is exactly `200 OK` with a closed body containing RFC 3339 `invoice_created_at` and `payment_deadline`; Locks validates both timestamps and requires `payment_deadline > invoice_created_at` before marking admission ready. Transport failures, invalid or ambiguous success responses, typed Reader setup or registry failures, `429`, and `5xx` responses remain worker-owned durable retries within the DB-owned admission deadline. Paykit conflicts and other terminal admission errors make the pending lifecycle fail with a viewer-safe message; they are not synchronous `POST /proof-bundles` errors.
 
 For connection observation, the Reader sends its existing `{ creator, bundle_id }` task handle to Locks `POST /paykit-connection-state-lookups`. Locks loads the persisted task, rejects non-payment tasks, then sends signed canonical `{ creator, bundle_id }` to Paykit `POST /connections/status`. Paykit resolves its persisted invoice binding and returns exactly one local state: `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. Locks rejects missing, malformed, unknown, or extra successful response fields as `502 paykit_connection_state_unavailable`. Browser callers cannot probe arbitrary peer keys or receiver paths.
 

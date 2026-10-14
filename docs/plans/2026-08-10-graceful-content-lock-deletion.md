@@ -24,7 +24,7 @@
 
 1. `paykit-payment` criterion params gain required `payment_in`.
 2. `payment_in` is a nonzero JSON `u64` integer measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. There is no product maximum beyond checked duration/timestamp representation.
-3. Locks sends only the persisted Bundle ID, canonical lock resource, and Reader binding in the signed invoice request. Paykit reads `payment_in` from the canonical lock before side effects.
+3. Locks includes the persisted `payment_in` from the validated canonical criterion in the signed invoice request. Paykit independently reads the canonical lock and rejects a mismatch before side effects.
 4. Paykit commits `invoice_created_at` and `payment_deadline = checked(invoice_created_at + payment_in hours)` atomically with invoice creation. Exact replay returns the original timestamps.
 5. Locks validates the returned timestamps before marking invoice admission ready. Paykit remains authoritative for the timestamps and returns them on later status reads; exact invoice replay never restarts the payment window.
 6. Paykit sets Payment Request `proposal_expires_at` to `payment_deadline`, but the field remains proposal-only. Locks and Paykit Server enforce the post-acceptance deadline as application state.
@@ -116,7 +116,8 @@ POST /invoices
 {
   "bundle_id": "...",
   "lock_resource": "pubky.../pub/locks.app/<lock_id>.json",
-  "reader": "pubky..."
+  "reader": "pubky...",
+  "payment_in": 24
 }
 ```
 
@@ -129,7 +130,7 @@ Success is exactly `200 OK` with closed JSON:
 }
 ```
 
-Paykit reads `payment_in` from the canonical criterion. Exact replay returns the original response.
+Paykit compares request `payment_in` with canonical criterion `payment_in` before side effects. Exact replay returns the original response.
 
 ### Lock-wide drain
 
@@ -331,7 +332,7 @@ cargo test --workspace --no-run
 
 ### Task 3: Upgrade the Locks-to-Paykit invoice boundary
 
-**Objective:** Create invoices from a durable worker intent, require the closed timestamp response, and validate it before invoice admission becomes ready.
+**Objective:** Send persisted `payment_in` from a durable worker intent, require the closed timestamp response, and validate it before invoice admission becomes ready.
 
 **Files:**
 - Modify: `locks-server/src/paykit_http_client.rs`
@@ -342,9 +343,9 @@ cargo test --workspace --no-run
 
 **Dependency gate:** Implement only after the Paykit Server invoice-response slice is reviewed and committed.
 
-**RED:** Test canonical signed request body, stable task UUID `X-Request-ID`, exact `200` handling, strict timestamp response decoding, checked ordering (`created < deadline`), durable retry, terminal failure, and claim-fenced ready transition.
+**RED:** Test canonical signed request body including `payment_in`, canonical lock/request mismatch rejection with no Paykit side effects, stable task UUID `X-Request-ID`, exact `200` handling, strict timestamp response decoding, checked ordering (`created < deadline`), durable retry, terminal failure, and claim-fenced ready transition.
 
-**GREEN:** Persist the pending task and immutable invoice intent before outbound I/O. Let the claimed worker call Paykit, validate its closed response, then mark admission ready with the exact live claim token. Paykit retains authoritative invoice timestamps; worker retry reuses the same intent and request ID.
+**GREEN:** Persist the pending task and immutable invoice intent, including `payment_in` copied from the validated canonical criterion, before outbound I/O. Let the claimed worker send that persisted value to Paykit, validate its closed response, then mark admission ready with the exact live claim token. Paykit retains authoritative invoice timestamps; worker retry reuses the same intent and request ID.
 
 **Verify:** focused unit tests, PostgreSQL E2E, then `cargo test --workspace --no-run`.
 
