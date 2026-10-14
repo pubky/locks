@@ -27,7 +27,8 @@ use locks_service::application::models::{
     CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, CreatorConnectFlowId,
     DeletionReadAuthorization, FrontendSessionRecord, FrontendSessionToken,
     GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
-    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, OrdinaryCredentialLookupResult,
+    PendingCreatorConnectFlowRecord,
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, GrantCreatorConnectFlowClient, GuardedResourceRepository,
@@ -138,6 +139,15 @@ impl AccessCredentialStore for ResponseBoundaryAccessCredentialStore {
         _lookup_key: &AccessCredentialLookupKey,
     ) -> Result<(), ApplicationError> {
         Ok(())
+    }
+
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _expected: &AccessCredentialRecord,
+        _invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+        Ok(OrdinaryCredentialLookupResult::DeletionEnrolled)
     }
 
     async fn prepare_deletion_read(
@@ -3031,6 +3041,72 @@ async fn deletion_proxy_read_consumes_claim_before_returning_http_200() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
     assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deletion_proxy_head_releases_claim_then_get_consumes_it() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new("text/plain"));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+    let app = router(state);
+
+    let head = app
+        .clone()
+        .oneshot(auth_request(
+            "HEAD",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 0);
+
+    let get = app
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_head_remains_reusable() {
+    let state = test_state();
+    let content_lock = content_lock(true);
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded bytes".to_vec()).await;
+    let app = router(state.clone());
+    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
+    complete_task(&app).await;
+    let credential = issue_credential(&app).await;
+
+    let head = app
+        .clone()
+        .oneshot(auth_request(
+            "HEAD",
+            "/priv-resources/content/hello.txt",
+            &format!("Bearer {credential}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let get = app
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            &format!("Bearer {credential}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
 }
 
 #[tokio::test]

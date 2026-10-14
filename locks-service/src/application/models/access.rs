@@ -94,6 +94,17 @@ pub struct DeletionReadAuthorization {
     pub resource: GuardedResource,
 }
 
+/// Atomic storage-owned classification after an ordinary credential lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdinaryCredentialLookupResult {
+    /// Exact ordinary credential remains current and may authorize prepared bytes.
+    OrdinaryCurrent,
+    /// Deletion enrolled the credential while ordinary validation was in flight.
+    DeletionEnrolled,
+    /// Credential disappeared, changed identity, or was invalidated.
+    Missing,
+}
+
 /// Non-bearer lookup key derived from an access credential.
 ///
 /// Stores use this BLAKE3 digest instead of raw bearer credential strings.

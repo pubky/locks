@@ -1,13 +1,13 @@
 use crate::application::errors::ApplicationError;
-use crate::application::models::{AccessCredential, AccessCredentialLookupKey};
+use crate::application::models::{
+    AccessCredential, AccessCredentialLookupKey, OrdinaryCredentialLookupResult,
+};
 use crate::application::ports::{
     AccessCredentialStore, Clock, ContentLockRepository, EntitlementRepository,
     GuardedResourceRepository,
 };
 use crate::application::use_cases::entitlement_check::load_valid_entitlement;
-use crate::application::use_cases::validate_access_credential::{
-    ValidateAccessCredentialRequest, ValidateAccessCredentialUseCase,
-};
+
 use locks_core::ids::GuardedResourceHash;
 
 /// Request to proxy-read a guarded resource using a presented access credential.
@@ -74,110 +74,119 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
     ) -> Result<ProxiedGuardedResource, ApplicationError> {
         let now = self.clock.now();
         let lookup_key = AccessCredentialLookupKey::derive(&request.credential);
-        if let Some(authorization) = self
+        if let Some(response) = self
+            .prepare_deletion_response(&lookup_key, &request.path, now)
+            .await?
+        {
+            return Ok(response);
+        }
+        let record = self
             .credential_store
-            .prepare_deletion_read(
-                &lookup_key,
-                &request.path,
-                now,
-                now + time::Duration::seconds(30),
+            .get_access_credential(&lookup_key)
+            .await?
+            .ok_or(ApplicationError::InvalidAccessCredential)?;
+        let ordinary_response = async {
+            if record.expires_at <= self.clock.now() {
+                return Err(ApplicationError::ExpiredAccessCredential);
+            }
+            let entitlement = load_valid_entitlement(
+                self.entitlements,
+                self.content_locks,
+                &record.creator,
+                &record.bundle_id,
             )
-            .await?
-        {
-            let claim_token = authorization.claim_token;
-            let guarded_resource = authorization.resource;
-            let prepared_response = async {
-                let guarded_record = self
-                    .guarded_resources
-                    .get_current_guarded_resource(&authorization.creator, &guarded_resource.path)
-                    .await?
-                    .ok_or(ApplicationError::GuardedResourceUnavailable)?;
-                if guarded_record.hash != guarded_resource.hash
-                    || guarded_record.content_type != guarded_resource.content_type
-                    || guarded_record.size != guarded_resource.size
-                {
-                    return Err(ApplicationError::GuardedResourceUnavailable);
-                }
-                Ok(ProxiedGuardedResource {
-                    path: guarded_resource.path,
-                    content_type: guarded_record.content_type,
-                    hash: guarded_resource.hash,
-                    bytes: guarded_record.bytes,
-                    deletion_claim: claim_token.map(|claim_token| DeletionReadClaim {
-                        lookup_key: lookup_key.clone(),
-                        path: request.path.clone(),
-                        claim_token,
-                    }),
-                })
-            }
-            .await;
-            match prepared_response {
-                Ok(response) => return Ok(response),
-                Err(error) => {
-                    if let Some(claim_token) = claim_token {
-                        self.credential_store
-                            .release_deletion_read(
-                                &lookup_key,
-                                &request.path,
-                                claim_token,
-                                self.clock.now(),
-                            )
-                            .await?;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        if self
-            .credential_store
-            .deletion_credential_enrolled(&lookup_key)
-            .await?
-        {
-            return Err(ApplicationError::GuardedResourceUnavailable);
-        }
-        let validation = ValidateAccessCredentialUseCase::new(
-            self.credential_store,
-            self.entitlements,
-            self.content_locks,
-            self.clock,
-        );
-        let validated = validation
-            .execute(ValidateAccessCredentialRequest {
-                credential: request.credential,
-            })
             .await?;
-
-        let entitlement = load_valid_entitlement(
-            self.entitlements,
-            self.content_locks,
-            &validated.creator,
-            &validated.bundle_id,
-        )
-        .await?;
-        let guarded_resource = entitlement
-            .content_lock
-            .resource_for_path(&request.path)
-            .ok_or(ApplicationError::GuardedResourceUnavailable)?;
-        let guarded_record = self
-            .guarded_resources
-            .get_current_guarded_resource(&validated.creator, &guarded_resource.path)
-            .await?
-            .ok_or(ApplicationError::GuardedResourceUnavailable)?;
-
-        if guarded_record.hash != guarded_resource.hash
-            || guarded_record.content_type != guarded_resource.content_type
-            || guarded_record.size != guarded_resource.size
-        {
-            return Err(ApplicationError::GuardedResourceUnavailable);
+            let guarded_resource = entitlement
+                .content_lock
+                .resource_for_path(&request.path)
+                .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+            let guarded_record = self
+                .guarded_resources
+                .get_current_guarded_resource(&record.creator, &guarded_resource.path)
+                .await?
+                .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+            if guarded_record.hash != guarded_resource.hash
+                || guarded_record.content_type != guarded_resource.content_type
+                || guarded_record.size != guarded_resource.size
+            {
+                return Err(ApplicationError::GuardedResourceUnavailable);
+            }
+            Ok(ProxiedGuardedResource {
+                path: guarded_resource.path,
+                content_type: guarded_record.content_type,
+                hash: guarded_resource.hash,
+                bytes: guarded_record.bytes,
+                deletion_claim: None,
+            })
         }
+        .await;
+        let classification = self
+            .credential_store
+            .finish_ordinary_credential_lookup(&lookup_key, &record, ordinary_response.is_err())
+            .await?;
+        match classification {
+            OrdinaryCredentialLookupResult::OrdinaryCurrent => ordinary_response,
+            OrdinaryCredentialLookupResult::DeletionEnrolled => self
+                .prepare_deletion_response(&lookup_key, &request.path, self.clock.now())
+                .await?
+                .ok_or(ApplicationError::GuardedResourceUnavailable),
+            OrdinaryCredentialLookupResult::Missing => Err(ordinary_response
+                .err()
+                .unwrap_or(ApplicationError::InvalidAccessCredential)),
+        }
+    }
 
-        Ok(ProxiedGuardedResource {
-            path: guarded_resource.path,
-            content_type: guarded_record.content_type,
-            hash: guarded_resource.hash,
-            bytes: guarded_record.bytes,
-            deletion_claim: None,
-        })
+    async fn prepare_deletion_response(
+        &self,
+        lookup_key: &AccessCredentialLookupKey,
+        path: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<ProxiedGuardedResource>, ApplicationError> {
+        let Some(authorization) = self
+            .credential_store
+            .prepare_deletion_read(lookup_key, path, now, now + time::Duration::seconds(30))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let claim_token = authorization.claim_token;
+        let guarded_resource = authorization.resource;
+        let prepared_response = async {
+            let guarded_record = self
+                .guarded_resources
+                .get_current_guarded_resource(&authorization.creator, &guarded_resource.path)
+                .await?
+                .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+            if guarded_record.hash != guarded_resource.hash
+                || guarded_record.content_type != guarded_resource.content_type
+                || guarded_record.size != guarded_resource.size
+            {
+                return Err(ApplicationError::GuardedResourceUnavailable);
+            }
+            Ok(ProxiedGuardedResource {
+                path: guarded_resource.path,
+                content_type: guarded_record.content_type,
+                hash: guarded_resource.hash,
+                bytes: guarded_record.bytes,
+                deletion_claim: claim_token.map(|claim_token| DeletionReadClaim {
+                    lookup_key: lookup_key.clone(),
+                    path: path.to_owned(),
+                    claim_token,
+                }),
+            })
+        }
+        .await;
+        match prepared_response {
+            Ok(response) => Ok(Some(response)),
+            Err(error) => {
+                if let Some(claim_token) = claim_token {
+                    self.credential_store
+                        .release_deletion_read(lookup_key, path, claim_token, self.clock.now())
+                        .await?;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Permanently consumes the exact final-read claim after a complete HTTP 200
@@ -252,7 +261,7 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
-        DeletionReadAuthorization, GuardedResourceRecord,
+        DeletionReadAuthorization, GuardedResourceRecord, OrdinaryCredentialLookupResult,
     };
     use crate::application::ports::{
         AccessCredentialStore, Clock, ContentLockRepository, EntitlementRepository,
@@ -484,6 +493,123 @@ mod tests {
         assert_eq!(credentials.consumes.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn deletion_enrollment_during_successful_ordinary_lookup_restarts_frozen_read() {
+        let fixture = Fixture::seed().await;
+        let credentials = EnrollmentRaceStore::new(fixture.credentials);
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &fixture.content_locks,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let response = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert!(response.deletion_claim.is_some());
+        assert_eq!(credentials.prepares.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn deletion_enrollment_during_failed_ordinary_lookup_preserves_frozen_read() {
+        let fixture = Fixture::seed().await;
+        let credentials = EnrollmentRaceStore::new(fixture.credentials);
+        let missing_public_lock = InMemoryContentLockRepository::new();
+        let use_case = ProxyReadGuardedResourceUseCase::new(
+            &credentials,
+            &fixture.entitlements,
+            &missing_public_lock,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let response = use_case
+            .execute(ProxyReadGuardedResourceRequest {
+                credential: fixture.credential,
+                path: "/priv/app.locks/content/resource.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert!(response.deletion_claim.is_some());
+        assert_eq!(credentials.prepares.load(Ordering::SeqCst), 2);
+    }
+
+    struct EnrollmentRaceStore {
+        ordinary: InMemoryAccessCredentialStore,
+        claim_token: Uuid,
+        prepares: AtomicUsize,
+    }
+
+    impl EnrollmentRaceStore {
+        fn new(ordinary: InMemoryAccessCredentialStore) -> Self {
+            Self {
+                ordinary,
+                claim_token: Uuid::new_v4(),
+                prepares: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AccessCredentialStore for EnrollmentRaceStore {
+        async fn insert_access_credential(
+            &self,
+            lock_id: &locks_core::ids::LockId,
+            lookup_key: AccessCredentialLookupKey,
+            record: AccessCredentialRecord,
+        ) -> Result<(), ApplicationError> {
+            self.ordinary
+                .insert_access_credential(lock_id, lookup_key, record)
+                .await
+        }
+
+        async fn get_access_credential(
+            &self,
+            lookup_key: &AccessCredentialLookupKey,
+        ) -> Result<Option<AccessCredentialRecord>, ApplicationError> {
+            self.ordinary.get_access_credential(lookup_key).await
+        }
+
+        async fn delete_access_credential(
+            &self,
+            lookup_key: &AccessCredentialLookupKey,
+        ) -> Result<(), ApplicationError> {
+            self.ordinary.delete_access_credential(lookup_key).await
+        }
+
+        async fn finish_ordinary_credential_lookup(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            _expected: &AccessCredentialRecord,
+            _invalidate: bool,
+        ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+            Ok(OrdinaryCredentialLookupResult::DeletionEnrolled)
+        }
+
+        async fn prepare_deletion_read(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            path: &str,
+            _now: OffsetDateTime,
+            _claim_expires_at: OffsetDateTime,
+        ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
+            let attempt = self.prepares.fetch_add(1, Ordering::SeqCst);
+            Ok((attempt > 0).then(|| DeletionReadAuthorization {
+                claim_token: Some(self.claim_token),
+                creator: creator(),
+                resource: content_lock_fixture().resource_for_path(path).unwrap(),
+            }))
+        }
+    }
+
     struct DeletionReadStore {
         ordinary: InMemoryAccessCredentialStore,
         claim_token: Uuid,
@@ -527,6 +653,17 @@ mod tests {
             lookup_key: &AccessCredentialLookupKey,
         ) -> Result<(), ApplicationError> {
             self.ordinary.delete_access_credential(lookup_key).await
+        }
+
+        async fn finish_ordinary_credential_lookup(
+            &self,
+            lookup_key: &AccessCredentialLookupKey,
+            expected: &AccessCredentialRecord,
+            invalidate: bool,
+        ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+            self.ordinary
+                .finish_ordinary_credential_lookup(lookup_key, expected, invalidate)
+                .await
         }
 
         async fn prepare_deletion_read(

@@ -456,6 +456,10 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let key = (creator.clone(), lock_id.clone());
+        let _admission = self
+            .verification_task_fence
+            .acquire_lock_admission(creator, lock_id)
+            .await;
         let mut verification_tasks = self.verification_task_fence.records.write().await;
         let intents = self.publication_intents.read().await;
         if intents.contains_key(&key) {
@@ -472,7 +476,15 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         if let Some(receipt) = receipts.get(&key) {
-            return Ok(PrepareForceDeletionResult::Synchronous(receipt.clone()));
+            let result = PrepareForceDeletionResult::Synchronous(receipt.clone());
+            drop(receipts);
+            drop(jobs);
+            drop(intents);
+            drop(verification_tasks);
+            self.access_credentials
+                .block_key_and_disable_job(creator, lock_id, None)
+                .await;
+            return Ok(result);
         }
         if let Some(stored) = jobs.get_mut(&key) {
             if matches!(
@@ -483,7 +495,15 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 stored.job.state = ContentLockDeletionState::Queued;
                 stored.job.next_attempt_at = None;
                 clear_claim(stored);
-                return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
+                let job = stored.job.clone();
+                drop(receipts);
+                drop(jobs);
+                drop(intents);
+                drop(verification_tasks);
+                self.access_credentials
+                    .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
+                    .await;
+                return Ok(PrepareForceDeletionResult::Active(job));
             }
             let receipt = ForceDeletionReceipt {
                 creator: creator.clone(),
@@ -500,6 +520,13 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                     task.deletion_job_id = None;
                 }
             }
+            drop(receipts);
+            drop(jobs);
+            drop(intents);
+            drop(verification_tasks);
+            self.access_credentials
+                .block_key_and_disable_job(creator, lock_id, Some(terminal_job_id))
+                .await;
             return Ok(PrepareForceDeletionResult::Synchronous(receipt));
         }
         let receipt = ForceDeletionReceipt {
@@ -510,6 +537,13 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             completed_at: None,
         };
         receipts.insert(key, receipt.clone());
+        drop(receipts);
+        drop(jobs);
+        drop(intents);
+        drop(verification_tasks);
+        self.access_credentials
+            .block_key_and_disable_job(creator, lock_id, None)
+            .await;
         Ok(PrepareForceDeletionResult::Synchronous(receipt))
     }
 

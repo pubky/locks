@@ -274,6 +274,40 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
 }
 
 #[tokio::test]
+async fn in_memory_force_receipt_blocks_later_ordinary_credential() {
+    let (_verification_tasks, access, deletions) = in_memory_access_stack();
+    let lock = content_lock();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(
+                &job.creator,
+                &job.lock_id,
+                Some(&job.frozen_content_lock),
+                NOW,
+            )
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    assert_eq!(
+        access
+            .insert_access_credential(
+                &job.lock_id,
+                AccessCredentialLookupKey::derive(&AccessCredential::new("after-force")),
+                AccessCredentialRecord {
+                    creator: job.creator,
+                    bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                    expires_at: NOW + time::Duration::minutes(10),
+                },
+            )
+            .await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
 async fn in_memory_deletion_enrolls_existing_ordinary_credentials_and_blocks_late_insertion() {
     let (verification_tasks, access, deletions) = in_memory_access_stack();
     let lock = content_lock();
