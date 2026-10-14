@@ -318,9 +318,41 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
         repository.insert_job(job.clone()).await,
         Err(locks_service::application::errors::ApplicationError::ContentLockPublicationInProgress)
     );
+    let mut mismatched_lock = lock.clone();
+    mismatched_lock
+        .access_policy
+        .requested_credential_ttl_seconds += 1;
+    assert!(
+        !repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &mismatched_lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .reconcile_publication(&lock.creator, &lock_id, &lock, &[])
+            .await
+            .unwrap()
+    );
     assert!(
         repository
-            .reconcile_publication(&lock.creator, &lock_id)
+            .publication_in_progress(&lock.creator, &lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
             .await
             .unwrap()
     );

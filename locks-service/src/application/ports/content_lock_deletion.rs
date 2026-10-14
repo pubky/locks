@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use locks_core::ids::{CreatorPubky, LockId};
+use std::collections::BTreeSet;
+
+use locks_core::{
+    ids::{CreatorPubky, LockId},
+    lock_policy::ContentLock,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -38,11 +43,13 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Clears an intent after caller verified exact public bytes and published ownership.
+    /// Clears an intent only for exact canonical bytes and the complete published ownership set.
     async fn reconcile_publication(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError>;
 
     /// Checks publication admission under the canonical per-lock fence.
@@ -131,4 +138,36 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
+}
+
+pub(crate) fn publication_reconciliation_matches(
+    creator: &CreatorPubky,
+    lock_id: &LockId,
+    published_content_lock: &ContentLock,
+    published_guarded_paths: &[String],
+) -> bool {
+    if &published_content_lock.creator != creator
+        || !published_content_lock
+            .lock_id()
+            .is_ok_and(|published_lock_id| &published_lock_id == lock_id)
+    {
+        return false;
+    }
+
+    let expected_paths = published_content_lock
+        .primary_resource
+        .iter()
+        .map(|resource| resource.path.as_str())
+        .chain(
+            published_content_lock
+                .secondary_resources
+                .keys()
+                .map(String::as_str),
+        )
+        .collect::<BTreeSet<_>>();
+    let published_paths = published_guarded_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    expected_paths.len() == published_guarded_paths.len() && expected_paths == published_paths
 }

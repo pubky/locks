@@ -14,7 +14,7 @@ use crate::application::{
         ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
         PrepareForceDeletionResult,
     },
-    ports::ContentLockDeletionRepository,
+    ports::{ContentLockDeletionRepository, publication_reconciliation_matches},
 };
 
 type JobKey = (CreatorPubky, LockId);
@@ -99,7 +99,17 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError> {
+        if !publication_reconciliation_matches(
+            creator,
+            lock_id,
+            published_content_lock,
+            published_guarded_paths,
+        ) {
+            return Ok(false);
+        }
         Ok(self
             .publication_intents
             .write()

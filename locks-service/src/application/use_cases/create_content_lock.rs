@@ -139,29 +139,43 @@ impl<'a> CreateContentLockUseCase<'a> {
             .content_lock_deletions
             .publication_in_progress(&request.creator, &lock_id)
             .await?
-            && self
+        {
+            let published_content_lock = self
                 .content_locks
                 .get_content_lock(&request.creator, &content_lock_path)
-                .await?
-                .as_ref()
-                == Some(&content_lock)
-        {
-            let mut ownership_matches = true;
+                .await?;
+            let Some(published_content_lock) = published_content_lock.as_ref() else {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: content_lock_path.to_string(),
+                });
+            };
+            if published_content_lock != &content_lock {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: content_lock_path.to_string(),
+                });
+            }
+            let mut published_guarded_paths = Vec::with_capacity(guarded_paths.len());
             for guarded_path in &guarded_paths {
-                ownership_matches &= self
+                if self
                     .content_lock_ownership
                     .get_path_ownership(&request.creator, guarded_path)
                     .await?
                     .is_some_and(|ownership| {
                         ownership.lock_id == lock_id
                             && ownership.status == ContentLockOwnershipStatus::Published
-                    });
+                    })
+                {
+                    published_guarded_paths.push(guarded_path.clone());
+                }
             }
-            if ownership_matches {
-                self.content_lock_deletions
-                    .reconcile_publication(&request.creator, &lock_id)
-                    .await?;
-            }
+            self.content_lock_deletions
+                .reconcile_publication(
+                    &request.creator,
+                    &lock_id,
+                    published_content_lock,
+                    &published_guarded_paths,
+                )
+                .await?;
         }
 
         let publication_token = Uuid::new_v4();
@@ -682,6 +696,37 @@ mod tests {
                 .unwrap()
                 .status,
             ContentLockOwnershipStatus::Published
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_retained_intent_when_public_canonical_bytes_do_not_match() {
+        let fixture = Fixture::seeded().await;
+        let request = content_lock_request(registered_guarded_resource());
+        let created = fixture.use_case().execute(request.clone()).await.unwrap();
+        fixture
+            .content_lock_deletions
+            .begin_publication(&creator(), &created.lock_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        let mut replacement = created.content_lock.clone();
+        replacement.access_policy.requested_credential_ttl_seconds += 1;
+        fixture
+            .content_locks
+            .upsert_content_lock(creator(), created.content_lock_path.clone(), replacement)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fixture.use_case().execute(request).await,
+            Err(ApplicationError::ContentLockPathConflict { .. })
+        ));
+        assert!(
+            fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &created.lock_id)
+                .await
+                .unwrap()
         );
     }
 

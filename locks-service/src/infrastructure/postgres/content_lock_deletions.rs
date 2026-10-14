@@ -16,7 +16,7 @@ use crate::application::{
         ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
         PrepareForceDeletionResult,
     },
-    ports::ContentLockDeletionRepository,
+    ports::{ContentLockDeletionRepository, publication_reconciliation_matches},
 };
 use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
 
@@ -108,9 +108,52 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError> {
+        if !publication_reconciliation_matches(
+            creator,
+            lock_id,
+            published_content_lock,
+            published_guarded_paths,
+        ) {
+            return Ok(false);
+        }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let intent_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM content_lock_publication_intents
+                WHERE creator = $1 AND lock_id = $2
+            )",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if !intent_exists {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let ownership = sqlx::query_as::<_, (String, String)>(
+            "SELECT guarded_path, status
+             FROM content_lock_ownership
+             WHERE creator = $1 AND lock_id = $2",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if ownership.len() != published_guarded_paths.len()
+            || ownership.iter().any(|(guarded_path, status)| {
+                status != "published" || !published_guarded_paths.contains(guarded_path)
+            })
+        {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(false);
+        }
         let result = sqlx::query(
             "DELETE FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2",
         )
@@ -817,6 +860,8 @@ mod tests {
     use time::macros::datetime;
     use uuid::Uuid;
 
+    use sqlx::{Postgres, Transaction};
+
     use super::PostgresContentLockDeletionRepository;
     use crate::{
         application::{
@@ -828,11 +873,14 @@ mod tests {
                 VerificationTaskStatus,
             },
             ports::{
-                ContentLockDeletionRepository, InvoiceAdmissionRepository,
-                VerificationTaskRepository,
+                ContentLockDeletionRepository, ContentLockOwnershipRepository,
+                InvoiceAdmissionRepository, VerificationTaskRepository,
             },
         },
-        infrastructure::postgres::{PostgresVerificationTaskRepository, testing::TestDatabase},
+        infrastructure::postgres::{
+            PostgresContentLockOwnershipRepository, PostgresVerificationTaskRepository,
+            proof_admission::lock_proof_admission, testing::TestDatabase,
+        },
     };
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -841,7 +889,6 @@ mod tests {
     #[tokio::test]
     async fn deletion_commit_order_is_the_authoritative_proof_admission_cutoff() {
         let database = TestDatabase::create().await;
-        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
 
@@ -851,7 +898,21 @@ mod tests {
             .await
             .unwrap();
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap();
-        deletions.insert_job(job.clone()).await.unwrap();
+        let mut cutoff = database.pool().begin().await.unwrap();
+        lock_proof_admission(&mut cutoff, &job.creator, &job.lock_id)
+            .await
+            .unwrap();
+        let replay_repository = tasks.clone();
+        let replay_task = admitted_before.clone();
+        let replay = tokio::spawn(async move {
+            replay_repository
+                .insert_verification_task(replay_task)
+                .await
+        });
+        wait_for_advisory_waiter(&mut cutoff).await;
+        insert_deletion_cutoff(&mut cutoff, &job).await;
+        cutoff.commit().await.unwrap();
+        assert_eq!(replay.await.unwrap(), Ok(()));
 
         let snapshotted: Vec<Uuid> = sqlx::query_scalar(
             "SELECT verification_task_id
@@ -889,7 +950,6 @@ mod tests {
     #[tokio::test]
     async fn exact_invoice_replay_precedes_cutoff_but_changed_or_new_admission_is_rejected() {
         let database = TestDatabase::create().await;
-        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
         let mut admitted_before = verification_task(&lock, BundleId::from_bytes([3; 16]));
@@ -902,25 +962,33 @@ mod tests {
             .insert_invoice_pending_task(admitted_before.clone(), intent.clone())
             .await
             .unwrap();
-        deletions
-            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap())
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap();
+        let mut cutoff = database.pool().begin().await.unwrap();
+        lock_proof_admission(&mut cutoff, &job.creator, &job.lock_id)
             .await
             .unwrap();
-
-        assert_eq!(
-            tasks
-                .insert_invoice_pending_task(admitted_before.clone(), intent.clone())
+        let replay_repository = tasks.clone();
+        let replay_task = admitted_before.clone();
+        let replay_intent = intent.clone();
+        let replay = tokio::spawn(async move {
+            replay_repository
+                .insert_invoice_pending_task(replay_task, replay_intent)
                 .await
-                .unwrap(),
-            original
-        );
-        let mut changed_intent = intent;
-        changed_intent.reader =
+        });
+        wait_for_advisory_waiter(&mut cutoff).await;
+        insert_deletion_cutoff(&mut cutoff, &job).await;
+        cutoff.commit().await.unwrap();
+        assert_eq!(replay.await.unwrap().unwrap(), original);
+        let changed_reader =
             CreatorPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
                 .unwrap();
+        let mut changed_task = admitted_before;
+        changed_task.submitted_proof_bundle.reader_public_key = Some(changed_reader.clone());
+        let mut changed_intent = intent;
+        changed_intent.reader = changed_reader;
         assert_eq!(
             tasks
-                .insert_invoice_pending_task(admitted_before, changed_intent)
+                .insert_invoice_pending_task(changed_task, changed_intent)
                 .await,
             Err(ApplicationError::VerificationTaskConflict)
         );
@@ -935,6 +1003,180 @@ mod tests {
                 .insert_invoice_pending_task(new_task, new_intent)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn tokenless_publication_reconciliation_is_exact_fenced_and_lock_scoped() {
+        let database = TestDatabase::create().await;
+        let publications = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let ownership = PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let lock_id = lock.lock_id().unwrap();
+        let paths = guarded_paths(&lock);
+        ownership
+            .reserve_paths(&lock.creator, &paths, &lock_id)
+            .await
+            .unwrap();
+        publications
+            .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        ownership
+            .mark_paths_published(&lock.creator, &paths, &lock_id)
+            .await
+            .unwrap();
+
+        let mut unrelated_lock = lock.clone();
+        unrelated_lock.primary_resource.as_mut().unwrap().path =
+            "/priv/app.locks/content/unrelated.json".to_owned();
+        let unrelated_lock_id = unrelated_lock.lock_id().unwrap();
+        let unrelated_paths = guarded_paths(&unrelated_lock);
+        ownership
+            .reserve_paths(
+                &unrelated_lock.creator,
+                &unrelated_paths,
+                &unrelated_lock_id,
+            )
+            .await
+            .unwrap();
+        publications
+            .begin_publication(&unrelated_lock.creator, &unrelated_lock_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        ownership
+            .mark_paths_published(
+                &unrelated_lock.creator,
+                &unrelated_paths,
+                &unrelated_lock_id,
+            )
+            .await
+            .unwrap();
+
+        let mut mismatched_lock = lock.clone();
+        mismatched_lock
+            .access_policy
+            .requested_credential_ttl_seconds += 1;
+        assert!(
+            !publications
+                .reconcile_publication(&lock.creator, &lock_id, &mismatched_lock, &paths)
+                .await
+                .unwrap()
+        );
+        assert!(
+            publications
+                .publication_in_progress(&lock.creator, &lock_id)
+                .await
+                .unwrap()
+        );
+
+        let mut fence = database.pool().begin().await.unwrap();
+        lock_proof_admission(&mut fence, &lock.creator, &lock_id)
+            .await
+            .unwrap();
+        let reconcile_repository = publications.clone();
+        let reconcile_creator = lock.creator.clone();
+        let reconcile_lock_id = lock_id.clone();
+        let reconcile_lock = lock.clone();
+        let reconcile_paths = paths.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_repository
+                .reconcile_publication(
+                    &reconcile_creator,
+                    &reconcile_lock_id,
+                    &reconcile_lock,
+                    &reconcile_paths,
+                )
+                .await
+        });
+        wait_for_advisory_waiter(&mut fence).await;
+        fence.commit().await.unwrap();
+        assert!(reconcile.await.unwrap().unwrap());
+        assert!(
+            !publications
+                .publication_in_progress(&lock.creator, &lock_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            publications
+                .publication_in_progress(&unrelated_lock.creator, &unrelated_lock_id)
+                .await
+                .unwrap()
+        );
+
+        let mut ownership_race_lock = lock.clone();
+        ownership_race_lock.primary_resource.as_mut().unwrap().path =
+            "/priv/app.locks/content/ownership-race.json".to_owned();
+        let ownership_race_lock_id = ownership_race_lock.lock_id().unwrap();
+        let ownership_race_paths = guarded_paths(&ownership_race_lock);
+        ownership
+            .reserve_paths(
+                &ownership_race_lock.creator,
+                &ownership_race_paths,
+                &ownership_race_lock_id,
+            )
+            .await
+            .unwrap();
+        publications
+            .begin_publication(
+                &ownership_race_lock.creator,
+                &ownership_race_lock_id,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        ownership
+            .mark_paths_published(
+                &ownership_race_lock.creator,
+                &ownership_race_paths,
+                &ownership_race_lock_id,
+            )
+            .await
+            .unwrap();
+        let mut fence = database.pool().begin().await.unwrap();
+        lock_proof_admission(
+            &mut fence,
+            &ownership_race_lock.creator,
+            &ownership_race_lock_id,
+        )
+        .await
+        .unwrap();
+        let reconcile_repository = publications.clone();
+        let reconcile_creator = ownership_race_lock.creator.clone();
+        let reconcile_lock_id = ownership_race_lock_id.clone();
+        let reconcile_lock = ownership_race_lock.clone();
+        let reconcile_paths = ownership_race_paths.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_repository
+                .reconcile_publication(
+                    &reconcile_creator,
+                    &reconcile_lock_id,
+                    &reconcile_lock,
+                    &reconcile_paths,
+                )
+                .await
+        });
+        wait_for_advisory_waiter(&mut fence).await;
+        sqlx::query(
+            "UPDATE content_lock_ownership
+             SET status = 'reserved'
+             WHERE creator = $1 AND lock_id = $2",
+        )
+        .bind(ownership_race_lock.creator.to_string())
+        .bind(ownership_race_lock_id.to_string())
+        .execute(&mut *fence)
+        .await
+        .unwrap();
+        fence.commit().await.unwrap();
+        assert!(!reconcile.await.unwrap().unwrap());
+        assert!(
+            publications
+                .publication_in_progress(&ownership_race_lock.creator, &ownership_race_lock_id,)
+                .await
+                .unwrap()
         );
 
         database.cleanup().await;
@@ -1368,6 +1610,85 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    async fn wait_for_advisory_waiter(transaction: &mut Transaction<'_, Postgres>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiter_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks held
+                        JOIN pg_locks waiting
+                          ON waiting.locktype = held.locktype
+                         AND waiting.database IS NOT DISTINCT FROM held.database
+                         AND waiting.classid IS NOT DISTINCT FROM held.classid
+                         AND waiting.objid IS NOT DISTINCT FROM held.objid
+                         AND waiting.objsubid IS NOT DISTINCT FROM held.objsubid
+                         AND waiting.pid <> held.pid
+                        WHERE held.pid = pg_backend_pid()
+                          AND held.locktype = 'advisory'
+                          AND held.granted
+                          AND NOT waiting.granted
+                    )",
+                )
+                .fetch_one(&mut **transaction)
+                .await
+                .unwrap();
+                if waiter_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second Postgres connection must wait on the canonical advisory fence");
+    }
+
+    async fn insert_deletion_cutoff(
+        transaction: &mut Transaction<'_, Postgres>,
+        job: &ContentLockDeletionJob,
+    ) {
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+             (job_id, creator, lock_id, frozen_content_lock, deletion_started_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(job.job_id)
+        .bind(job.creator.to_string())
+        .bind(job.lock_id.to_string())
+        .bind(serde_json::to_value(&job.frozen_content_lock).unwrap())
+        .bind(job.deletion_started_at)
+        .execute(&mut **transaction)
+        .await
+        .unwrap();
+        let lock_resource = format!(
+            "{}/pub/app.locks/{}.json",
+            job.creator,
+            job.lock_id.as_str()
+        );
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id)
+             SELECT $1, task_id
+             FROM verification_tasks
+             WHERE creator = $2
+               AND submitted_proof_bundle->>'pubky_lock_resource' = $3",
+        )
+        .bind(job.job_id)
+        .bind(job.creator.to_string())
+        .bind(lock_resource)
+        .execute(&mut **transaction)
+        .await
+        .unwrap();
+    }
+
+    fn guarded_paths(lock: &ContentLock) -> Vec<String> {
+        lock.primary_resource
+            .iter()
+            .map(|resource| resource.path.clone())
+            .chain(lock.secondary_resources.keys().cloned())
+            .collect()
     }
 
     fn verification_task(lock: &ContentLock, bundle_id: BundleId) -> VerificationTaskRecord {
