@@ -1117,6 +1117,12 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
             .await
             .unwrap()
     );
+    assert!(
+        access
+            .release_deletion_read(&lookup, path, stale_claim, reclaim_time)
+            .await
+            .unwrap()
+    );
     let recovered_claim = access
         .prepare_deletion_read(
             &lookup,
