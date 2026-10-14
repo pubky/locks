@@ -1055,7 +1055,7 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
     let publication_token = Uuid::new_v4();
     state
         .content_lock_deletions()
-        .begin_publication(&creator(), &lock_id, publication_token)
+        .begin_publication(&creator(), &lock_id, publication_token, &content_lock)
         .await
         .unwrap();
 
@@ -4337,6 +4337,58 @@ async fn creator_content_locks_identical_request_returns_same_lock_id_and_path()
         first_body["content_lock_path"]
     );
     assert_eq!(second_body["content_lock"], first_body["content_lock"]);
+}
+
+#[tokio::test]
+async fn creator_content_lock_replay_after_graceful_delete_returns_deletion_in_progress() {
+    let state = test_state_with_creator_publishing(true)
+        .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = creator_content_lock_request(guarded_resource);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/creator/content-locks",
+            request.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let lock_id = response_json(created).await["lock_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let deleted = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+
+    let replay = app
+        .oneshot(json_request("POST", "/creator/content-locks", request))
+        .await
+        .unwrap();
+    let body = assert_error_response(
+        replay,
+        StatusCode::CONFLICT,
+        "content_lock_deletion_in_progress",
+    )
+    .await;
+    assert_eq!(
+        body["error"]["message"],
+        "content lock deletion is in progress"
+    );
 }
 
 #[tokio::test]

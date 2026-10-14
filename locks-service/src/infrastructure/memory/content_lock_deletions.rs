@@ -14,7 +14,10 @@ use crate::application::{
         ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
         PrepareForceDeletionResult,
     },
-    ports::{ContentLockDeletionRepository, publication_reconciliation_matches},
+    ports::{
+        ContentLockDeletionRepository, PublicationRecovery, publication_intent_matches_request,
+        publication_reconciliation_matches,
+    },
 };
 use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
@@ -28,10 +31,11 @@ struct StoredJob {
     claim_expires_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PublicationIntent {
     token: Uuid,
     write_completed: bool,
+    original_content_lock: ContentLock,
 }
 
 /// In-memory deletion repository with the same lease-fencing semantics as PostgreSQL.
@@ -73,7 +77,18 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
+        original_content_lock: &ContentLock,
     ) -> Result<(), ApplicationError> {
+        if !publication_intent_matches_request(
+            creator,
+            lock_id,
+            original_content_lock,
+            original_content_lock,
+        ) {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication intent identity mismatch".to_owned(),
+            });
+        }
         let key = (creator.clone(), lock_id.clone());
         let mut intents = self.publication_intents.write().await;
         let jobs = self.jobs.read().await;
@@ -91,6 +106,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             PublicationIntent {
                 token: publication_token,
                 write_completed: false,
+                original_content_lock: original_content_lock.clone(),
             },
         );
         Ok(())
@@ -111,21 +127,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         }
         intent.write_completed = true;
         Ok(true)
-    }
-
-    async fn finish_publication(
-        &self,
-        creator: &CreatorPubky,
-        lock_id: &LockId,
-        publication_token: Uuid,
-    ) -> Result<bool, ApplicationError> {
-        remove_publication_intent(
-            &self.publication_intents,
-            creator,
-            lock_id,
-            publication_token,
-        )
-        .await
     }
 
     async fn abandon_publication(
@@ -160,10 +161,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         }
         let key = (creator.clone(), lock_id.clone());
         let mut intents = self.publication_intents.write().await;
-        if !intents
-            .get(&key)
-            .is_some_and(|intent| intent.write_completed)
-        {
+        if !intents.get(&key).is_some_and(|intent| {
+            intent.write_completed && intent.original_content_lock == *published_content_lock
+        }) {
             return Ok(false);
         }
         intents.remove(&key);
@@ -175,11 +175,52 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError> {
-        Ok(self
-            .publication_intents
-            .read()
-            .await
-            .contains_key(&(creator.clone(), lock_id.clone())))
+        let key = (creator.clone(), lock_id.clone());
+        let intents = self.publication_intents.read().await;
+        let jobs = self.jobs.read().await;
+        let receipts = self.force_receipts.read().await;
+        if jobs.contains_key(&key) || receipts.contains_key(&key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        Ok(intents.contains_key(&key))
+    }
+
+    async fn recover_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        replacement_token: Uuid,
+        requested_content_lock: &ContentLock,
+    ) -> Result<PublicationRecovery, ApplicationError> {
+        let key = (creator.clone(), lock_id.clone());
+        let mut intents = self.publication_intents.write().await;
+        let jobs = self.jobs.read().await;
+        let receipts = self.force_receipts.read().await;
+        if jobs.contains_key(&key) || receipts.contains_key(&key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let Some(intent) = intents.get_mut(&key) else {
+            return Ok(PublicationRecovery::None);
+        };
+        if !publication_intent_matches_request(
+            creator,
+            lock_id,
+            &intent.original_content_lock,
+            requested_content_lock,
+        ) {
+            return Ok(PublicationRecovery::RequestMismatch);
+        }
+        if intent.write_completed {
+            return Ok(PublicationRecovery::WriteCompleted {
+                publication_token: intent.token,
+                content_lock: intent.original_content_lock.clone(),
+            });
+        }
+        intent.token = replacement_token;
+        Ok(PublicationRecovery::RetryWithToken {
+            publication_token: replacement_token,
+            content_lock: intent.original_content_lock.clone(),
+        })
     }
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
@@ -496,7 +537,7 @@ async fn remove_publication_intent(
     let mut intents = intents.write().await;
     if intents
         .get(&key)
-        .is_none_or(|intent| intent.token != publication_token)
+        .is_none_or(|intent| intent.token != publication_token || intent.write_completed)
     {
         return Ok(false);
     }

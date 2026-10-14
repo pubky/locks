@@ -13,7 +13,7 @@ use locks_service::{
             ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
             ContentLockDeletionState, PrepareForceDeletionResult,
         },
-        ports::ContentLockDeletionRepository,
+        ports::{ContentLockDeletionRepository, PublicationRecovery},
     },
     infrastructure::memory::content_lock_deletions::InMemoryContentLockDeletionRepository,
 };
@@ -367,7 +367,7 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
     let lock_id = lock.lock_id().unwrap();
     let publication_token = Uuid::new_v4();
     repository
-        .begin_publication(&lock.creator, &lock_id, publication_token)
+        .begin_publication(&lock.creator, &lock_id, publication_token, &lock)
         .await
         .unwrap();
 
@@ -421,6 +421,82 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
             .unwrap()
     );
     repository.insert_job(job).await.unwrap();
+    assert_eq!(
+        repository
+            .publication_in_progress(&lock.creator, &lock_id)
+            .await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
+async fn publication_recovery_replaces_only_uncompleted_token_and_requires_write_marker() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let lock = content_lock();
+    let lock_id = lock.lock_id().unwrap();
+    let original_token = Uuid::new_v4();
+    let recovery_token = Uuid::new_v4();
+    repository
+        .begin_publication(&lock.creator, &lock_id, original_token, &lock)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, recovery_token, &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::RetryWithToken {
+            publication_token: recovery_token,
+            content_lock: lock.clone(),
+        }
+    );
+    assert!(
+        !repository
+            .mark_publication_written(&lock.creator, &lock_id, original_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .mark_publication_written(&lock.creator, &lock_id, recovery_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .abandon_publication(&lock.creator, &lock_id, recovery_token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::WriteCompleted {
+            publication_token: recovery_token,
+            content_lock: lock.clone(),
+        }
+    );
+    assert!(
+        repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::None
+    );
 }
 
 fn content_lock() -> ContentLock {
