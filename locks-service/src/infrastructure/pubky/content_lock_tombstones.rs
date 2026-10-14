@@ -10,6 +10,17 @@ use crate::application::ports::content_lock_tombstone::{
 use crate::application::ports::{ContentLockTombstoneRepository, TombstoneReadback};
 use crate::infrastructure::pubky::storage_client::PubkyHomeserverStorageClient;
 
+fn matches_frozen_content_lock(actual: &[u8], expected_canonical: &[u8]) -> bool {
+    if actual == expected_canonical {
+        return true;
+    }
+
+    serde_json::from_slice::<ContentLock>(actual)
+        .ok()
+        .and_then(|content_lock| content_lock.canonical_json_bytes().ok())
+        .is_some_and(|canonical| canonical == expected_canonical)
+}
+
 /// Pubky homeserver adapter for exact public content-lock tombstone bytes.
 ///
 /// Pubky 0.9.3 cannot condition a PUT on the bytes read below. The pre-write comparison protects
@@ -56,7 +67,11 @@ where
             .await?;
         match actual.as_ref().map(|resource| resource.bytes.as_slice()) {
             Some(actual) if actual == tombstone_bytes => return Ok(TombstoneReadback::Exact),
-            Some(actual) if actual == original_bytes => {}
+            // Content locks published through the legacy JSON writer can have non-JCS number
+            // spellings (for example 1.0 or integers above 2^53). Re-canonicalize a valid live
+            // ContentLock before classifying it as replaced, while malformed or changed locks
+            // still fail closed without another PUT.
+            Some(actual) if matches_frozen_content_lock(actual, &original_bytes) => {}
             None => return Ok(TombstoneReadback::Missing),
             Some(_) => return Ok(TombstoneReadback::Replaced),
         }

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
+use locks_core::lock_policy::{Criterion, LockLogic, VerifierType};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::ports::{
     ContentLockRepository, ContentLockTombstoneRepository, TombstoneReadback,
@@ -221,6 +222,78 @@ async fn pubky_withdrawal_writes_canonical_bytes_to_exact_path_and_reads_them_ba
 }
 
 #[tokio::test]
+async fn pubky_withdrawal_accepts_legacy_json_number_spelling_but_rejects_changed_lock() {
+    let repository = PubkyContentLockTombstoneRepository::new(FakePubkyStorage::default());
+    let creator = creator();
+    let path = path();
+    let mut original = original_content_lock();
+    original.criteria = vec![Criterion {
+        criterion_id: "numeric-params".to_owned(),
+        verifier_type: VerifierType::DevStatic,
+        params: serde_json::json!({
+            "fraction": 1.0,
+            "huge_exponent": 1e300,
+            "above_jcs_exact_integer_range": 9_007_199_254_740_993_u64,
+        }),
+    }];
+    original.lock_logic = LockLogic::All {
+        criteria: vec!["numeric-params".to_owned()],
+    };
+    let legacy_published_bytes = serde_json::to_vec(&original).unwrap();
+    assert_ne!(
+        legacy_published_bytes,
+        original.canonical_json_bytes().unwrap(),
+        "fixture must exercise serde_json versus JCS numeric spelling"
+    );
+    repository.client().replace_bytes(legacy_published_bytes);
+
+    assert_eq!(
+        repository
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original,
+                &tombstone_at_five(),
+            )
+            .await
+            .unwrap(),
+        TombstoneReadback::Exact
+    );
+    assert_eq!(
+        repository
+            .client()
+            .operations()
+            .iter()
+            .filter(|operation| operation.starts_with("put_bytes "))
+            .count(),
+        1
+    );
+
+    let mut replacement = original.clone();
+    replacement.created_at = datetime!(2026-08-12 05:00:01 UTC);
+    let replacement_bytes = serde_json::to_vec(&replacement).unwrap();
+    repository.client().replace_bytes(replacement_bytes.clone());
+    assert_eq!(
+        repository
+            .withdraw_content_lock(creator, path, &original, &tombstone_at_five())
+            .await
+            .unwrap(),
+        TombstoneReadback::Replaced
+    );
+    assert_eq!(
+        repository
+            .client()
+            .operations()
+            .iter()
+            .filter(|operation| operation.starts_with("put_bytes "))
+            .count(),
+        1,
+        "changed lock must not be overwritten"
+    );
+    assert_eq!(repository.client().stored_bytes(), replacement_bytes);
+}
+
+#[tokio::test]
 async fn pubky_readback_classifies_missing_and_non_tombstone_replacement_as_raw_bytes() {
     let repository = PubkyContentLockTombstoneRepository::new(FakePubkyStorage::default());
     let creator = creator();
@@ -311,6 +384,10 @@ impl FakePubkyStorage {
 
     fn written_bytes(&self) -> Vec<u8> {
         self.written_bytes.lock().unwrap().clone().unwrap()
+    }
+
+    fn stored_bytes(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap().clone().unwrap()
     }
 
     fn operations(&self) -> Vec<String> {
