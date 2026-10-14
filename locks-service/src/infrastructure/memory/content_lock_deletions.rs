@@ -422,7 +422,7 @@ fn is_claimable(stored: &StoredJob, now: OffsetDateTime) -> bool {
             .is_none_or(|next_attempt_at| next_attempt_at <= now),
         ContentLockDeletionState::Running => stored
             .claim_expires_at
-            .is_some_and(|claim_expires_at| claim_expires_at < now),
+            .is_some_and(|claim_expires_at| claim_expires_at <= now),
         ContentLockDeletionState::Completed | ContentLockDeletionState::Failed => false,
     }
 }
@@ -440,7 +440,7 @@ fn owns_claim(
         && stored.claim_token == Some(claim_token)
         && stored
             .claim_expires_at
-            .is_some_and(|claim_expires_at| claim_expires_at >= now)
+            .is_some_and(|claim_expires_at| now < claim_expires_at)
 }
 
 fn clear_claim(stored: &mut StoredJob) {

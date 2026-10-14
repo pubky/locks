@@ -8,7 +8,6 @@ use locks_core::lock_policy::{
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::ContentLockOwnershipStatus;
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
     GuardedResourceRepository,
@@ -131,10 +130,6 @@ impl<'a> CreateContentLockUseCase<'a> {
             .map(|resource| resource.path)
             .collect::<Vec<_>>();
 
-        self.content_lock_ownership
-            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
-            .await?;
-
         if self
             .content_lock_deletions
             .publication_in_progress(&request.creator, &lock_id)
@@ -154,29 +149,38 @@ impl<'a> CreateContentLockUseCase<'a> {
                     guarded_path: content_lock_path.to_string(),
                 });
             }
-            let mut published_guarded_paths = Vec::with_capacity(guarded_paths.len());
-            for guarded_path in &guarded_paths {
-                if self
-                    .content_lock_ownership
-                    .get_path_ownership(&request.creator, guarded_path)
-                    .await?
-                    .is_some_and(|ownership| {
-                        ownership.lock_id == lock_id
-                            && ownership.status == ContentLockOwnershipStatus::Published
-                    })
-                {
-                    published_guarded_paths.push(guarded_path.clone());
-                }
-            }
-            self.content_lock_deletions
+            self.content_lock_ownership
+                .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                .await?;
+            let reconciled = self
+                .content_lock_deletions
                 .reconcile_publication(
                     &request.creator,
                     &lock_id,
                     published_content_lock,
-                    &published_guarded_paths,
+                    &guarded_paths,
                 )
                 .await?;
+            if !reconciled
+                && self
+                    .content_lock_deletions
+                    .publication_in_progress(&request.creator, &lock_id)
+                    .await?
+            {
+                return Err(ApplicationError::Storage {
+                    message: "content lock publication reconciliation was not committed".to_owned(),
+                });
+            }
+            return Ok(CreatedContentLock {
+                lock_id,
+                content_lock_path,
+                content_lock,
+            });
         }
+
+        self.content_lock_ownership
+            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+            .await?;
 
         let publication_token = Uuid::new_v4();
         if let Err(error) = self
@@ -293,6 +297,7 @@ fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -314,6 +319,10 @@ mod tests {
     use crate::infrastructure::memory::content_lock_ownership::InMemoryContentLockOwnershipRepository;
     use crate::infrastructure::memory::content_locks::InMemoryContentLockRepository;
     use crate::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
+    use crate::infrastructure::postgres::{
+        PostgresContentLockDeletionRepository, PostgresContentLockOwnershipRepository,
+        testing::TestDatabase,
+    };
 
     #[tokio::test]
     async fn create_content_lock_stores_payload_under_derived_path() {
@@ -700,6 +709,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_recovers_same_lock_reserved_ownership_after_publish_commit_failure() {
+        let fixture = Fixture::seeded().await;
+        let ownership = FailFirstPublishOwnership {
+            inner: &fixture.content_lock_ownership,
+            fail_next_publish: AtomicBool::new(true),
+        };
+        let use_case = CreateContentLockUseCase::new(
+            &fixture.content_locks,
+            &fixture.content_lock_deletions,
+            &ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+
+        assert!(matches!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message }) if message == "injected ownership commit failure"
+        ));
+        let recovered = use_case.execute(request).await.unwrap();
+
+        assert!(
+            !fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &recovered.lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_exact_retry_recovers_after_injected_ownership_commit_failure() {
+        let database = TestDatabase::create().await;
+        let content_locks = InMemoryContentLockRepository::new();
+        let content_lock_deletions =
+            PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let content_lock_ownership =
+            PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        let ownership = FailFirstPublishOwnership {
+            inner: &content_lock_ownership,
+            fail_next_publish: AtomicBool::new(true),
+        };
+        let guarded_resources = InMemoryGuardedResourceRepository::new();
+        let clock = FixedClock(datetime!(2026-06-03 12:00:00 UTC));
+        let guarded_resource = registered_guarded_resource();
+        guarded_resources
+            .upsert_guarded_resource(GuardedResourceRecord {
+                creator: creator(),
+                path: guarded_resource.path.clone(),
+                hash: guarded_resource.hash,
+                content_type: guarded_resource.content_type.clone(),
+                size: guarded_resource.size,
+                bytes: b"guarded bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &content_lock_deletions,
+            &ownership,
+            &guarded_resources,
+            &clock,
+        );
+        let request = content_lock_request(guarded_resource);
+
+        assert!(matches!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message }) if message == "injected ownership commit failure"
+        ));
+        let recovered = use_case.execute(request).await.unwrap();
+
+        assert!(
+            !content_lock_deletions
+                .publication_in_progress(&creator(), &recovered.lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn retry_keeps_retained_intent_when_public_canonical_bytes_do_not_match() {
         let fixture = Fixture::seeded().await;
         let request = content_lock_request(registered_guarded_resource());
@@ -941,6 +1050,61 @@ mod tests {
             _path: &ContentLockPath,
         ) -> Result<bool, ApplicationError> {
             unreachable!("creation must not delete content locks")
+        }
+    }
+
+    struct FailFirstPublishOwnership<'a> {
+        inner: &'a dyn ContentLockOwnershipRepository,
+        fail_next_publish: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ContentLockOwnershipRepository for FailFirstPublishOwnership<'_> {
+        async fn reserve_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .reserve_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn mark_paths_published(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            if self.fail_next_publish.swap(false, Ordering::SeqCst) {
+                return Err(ApplicationError::Storage {
+                    message: "injected ownership commit failure".to_owned(),
+                });
+            }
+            self.inner
+                .mark_paths_published(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn compensate_reserved_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn get_path_ownership(
+            &self,
+            creator: &CreatorPubky,
+            guarded_path: &str,
+        ) -> Result<Option<crate::application::models::ContentLockOwnership>, ApplicationError>
+        {
+            self.inner.get_path_ownership(creator, guarded_path).await
         }
     }
 

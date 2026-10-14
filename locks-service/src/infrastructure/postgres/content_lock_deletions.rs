@@ -283,17 +283,22 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
     ) -> Result<Option<ClaimedContentLockDeletionJob>, ApplicationError> {
         let claim_token = Uuid::new_v4();
         let sql = format!(
-            "UPDATE content_lock_deletion_jobs
-             SET state = 'running', claimed_by = $1, claim_token = $2,
-                 claim_expires_at = $3, next_attempt_at = NULL,
-                 attempt_count = attempt_count + 1, updated_at = $4
-             WHERE job_id = (
-                 SELECT job_id FROM content_lock_deletion_jobs
-                 WHERE (state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= $4))
-                    OR (state = 'running' AND claim_expires_at < $4)
+            "WITH candidate AS MATERIALIZED (
+                 SELECT job_id AS candidate_job_id FROM content_lock_deletion_jobs
+                 WHERE (state = 'queued'
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
+                    OR (state = 'running' AND claim_expires_at <= clock_timestamp())
                  ORDER BY deletion_started_at
                  FOR UPDATE SKIP LOCKED LIMIT 1
+             ), timing AS MATERIALIZED (
+                 SELECT clock_timestamp() AS repository_now FROM candidate
              )
+             UPDATE content_lock_deletion_jobs AS job
+             SET state = 'running', claimed_by = $1, claim_token = $2,
+                 claim_expires_at = timing.repository_now + ($3 - $4), next_attempt_at = NULL,
+                 attempt_count = job.attempt_count + 1, updated_at = timing.repository_now
+             FROM candidate, timing
+             WHERE job.job_id = candidate.candidate_job_id
              RETURNING {ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, DeletionJobRow>(&sql)
@@ -318,11 +323,22 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         next_attempt_at: OffsetDateTime,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
         let sql = format!(
-            "UPDATE content_lock_deletion_jobs
-             SET state = 'queued', next_attempt_at = $5, claimed_by = NULL,
-                 claim_token = NULL, claim_expires_at = NULL, updated_at = $4
-             WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-               AND claim_token = $3 AND claim_expires_at >= $4
+            "WITH locked AS MATERIALIZED (
+                 SELECT job_id AS locked_job_id FROM content_lock_deletion_jobs
+                 WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
+                   AND claim_token = $3
+                 FOR UPDATE
+             ), timing AS MATERIALIZED (
+                 SELECT clock_timestamp() AS repository_now FROM locked
+             )
+             UPDATE content_lock_deletion_jobs AS job
+             SET state = 'queued',
+                 next_attempt_at = timing.repository_now + ($5 - $4),
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 updated_at = timing.repository_now
+             FROM locked, timing
+             WHERE job.job_id = locked.locked_job_id
+               AND job.claim_expires_at > timing.repository_now
              RETURNING {ROW_COLUMNS}"
         );
         fetch_optional_job(
@@ -343,12 +359,11 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
         next_phase: ContentLockDeletionPhase,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let current =
-            load_owned_claim(&mut transaction, job_id, worker_id, claim_token, now).await?;
+        let current = load_owned_claim(&mut transaction, job_id, worker_id, claim_token).await?;
         let Some(current) = current else {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
@@ -385,16 +400,23 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "UPDATE content_lock_deletion_jobs
              SET phase = $2, state = 'queued', attempt_count = 0, next_attempt_at = NULL,
                  failure_code = NULL, claimed_by = NULL, claim_token = NULL,
-                 claim_expires_at = NULL, updated_at = $3
-             WHERE job_id = $1 RETURNING {ROW_COLUMNS}"
+                 claim_expires_at = NULL, updated_at = clock_timestamp()
+             WHERE job_id = $1 AND state = 'running' AND claimed_by = $3
+               AND claim_token = $4 AND claim_expires_at > clock_timestamp()
+             RETURNING {ROW_COLUMNS}"
         );
         let updated = sqlx::query_as::<_, DeletionJobRow>(&sql)
             .bind(job_id)
             .bind(phase_to_database(next_phase))
-            .bind(now)
-            .fetch_one(&mut *transaction)
+            .bind(worker_id)
+            .bind(claim_token)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?;
+        let Some(updated) = updated else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
         transaction.commit().await.map_err(storage_error)?;
         Ok(Some(row_to_job(updated)?))
     }
@@ -413,11 +435,21 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "completed"
         };
         let sql = format!(
-            "UPDATE content_lock_deletion_jobs
+            "WITH locked AS MATERIALIZED (
+                 SELECT job_id AS locked_job_id FROM content_lock_deletion_jobs
+                 WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
+                   AND claim_token = $3
+                 FOR UPDATE
+             ), timing AS MATERIALIZED (
+                 SELECT clock_timestamp() AS repository_now FROM locked
+             )
+             UPDATE content_lock_deletion_jobs AS job
              SET state = $5, failure_code = $6, next_attempt_at = NULL,
-                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL, updated_at = $4
-             WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-               AND claim_token = $3 AND claim_expires_at >= $4
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 updated_at = timing.repository_now
+             FROM locked, timing
+             WHERE job.job_id = locked.locked_job_id
+               AND job.claim_expires_at > timing.repository_now
              RETURNING {ROW_COLUMNS}"
         );
         fetch_optional_job(
@@ -684,18 +716,23 @@ async fn load_owned_claim(
     job_id: Uuid,
     worker_id: &str,
     claim_token: Uuid,
-    now: OffsetDateTime,
 ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
     let sql = format!(
-        "SELECT {ROW_COLUMNS} FROM content_lock_deletion_jobs
-         WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-           AND claim_token = $3 AND claim_expires_at >= $4 FOR UPDATE"
+        "WITH locked AS MATERIALIZED (
+             SELECT * FROM content_lock_deletion_jobs
+             WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
+               AND claim_token = $3
+             FOR UPDATE
+         ), timing AS MATERIALIZED (
+             SELECT clock_timestamp() AS repository_now FROM locked
+         )
+         SELECT {ROW_COLUMNS} FROM locked, timing
+         WHERE locked.claim_expires_at > timing.repository_now"
     );
     sqlx::query_as::<_, DeletionJobRow>(&sql)
         .bind(job_id)
         .bind(worker_id)
         .bind(claim_token)
-        .bind(now)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(storage_error)?
@@ -1343,6 +1380,15 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp()
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
         let reclaimed = reopened
             .claim_next(
                 "worker-b",
@@ -1583,6 +1629,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_reclaims_at_equality_and_derives_expiry_from_repository_time() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let first = repository
+            .claim_next("worker-a", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp()
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let reclaimed = repository
+            .claim_next("worker-b", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first.claim_token, reclaimed.claim_token);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT claim_expires_at > clock_timestamp() + INTERVAL '4 minutes'
+             FROM content_lock_deletion_jobs WHERE job_id = $1",
+            )
+            .bind(job.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn retry_advance_and_finish_are_fenced_when_row_lock_wait_crosses_expiry() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let claimed = repository
+            .claim_next("worker-a", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let retry_repository = repository.clone();
+        let mut retry = tokio::spawn(async move {
+            retry_repository
+                .schedule_retry(
+                    job.job_id,
+                    "worker-a",
+                    claimed.claim_token,
+                    NOW,
+                    NOW + time::Duration::minutes(1),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry)
+                .await
+                .is_err(),
+            "retry must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(retry.await.unwrap().unwrap().is_none());
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let advance_repository = repository.clone();
+        let mut advance = tokio::spawn(async move {
+            advance_repository
+                .advance_phase(
+                    job.job_id,
+                    "worker-a",
+                    claimed.claim_token,
+                    NOW,
+                    ContentLockDeletionPhase::StartPaymentDrain,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut advance)
+                .await
+                .is_err(),
+            "advance must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(advance.await.unwrap().unwrap().is_none());
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let finish_repository = repository.clone();
+        let mut finish = tokio::spawn(async move {
+            finish_repository
+                .finish(job.job_id, "worker-a", claimed.claim_token, NOW, None)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut finish)
+                .await
+                .is_err(),
+            "finish must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(finish.await.unwrap().unwrap().is_none());
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn read_rejects_corrupt_frozen_manifest_identity() {
         let database = TestDatabase::create().await;
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
@@ -1643,6 +1811,28 @@ mod tests {
         })
         .await
         .expect("second Postgres connection must wait on the canonical advisory fence");
+    }
+
+    async fn set_short_lease(pool: &sqlx::PgPool, job_id: Uuid) {
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp() + INTERVAL '200 milliseconds'
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn lock_job_row(pool: &sqlx::PgPool, job_id: Uuid) -> Transaction<'_, Postgres> {
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        transaction
     }
 
     async fn insert_deletion_cutoff(

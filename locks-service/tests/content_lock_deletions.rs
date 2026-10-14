@@ -160,6 +160,63 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
     );
 }
 
+#[tokio::test]
+async fn lease_expiry_is_half_open_for_claim_retry_advance_and_finish() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claimed = repository
+        .claim_next("worker-a", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        repository
+            .schedule_retry(
+                job.job_id,
+                "worker-a",
+                claimed.claim_token,
+                LEASE_END,
+                LEASE_END + time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .advance_phase(
+                job.job_id,
+                "worker-a",
+                claimed.claim_token,
+                LEASE_END,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .finish(job.job_id, "worker-a", claimed.claim_token, LEASE_END, None,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let reclaimed = repository
+        .claim_next(
+            "worker-b",
+            LEASE_END,
+            LEASE_END + time::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(claimed.claim_token, reclaimed.claim_token);
+}
+
 #[test]
 fn failure_codes_are_a_closed_stable_vocabulary() {
     for (code, wire) in [
