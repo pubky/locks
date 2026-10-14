@@ -15,6 +15,7 @@ use crate::application::models::{
     AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord, DeletionReadAuthorization,
     EncryptedFinalCredential, FinalAccessWindows, FinalCredentialContext,
     FinalCredentialMaterialization, InitializeFinalAccessWindowsResult, IssuedDeletionCredential,
+    OrdinaryCredentialLookupResult,
 };
 use crate::application::ports::{AccessCredentialStore, FinalCredentialWorkerIssueRequest};
 use crate::infrastructure::final_credentials::FinalCredentialCipher;
@@ -62,6 +63,10 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             "SELECT EXISTS (
                 SELECT 1
                 FROM content_lock_deletion_jobs
+                WHERE creator = $1 AND lock_id = $2
+                UNION ALL
+                SELECT 1
+                FROM content_lock_force_deletion_receipts
                 WHERE creator = $1 AND lock_id = $2
             )",
         )
@@ -111,7 +116,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .await
         .map_err(storage_error)?;
 
-        row.map(row_to_record).transpose()
+        row.as_ref().map(row_to_record).transpose()
     }
 
     async fn delete_access_credential(
@@ -124,6 +129,53 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             .await
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        lookup_key: &AccessCredentialLookupKey,
+        expected: &AccessCredentialRecord,
+        invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let row = sqlx::query(
+            "SELECT creator, bundle_id, expires_at, deletion_job_id
+             FROM access_credentials
+             WHERE lookup_key = $1
+             FOR UPDATE",
+        )
+        .bind(lookup_key.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(row) = row else {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        };
+        let current = row_to_record(&row)?;
+        if current != *expected {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        if row
+            .try_get::<Option<Uuid>, _>("deletion_job_id")
+            .map_err(storage_error)?
+            .is_some()
+        {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(OrdinaryCredentialLookupResult::DeletionEnrolled);
+        }
+        if invalidate {
+            sqlx::query("DELETE FROM access_credentials WHERE lookup_key = $1")
+                .bind(lookup_key.as_bytes().as_slice())
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(OrdinaryCredentialLookupResult::OrdinaryCurrent)
     }
 
     async fn initialize_final_access_windows(
@@ -490,15 +542,17 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .await
         .map_err(storage_error)?;
         let mut resources: Vec<GuardedResource> = frozen.primary_resource.into_iter().collect();
-        resources.extend(
-            frozen
-                .secondary_resources
-                .into_iter()
-                .map(|(path, resource)| {
-                    GuardedResource::new(path, resource.hash, resource.content_type, resource.size)
-                        .expect("persisted frozen manifest was validated at deletion admission")
-                }),
-        );
+        let secondary_resources = frozen
+            .secondary_resources
+            .into_iter()
+            .map(|(path, resource)| {
+                GuardedResource::new(path, resource.hash, resource.content_type, resource.size)
+                    .map_err(|error| ApplicationError::InvalidContentLockDeletionState {
+                        message: format!("state_corrupt: invalid frozen guarded resource: {error}"),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        resources.extend(secondary_resources);
         for resource in resources {
             sqlx::query(
                 "INSERT INTO content_lock_access_drain_reads (credential_id, guarded_path)
@@ -792,12 +846,6 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(None);
         };
-        // Transaction time is fixed at BEGIN. Sample wall-clock time only after the exact job-row
-        // fence, so a wait cannot revive an expired credential, deadline, or read claim.
-        let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
         let credential = sqlx::query(
             "SELECT credential_id, credential_kind, creator, expires_at
              FROM content_lock_access_drain_credentials
@@ -818,10 +866,6 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             .map_err(storage_error)?;
         let credential_expiry: OffsetDateTime =
             credential.try_get("expires_at").map_err(storage_error)?;
-        if credential_expiry <= now || !phase_allows_credential_access(&job.phase, &kind) {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(None);
-        }
         let frozen: ContentLock =
             serde_json::from_value(job.frozen_content_lock).map_err(|error| {
                 ApplicationError::Storage {
@@ -841,6 +885,16 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             message: format!("invalid drain credential creator stored in Postgres: {error}"),
         })?;
         if kind == "ordinary" {
+            let repository_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            if credential_expiry <= repository_now
+                || !phase_allows_credential_access(&job.phase, &kind)
+            {
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(None);
+            }
             transaction.commit().await.map_err(storage_error)?;
             return Ok(Some(DeletionReadAuthorization {
                 claim_token: None,
@@ -875,7 +929,15 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         let existing_claim: Option<Uuid> = read.try_get("claim_token").map_err(storage_error)?;
         let existing_expiry: Option<OffsetDateTime> =
             read.try_get("claim_expires_at").map_err(storage_error)?;
-        if existing_claim.is_some() && existing_expiry.is_some_and(|expiry| expiry > now) {
+        let repository_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if credential_expiry <= repository_now
+            || !phase_allows_credential_access(&job.phase, &kind)
+            || (existing_claim.is_some()
+                && existing_expiry.is_some_and(|expiry| expiry > repository_now))
+        {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(None);
         }
@@ -883,15 +945,15 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(None);
         };
-        let bounded_expiry = now
+        let bounded_expiry = repository_now
             .checked_add(claim_duration)
             .ok_or_else(|| ApplicationError::Storage {
                 message: "final read claim expiry overflow".to_owned(),
             })?
-            .min(now + time::Duration::seconds(30))
+            .min(repository_now + time::Duration::seconds(30))
             .min(credential_expiry)
             .min(read_deadline);
-        if read_deadline <= now || bounded_expiry <= now {
+        if read_deadline <= repository_now || bounded_expiry <= repository_now {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(None);
         }
@@ -907,7 +969,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .bind(path)
         .bind(claim_token)
         .bind(bounded_expiry)
-        .bind(now)
+        .bind(repository_now)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -953,14 +1015,10 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(false);
         };
-        let Some(job) = lock_active_drain_job(&mut transaction, deletion_job_id).await? else {
+        let Some(_job) = lock_active_drain_job(&mut transaction, deletion_job_id).await? else {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(false);
         };
-        if !phase_allows_credential_access(&job.phase, "final") {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        }
         let updated = sqlx::query(
             "UPDATE content_lock_access_drain_reads AS read
              SET claim_token = NULL, claim_expires_at = NULL
@@ -987,47 +1045,49 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         path: &str,
         claim_token: Uuid,
     ) -> Result<bool, ApplicationError> {
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let Some(deletion_job_id) = lookup_deletion_job_id(&mut transaction, lookup_key).await?
-        else {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        };
-        let Some(job) = lock_active_drain_job(&mut transaction, deletion_job_id).await? else {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        };
-        let now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        if !phase_allows_credential_access(&job.phase, "final")
-            || job
-                .final_read_deadline
-                .is_none_or(|deadline| deadline <= now)
-        {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        }
         let updated = sqlx::query(
-            "UPDATE content_lock_access_drain_reads AS read
-             SET claim_token = NULL, claim_expires_at = NULL, consumed_at = $4
-             FROM content_lock_access_drain_credentials AS credential
-             WHERE read.credential_id = credential.credential_id
-               AND credential.deletion_job_id = $5
-               AND credential.lookup_key = $1 AND read.guarded_path = $2
-               AND read.claim_token = $3 AND read.claim_expires_at > $4
-               AND read.consumed_at IS NULL",
+            "WITH locked_job AS MATERIALIZED (
+                 SELECT job_id, phase, final_read_deadline
+                 FROM content_lock_deletion_jobs
+                 WHERE job_id = (
+                     SELECT deletion_job_id FROM content_lock_access_drain_credentials
+                     WHERE lookup_key = $1
+                 )
+                   AND state IN ('queued', 'running') AND force_requested_at IS NULL
+                 FOR UPDATE
+             ), locked_read AS MATERIALIZED (
+                 SELECT read.credential_id, read.claim_token, read.claim_expires_at,
+                        read.consumed_at, credential.expires_at,
+                        job.phase, job.final_read_deadline
+                 FROM locked_job AS job
+                 JOIN content_lock_access_drain_credentials AS credential
+                   ON credential.deletion_job_id = job.job_id
+                 JOIN content_lock_access_drain_reads AS read
+                   ON read.credential_id = credential.credential_id
+                 WHERE credential.lookup_key = $1 AND read.guarded_path = $2
+                 FOR UPDATE OF credential, read
+             ), timing AS MATERIALIZED (
+                 SELECT clock_timestamp() AS repository_now FROM locked_read
+             )
+             UPDATE content_lock_access_drain_reads AS read
+             SET claim_token = NULL, claim_expires_at = NULL,
+                 consumed_at = timing.repository_now
+             FROM locked_read, timing
+             WHERE read.credential_id = locked_read.credential_id
+               AND read.guarded_path = $2
+               AND locked_read.phase IN ('issue_final_credentials', 'drain_final_reads')
+               AND locked_read.final_read_deadline > timing.repository_now
+               AND locked_read.expires_at > timing.repository_now
+               AND locked_read.claim_token = $3
+               AND locked_read.claim_expires_at > timing.repository_now
+               AND locked_read.consumed_at IS NULL",
         )
         .bind(lookup_key.as_bytes().as_slice())
         .bind(path)
         .bind(claim_token)
-        .bind(now)
-        .bind(deletion_job_id)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await
         .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
         Ok(updated.rows_affected() == 1)
     }
 }
@@ -1094,7 +1154,7 @@ fn phase_allows_credential_access(phase: &str, credential_kind: &str) -> bool {
     }
 }
 
-fn row_to_record(row: sqlx::postgres::PgRow) -> Result<AccessCredentialRecord, ApplicationError> {
+fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<AccessCredentialRecord, ApplicationError> {
     let creator =
         CreatorPubky::from_str(&row.try_get::<String, _>("creator").map_err(storage_error)?)
             .map_err(|error| ApplicationError::Storage {
@@ -1769,6 +1829,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(windows, (None, None, None));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_force_receipt_rejects_ordinary_credential_without_inserting() {
+        let database = TestDatabase::create().await;
+        let store = PostgresAccessCredentialStore::new(database.pool().clone());
+        let lock_id =
+            LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+        let record = access_credential_record();
+        let lookup_key = AccessCredentialLookupKey::derive(&AccessCredential::new("rejected"));
+        sqlx::query(
+            "INSERT INTO content_lock_force_deletion_receipts (
+                creator, lock_id, forced_at
+            ) VALUES ($1, $2, $3)",
+        )
+        .bind(record.creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(datetime!(2026-05-29 12:00:00 UTC))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .insert_access_credential(&lock_id, lookup_key, record)
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_credentials")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
 
         database.cleanup().await;
     }

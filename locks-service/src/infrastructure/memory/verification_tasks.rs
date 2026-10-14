@@ -113,6 +113,7 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         records.insert(task.task_id, task.clone());
         drop(records);
         drop(fence_records);
+        drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::Ready)
@@ -217,6 +218,7 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         drop(admissions);
         drop(records);
         drop(fence_records);
+        drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer.remove_task(task_id).await;
         }
@@ -301,6 +303,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         drop(admissions);
         drop(records);
         drop(fence_records);
+        drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::InvoicePending)
@@ -509,6 +512,7 @@ fn validate_invoice_admission_inputs(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use serde_json::json;
     use time::macros::datetime;
@@ -522,7 +526,7 @@ mod tests {
         INVOICE_ADMISSION_INTENT_VERSION, InvoiceAdmissionIntentV1, InvoiceAdmissionPhase,
         VerificationTaskStatus,
     };
-    use crate::application::ports::InvoiceAdmissionRepository;
+    use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskClaimer};
 
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
     const OTHER_TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d11";
@@ -571,6 +575,59 @@ mod tests {
         repo.delete_verification_task(&task_id).await.unwrap();
         repo.delete_verification_task(&task_id).await.unwrap();
         assert_eq!(repo.get_verification_task(&task_id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn repository_callbacks_do_not_await_claimer_while_holding_admission_guard() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let repo = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let first = task(VerificationTaskStatus::Pending);
+        repo.insert_verification_task(first.clone()).await.unwrap();
+        let claimer = Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+            vec![first.clone()],
+            repo.clone(),
+        ));
+        repo.attach_verification_task_claimer(Arc::downgrade(&claimer));
+
+        let admission = fence
+            .acquire_lock_admission(
+                &first.creator,
+                first.submitted_proof_bundle.pubky_lock_resource.lock_id(),
+            )
+            .await;
+        let second = task_with(
+            OTHER_TASK_ID,
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "000G40R40M30E209185GR38E1V",
+            VerificationTaskStatus::Pending,
+        );
+        let inserting_repo = Arc::clone(&repo);
+        let inserting =
+            tokio::spawn(async move { inserting_repo.insert_verification_task(second).await });
+        tokio::task::yield_now().await;
+        assert!(!inserting.is_finished());
+
+        let claiming = tokio::spawn(async move {
+            claimer
+                .claim_next_verification_task(
+                    "worker",
+                    first.submitted_at,
+                    first.submitted_at + time::Duration::minutes(1),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drop(admission);
+
+        let (inserted, claimed) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(inserting, claiming)
+        })
+        .await
+        .expect("repository/claimer lock cycle must not deadlock");
+        inserted.unwrap().unwrap();
+        assert!(claimed.unwrap().unwrap().is_some());
     }
 
     #[tokio::test]

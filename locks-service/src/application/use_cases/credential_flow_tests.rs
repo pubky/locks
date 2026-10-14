@@ -23,7 +23,8 @@ use locks_core::verification::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     AccessCredential, AccessCredentialLookupKey, AccessCredentialPolicy, AccessCredentialRecord,
-    GuardedResourceRecord, IssuedDeletionCredential, VerificationTaskRecord,
+    GuardedResourceRecord, IssuedDeletionCredential, OrdinaryCredentialLookupResult,
+    VerificationTaskRecord,
 };
 use crate::application::ports::{
     AccessCredentialGenerator, AccessCredentialStore, Clock, ContentLockRepository,
@@ -680,6 +681,26 @@ impl AccessCredentialStore for FakeAccessCredentialStore {
             credential: candidate,
             expires_at: now + time::Duration::minutes(1),
         }))
+    }
+
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        lookup_key: &AccessCredentialLookupKey,
+        expected: &AccessCredentialRecord,
+        invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+        let mut record = self.record.lock().unwrap();
+        let Some((stored_lookup, stored_record)) = record.as_ref() else {
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        };
+        if stored_lookup != lookup_key || stored_record != expected {
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        if invalidate {
+            *record = None;
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        Ok(OrdinaryCredentialLookupResult::OrdinaryCurrent)
     }
 }
 

@@ -629,6 +629,40 @@ async fn in_memory_active_force_completion_is_exactly_fenced_and_permanently_blo
 }
 
 #[tokio::test]
+async fn in_memory_force_receipt_blocks_later_ordinary_credential() {
+    let (_verification_tasks, access, deletions) = in_memory_access_stack();
+    let lock = content_lock();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(
+                &job.creator,
+                &job.lock_id,
+                Some(&job.frozen_content_lock),
+                NOW,
+            )
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    assert_eq!(
+        access
+            .insert_access_credential(
+                &job.lock_id,
+                AccessCredentialLookupKey::derive(&AccessCredential::new("after-force")),
+                AccessCredentialRecord {
+                    creator: job.creator,
+                    bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                    expires_at: NOW + time::Duration::minutes(10),
+                },
+            )
+            .await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
 async fn in_memory_unforced_claim_cannot_create_a_force_receipt() {
     let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
         InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(FixedClock(NOW))),

@@ -7,6 +7,7 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord, DeletionReadAuthorization,
     FinalCredentialMaterialization, InitializeFinalAccessWindowsResult, IssuedDeletionCredential,
+    OrdinaryCredentialLookupResult,
 };
 
 /// Exact worker ownership and candidate material for one final-credential winner operation.
@@ -48,6 +49,15 @@ pub trait AccessCredentialStore: Send + Sync {
         &self,
         lookup_key: &AccessCredentialLookupKey,
     ) -> Result<(), ApplicationError>;
+
+    /// Atomically classifies the exact record after ordinary validation.
+    /// Invalid ordinary records are removed only when deletion has not enrolled them.
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        lookup_key: &AccessCredentialLookupKey,
+        expected: &AccessCredentialRecord,
+        invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError>;
 
     async fn initialize_final_access_windows(
         &self,

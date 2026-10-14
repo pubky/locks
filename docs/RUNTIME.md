@@ -233,7 +233,7 @@ runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
 
 The named env var must contain a 32-byte key encoded as base64url without padding. Locks derives separate fixed-domain keys for creator-authority material and replayable final deletion credentials; the root key is never used directly as an AEAD key. Rotating it requires an explicit data migration. In the local Compose flow, an explicitly supplied `PUBKY_LOCK_RUNTIME_MASTER_KEY` is validated and persisted only when `.pubky-lock/runtime-master-key` does not yet exist. Once persisted, an override must match those exact bytes or startup fails closed; later starts without the override reuse the persisted key. Changing the key therefore requires an explicit encrypted-data migration or an intentional reset that discards the dependent ciphertext and its old key together.
 
-Migration `0021_content_lock_access_drains` fails closed when an older database contains a resumable `queued`, `running`, or `failed` deletion job, because earlier rows do not contain enough information to reconstruct cutoff credential classification safely. Failed jobs are resumable by graceful-deletion replay, so they cannot be treated as terminal for this upgrade. Before upgrading, stop new writes and check:
+Migration `0022_content_lock_access_drains` fails closed when an older database contains a resumable `queued`, `running`, or `failed` deletion job, because earlier rows do not contain enough information to reconstruct cutoff credential classification safely. Failed jobs are resumable by graceful-deletion replay, so they cannot be treated as terminal for this upgrade. Before upgrading, stop new writes and check:
 
 ```sql
 SELECT job_id, state, phase

@@ -1,7 +1,7 @@
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use locks_service::application::models::AccessCredential;
 use locks_service::application::use_cases::issue_access_credential::{
@@ -42,6 +42,7 @@ pub(super) async fn issue_access_credential(
 pub(super) async fn proxy_read_guarded_resource(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(tail): axum::extract::Path<String>,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -65,7 +66,11 @@ pub(super) async fn proxy_read_guarded_resource(
             return Err(error);
         }
     };
-    use_case.consume_prepared_deletion_read(&proxied).await?;
+    if method == Method::HEAD {
+        use_case.release_prepared_deletion_read(&proxied).await?;
+    } else {
+        use_case.consume_prepared_deletion_read(&proxied).await?;
+    }
     Ok(response)
 }
 

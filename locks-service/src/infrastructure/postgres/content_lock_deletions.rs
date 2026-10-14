@@ -3500,6 +3500,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_issuance_rejects_malformed_persisted_secondary_path_without_panicking() {
+        let database = TestDatabase::create().await;
+        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let mut frozen: serde_json::Value = sqlx::query_scalar(
+            "SELECT frozen_content_lock FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let mut secondary = frozen["primary_resource"].clone();
+        secondary.as_object_mut().unwrap().remove("path");
+        frozen["secondary_resources"] = serde_json::json!({"not-a-private-path": secondary});
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs SET frozen_content_lock = $2 WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .bind(frozen)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            access
+                .issue_or_replay_final_credential(
+                    &job.creator,
+                    &task.submitted_proof_bundle.bundle_id,
+                    NOW,
+                    AccessCredential::new("malformed-frozen-manifest"),
+                )
+                .await,
+            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+        ));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn force_revokes_live_final_read_claim() {
         let database = TestDatabase::create().await;
         let (job, task, access, final_access_started_at) =

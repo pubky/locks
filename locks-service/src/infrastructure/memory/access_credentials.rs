@@ -22,6 +22,7 @@ use crate::application::{
         DeletionReadAuthorization, EncryptedFinalCredential, FinalAccessWindows,
         FinalCredentialContext, FinalCredentialMaterialization, InitializeFinalAccessWindowsResult,
         IssuedDeletionCredential, VerificationTaskStatus, VerificationTerminalReason,
+        OrdinaryCredentialLookupResult,
     },
     ports::{AccessCredentialStore, FinalCredentialWorkerIssueRequest, VerificationTaskRepository},
 };
@@ -673,6 +674,32 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             .final_credentials
             .retain(|_, credential| &credential.lookup_key != lookup_key);
         Ok(())
+    }
+
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        lookup_key: &AccessCredentialLookupKey,
+        expected: &AccessCredentialRecord,
+        invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+        let mut state = self.state.write().await;
+        let Some(stored) = state.records.get(lookup_key) else {
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        };
+        if stored.record != *expected {
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        if stored.deletion.is_some() {
+            return Ok(OrdinaryCredentialLookupResult::DeletionEnrolled);
+        }
+        if invalidate {
+            state.records.remove(lookup_key);
+            state
+                .final_credentials
+                .retain(|_, credential| &credential.lookup_key != lookup_key);
+            return Ok(OrdinaryCredentialLookupResult::Missing);
+        }
+        Ok(OrdinaryCredentialLookupResult::OrdinaryCurrent)
     }
 
     async fn initialize_final_access_windows(
