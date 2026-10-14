@@ -591,7 +591,7 @@ Success response returns lifecycle metadata only. It does not return connection 
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
+Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent. The intent includes `payment_in` copied from the validated canonical `paykit-payment` criterion and is stored before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
 
 A claimed background worker sends the persisted body below to Paykit `POST /invoices`, using the task UUID as stable `X-Request-ID` for exact Paykit replay after an ambiguous response or process restart:
 
@@ -599,11 +599,12 @@ A claimed background worker sends the persisted body below to Paykit `POST /invo
 {
   "bundle_id": "<bundle_id>",
   "lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
-  "reader": "pubky<reader>"
+  "reader": "pubky<reader>",
+  "payment_in": 24
 }
 ```
 
-Paykit invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks validates the response, marks invoice admission ready with the exact live claim token, then leaves existing payment-status/outbox processing unchanged. No entitlement can be issued before admission is ready.
+Paykit independently reads the canonical lock and rejects a request whose `payment_in` differs from the canonical criterion before side effects. Invoice success is `200 OK` with `invoice_created_at` and `payment_deadline` RFC 3339 timestamps. Locks validates the response, marks invoice admission ready with the exact live claim token, then leaves existing payment-status/outbox processing unchanged. No entitlement can be issued before admission is ready.
 
 Transport errors, typed Reader setup/registry failures (including malformed or oversized registry data), `429`, and every `5xx` response schedule durable full-jitter retry (2-second initial cap, then exponential caps through 60 seconds) without extending the DB-owned 10-minute admission deadline. Numeric `Retry-After` is clamped to 60 seconds. `409 reader_not_payable` maps to `reader is not payable`; `409 invoice_conflict` maps to `paykit invoice conflict`; any other `409` and other terminal Paykit admission errors map to `paykit invoice admission failed`. A status-only `409` (no typed code, such as Paykit `creator_session_invalid`) is a terminal creator-side failure: it is not retried, and the purchase ends on the first attempt. `400` remains terminal. Deadline expiry maps to `invoice admission deadline exceeded`; it bounds when new Paykit attempts start, so a claim taken before the deadline is not cut off by it. If Paykit's `200` for such a claim arrives after the deadline but while the claim lease is still live, the admission still becomes ready, because Paykit has already created the invoice and durably queued its delivery to the Reader's wallet. A late `200` whose lease was lost, or whose claim token was superseded, is dropped. These four messages are the closed invoice-admission failure vocabulary; every failure is worker-owned and issues no entitlement.
 
