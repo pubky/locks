@@ -1191,41 +1191,58 @@ mod tests {
             Some(ContentLockDeletionFailureCode::TombstoneMissing)
         );
 
+        let prepared = reopened
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+            .await
+            .unwrap();
         assert!(matches!(
-            reopened
-                .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
-                .await
-                .unwrap(),
-            PrepareForceDeletionResult::Synchronous(receipt)
+            prepared,
+            PrepareForceDeletionResult::Synchronous(ref receipt)
                 if receipt.frozen_content_lock == Some(job.frozen_content_lock.clone())
+                    && receipt.completed_at.is_none()
         ));
+        let reopened_after_force =
+            PostgresContentLockDeletionRepository::new(database.pool().clone());
         assert!(matches!(
-            reopened
+            reopened_after_force
                 .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(receipt)
                 if receipt.frozen_content_lock == Some(job.frozen_content_lock.clone())
+                    && receipt.completed_at.is_none()
         ));
         assert!(
-            reopened
+            reopened_after_force
                 .has_force_receipt(&job.creator, &job.lock_id)
                 .await
                 .unwrap()
         );
         assert!(
-            reopened
+            reopened_after_force
                 .get_job(&job.creator, &job.lock_id)
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
-            reopened
-                .has_force_receipt(&job.creator, &job.lock_id)
+            reopened_after_force
+                .complete_force_deletion(&job.creator, &job.lock_id, NOW)
                 .await
                 .unwrap()
         );
+        let reopened_after_completion =
+            PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let completed = reopened_after_completion
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.frozen_content_lock,
+            Some(job.frozen_content_lock.clone())
+        );
+        assert_eq!(completed.completed_at, Some(NOW));
 
         database.cleanup().await;
     }
