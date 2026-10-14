@@ -921,38 +921,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_force_receipt_rejects_ordinary_credential_without_inserting() {
-        let database = TestDatabase::create().await;
-        let store = PostgresAccessCredentialStore::new(database.pool().clone());
-        let lock_id =
-            LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
-        let record = access_credential_record();
-        let lookup_key = AccessCredentialLookupKey::derive(&AccessCredential::new("rejected"));
-        sqlx::query(
-            "INSERT INTO content_lock_force_deletion_receipts (
-                creator, lock_id, forced_at
-            ) VALUES ($1, $2, $3)",
-        )
-        .bind(record.creator.to_string())
-        .bind(lock_id.to_string())
-        .bind(datetime!(2026-05-29 12:00:00 UTC))
-        .execute(database.pool())
-        .await
-        .unwrap();
-
-        assert_eq!(
-            store
-                .insert_access_credential(&lock_id, lookup_key, record)
-                .await,
-            Err(ApplicationError::ContentLockDeletionInProgress)
-        );
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_credentials")
-            .fetch_one(database.pool())
+    async fn permanent_force_receipt_rejects_ordinary_credential_with_or_without_terminal_job() {
+        for terminal_job_exists in [false, true] {
+            let database = TestDatabase::create().await;
+            let store = PostgresAccessCredentialStore::new(database.pool().clone());
+            let lock_id =
+                LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+            let record = access_credential_record();
+            let lookup_key = AccessCredentialLookupKey::derive(&AccessCredential::new(format!(
+                "rejected-{terminal_job_exists}"
+            )));
+            if terminal_job_exists {
+                sqlx::query(
+                    "INSERT INTO content_lock_deletion_jobs (
+                        job_id, creator, lock_id, frozen_content_lock, deletion_started_at, state
+                    ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'completed')",
+                )
+                .bind(Uuid::new_v4())
+                .bind(record.creator.to_string())
+                .bind(lock_id.to_string())
+                .bind(datetime!(2026-05-29 12:00:00 UTC))
+                .execute(database.pool())
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO content_lock_force_deletion_receipts (
+                    creator, lock_id, forced_at
+                ) VALUES ($1, $2, $3)",
+            )
+            .bind(record.creator.to_string())
+            .bind(lock_id.to_string())
+            .bind(datetime!(2026-05-29 12:00:00 UTC))
+            .execute(database.pool())
             .await
             .unwrap();
-        assert_eq!(count, 0);
 
-        database.cleanup().await;
+            assert_eq!(
+                store
+                    .insert_access_credential(&lock_id, lookup_key, record)
+                    .await,
+                Err(ApplicationError::ContentLockDeletionInProgress)
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_credentials")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+
+            database.cleanup().await;
+        }
     }
 
     #[tokio::test]

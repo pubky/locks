@@ -80,57 +80,66 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
         {
             return Ok(response);
         }
+        if self
+            .credential_store
+            .deletion_credential_enrolled(&lookup_key)
+            .await?
+        {
+            return Err(ApplicationError::GuardedResourceUnavailable);
+        }
         let record = self
             .credential_store
             .get_access_credential(&lookup_key)
             .await?
             .ok_or(ApplicationError::InvalidAccessCredential)?;
-        let ordinary_response = async {
+        let ordinary_validation = async {
             if record.expires_at <= self.clock.now() {
                 return Err(ApplicationError::ExpiredAccessCredential);
             }
-            let entitlement = load_valid_entitlement(
+            load_valid_entitlement(
                 self.entitlements,
                 self.content_locks,
                 &record.creator,
                 &record.bundle_id,
             )
-            .await?;
-            let guarded_resource = entitlement
-                .content_lock
-                .resource_for_path(&request.path)
-                .ok_or(ApplicationError::GuardedResourceUnavailable)?;
-            let guarded_record = self
-                .guarded_resources
-                .get_current_guarded_resource(&record.creator, &guarded_resource.path)
-                .await?
-                .ok_or(ApplicationError::GuardedResourceUnavailable)?;
-            if guarded_record.hash != guarded_resource.hash
-                || guarded_record.content_type != guarded_resource.content_type
-                || guarded_record.size != guarded_resource.size
-            {
-                return Err(ApplicationError::GuardedResourceUnavailable);
-            }
-            Ok(ProxiedGuardedResource {
-                path: guarded_resource.path,
-                content_type: guarded_record.content_type,
-                hash: guarded_resource.hash,
-                bytes: guarded_record.bytes,
-                deletion_claim: None,
-            })
+            .await
         }
         .await;
         let classification = self
             .credential_store
-            .finish_ordinary_credential_lookup(&lookup_key, &record, ordinary_response.is_err())
+            .finish_ordinary_credential_lookup(&lookup_key, &record, ordinary_validation.is_err())
             .await?;
         match classification {
-            OrdinaryCredentialLookupResult::OrdinaryCurrent => ordinary_response,
+            OrdinaryCredentialLookupResult::OrdinaryCurrent => {
+                let entitlement = ordinary_validation?;
+                let guarded_resource = entitlement
+                    .content_lock
+                    .resource_for_path(&request.path)
+                    .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+                let guarded_record = self
+                    .guarded_resources
+                    .get_current_guarded_resource(&record.creator, &guarded_resource.path)
+                    .await?
+                    .ok_or(ApplicationError::GuardedResourceUnavailable)?;
+                if guarded_record.hash != guarded_resource.hash
+                    || guarded_record.content_type != guarded_resource.content_type
+                    || guarded_record.size != guarded_resource.size
+                {
+                    return Err(ApplicationError::GuardedResourceUnavailable);
+                }
+                Ok(ProxiedGuardedResource {
+                    path: guarded_resource.path,
+                    content_type: guarded_record.content_type,
+                    hash: guarded_resource.hash,
+                    bytes: guarded_record.bytes,
+                    deletion_claim: None,
+                })
+            }
             OrdinaryCredentialLookupResult::DeletionEnrolled => self
                 .prepare_deletion_response(&lookup_key, &request.path, self.clock.now())
                 .await?
                 .ok_or(ApplicationError::GuardedResourceUnavailable),
-            OrdinaryCredentialLookupResult::Missing => Err(ordinary_response
+            OrdinaryCredentialLookupResult::Missing => Err(ordinary_validation
                 .err()
                 .unwrap_or(ApplicationError::InvalidAccessCredential)),
         }

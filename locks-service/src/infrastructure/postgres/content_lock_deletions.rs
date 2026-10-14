@@ -2939,7 +2939,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_credential_eligible_at, Some(NOW));
-        let issuance_deadline = NOW + time::Duration::minutes(15);
+        let window_start: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        let issuance_deadline = window_start + time::Duration::minutes(15);
         let read_deadline = issuance_deadline + time::Duration::minutes(15);
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
@@ -2960,7 +2964,7 @@ mod tests {
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW,
+                    window_start,
                     issuance_deadline,
                     read_deadline,
                 )
@@ -2973,7 +2977,7 @@ mod tests {
                     job.job_id,
                     "deletion",
                     drain_claim.claim_token,
-                    NOW + time::Duration::seconds(1),
+                    window_start + time::Duration::seconds(1),
                     issuance_deadline + time::Duration::hours(1),
                     read_deadline + time::Duration::hours(1),
                 )
@@ -2996,7 +3000,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             persisted_windows,
-            (Some(NOW), Some(issuance_deadline), Some(read_deadline))
+            (
+                Some(window_start),
+                Some(issuance_deadline),
+                Some(read_deadline)
+            )
         );
         let first = access
             .issue_or_replay_final_credential(
@@ -3620,7 +3628,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::hours(1))
+        .bind(database_now(database.pool()).await + time::Duration::hours(1))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3755,7 +3763,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(database.pool()).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3824,7 +3832,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(database.pool()).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -3869,7 +3877,13 @@ mod tests {
             .path
             .clone();
         let issue_claim = Uuid::new_v4();
-        let read_deadline = NOW + time::Duration::minutes(30);
+        let read_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "SELECT final_read_deadline FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
              SET state = 'running', claimed_by = 'worker', claim_token = $2,
@@ -3943,7 +3957,14 @@ mod tests {
         let (job, _task, _access) = eligible_final_credential_fixture(&database).await;
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let claim_token = Uuid::new_v4();
-        let after_deadline = NOW + time::Duration::minutes(16);
+        let after_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "SELECT final_credential_issuance_deadline + INTERVAL '1 minute'
+             FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
              SET state = 'running', claimed_by = 'worker', claim_token = $2,
@@ -4021,7 +4042,7 @@ mod tests {
         )
         .bind(job.job_id)
         .bind(claim_token)
-        .bind(NOW + time::Duration::minutes(5))
+        .bind(database_now(database.pool()).await + time::Duration::minutes(5))
         .execute(database.pool())
         .await
         .unwrap();
@@ -4103,7 +4124,14 @@ mod tests {
     async fn issuance_deadline_is_half_open_and_transition_preserves_only_exact_replay() {
         let database = TestDatabase::create().await;
         let (job, task, access) = eligible_final_credential_fixture(&database).await;
-        let issuance_deadline = NOW + time::Duration::minutes(15);
+        let issuance_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "SELECT final_credential_issuance_deadline
+             FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
 
         assert!(
             access
@@ -4201,6 +4229,10 @@ mod tests {
             .path
             .clone();
 
+        let before: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
         access
             .prepare_deletion_read(&lookup, &path, NOW, NOW + time::Duration::seconds(1))
             .await
@@ -4218,7 +4250,8 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .unwrap();
-        assert_eq!(stored_expiry, NOW + time::Duration::seconds(30));
+        assert!(stored_expiry >= before + time::Duration::seconds(29));
+        assert!(stored_expiry <= before + time::Duration::seconds(31));
 
         database.cleanup().await;
     }
@@ -4308,14 +4341,13 @@ mod tests {
         .unwrap();
         sqlx::query(
             "UPDATE content_lock_deletion_jobs
-             SET phase = 'issue_final_credentials', final_issuance_started_at = $2,
-                 final_credential_issuance_deadline = $3, final_read_deadline = $4
+             SET phase = 'issue_final_credentials',
+                 final_issuance_started_at = clock_timestamp(),
+                 final_credential_issuance_deadline = clock_timestamp() + INTERVAL '15 minutes',
+                 final_read_deadline = clock_timestamp() + INTERVAL '30 minutes'
              WHERE job_id = $1",
         )
         .bind(job.job_id)
-        .bind(NOW)
-        .bind(NOW + time::Duration::minutes(15))
-        .bind(NOW + time::Duration::minutes(30))
         .execute(database.pool())
         .await
         .unwrap();
@@ -4324,6 +4356,13 @@ mod tests {
             crate::infrastructure::final_credentials::FinalCredentialCipher::new([9; 32]),
         );
         (job, task, access)
+    }
+
+    async fn database_now(pool: &sqlx::PgPool) -> time::OffsetDateTime {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn wait_for_advisory_waiter(transaction: &mut Transaction<'_, Postgres>) {
@@ -4357,50 +4396,6 @@ mod tests {
         })
         .await
         .expect("second Postgres connection must wait on the canonical advisory fence");
-    }
-
-    async fn wait_for_blocked_connection(transaction: &mut Transaction<'_, Postgres>) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let waiter_exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM pg_stat_activity
-                        WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
-                    )",
-                )
-                .fetch_one(&mut **transaction)
-                .await
-                .unwrap();
-                if waiter_exists {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("deletion admission must wait for the worker-owned task row");
-    }
-
-    async fn set_short_lease(pool: &sqlx::PgPool, job_id: Uuid) {
-        sqlx::query(
-            "UPDATE content_lock_deletion_jobs
-             SET claim_expires_at = clock_timestamp() + INTERVAL '200 milliseconds'
-             WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn lock_job_row(pool: &sqlx::PgPool, job_id: Uuid) -> Transaction<'_, Postgres> {
-        let mut transaction = pool.begin().await.unwrap();
-        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
-            .bind(job_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .unwrap();
-        transaction
     }
 
     async fn insert_deletion_cutoff(

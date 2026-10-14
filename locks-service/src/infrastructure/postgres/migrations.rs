@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0021_rejects_every_preexisting_resumable_deletion_state() {
+    async fn migration_0022_rejects_every_preexisting_resumable_deletion_state() {
         for (state, failure_code) in [
             ("queued", None),
             ("running", None),
@@ -416,14 +416,14 @@ mod tests {
             .unwrap();
             let migration = super::MIGRATOR
                 .iter()
-                .find(|migration| migration.version == 21)
-                .expect("migration 0021 exists");
+                .find(|migration| migration.version == 22)
+                .expect("migration 0022 exists");
 
             let error = sqlx::raw_sql(migration.sql.as_ref())
                 .execute(database.pool())
                 .await
                 .expect_err(
-                    "0021 must fail closed instead of misclassifying a resumable deletion job",
+                    "0022 must fail closed instead of misclassifying a resumable deletion job",
                 );
             assert!(
                 error
