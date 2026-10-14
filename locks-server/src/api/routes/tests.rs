@@ -1055,7 +1055,7 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
     let publication_token = Uuid::new_v4();
     state
         .content_lock_deletions()
-        .begin_publication(&creator(), &lock_id, publication_token)
+        .begin_publication(&creator(), &lock_id, publication_token, &content_lock)
         .await
         .unwrap();
 
