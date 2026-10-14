@@ -177,6 +177,8 @@ body.embed{background:#1d1d20}
 .ring-logo svg{display:block;width:100%;height:100%}
 .authorize-btn{align-self:stretch;align-items:center;justify-content:center;gap:8px;height:60px;padding:20px 32px;border:0;border-radius:9999px;background:#303034;color:#d4d4db;font:inherit;font-weight:700;font-size:14px;line-height:20px;text-decoration:none}
 .authorize-btn svg{display:block;width:20px;height:20px}
+/* The Bitkit link stays hidden until the embed script reveals it on iOS. */
+.authorize-btn[hidden]{display:none!important}
 @media (hover:none) and (pointer:coarse){.qr{display:none}.ring-logo{display:block}.authorize-btn{display:flex}}
 /* Embedded, the parent modal draws the wordmark and store badges below this frame (Figma
    "Dialog / Lock / EnableLocks mobile"), so the shell's own copy would be a second one. */
@@ -205,6 +207,22 @@ fn render_connect_shell_html(
     let escaped_flow_id = escape_html(flow_id);
     let escaped_authorization_url = escape_html(authorization_url);
     let qr_svg = render_authorization_qr_svg(authorization_url);
+    // Embedded grant flows also carry a hidden Bitkit link that the embed script shows on iOS only.
+    let bitkit_link = match delivery {
+        ConnectDeliveryMode::PostMessage => bitkit_signin_url(authorization_url)
+            .map(|url| {
+                format!(
+                    r#"
+      <a class="authorize-btn bitkit-btn" href="{}" hidden>
+        {KEY_ICON_SVG}
+        <span>Continue with Bitkit</span>
+      </a>"#,
+                    escape_html(&url)
+                )
+            })
+            .unwrap_or_default(),
+        ConnectDeliveryMode::Redirect => String::new(),
+    };
     // Desktop: a plain (non-interactive) QR to scan from a separate device. Touch devices swap it for
     // the Authorize deep-link button below — the same-device deep link lives only on that button, so
     // the QR itself is not a link (per the team decision: desktop QR is scan-only).
@@ -218,7 +236,7 @@ fn render_connect_shell_html(
       <a class="authorize-btn" href="{escaped_authorization_url}">
         {KEY_ICON_SVG}
         <span>Continue with Pubky Ring</span>
-      </a>
+      </a>{bitkit_link}
       <span class="caption">LOCKS.PUBKY.APP</span>
     </div>"#
     );
@@ -282,11 +300,20 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state:
         r#"<script>
     // Mobile Safari ignores a custom-scheme navigation of this frame itself, so on iOS the Pubky Ring
     // link targets the top frame, which a user tap may send to `pubkyauth://`.
+    // Bitkit iOS registers only `bitkit://`, so iOS also gets the grant flow's Bitkit link, likewise
+    // targeting the top frame. Android Bitkit opens the `pubkyauth://` link itself.
     {{
-      const authorizeButton = document.querySelector(".authorize-btn");
+      const authorizeButton = document.querySelector(".authorize-btn:not(.bitkit-btn)");
+      const bitkitButton = document.querySelector(".bitkit-btn");
       const userAgent = navigator.userAgent;
-      if (authorizeButton && (/iPhone|iPad|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1))) {{
-        authorizeButton.target = "_top";
+      if (/iPhone|iPad|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1)) {{
+        if (authorizeButton) {{
+          authorizeButton.target = "_top";
+        }}
+        if (bitkitButton) {{
+          bitkitButton.target = "_top";
+          bitkitButton.hidden = false;
+        }}
       }}
     }}
     (async () => {{
@@ -353,6 +380,16 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state:
     }})();
     </script>"#
     )
+}
+
+/// Bitkit's iOS link for a grant sign-in: `bitkit://pubky-auth/signin` with the same query, which
+/// Bitkit maps back to `pubkyauth://signin_grant`. Legacy `pubkyauth://signin` links get none,
+/// because Bitkit accepts only grant auth.
+fn bitkit_signin_url(authorization_url: &str) -> Option<String> {
+    authorization_url
+        .strip_prefix("pubkyauth://signin_grant?")
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("bitkit://pubky-auth/signin?{query}"))
 }
 
 /// Serializes a string as a JavaScript string literal safe to inline inside an HTML `<script>`.
