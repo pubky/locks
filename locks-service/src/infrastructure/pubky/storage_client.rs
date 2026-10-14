@@ -10,7 +10,9 @@ use locks_core::lock_policy::{
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, CreatorAuthoritySecret};
-use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStore};
+use crate::application::ports::{
+    ContentLockWriteError, CreatorAuthorityManager, CreatorAuthorityStore,
+};
 use crate::infrastructure::pubky::grant_connect_flow::{
     LockServerGrantPopKeys, restore_grant_session,
 };
@@ -67,6 +69,18 @@ pub trait PubkyHomeserverStorageClient: Send + Sync {
         path: &str,
         body: serde_json::Value,
     ) -> Result<(), ApplicationError>;
+
+    /// Writes JSON while classifying failures that provably precede external dispatch.
+    async fn put_json_value_as_creator_classified(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        self.put_json_value_as_creator(creator, path, body)
+            .await
+            .map_err(ContentLockWriteError::Ambiguous)
+    }
 
     /// Reads JSON from a creator-owned path.
     async fn get_json_value_as_creator(
@@ -130,6 +144,17 @@ where
     ) -> Result<(), ApplicationError> {
         (**self)
             .put_json_value_as_creator(creator, path, body)
+            .await
+    }
+
+    async fn put_json_value_as_creator_classified(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        (**self)
+            .put_json_value_as_creator_classified(creator, path, body)
             .await
     }
 
@@ -749,6 +774,23 @@ where
             .await
     }
 
+    async fn put_json_value_as_creator_classified(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        let acquired = self
+            .provider
+            .storage_for_creator(creator)
+            .await
+            .map_err(ContentLockWriteError::NotStarted)?;
+        let result = acquired.storage.put_json_value(path, body).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
+            .map_err(ContentLockWriteError::Ambiguous)
+    }
+
     async fn get_json_value_as_creator(
         &self,
         creator: &CreatorPubky,
@@ -857,6 +899,21 @@ where
         self.manager.require_creator_authority(creator).await?;
         self.inner
             .put_json_value_as_creator(creator, path, body)
+            .await
+    }
+
+    async fn put_json_value_as_creator_classified(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        self.manager
+            .require_creator_authority(creator)
+            .await
+            .map_err(ContentLockWriteError::NotStarted)?;
+        self.inner
+            .put_json_value_as_creator_classified(creator, path, body)
             .await
     }
 
@@ -1060,7 +1117,8 @@ mod tests {
         CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     };
     use crate::application::ports::{
-        CreatorAuthorityManager, CreatorAuthorityStatus, CreatorAuthorityStore,
+        ContentLockWriteError, CreatorAuthorityManager, CreatorAuthorityStatus,
+        CreatorAuthorityStore,
     };
 
     #[tokio::test]
@@ -1393,6 +1451,55 @@ mod tests {
         assert_eq!(result, Err(ApplicationError::CreatorAuthorityUnavailable));
         assert_eq!(provider.seen_creators(), vec![creator()]);
         assert_eq!(provider.storage_operations(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn classified_content_lock_write_distinguishes_pre_dispatch_provider_failure() {
+        let provider = FakeCreatorScopedPubkyStorageProvider::unavailable();
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        let result = client
+            .put_json_value_as_creator_classified(
+                &creator(),
+                "/pub/app.locks/example.json",
+                json!({"version": 1}),
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            Err(ContentLockWriteError::NotStarted(
+                ApplicationError::CreatorAuthorityUnavailable
+            ))
+        );
+        assert_eq!(provider.seen_creators(), vec![creator()]);
+        assert_eq!(provider.storage_operations(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn classified_content_lock_write_keeps_post_dispatch_failure_ambiguous() {
+        let provider = RevokedSessionProvider::default();
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        let result = client
+            .put_json_value_as_creator_classified(
+                &creator(),
+                "/pub/app.locks/example.json",
+                json!({"version": 1}),
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            Err(ContentLockWriteError::Ambiguous(
+                ApplicationError::CreatorAuthorityUnavailable
+            ))
+        );
+        assert_eq!(*provider.operations.lock().unwrap(), 1);
+        assert_eq!(
+            *provider.invalidations.lock().unwrap(),
+            vec![(creator(), 7)]
+        );
     }
 
     #[tokio::test]

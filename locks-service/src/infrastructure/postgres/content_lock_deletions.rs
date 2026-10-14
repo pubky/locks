@@ -16,7 +16,9 @@ use crate::application::{
         ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
         PrepareForceDeletionResult,
     },
-    ports::{ContentLockDeletionRepository, publication_reconciliation_matches},
+    ports::{
+        ContentLockDeletionRepository, PublicationRecovery, publication_reconciliation_matches,
+    },
 };
 use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
 
@@ -86,15 +88,6 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         transaction.commit().await.map_err(storage_error)
     }
 
-    async fn finish_publication(
-        &self,
-        creator: &CreatorPubky,
-        lock_id: &LockId,
-        publication_token: Uuid,
-    ) -> Result<bool, ApplicationError> {
-        delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
-    }
-
     async fn mark_publication_written(
         &self,
         creator: &CreatorPubky,
@@ -144,40 +137,6 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
-        let intent_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (
-                SELECT 1 FROM content_lock_publication_intents
-                WHERE creator = $1 AND lock_id = $2
-                  AND external_write_completed_at IS NOT NULL
-            )",
-        )
-        .bind(creator.to_string())
-        .bind(lock_id.to_string())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        if !intent_exists {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        }
-        let ownership = sqlx::query_as::<_, (String, String)>(
-            "SELECT guarded_path, status
-             FROM content_lock_ownership
-             WHERE creator = $1 AND lock_id = $2",
-        )
-        .bind(creator.to_string())
-        .bind(lock_id.to_string())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        if ownership.len() != published_guarded_paths.len()
-            || ownership.iter().any(|(guarded_path, status)| {
-                status != "published" || !published_guarded_paths.contains(guarded_path)
-            })
-        {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(false);
-        }
         let result = sqlx::query(
             "DELETE FROM content_lock_publication_intents
              WHERE creator = $1 AND lock_id = $2
@@ -199,6 +158,18 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
     ) -> Result<bool, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let deletion_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts WHERE creator = $1 AND lock_id = $2)
+             OR EXISTS (SELECT 1 FROM content_lock_deletion_jobs WHERE creator = $1 AND lock_id = $2)",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if deletion_exists {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2)",
         )
@@ -209,6 +180,62 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(exists)
+    }
+
+    async fn recover_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        replacement_token: Uuid,
+    ) -> Result<PublicationRecovery, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let deletion_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts WHERE creator = $1 AND lock_id = $2)
+             OR EXISTS (SELECT 1 FROM content_lock_deletion_jobs WHERE creator = $1 AND lock_id = $2)",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if deletion_exists {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let intent = sqlx::query_as::<_, (Uuid, bool)>(
+            "SELECT publication_token, external_write_completed_at IS NOT NULL
+             FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2
+             FOR UPDATE",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let recovery = match intent {
+            None => PublicationRecovery::None,
+            Some((publication_token, true)) => {
+                PublicationRecovery::WriteCompleted(publication_token)
+            }
+            Some((_, false)) => {
+                sqlx::query(
+                    "UPDATE content_lock_publication_intents
+                     SET publication_token = $3
+                     WHERE creator = $1 AND lock_id = $2
+                       AND external_write_completed_at IS NULL",
+                )
+                .bind(creator.to_string())
+                .bind(lock_id.to_string())
+                .bind(replacement_token)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+                PublicationRecovery::RetryWithToken(replacement_token)
+            }
+        };
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(recovery)
     }
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
@@ -719,7 +746,7 @@ async fn delete_publication_intent(
 ) -> Result<bool, ApplicationError> {
     let mut transaction = pool.begin().await.map_err(storage_error)?;
     lock_proof_admission(&mut transaction, creator, lock_id).await?;
-    let result = sqlx::query("DELETE FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2 AND publication_token = $3")
+    let result = sqlx::query("DELETE FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2 AND publication_token = $3 AND external_write_completed_at IS NULL")
         .bind(creator.to_string()).bind(lock_id.to_string()).bind(publication_token)
         .execute(&mut *transaction).await.map_err(storage_error)?;
     transaction.commit().await.map_err(storage_error)?;
@@ -1199,89 +1226,6 @@ mod tests {
                 .unwrap()
         );
 
-        let mut ownership_race_lock = lock.clone();
-        ownership_race_lock.primary_resource.as_mut().unwrap().path =
-            "/priv/app.locks/content/ownership-race.json".to_owned();
-        let ownership_race_lock_id = ownership_race_lock.lock_id().unwrap();
-        let ownership_race_paths = guarded_paths(&ownership_race_lock);
-        ownership
-            .reserve_paths(
-                &ownership_race_lock.creator,
-                &ownership_race_paths,
-                &ownership_race_lock_id,
-            )
-            .await
-            .unwrap();
-        let ownership_race_publication_token = Uuid::new_v4();
-        publications
-            .begin_publication(
-                &ownership_race_lock.creator,
-                &ownership_race_lock_id,
-                ownership_race_publication_token,
-            )
-            .await
-            .unwrap();
-        assert!(
-            publications
-                .mark_publication_written(
-                    &ownership_race_lock.creator,
-                    &ownership_race_lock_id,
-                    ownership_race_publication_token,
-                )
-                .await
-                .unwrap()
-        );
-        ownership
-            .mark_paths_published(
-                &ownership_race_lock.creator,
-                &ownership_race_paths,
-                &ownership_race_lock_id,
-            )
-            .await
-            .unwrap();
-        let mut fence = database.pool().begin().await.unwrap();
-        lock_proof_admission(
-            &mut fence,
-            &ownership_race_lock.creator,
-            &ownership_race_lock_id,
-        )
-        .await
-        .unwrap();
-        let reconcile_repository = publications.clone();
-        let reconcile_creator = ownership_race_lock.creator.clone();
-        let reconcile_lock_id = ownership_race_lock_id.clone();
-        let reconcile_lock = ownership_race_lock.clone();
-        let reconcile_paths = ownership_race_paths.clone();
-        let reconcile = tokio::spawn(async move {
-            reconcile_repository
-                .reconcile_publication(
-                    &reconcile_creator,
-                    &reconcile_lock_id,
-                    &reconcile_lock,
-                    &reconcile_paths,
-                )
-                .await
-        });
-        wait_for_advisory_waiter(&mut fence).await;
-        sqlx::query(
-            "UPDATE content_lock_ownership
-             SET status = 'reserved'
-             WHERE creator = $1 AND lock_id = $2",
-        )
-        .bind(ownership_race_lock.creator.to_string())
-        .bind(ownership_race_lock_id.to_string())
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-        fence.commit().await.unwrap();
-        assert!(!reconcile.await.unwrap().unwrap());
-        assert!(
-            publications
-                .publication_in_progress(&ownership_race_lock.creator, &ownership_race_lock_id,)
-                .await
-                .unwrap()
-        );
-
         database.cleanup().await;
     }
 
@@ -1392,7 +1336,7 @@ mod tests {
         );
         assert!(
             repository
-                .finish_publication(&lock.creator, &lock_id, token)
+                .abandon_publication(&lock.creator, &lock_id, token)
                 .await
                 .unwrap()
         );
@@ -1407,6 +1351,64 @@ mod tests {
         assert_eq!(
             repository
                 .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_job_and_force_receipt_block_exact_publication_replay() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let graceful_lock = content_lock();
+        let graceful_lock_id = graceful_lock.lock_id().unwrap();
+        repository
+            .insert_job(
+                ContentLockDeletionJob::new(Uuid::new_v4(), graceful_lock.clone(), NOW).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .publication_in_progress(&graceful_lock.creator, &graceful_lock_id)
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+        assert_eq!(
+            repository
+                .recover_publication(&graceful_lock.creator, &graceful_lock_id, Uuid::new_v4(),)
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+
+        let mut force_lock = graceful_lock;
+        force_lock.primary_resource.as_mut().unwrap().path =
+            "/priv/app.locks/content/force-replay.json".to_owned();
+        let force_lock_id = force_lock.lock_id().unwrap();
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(
+                    &force_lock.creator,
+                    &force_lock_id,
+                    Some(&force_lock),
+                    NOW,
+                )
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(_)
+        ));
+        assert_eq!(
+            repository
+                .publication_in_progress(&force_lock.creator, &force_lock_id)
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+        assert_eq!(
+            repository
+                .recover_publication(&force_lock.creator, &force_lock_id, Uuid::new_v4())
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );

@@ -16,6 +16,17 @@ use crate::application::{
     },
 };
 
+/// Fenced recovery state for an existing exact publication intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationRecovery {
+    /// No publication intent exists.
+    None,
+    /// Token owner recorded successful external write completion; reconciliation may proceed.
+    WriteCompleted(Uuid),
+    /// Caller owns the replaced intent token and must re-PUT exact canonical bytes.
+    RetryWithToken(Uuid),
+}
+
 /// Durable repository and fenced worker lease boundary for content-lock deletion jobs.
 #[async_trait]
 pub trait ContentLockDeletionRepository: Send + Sync {
@@ -35,14 +46,6 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Finalizes the exact publication reservation after external publication and ownership commit.
-    async fn finish_publication(
-        &self,
-        creator: &CreatorPubky,
-        lock_id: &LockId,
-        publication_token: Uuid,
-    ) -> Result<bool, ApplicationError>;
-
     /// Removes the exact unfinalized reservation after a safely compensated publication failure.
     async fn abandon_publication(
         &self,
@@ -51,8 +54,8 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Clears a retained write-complete intent from the early exact-published replay path, after
-    /// exact canonical bytes and the complete published ownership set match.
+    /// Validates and clears a retained write-complete intent against exact canonical bytes and
+    /// guarded paths. Ownership promotion follows only after this reconciliation succeeds.
     async fn reconcile_publication(
         &self,
         creator: &CreatorPubky,
@@ -67,6 +70,14 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
+
+    /// Checks deletion admission and claims an uncompleted exact intent for safe identical retry.
+    async fn recover_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        replacement_token: Uuid,
+    ) -> Result<PublicationRecovery, ApplicationError>;
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError>;
 
