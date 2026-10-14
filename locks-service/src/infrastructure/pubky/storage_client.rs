@@ -37,6 +37,15 @@ pub struct PubkyResourceMetadata {
     pub content_hash: Option<[u8; 32]>,
 }
 
+/// Outcome of an idempotent Pubky homeserver delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PubkyDeleteOutcome {
+    /// Resource was deleted by this request.
+    Deleted,
+    /// Resource was already absent when deletion reached the homeserver.
+    NotFound,
+}
+
 impl PubkyResourceMetadata {
     /// Builds metadata for in-process storage adapters which already hold resource bytes.
     pub fn from_bytes(bytes: &[u8], content_type: Option<String>) -> Self {
@@ -95,6 +104,17 @@ pub trait PubkyHomeserverStorageClient: Send + Sync {
         creator: &CreatorPubky,
         path: &str,
     ) -> Result<(), ApplicationError>;
+
+    /// Deletes a creator-owned path while treating a typed homeserver 404 as absence.
+    async fn delete_if_present_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        self.delete_as_creator(creator, path)
+            .await
+            .map(|()| PubkyDeleteOutcome::Deleted)
+    }
 }
 
 #[async_trait]
@@ -156,6 +176,14 @@ where
     ) -> Result<(), ApplicationError> {
         (**self).delete_as_creator(creator, path).await
     }
+
+    async fn delete_if_present_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        (**self).delete_if_present_as_creator(creator, path).await
+    }
 }
 
 /// Object-safe operations for storage already scoped to one creator's Pubky session.
@@ -187,6 +215,12 @@ pub trait CreatorScopedPubkyStorage: Send + Sync {
     ) -> Result<Option<PubkyResourceMetadata>, ApplicationError>;
 
     async fn delete(&self, path: &str) -> Result<(), ApplicationError>;
+
+    async fn delete_if_present(&self, path: &str) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        self.delete(path)
+            .await
+            .map(|()| PubkyDeleteOutcome::Deleted)
+    }
 }
 
 /// Creator-scoped storage plus cache generation used to acquire it.
@@ -618,6 +652,14 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .map(|_| ())
             .map_err(|error| self.map_error("delete", path, error))
     }
+
+    async fn delete_if_present(&self, path: &str) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        match self.storage.delete(path).await {
+            Ok(_) => Ok(PubkyDeleteOutcome::Deleted),
+            Err(error) if is_pubky_not_found(&error) => Ok(PubkyDeleteOutcome::NotFound),
+            Err(error) => Err(self.map_error("delete", path, error)),
+        }
+    }
 }
 
 /// Pubky homeserver storage client backed by a creator-scoped storage provider.
@@ -763,6 +805,17 @@ where
         self.finish_operation(creator, acquired.generation, result)
             .await
     }
+
+    async fn delete_if_present_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        let acquired = self.provider.storage_for_creator(creator).await?;
+        let result = acquired.storage.delete_if_present(path).await;
+        self.finish_operation(creator, acquired.generation, result)
+            .await
+    }
 }
 
 /// Storage-client decorator that requires creator authority before every operation.
@@ -855,6 +908,23 @@ where
         self.manager.require_creator_authority(creator).await?;
         self.inner.delete_as_creator(creator, path).await
     }
+
+    async fn delete_if_present_as_creator(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+        self.manager.require_creator_authority(creator).await?;
+        self.inner.delete_if_present_as_creator(creator, path).await
+    }
+}
+
+fn is_pubky_not_found(error: &pubky::Error) -> bool {
+    matches!(
+        error,
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+            if *status == pubky::StatusCode::NOT_FOUND
+    )
 }
 
 fn decode_pubky_etag(etag: &str) -> Option<[u8; 32]> {
@@ -982,7 +1052,8 @@ mod tests {
         CreatorScopedPubkyStorage, CreatorScopedPubkyStorageProvider, ImportedPubkySession,
         LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
         PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
-        PubkySessionImporter, pubky_storage_error, pubky_storage_error_for_grant,
+        PubkySessionImporter, is_pubky_not_found, pubky_storage_error,
+        pubky_storage_error_for_grant,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -1058,6 +1129,28 @@ mod tests {
             assert_eq!(error, ApplicationError::CreatorAuthorityUnavailable);
             assert!(!format!("{error:?}").contains("raw secret-bearing upstream body"));
         }
+    }
+
+    #[test]
+    fn delete_not_found_detection_uses_only_typed_404_server_errors() {
+        let server_error = |status| {
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status,
+                message: "upstream body".to_owned(),
+            })
+        };
+
+        assert!(is_pubky_not_found(&server_error(
+            pubky::StatusCode::NOT_FOUND
+        )));
+        assert!(!is_pubky_not_found(&server_error(
+            pubky::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!is_pubky_not_found(&pubky::Error::Request(
+            pubky::errors::RequestError::DecodeJson {
+                message: "not found".to_owned(),
+            }
+        )));
     }
 
     #[test]

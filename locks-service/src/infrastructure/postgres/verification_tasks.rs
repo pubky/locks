@@ -93,6 +93,20 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let lock_id = task.submitted_proof_bundle.pubky_lock_resource.lock_id();
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+        if let Some(existing) = get_task_by_handle_in_transaction(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?
+        {
+            if existing.submitted_proof_bundle != task.submitted_proof_bundle {
+                return Err(ApplicationError::VerificationTaskConflict);
+            }
+            return Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            });
+        }
         reject_deletion_cutoff(&mut transaction, &task.creator, lock_id).await?;
         let result = sqlx::query(
             "INSERT INTO verification_tasks (
@@ -248,6 +262,31 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             })?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+        if let Some(existing) = get_task_by_handle_in_transaction(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?
+        {
+            let existing_intent = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+                "SELECT invoice_admission_intent FROM verification_tasks WHERE task_id = $1::uuid",
+            )
+            .bind(existing.task_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if existing.submitted_proof_bundle != task.submitted_proof_bundle
+                || existing_intent.as_ref() != Some(&intent_json)
+            {
+                return Err(ApplicationError::VerificationTaskConflict);
+            }
+            transaction.commit().await.map_err(storage_error)?;
+            return self
+                .get_invoice_admission(&existing.task_id)
+                .await?
+                .ok_or(ApplicationError::VerificationTaskConflict);
+        }
         reject_deletion_cutoff(&mut transaction, &task.creator, lock_id).await?;
         let result = sqlx::query(
             "WITH timing AS (SELECT clock_timestamp() AS winner_time)
@@ -775,6 +814,26 @@ fn status_from_database(status: &str) -> Result<VerificationTaskStatus, Applicat
     }
 }
 
+async fn get_task_by_handle_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    creator: &CreatorPubky,
+    bundle_id: &BundleId,
+) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
+    let sql = format!(
+        "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
+         FROM verification_tasks
+         WHERE creator = $1 AND bundle_id = $2"
+    );
+    sqlx::query_as::<_, VerificationTaskRow>(&sql)
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .map(row_to_task)
+        .transpose()
+}
+
 async fn reject_deletion_cutoff(
     transaction: &mut Transaction<'_, Postgres>,
     creator: &CreatorPubky,
@@ -864,22 +923,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.insert_verification_task(pending).await,
+            repo.insert_verification_task(pending.clone()).await,
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
+        );
+        let started = pending
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
+        let exact_replay = task_with(
+            DUPLICATE_HANDLE_TASK_ID,
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            BUNDLE_ID,
+            VerificationTaskStatus::Pending,
+        );
+        assert_eq!(
+            repo.insert_verification_task(exact_replay.clone()).await,
             Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             })
         );
         assert_eq!(
-            repo.insert_verification_task(task_with(
-                DUPLICATE_HANDLE_TASK_ID,
-                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
-                BUNDLE_ID,
-                VerificationTaskStatus::Pending,
-            ))
-            .await,
-            Err(ApplicationError::DuplicateRecord {
-                record: "verification_task",
-            })
+            repo.get_verification_task(&task_id).await.unwrap(),
+            Some(started)
+        );
+        let mut changed_replay = exact_replay;
+        changed_replay.submitted_proof_bundle.proofs.clear();
+        assert_eq!(
+            repo.insert_verification_task(changed_replay).await,
+            Err(ApplicationError::VerificationTaskConflict)
         );
 
         repo.update_verification_task(failed.clone()).await.unwrap();

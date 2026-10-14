@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use locks_core::ids::{CreatorPubky, LockId};
+use std::collections::BTreeSet;
+
+use locks_core::{
+    ids::{CreatorPubky, LockId},
+    lock_policy::ContentLock,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -7,7 +12,7 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, PrepareForceDeletionResult,
+        ContentLockDeletionPhase, ForceDeletionReceipt, PrepareForceDeletionResult,
     },
 };
 
@@ -21,6 +26,14 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         lock_id: &LockId,
         publication_token: Uuid,
     ) -> Result<(), ApplicationError>;
+
+    /// Records that the exact token-owned external write has returned before local finalization.
+    async fn mark_publication_written(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
 
     /// Finalizes the exact publication reservation after external publication and ownership commit.
     async fn finish_publication(
@@ -36,6 +49,16 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
+    /// Clears a retained write-complete intent from the early exact-published replay path, after
+    /// exact canonical bytes and the complete published ownership set match.
+    async fn reconcile_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError>;
 
     /// Checks publication admission under the canonical per-lock fence.
@@ -101,12 +124,59 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        frozen_content_lock: Option<&locks_core::lock_policy::ContentLock>,
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError>;
+
+    async fn get_force_receipt(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError>;
+
+    /// Marks cleanup complete after public absence and all guarded-resource attempts.
+    async fn complete_force_deletion(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError>;
 
     async fn has_force_receipt(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
+}
+
+pub(crate) fn publication_reconciliation_matches(
+    creator: &CreatorPubky,
+    lock_id: &LockId,
+    published_content_lock: &ContentLock,
+    published_guarded_paths: &[String],
+) -> bool {
+    if &published_content_lock.creator != creator
+        || !published_content_lock
+            .lock_id()
+            .is_ok_and(|published_lock_id| &published_lock_id == lock_id)
+    {
+        return false;
+    }
+
+    let expected_paths = published_content_lock
+        .primary_resource
+        .iter()
+        .map(|resource| resource.path.as_str())
+        .chain(
+            published_content_lock
+                .secondary_resources
+                .keys()
+                .map(String::as_str),
+        )
+        .collect::<BTreeSet<_>>();
+    let published_paths = published_guarded_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    expected_paths.len() == published_guarded_paths.len() && expected_paths == published_paths
 }

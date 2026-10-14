@@ -1,10 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, LockId};
+use locks_core::lock_policy::ContentLock;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -13,9 +11,10 @@ use crate::application::{
     errors::ApplicationError,
     models::{
         ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, ContentLockDeletionState, PrepareForceDeletionResult,
+        ContentLockDeletionPhase, ContentLockDeletionState, ForceDeletionReceipt,
+        PrepareForceDeletionResult,
     },
-    ports::ContentLockDeletionRepository,
+    ports::{ContentLockDeletionRepository, publication_reconciliation_matches},
 };
 use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
@@ -29,12 +28,18 @@ struct StoredJob {
     claim_expires_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PublicationIntent {
+    token: Uuid,
+    write_completed: bool,
+}
+
 /// In-memory deletion repository with the same lease-fencing semantics as PostgreSQL.
 #[derive(Debug)]
 pub struct InMemoryContentLockDeletionRepository {
     jobs: RwLock<HashMap<JobKey, StoredJob>>,
-    force_receipts: RwLock<HashSet<JobKey>>,
-    publication_intents: RwLock<HashMap<JobKey, Uuid>>,
+    force_receipts: RwLock<HashMap<JobKey, ForceDeletionReceipt>>,
+    publication_intents: RwLock<HashMap<JobKey, PublicationIntent>>,
     verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
 }
 
@@ -54,7 +59,7 @@ impl InMemoryContentLockDeletionRepository {
     ) -> Self {
         Self {
             jobs: RwLock::new(HashMap::new()),
-            force_receipts: RwLock::new(HashSet::new()),
+            force_receipts: RwLock::new(HashMap::new()),
             publication_intents: RwLock::new(HashMap::new()),
             verification_task_fence,
         }
@@ -73,7 +78,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let mut intents = self.publication_intents.write().await;
         let jobs = self.jobs.read().await;
         let receipts = self.force_receipts.read().await;
-        if jobs.contains_key(&key) || receipts.contains(&key) {
+        if jobs.contains_key(&key) || receipts.contains_key(&key) {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
         if intents.contains_key(&key) {
@@ -81,8 +86,31 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 guarded_path: "content lock publication in progress".to_owned(),
             });
         }
-        intents.insert(key, publication_token);
+        intents.insert(
+            key,
+            PublicationIntent {
+                token: publication_token,
+                write_completed: false,
+            },
+        );
         Ok(())
+    }
+
+    async fn mark_publication_written(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut intents = self.publication_intents.write().await;
+        let Some(intent) = intents.get_mut(&(creator.clone(), lock_id.clone())) else {
+            return Ok(false);
+        };
+        if intent.token != publication_token {
+            return Ok(false);
+        }
+        intent.write_completed = true;
+        Ok(true)
     }
 
     async fn finish_publication(
@@ -115,6 +143,33 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         .await
     }
 
+    async fn reconcile_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
+    ) -> Result<bool, ApplicationError> {
+        if !publication_reconciliation_matches(
+            creator,
+            lock_id,
+            published_content_lock,
+            published_guarded_paths,
+        ) {
+            return Ok(false);
+        }
+        let key = (creator.clone(), lock_id.clone());
+        let mut intents = self.publication_intents.write().await;
+        if !intents
+            .get(&key)
+            .is_some_and(|intent| intent.write_completed)
+        {
+            return Ok(false);
+        }
+        intents.remove(&key);
+        Ok(true)
+    }
+
     async fn publication_in_progress(
         &self,
         creator: &CreatorPubky,
@@ -135,7 +190,10 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let intents = self.publication_intents.read().await;
         let mut jobs = self.jobs.write().await;
         let receipts = self.force_receipts.read().await;
-        if intents.contains_key(&key) || receipts.contains(&key) {
+        if intents.contains_key(&key) {
+            return Err(ApplicationError::ContentLockPublicationInProgress);
+        }
+        if receipts.contains_key(&key) {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
         if jobs.contains_key(&key) || jobs.values().any(|stored| stored.job.job_id == job.job_id) {
@@ -307,7 +365,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
         let mut jobs = self.jobs.write().await;
         let receipts = self.force_receipts.read().await;
-        if receipts.contains(&(creator.clone(), lock_id.clone())) {
+        if receipts.contains_key(&(creator.clone(), lock_id.clone())) {
             return Ok(None);
         }
         let Some(stored) = jobs.get_mut(&(creator.clone(), lock_id.clone())) else {
@@ -327,6 +385,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
+        frozen_content_lock: Option<&ContentLock>,
         forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let key = (creator.clone(), lock_id.clone());
@@ -346,10 +405,8 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         drop(verification_tasks);
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
-        if receipts.contains(&key) {
-            return Ok(PrepareForceDeletionResult::Synchronous(
-                jobs.get(&key).map(|stored| stored.job.clone()),
-            ));
+        if let Some(receipt) = receipts.get(&key) {
+            return Ok(PrepareForceDeletionResult::Synchronous(receipt.clone()));
         }
         if let Some(stored) = jobs.get_mut(&key) {
             if matches!(
@@ -362,13 +419,52 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 clear_claim(stored);
                 return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
             }
-            let job = stored.job.clone();
-            jobs.remove(&key);
-            receipts.insert(key);
-            return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
+            let receipt = ForceDeletionReceipt {
+                creator: creator.clone(),
+                lock_id: lock_id.clone(),
+                frozen_content_lock: Some(stored.job.frozen_content_lock.clone()),
+                forced_at,
+                completed_at: None,
+            };
+            receipts.insert(key, receipt.clone());
+            return Ok(PrepareForceDeletionResult::Synchronous(receipt));
         }
-        receipts.insert(key);
-        Ok(PrepareForceDeletionResult::Synchronous(None))
+        let receipt = ForceDeletionReceipt {
+            creator: creator.clone(),
+            lock_id: lock_id.clone(),
+            frozen_content_lock: frozen_content_lock.cloned(),
+            forced_at,
+            completed_at: None,
+        };
+        receipts.insert(key, receipt.clone());
+        Ok(PrepareForceDeletionResult::Synchronous(receipt))
+    }
+
+    async fn get_force_receipt(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError> {
+        Ok(self
+            .force_receipts
+            .read()
+            .await
+            .get(&(creator.clone(), lock_id.clone()))
+            .cloned())
+    }
+
+    async fn complete_force_deletion(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let mut receipts = self.force_receipts.write().await;
+        let Some(receipt) = receipts.get_mut(&(creator.clone(), lock_id.clone())) else {
+            return Ok(false);
+        };
+        receipt.completed_at.get_or_insert(completed_at);
+        Ok(true)
     }
 
     async fn has_force_receipt(
@@ -380,19 +476,22 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .force_receipts
             .read()
             .await
-            .contains(&(creator.clone(), lock_id.clone())))
+            .contains_key(&(creator.clone(), lock_id.clone())))
     }
 }
 
 async fn remove_publication_intent(
-    intents: &RwLock<HashMap<JobKey, Uuid>>,
+    intents: &RwLock<HashMap<JobKey, PublicationIntent>>,
     creator: &CreatorPubky,
     lock_id: &LockId,
     publication_token: Uuid,
 ) -> Result<bool, ApplicationError> {
     let key = (creator.clone(), lock_id.clone());
     let mut intents = intents.write().await;
-    if intents.get(&key) != Some(&publication_token) {
+    if intents
+        .get(&key)
+        .is_none_or(|intent| intent.token != publication_token)
+    {
         return Ok(false);
     }
     intents.remove(&key);
@@ -407,7 +506,7 @@ fn is_claimable(stored: &StoredJob, now: OffsetDateTime) -> bool {
             .is_none_or(|next_attempt_at| next_attempt_at <= now),
         ContentLockDeletionState::Running => stored
             .claim_expires_at
-            .is_some_and(|claim_expires_at| claim_expires_at < now),
+            .is_some_and(|claim_expires_at| claim_expires_at <= now),
         ContentLockDeletionState::Completed | ContentLockDeletionState::Failed => false,
     }
 }
@@ -425,7 +524,7 @@ fn owns_claim(
         && stored.claim_token == Some(claim_token)
         && stored
             .claim_expires_at
-            .is_some_and(|claim_expires_at| claim_expires_at >= now)
+            .is_some_and(|claim_expires_at| now < claim_expires_at)
 }
 
 fn clear_claim(stored: &mut StoredJob) {

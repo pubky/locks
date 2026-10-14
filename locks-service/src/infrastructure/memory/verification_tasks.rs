@@ -58,13 +58,20 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
         let mut records = self.records.write().await;
-        if records.contains_key(&task.task_id)
-            || records.values().any(|existing| {
-                existing.creator == task.creator
-                    && existing.submitted_proof_bundle.bundle_id
-                        == task.submitted_proof_bundle.bundle_id
-            })
-        {
+        if let Some(existing) = records.values().find(|existing| {
+            existing.creator == task.creator
+                && existing.submitted_proof_bundle.bundle_id
+                    == task.submitted_proof_bundle.bundle_id
+        }) {
+            return if existing.submitted_proof_bundle == task.submitted_proof_bundle {
+                Err(ApplicationError::DuplicateRecord {
+                    record: "verification_task",
+                })
+            } else {
+                Err(ApplicationError::VerificationTaskConflict)
+            };
+        }
+        if records.contains_key(&task.task_id) {
             return Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             });
@@ -417,7 +424,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.insert_verification_task(pending).await,
+            repo.insert_verification_task(pending.clone()).await,
             Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             })
@@ -491,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_rejects_duplicate_public_handle_even_with_distinct_task_id() {
+    async fn insert_replays_exact_public_handle_and_rejects_changed_payload() {
         let repo = InMemoryVerificationTaskRepository::new();
         let original = task_with(
             TASK_ID,
@@ -509,18 +516,36 @@ mod tests {
         repo.insert_verification_task(original.clone())
             .await
             .unwrap();
+        let started = original
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
 
         assert_eq!(
-            repo.insert_verification_task(duplicate_handle).await,
+            repo.insert_verification_task(duplicate_handle.clone())
+                .await,
             Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             })
+        );
+        let mut changed = duplicate_handle;
+        changed.submitted_proof_bundle.proofs.clear();
+        assert_eq!(
+            repo.insert_verification_task(changed).await,
+            Err(ApplicationError::VerificationTaskConflict)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(TASK_ID).unwrap())
                 .await
                 .unwrap(),
-            Some(original)
+            Some(started)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(OTHER_TASK_ID).unwrap())

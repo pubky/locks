@@ -220,6 +220,10 @@ impl From<ApplicationError> for ApiError {
                 ApiErrorCode::ContentLockDeletionInProgress,
                 "content lock deletion is in progress",
             ),
+            ApplicationError::ContentLockPublicationInProgress => Self::new(
+                ApiErrorCode::ContentLockPathConflict,
+                "content lock publication is in progress",
+            ),
             ApplicationError::InvalidGuardedResource { .. } => {
                 Self::new(ApiErrorCode::InvalidRequest, "invalid guarded resource")
             }

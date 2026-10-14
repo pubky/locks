@@ -65,5 +65,7 @@ CREATE TABLE content_lock_force_deletion_receipts (
     creator TEXT NOT NULL,
     lock_id TEXT NOT NULL,
     forced_at TIMESTAMPTZ NOT NULL,
+    frozen_content_lock JSONB,
+    completed_at TIMESTAMPTZ,
     CONSTRAINT content_lock_force_deletion_receipts_pkey PRIMARY KEY (creator, lock_id)
 );

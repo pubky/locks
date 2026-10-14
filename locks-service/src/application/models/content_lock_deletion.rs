@@ -109,6 +109,16 @@ pub struct ClaimedContentLockDeletionJob {
     pub claim_token: Uuid,
 }
 
+/// Durable synchronous-force admission fence and retained retry material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceDeletionReceipt {
+    pub creator: CreatorPubky,
+    pub lock_id: LockId,
+    pub frozen_content_lock: Option<ContentLock>,
+    pub forced_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+}
+
 /// Durable decision made while serializing force deletion against graceful lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareForceDeletionResult {
@@ -116,8 +126,8 @@ pub enum PrepareForceDeletionResult {
     PublicationInProgress,
     /// An active graceful job was durably marked for asynchronous force processing.
     Active(ContentLockDeletionJob),
-    /// A permanent force receipt was established. A terminal frozen job is returned when present.
-    Synchronous(Option<ContentLockDeletionJob>),
+    /// A permanent receipt fence exists; completion remains explicit and retryable.
+    Synchronous(ForceDeletionReceipt),
 }
 
 impl ContentLockDeletionJob {

@@ -237,7 +237,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=20).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=21).collect::<Vec<_>>());
 
         sqlx::query(
             "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)

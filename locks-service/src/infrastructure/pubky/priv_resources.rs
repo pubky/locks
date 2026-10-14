@@ -128,7 +128,9 @@ where
             .await?
             .is_some();
         if existed {
-            self.client.delete_as_creator(creator, path).await?;
+            self.client
+                .delete_if_present_as_creator(creator, path)
+                .await?;
         }
         Ok(existed)
     }
@@ -187,7 +189,7 @@ mod tests {
         RegisterGuardedResourceRequest, RegisterGuardedResourceUseCase,
     };
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
+        PubkyBytesResource, PubkyDeleteOutcome, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     #[tokio::test]
@@ -558,7 +560,7 @@ mod tests {
             repository.client().operations(),
             vec![
                 "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
-                "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
+                "delete_if_present pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
             ]
         );
     }
@@ -581,6 +583,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_guarded_resource_succeeds_when_resource_disappears_after_read() {
+        let client = FakeStorageClient::default()
+            .with_bytes_read(Some(PubkyBytesResource {
+                bytes: b"guarded bytes".to_vec(),
+                content_type: Some("text/plain".to_owned()),
+            }))
+            .with_delete_outcome(PubkyDeleteOutcome::NotFound);
+        let repository = PubkyPrivResourceRepository::new(client);
+
+        assert!(
+            repository
+                .delete_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
+                .await
+                .unwrap()
+        );
+        assert_eq!(repository.client().operations().len(), 2);
+    }
+
     #[derive(Debug, Default)]
     struct FakeStorageClient {
         bytes_read: Mutex<Option<PubkyBytesResource>>,
@@ -588,6 +609,7 @@ mod tests {
         replacement_after_put: Mutex<Option<PubkyBytesResource>>,
         last_bytes: Mutex<Option<Vec<u8>>>,
         operations: Mutex<Vec<String>>,
+        delete_outcome: Mutex<Option<PubkyDeleteOutcome>>,
     }
 
     impl FakeStorageClient {
@@ -603,6 +625,11 @@ mod tests {
 
         fn with_replacement_after_put(self, value: PubkyBytesResource) -> Self {
             *self.replacement_after_put.lock().unwrap() = Some(value);
+            self
+        }
+
+        fn with_delete_outcome(self, outcome: PubkyDeleteOutcome) -> Self {
+            *self.delete_outcome.lock().unwrap() = Some(outcome);
             self
         }
 
@@ -698,6 +725,22 @@ mod tests {
                 .unwrap()
                 .push(format!("delete {creator} {path}"));
             Ok(())
+        }
+
+        async fn delete_if_present_as_creator(
+            &self,
+            creator: &CreatorPubky,
+            path: &str,
+        ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("delete_if_present {creator} {path}"));
+            Ok(self
+                .delete_outcome
+                .lock()
+                .unwrap()
+                .unwrap_or(PubkyDeleteOutcome::Deleted))
         }
     }
 
