@@ -22,10 +22,10 @@ use locks_core::lock_policy::{
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    ContentLockDeletionFailureCode, ContentLockDeletionState, CreatorAuthorityAuthKind,
-    CreatorAuthorityRecord, CreatorAuthoritySecret, CreatorConnectAuthorizationUrl,
-    CreatorConnectFlowId, FrontendSessionRecord, FrontendSessionToken,
-    GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
+    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
+    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
+    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
     InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
     PrepareForceDeletionResult,
 };
@@ -680,6 +680,176 @@ async fn force_delete_error_keeps_receipt_pending_and_retries_from_frozen_manife
         StatusCode::OK
     );
     assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(
+                &creator(),
+                &lock_id,
+                Some(&content_lock),
+                state.clock().now(),
+            )
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
+    ));
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn force_from_failed_job_uses_frozen_manifest_after_resource_limits_are_lowered() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job)
+        .await
+        .unwrap();
+    let now = state.clock().now();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("test-worker", now, now + time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            claim.job.job_id,
+            "test-worker",
+            claim.claim_token,
+            now,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_resumable() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(
+                &creator(),
+                &lock_id,
+                Some(&content_lock),
+                state.clock().now(),
+            )
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
+    ));
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "internal_error",
+                "message": "state_corrupt"
+            }
+        })
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    );
 }
 
 #[tokio::test]

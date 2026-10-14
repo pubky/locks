@@ -74,7 +74,8 @@ pub trait VerificationTaskRepository: Send + Sync {
     /// Inserts a new verification task.
     ///
     /// Exact replay of an existing public verification attempt handle
-    /// (`creator`, `bundle_id`) succeeds without replacing its lifecycle.
+    /// (`creator`, `bundle_id`) returns `DuplicateRecord` without replacing its lifecycle, so
+    /// callers re-read and return the canonical stored task.
     /// Changed payload for that handle returns `VerificationTaskConflict`;
     /// reuse of a Task ID for another handle returns `DuplicateRecord`.
     /// PostgreSQL additionally returns `ContentLockDeletionInProgress` when the

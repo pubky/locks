@@ -949,7 +949,12 @@ mod tests {
         wait_for_advisory_waiter(&mut cutoff).await;
         insert_deletion_cutoff(&mut cutoff, &job).await;
         cutoff.commit().await.unwrap();
-        assert_eq!(replay.await.unwrap(), Ok(()));
+        assert_eq!(
+            replay.await.unwrap(),
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
+        );
 
         let snapshotted: Vec<Uuid> = sqlx::query_scalar(
             "SELECT verification_task_id
@@ -965,7 +970,9 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Ok(())
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
         );
 
         let mut changed_replay = admitted_before.clone();

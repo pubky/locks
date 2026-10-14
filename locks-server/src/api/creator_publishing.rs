@@ -285,12 +285,7 @@ async fn force_delete_content_lock(
     };
 
     if let Some(content_lock) = content_lock.as_ref() {
-        validate_content_lock_identity(
-            content_lock,
-            &creator,
-            &lock_id,
-            state.config().content_locks.clone(),
-        )?;
+        validate_frozen_content_lock_identity(content_lock, &creator, &lock_id)?;
     }
 
     state
@@ -388,6 +383,23 @@ fn validate_content_lock_identity(
             ApiErrorCode::InternalError,
             "content lock unavailable",
         ));
+    }
+    Ok(())
+}
+
+fn validate_frozen_content_lock_identity(
+    content_lock: &locks_core::lock_policy::ContentLock,
+    creator: &CreatorPubky,
+    expected_lock_id: &LockId,
+) -> Result<(), ApiError> {
+    content_lock
+        .validate_resource_set()
+        .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "state_corrupt"))?;
+    let actual_lock_id = content_lock
+        .lock_id()
+        .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "state_corrupt"))?;
+    if &content_lock.creator != creator || &actual_lock_id != expected_lock_id {
+        return Err(ApiError::new(ApiErrorCode::InternalError, "state_corrupt"));
     }
     Ok(())
 }

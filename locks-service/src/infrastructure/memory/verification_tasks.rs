@@ -64,7 +64,9 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                     == task.submitted_proof_bundle.bundle_id
         }) {
             return if existing.submitted_proof_bundle == task.submitted_proof_bundle {
-                Ok(())
+                Err(ApplicationError::DuplicateRecord {
+                    record: "verification_task",
+                })
             } else {
                 Err(ApplicationError::VerificationTaskConflict)
             };
@@ -409,7 +411,12 @@ mod tests {
         repo.insert_verification_task(pending.clone())
             .await
             .unwrap();
-        assert_eq!(repo.insert_verification_task(pending).await, Ok(()));
+        assert_eq!(
+            repo.insert_verification_task(pending.clone()).await,
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
+        );
 
         repo.update_verification_task(in_progress.clone())
             .await
@@ -497,11 +504,24 @@ mod tests {
         repo.insert_verification_task(original.clone())
             .await
             .unwrap();
+        let started = original
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
 
         assert_eq!(
             repo.insert_verification_task(duplicate_handle.clone())
                 .await,
-            Ok(())
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
         );
         let mut changed = duplicate_handle;
         changed.submitted_proof_bundle.proofs.clear();
@@ -513,7 +533,7 @@ mod tests {
             repo.get_verification_task(&TaskId::from_str(TASK_ID).unwrap())
                 .await
                 .unwrap(),
-            Some(original)
+            Some(started)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(OTHER_TASK_ID).unwrap())

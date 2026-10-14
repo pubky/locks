@@ -43,7 +43,9 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Clears an intent only for exact canonical bytes and the complete published ownership set.
+    /// Clears a retained intent only from the early exact-published replay path, after exact
+    /// canonical bytes and the complete published ownership set establish that no publisher is
+    /// still before its external write.
     async fn reconcile_publication(
         &self,
         creator: &CreatorPubky,

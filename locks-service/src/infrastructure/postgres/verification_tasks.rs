@@ -101,8 +101,9 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
             if existing.submitted_proof_bundle != task.submitted_proof_bundle {
                 return Err(ApplicationError::VerificationTaskConflict);
             }
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(());
+            return Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            });
         }
         reject_deletion_cutoff(&mut transaction, &task.creator, lock_id).await?;
         let result = sqlx::query(
@@ -902,7 +903,22 @@ mod tests {
         repo.insert_verification_task(pending.clone())
             .await
             .unwrap();
-        assert_eq!(repo.insert_verification_task(pending).await, Ok(()));
+        assert_eq!(
+            repo.insert_verification_task(pending.clone()).await,
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
+        );
+        let started = pending
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
         let exact_replay = task_with(
             DUPLICATE_HANDLE_TASK_ID,
             "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
@@ -911,7 +927,13 @@ mod tests {
         );
         assert_eq!(
             repo.insert_verification_task(exact_replay.clone()).await,
-            Ok(())
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            })
+        );
+        assert_eq!(
+            repo.get_verification_task(&task_id).await.unwrap(),
+            Some(started)
         );
         let mut changed_replay = exact_replay;
         changed_replay.submitted_proof_bundle.proofs.clear();

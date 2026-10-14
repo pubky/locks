@@ -8,6 +8,7 @@ use locks_core::lock_policy::{
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
+use crate::application::models::ContentLockOwnershipStatus;
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
     GuardedResourceRepository,
@@ -119,11 +120,13 @@ impl<'a> CreateContentLockUseCase<'a> {
             .into_iter()
             .map(|resource| resource.path)
             .collect::<Vec<_>>();
-        if let Some(existing) = self
+        let mut already_published = false;
+        if let Some((existing, ownership_status)) = self
             .resolve_owned_content_lock(&request.creator, &guarded_paths, &content_lock)
             .await?
         {
             content_lock = existing;
+            already_published = ownership_status == ContentLockOwnershipStatus::Published;
         }
         let lock_id = content_lock.lock_id().map_err(|error| {
             ApplicationError::ContentLockCanonicalization {
@@ -135,6 +138,19 @@ impl<'a> CreateContentLockUseCase<'a> {
                 message: error.to_string(),
             }
         })?;
+        if already_published {
+            // Exact canonical readback plus a complete published ownership set proves that no
+            // publisher can still be before its PUT. A retained post-PUT intent may therefore be
+            // reconciled, but an exact replay must never open a new intent or publish again.
+            self.content_lock_deletions
+                .reconcile_publication(&request.creator, &lock_id, &content_lock, &guarded_paths)
+                .await?;
+            return Ok(CreatedContentLock {
+                lock_id,
+                content_lock_path,
+                content_lock,
+            });
+        }
         if self
             .content_lock_deletions
             .publication_in_progress(&request.creator, &lock_id)
@@ -248,15 +264,11 @@ impl<'a> CreateContentLockUseCase<'a> {
         self.content_lock_ownership
             .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
             .await?;
-        if !self
-            .content_lock_deletions
+        // An exact replay may have reconciled this intent after the PUT and ownership commit.
+        // Either outcome leaves this publisher's canonical write durably owned.
+        self.content_lock_deletions
             .finish_publication(&request.creator, &lock_id, publication_token)
-            .await?
-        {
-            return Err(ApplicationError::Storage {
-                message: "content lock publication intent was lost".to_owned(),
-            });
-        }
+            .await?;
 
         Ok(CreatedContentLock {
             lock_id,
@@ -270,10 +282,11 @@ impl<'a> CreateContentLockUseCase<'a> {
         creator: &CreatorPubky,
         guarded_paths: &[String],
         requested: &ContentLock,
-    ) -> Result<Option<ContentLock>, ApplicationError> {
+    ) -> Result<Option<(ContentLock, ContentLockOwnershipStatus)>, ApplicationError> {
         // Reuse an earlier `created_at` only when every requested path has the
         // same owner and the published canonical payload matches every other
-        // request field. Reservation and publication fencing still run below.
+        // request field. Fully published ownership returns idempotently before
+        // admission; uniformly reserved ownership still follows recovery below.
         let mut ownership = Vec::with_capacity(guarded_paths.len());
         for guarded_path in guarded_paths {
             ownership.push(
@@ -297,6 +310,21 @@ impl<'a> CreateContentLockUseCase<'a> {
                     guarded_path: guarded_path.clone(),
                 });
             }
+        }
+        let all_published = ownership.iter().all(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.status == ContentLockOwnershipStatus::Published)
+        });
+        let all_reserved = ownership.iter().all(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.status == ContentLockOwnershipStatus::Reserved)
+        });
+        if !all_published && !all_reserved {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
         }
 
         let existing_path = ContentLockPath::from_lock_id(existing_lock_id.clone());
@@ -322,7 +350,12 @@ impl<'a> CreateContentLockUseCase<'a> {
                 guarded_path: guarded_paths[0].clone(),
             });
         }
-        Ok(Some(existing))
+        let ownership_status = if all_published {
+            ContentLockOwnershipStatus::Published
+        } else {
+            ContentLockOwnershipStatus::Reserved
+        };
+        Ok(Some((existing, ownership_status)))
     }
 }
 
@@ -363,12 +396,13 @@ fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
 mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
     use time::OffsetDateTime;
     use time::macros::datetime;
+    use tokio::sync::Notify;
 
     use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockServerPubky};
     use locks_core::lock_policy::VerifierType;
@@ -572,6 +606,30 @@ mod tests {
                 .unwrap(),
             Some(first.content_lock)
         );
+    }
+
+    #[tokio::test]
+    async fn identical_create_does_not_republish_already_published_lock() {
+        let fixture = Fixture::seeded().await;
+        let content_locks = CountingContentLockRepository {
+            inner: &fixture.content_locks,
+            upsert_count: AtomicUsize::new(0),
+        };
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &fixture.content_lock_deletions,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+
+        let first = use_case.execute(request.clone()).await.unwrap();
+        fixture.clock.advance(time::Duration::seconds(1));
+        let replayed = use_case.execute(request).await.unwrap();
+
+        assert_eq!(replayed, first);
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -787,6 +845,108 @@ mod tests {
                 .unwrap()
                 .status,
             ContentLockOwnershipStatus::Published
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_published_retry_racing_force_does_not_republish_or_fail() {
+        let fixture = Fixture::seeded().await;
+        let request = content_lock_request(registered_guarded_resource());
+        let created = fixture.use_case().execute(request.clone()).await.unwrap();
+        let content_locks = BlockingReadContentLockRepository {
+            inner: &fixture.content_locks,
+            snapshot_taken: Notify::new(),
+            release_read: Notify::new(),
+            upsert_count: AtomicUsize::new(0),
+        };
+        let retry_use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &fixture.content_lock_deletions,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+
+        let retry = retry_use_case.execute(request);
+        let force = async {
+            content_locks.snapshot_taken.notified().await;
+            let prepared = fixture
+                .content_lock_deletions
+                .prepare_force_deletion(
+                    &creator(),
+                    &created.lock_id,
+                    Some(&created.content_lock),
+                    fixture.clock.now(),
+                )
+                .await
+                .unwrap();
+            fixture
+                .content_locks
+                .delete_content_lock(&creator(), &created.content_lock_path)
+                .await
+                .unwrap();
+            content_locks.release_read.notify_one();
+            prepared
+        };
+
+        let (retried, forced) = tokio::join!(retry, force);
+
+        assert_eq!(retried.unwrap(), created);
+        assert!(matches!(
+            forced,
+            PrepareForceDeletionResult::Synchronous(receipt)
+                if receipt.completed_at.is_none()
+        ));
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 0);
+        assert!(
+            fixture
+                .content_locks
+                .get_content_lock(&creator(), &created.content_lock_path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_retry_reconciliation_does_not_fail_original_publisher() {
+        let fixture = Fixture::seeded().await;
+        let content_locks = CountingContentLockRepository {
+            inner: &fixture.content_locks,
+            upsert_count: AtomicUsize::new(0),
+        };
+        let ownership = PauseAfterPublishOwnership {
+            inner: &fixture.content_lock_ownership,
+            published: Notify::new(),
+            release: Notify::new(),
+        };
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &fixture.content_lock_deletions,
+            &ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+
+        let original = use_case.execute(request.clone());
+        let replay = async {
+            ownership.published.notified().await;
+            let result = use_case.execute(request).await;
+            ownership.release.notify_one();
+            result
+        };
+        let (original, replayed) = tokio::join!(original, replay);
+
+        let original = original.unwrap();
+        assert_eq!(replayed.unwrap(), original);
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &original.lock_id)
+                .await
+                .unwrap()
         );
     }
 
@@ -1220,6 +1380,137 @@ mod tests {
             _path: &ContentLockPath,
         ) -> Result<bool, ApplicationError> {
             unreachable!("creation must not delete content locks")
+        }
+    }
+
+    struct CountingContentLockRepository<'a> {
+        inner: &'a dyn ContentLockRepository,
+        upsert_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContentLockRepository for CountingContentLockRepository<'_> {
+        async fn upsert_content_lock(
+            &self,
+            creator: CreatorPubky,
+            path: ContentLockPath,
+            content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            self.upsert_count.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .upsert_content_lock(creator, path, content_lock)
+                .await
+        }
+
+        async fn get_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            self.inner.get_content_lock(creator, path).await
+        }
+
+        async fn delete_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            self.inner.delete_content_lock(creator, path).await
+        }
+    }
+
+    struct BlockingReadContentLockRepository<'a> {
+        inner: &'a dyn ContentLockRepository,
+        snapshot_taken: Notify,
+        release_read: Notify,
+        upsert_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContentLockRepository for BlockingReadContentLockRepository<'_> {
+        async fn upsert_content_lock(
+            &self,
+            creator: CreatorPubky,
+            path: ContentLockPath,
+            content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            self.upsert_count.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .upsert_content_lock(creator, path, content_lock)
+                .await
+        }
+
+        async fn get_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            let content_lock = self.inner.get_content_lock(creator, path).await?;
+            self.snapshot_taken.notify_one();
+            self.release_read.notified().await;
+            Ok(content_lock)
+        }
+
+        async fn delete_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            self.inner.delete_content_lock(creator, path).await
+        }
+    }
+
+    struct PauseAfterPublishOwnership<'a> {
+        inner: &'a dyn ContentLockOwnershipRepository,
+        published: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl ContentLockOwnershipRepository for PauseAfterPublishOwnership<'_> {
+        async fn reserve_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .reserve_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn mark_paths_published(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .mark_paths_published(creator, guarded_paths, lock_id)
+                .await?;
+            self.published.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn compensate_reserved_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn get_path_ownership(
+            &self,
+            creator: &CreatorPubky,
+            guarded_path: &str,
+        ) -> Result<Option<crate::application::models::ContentLockOwnership>, ApplicationError>
+        {
+            self.inner.get_path_ownership(creator, guarded_path).await
         }
     }
 
