@@ -280,6 +280,15 @@ fn render_postmessage_script(flow_id: &str, target_origin: &str, callback_state:
     let callback_state_js = js_string_literal(callback_state);
     format!(
         r#"<script>
+    // Mobile Safari ignores a custom-scheme navigation of this frame itself, so on iOS the Pubky Ring
+    // link targets the top frame, which a user tap may send to `pubkyauth://`.
+    {{
+      const authorizeButton = document.querySelector(".authorize-btn");
+      const userAgent = navigator.userAgent;
+      if (authorizeButton && (/iPhone|iPad|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1))) {{
+        authorizeButton.target = "_top";
+      }}
+    }}
     (async () => {{
       const TARGET_ORIGIN = {target_origin_js};
       const CALLBACK_TYPE = {type_js};
