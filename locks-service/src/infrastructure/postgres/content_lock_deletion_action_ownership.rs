@@ -31,6 +31,7 @@ impl ContentLockDeletionActionOwnership for PostgresContentLockDeletionActionOwn
     ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
         let lock_key = action_lock_key(claim.job_id);
         let mut pooled = self.pool.acquire().await.map_err(storage_error)?;
+        pooled.close_on_drop();
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *pooled)
@@ -85,6 +86,7 @@ impl ContentLockDeletionActionOwnership for PostgresContentLockDeletionActionOwn
     ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
         let lock_key = action_lock_key(job_id);
         let mut pooled = self.pool.acquire().await.map_err(storage_error)?;
+        pooled.close_on_drop();
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *pooled)

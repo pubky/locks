@@ -32,7 +32,8 @@ use locks_service::application::models::{
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
-    ContentLockDeletionActionClaim, ContentLockRepository, GrantCreatorConnectFlowClient,
+    ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
+    ContentLockDeletionRepository, ContentLockRepository, GrantCreatorConnectFlowClient,
     GuardedResourceRepository, LegacyCreatorConnectFlowClient,
 };
 
@@ -194,6 +195,39 @@ struct FaultInjectingGuardedResourceRepository {
     inner: InMemoryGuardedResourceRepository,
     fail_path_once: Mutex<Option<String>>,
     delete_attempts: Mutex<Vec<String>>,
+}
+
+struct CompleteReceiptBeforeClaimLost {
+    deletions: Arc<dyn ContentLockDeletionRepository>,
+    creator: CreatorPubky,
+    lock_id: LockId,
+    completed_at: time::OffsetDateTime,
+}
+
+#[async_trait]
+impl ContentLockDeletionActionOwnership for CompleteReceiptBeforeClaimLost {
+    async fn try_acquire(
+        &self,
+        _claim: ContentLockDeletionActionClaim<'_>,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        _job_id: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        assert!(
+            self.deletions
+                .complete_synchronous_force_deletion(
+                    &self.creator,
+                    &self.lock_id,
+                    self.completed_at,
+                )
+                .await?
+        );
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
 }
 
 #[async_trait]
@@ -6323,6 +6357,65 @@ async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_clea
             .has_force_receipt(&creator(), &lock_id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_delete_returns_completed_when_action_claim_is_lost_to_completed_request() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("test-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            job.job_id,
+            "test-worker",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(&creator(), &lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+    let ownership = CompleteReceiptBeforeClaimLost {
+        deletions: Arc::clone(state.content_lock_deletions()),
+        creator: creator(),
+        lock_id: lock_id.clone(),
+        completed_at: state.clock().now(),
+    };
+    let app = router(state.with_content_lock_deletion_action_ownership(Arc::new(ownership)));
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
     );
 }
 

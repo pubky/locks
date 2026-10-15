@@ -864,6 +864,15 @@ impl AppState {
         &self.content_lock_deletion_action_ownership
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_content_lock_deletion_action_ownership(
+        mut self,
+        ownership: Arc<dyn ContentLockDeletionActionOwnership>,
+    ) -> Self {
+        self.content_lock_deletion_action_ownership = ownership;
+        self
+    }
+
     pub fn payment_drains(&self) -> Option<&Arc<dyn PaymentDrainRepository>> {
         self.payment_drains.as_ref()
     }

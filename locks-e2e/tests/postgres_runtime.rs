@@ -68,6 +68,44 @@ use tower::ServiceExt;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 
+struct CompletePostgresReceiptBeforeClaimLost {
+    deletions: Arc<PostgresContentLockDeletionRepository>,
+    creator: CreatorPubky,
+    lock_id: locks_core::ids::LockId,
+}
+
+#[async_trait]
+impl ContentLockDeletionActionOwnership for CompletePostgresReceiptBeforeClaimLost {
+    async fn try_acquire(
+        &self,
+        _claim: ContentLockDeletionActionClaim<'_>,
+    ) -> Result<
+        ContentLockDeletionActionAcquireResult,
+        locks_service::application::errors::ApplicationError,
+    > {
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        _job_id: uuid::Uuid,
+    ) -> Result<
+        ContentLockDeletionActionAcquireResult,
+        locks_service::application::errors::ApplicationError,
+    > {
+        assert!(
+            self.deletions
+                .complete_synchronous_force_deletion(
+                    &self.creator,
+                    &self.lock_id,
+                    OffsetDateTime::now_utc(),
+                )
+                .await?
+        );
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
+}
+
 struct ZeroInvoiceRetryJitter;
 
 impl InvoiceRetryJitter for ZeroInvoiceRetryJitter {
@@ -210,6 +248,96 @@ async fn postgres_terminal_force_waits_for_expired_worker_action_before_receipt_
     );
 
     database.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_force_delete_returns_completed_when_action_claim_loses_completion_race() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let deletions = Arc::new(PostgresContentLockDeletionRepository::new(
+        database.pool().clone(),
+    ));
+    let lock = content_lock();
+    let lock_id = lock.lock_id().unwrap();
+    let job =
+        ContentLockDeletionJob::new(uuid::Uuid::new_v4(), lock, OffsetDateTime::now_utc()).unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = deletions
+        .claim_next("route-race-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    deletions
+        .finish(
+            job.job_id,
+            "route-race-worker",
+            claimed.claim_token,
+            Some(locks_service::application::models::ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+    let ownership = Arc::new(CompletePostgresReceiptBeforeClaimLost {
+        deletions: Arc::clone(&deletions),
+        creator: job.creator.clone(),
+        lock_id: job.lock_id.clone(),
+    });
+    let state =
+        app_state(database.pool().clone()).with_content_lock_deletion_action_ownership(ownership);
+    let app = TestServerApp::from_state(state);
+    let token = "force-race-creator-session";
+    app.insert_frontend_session_for_test(
+        FrontendSessionToken::new(token),
+        job.creator,
+        OffsetDateTime::now_utc() + time::Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/creator/content-locks/{lock_id}?force=true"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    database.cleanup().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+}
+
+#[tokio::test]
+async fn postgres_cancelled_worker_action_acquire_does_not_leak_advisory_lock() {
+    assert_cancelled_action_acquire_releases_lock(false).await;
+}
+
+#[tokio::test]
+async fn postgres_cancelled_synchronous_force_acquire_does_not_leak_advisory_lock() {
+    assert_cancelled_action_acquire_releases_lock(true).await;
 }
 
 #[tokio::test]
@@ -1550,6 +1678,24 @@ impl TestDatabase {
         &self.pool
     }
 
+    async fn cancellation_probe_pool(&self) -> PgPool {
+        let search_path = self.schema_name.clone();
+        PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(move |connection, _metadata| {
+                let search_path = search_path.clone();
+                Box::pin(async move {
+                    connection
+                        .execute(format!("SET search_path TO {search_path}, pg_catalog").as_str())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&self.database_url)
+            .await
+            .expect("connect cancellation probe pool")
+    }
+
     async fn cleanup(self) {
         self.pool.close().await;
         let mut admin_connection = PgConnection::connect(&self.database_url)
@@ -1560,6 +1706,154 @@ impl TestDatabase {
             .await
             .expect("drop isolated schema");
     }
+}
+
+async fn assert_cancelled_action_acquire_releases_lock(synchronous_force: bool) {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let probe_pool = database.cancellation_probe_pool().await;
+    let observer_pool = database.cancellation_probe_pool().await;
+    sqlx::query("CREATE SEQUENCE action_acquire_cancellation_probe")
+        .execute(&probe_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION pg_try_advisory_lock(requested_key bigint)
+         RETURNS boolean
+         LANGUAGE plpgsql
+         AS $$
+         DECLARE
+             acquired boolean;
+             attempt bigint;
+         BEGIN
+             acquired := pg_catalog.pg_try_advisory_lock(requested_key);
+             IF acquired THEN
+                 attempt := nextval('action_acquire_cancellation_probe');
+                 IF attempt = 1 THEN
+                     PERFORM pg_catalog.pg_sleep(3);
+                 END IF;
+             END IF;
+             RETURN acquired;
+         END
+         $$",
+    )
+    .execute(&probe_pool)
+    .await
+    .unwrap();
+
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let job = ContentLockDeletionJob::new(
+        uuid::Uuid::new_v4(),
+        content_lock(),
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = deletions
+        .claim_next("cancelled-acquire-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    if synchronous_force {
+        deletions
+            .finish(
+                job.job_id,
+                "cancelled-acquire-worker",
+                claimed.claim_token,
+                Some(
+                    locks_service::application::models::ContentLockDeletionFailureCode::StateCorrupt,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            deletions
+                .prepare_force_deletion(&job.creator, &job.lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(Some(_))
+        ));
+    }
+
+    let cancelled_owner = PostgresContentLockDeletionActionOwnership::new(probe_pool.clone());
+    let replacement_owner = PostgresContentLockDeletionActionOwnership::new(observer_pool.clone());
+    let cancelled_claim = claimed.clone();
+    let cancelled = tokio::spawn(async move {
+        if synchronous_force {
+            cancelled_owner
+                .try_acquire_synchronous_force(cancelled_claim.job.job_id)
+                .await
+        } else {
+            cancelled_owner
+                .try_acquire(deletion_action_claim(
+                    &cancelled_claim,
+                    "cancelled-acquire-worker",
+                    false,
+                ))
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (last_value, is_called): (i64, bool) = sqlx::query_as(
+                "SELECT last_value, is_called FROM action_acquire_cancellation_probe",
+            )
+            .fetch_one(&probe_pool)
+            .await
+            .unwrap();
+            if is_called && last_value == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("advisory lock was granted before cancellation");
+    cancelled.abort();
+    let _ = cancelled.await;
+
+    let reacquired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = if synchronous_force {
+                replacement_owner
+                    .try_acquire_synchronous_force(job.job_id)
+                    .await
+                    .unwrap()
+            } else {
+                replacement_owner
+                    .try_acquire(deletion_action_claim(
+                        &claimed,
+                        "cancelled-acquire-worker",
+                        false,
+                    ))
+                    .await
+                    .unwrap()
+            };
+            match result {
+                ContentLockDeletionActionAcquireResult::Acquired(guard) => break Some(guard),
+                ContentLockDeletionActionAcquireResult::Busy => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                ContentLockDeletionActionAcquireResult::ClaimLost => break None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    let reacquired_after_cancellation = reacquired.is_some();
+    if let Some(guard) = reacquired {
+        guard.release().await.unwrap();
+    }
+    probe_pool.close().await;
+    observer_pool.close().await;
+    database.cleanup().await;
+    assert!(
+        reacquired_after_cancellation,
+        "cancelled acquisition retained the advisory lock"
+    );
 }
 
 fn app_state(pool: PgPool) -> AppState {

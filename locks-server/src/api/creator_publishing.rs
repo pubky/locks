@@ -319,6 +319,21 @@ async fn force_delete_content_lock(
                 ));
             }
             ContentLockDeletionActionAcquireResult::ClaimLost => {
+                if state
+                    .content_lock_deletions()
+                    .get_force_receipt(&creator, &lock_id)
+                    .await?
+                    .is_some_and(|receipt| receipt.completed_at.is_some())
+                {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({
+                            "lock_id": lock_id,
+                            "lock_deleted": true,
+                            "failed_resource_paths": []
+                        })),
+                    ));
+                }
                 return Err(ApiError::new(
                     ApiErrorCode::InternalError,
                     "content lock deletion action unavailable",
