@@ -197,7 +197,10 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
         )),
         Err(
             locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress,
-        ) => force_delete_content_lock(&state, creator, lock_id).await,
+        ) => Err(ApiError::new(
+            ApiErrorCode::ContentLockDeletionInProgress,
+            "content lock deletion is in progress",
+        )),
         Err(error) => Err(error.into()),
     }
 }

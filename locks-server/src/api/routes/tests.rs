@@ -19,7 +19,10 @@ use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
     LockServerConfig, PaykitPaymentAsset, VerifierType,
 };
-use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+use locks_core::verification::{
+    EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
+    VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     AccessCredentialLookupKey, AccessCredentialRecord, ContentLockDeletionFailureCode,
@@ -510,6 +513,130 @@ async fn graceful_delete_of_absent_lock_returns_completed_postcondition() {
 }
 
 #[tokio::test]
+async fn graceful_delete_during_entitlement_publication_conflicts_without_force_receipt() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    let app = router(state.clone());
+    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
+
+    let now = state.clock().now();
+    let claim = state
+        .verification_task_claimer()
+        .claim_next_verification_task("publisher", now, now + time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let publishing = claim
+        .task
+        .begin_entitlement_publication(VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: claim.task.submitted_proof_bundle.bundle_id.clone(),
+            pubky_lock_resource: claim
+                .task
+                .submitted_proof_bundle
+                .pubky_lock_resource
+                .clone(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        })
+        .unwrap();
+    state
+        .verification_task_claimer()
+        .persist_claimed_verification_task_transition(
+            publishing,
+            "publisher",
+            &claim.claim_token,
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(
+        response,
+        StatusCode::CONFLICT,
+        "content_lock_deletion_in_progress",
+    )
+    .await;
+    assert!(
+        !state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn proof_submission_after_in_memory_deletion_cutoff_is_rejected() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    let app = router(state.clone());
+
+    let delete_response = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+
+    let submitted = submitted_proof_bundle_for(&content_lock);
+    let bundle_id = submitted.bundle_id.clone();
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted }),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(
+        response,
+        StatusCode::CONFLICT,
+        "content_lock_deletion_in_progress",
+    )
+    .await;
+    assert!(
+        state
+            .verification_tasks()
+            .get_verification_task_by_handle(&creator(), &bundle_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn graceful_delete_of_existing_lock_queues_one_frozen_job_and_replays() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -629,7 +756,7 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
     let publication_token = Uuid::new_v4();
     state
         .content_lock_deletions()
-        .begin_publication(&creator(), &lock_id, publication_token)
+        .begin_publication(&creator(), &lock_id, publication_token, &content_lock)
         .await
         .unwrap();
 
@@ -4044,6 +4171,58 @@ async fn creator_content_locks_identical_request_returns_same_lock_id_and_path()
         first_body["content_lock_path"]
     );
     assert_eq!(second_body["content_lock"], first_body["content_lock"]);
+}
+
+#[tokio::test]
+async fn creator_content_lock_replay_after_graceful_delete_returns_deletion_in_progress() {
+    let state = test_state_with_creator_publishing(true)
+        .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = creator_content_lock_request(guarded_resource);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/creator/content-locks",
+            request.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let lock_id = response_json(created).await["lock_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let deleted = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+
+    let replay = app
+        .oneshot(json_request("POST", "/creator/content-locks", request))
+        .await
+        .unwrap();
+    let body = assert_error_response(
+        replay,
+        StatusCode::CONFLICT,
+        "content_lock_deletion_in_progress",
+    )
+    .await;
+    assert_eq!(
+        body["error"]["message"],
+        "content lock deletion is in progress"
+    );
 }
 
 #[tokio::test]

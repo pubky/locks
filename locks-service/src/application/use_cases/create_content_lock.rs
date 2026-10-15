@@ -11,7 +11,7 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::ContentLockOwnershipStatus;
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
-    GuardedResourceRepository,
+    ContentLockWriteError, GuardedResourceRepository, PublicationRecovery,
 };
 
 /// Request to create a local content lock for an already-registered guarded resource.
@@ -120,13 +120,15 @@ impl<'a> CreateContentLockUseCase<'a> {
             .into_iter()
             .map(|resource| resource.path)
             .collect::<Vec<_>>();
-        let mut already_published = false;
-        if let Some((existing, ownership_status)) = self
+        let mut ownership_status = None;
+        let mut recovered_publication = None;
+        if let Some((existing, existing_status, recovery)) = self
             .resolve_owned_content_lock(&request.creator, &guarded_paths, &content_lock)
             .await?
         {
             content_lock = existing;
-            already_published = ownership_status == ContentLockOwnershipStatus::Published;
+            ownership_status = Some(existing_status);
+            recovered_publication = recovery;
         }
         let lock_id = content_lock.lock_id().map_err(|error| {
             ApplicationError::ContentLockCanonicalization {
@@ -138,112 +140,121 @@ impl<'a> CreateContentLockUseCase<'a> {
                 message: error.to_string(),
             }
         })?;
-        if already_published {
-            // Reconciliation additionally requires the token owner to have durably recorded that
-            // its external write returned. An exact replay never opens a new intent or republishes.
-            self.content_lock_deletions
-                .reconcile_publication(&request.creator, &lock_id, &content_lock, &guarded_paths)
-                .await?;
-            return Ok(CreatedContentLock {
-                lock_id,
-                content_lock_path,
-                content_lock,
-            });
-        }
-        if self
-            .content_lock_deletions
-            .publication_in_progress(&request.creator, &lock_id)
-            .await?
-        {
-            let published_content_lock = self
-                .content_locks
-                .get_content_lock(&request.creator, &content_lock_path)
-                .await?;
-            let Some(published_content_lock) = published_content_lock.as_ref() else {
-                return Err(ApplicationError::ContentLockPathConflict {
-                    guarded_path: content_lock_path.to_string(),
-                });
+        if let Some(existing_status) = ownership_status {
+            let recovery = match recovered_publication {
+                Some(recovery) => recovery,
+                None => {
+                    self.content_lock_deletions
+                        .recover_publication(
+                            &request.creator,
+                            &lock_id,
+                            Uuid::new_v4(),
+                            &content_lock,
+                        )
+                        .await?
+                }
             };
-            if published_content_lock != &content_lock {
-                return Err(ApplicationError::ContentLockPathConflict {
-                    guarded_path: content_lock_path.to_string(),
-                });
+            match recovery {
+                PublicationRecovery::None
+                    if existing_status == ContentLockOwnershipStatus::Published =>
+                {
+                    return Ok(CreatedContentLock {
+                        lock_id,
+                        content_lock_path,
+                        content_lock,
+                    });
+                }
+                PublicationRecovery::WriteCompleted {
+                    content_lock: recovered_content_lock,
+                    ..
+                } => {
+                    content_lock = recovered_content_lock;
+                    if !self
+                        .content_lock_deletions
+                        .reconcile_publication(
+                            &request.creator,
+                            &lock_id,
+                            &content_lock,
+                            &guarded_paths,
+                        )
+                        .await?
+                    {
+                        return Err(ApplicationError::Storage {
+                            message: "content lock publication reconciliation was not committed"
+                                .to_owned(),
+                        });
+                    }
+                    if existing_status == ContentLockOwnershipStatus::Reserved {
+                        self.content_lock_ownership
+                            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                            .await?;
+                    }
+                    return Ok(CreatedContentLock {
+                        lock_id,
+                        content_lock_path,
+                        content_lock,
+                    });
+                }
+                PublicationRecovery::RetryWithToken {
+                    publication_token,
+                    content_lock: recovered_content_lock,
+                } => {
+                    content_lock = recovered_content_lock;
+                    self.publish_with_token(
+                        &request.creator,
+                        &lock_id,
+                        &content_lock,
+                        &guarded_paths,
+                        publication_token,
+                        false,
+                    )
+                    .await?;
+                    return Ok(CreatedContentLock {
+                        lock_id,
+                        content_lock_path,
+                        content_lock,
+                    });
+                }
+                PublicationRecovery::RequestMismatch => {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+                PublicationRecovery::None => {}
             }
-            self.content_lock_ownership
-                .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
-                .await?;
-            let reconciled = self
-                .content_lock_deletions
-                .reconcile_publication(
-                    &request.creator,
-                    &lock_id,
-                    published_content_lock,
-                    &guarded_paths,
-                )
-                .await?;
-            if !reconciled
-                && self
-                    .content_lock_deletions
-                    .publication_in_progress(&request.creator, &lock_id)
-                    .await?
-            {
-                return Err(ApplicationError::Storage {
-                    message: "content lock publication reconciliation was not committed".to_owned(),
-                });
-            }
-            return Ok(CreatedContentLock {
-                lock_id,
-                content_lock_path,
-                content_lock,
-            });
         }
 
-        self.content_lock_ownership
-            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
-            .await?;
+        let newly_reserved = ownership_status.is_none();
+        if newly_reserved {
+            self.content_lock_ownership
+                .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+                .await?;
+        }
 
         let publication_token = Uuid::new_v4();
         if let Err(error) = self
             .content_lock_deletions
-            .begin_publication(&request.creator, &lock_id, publication_token)
+            .begin_publication(&request.creator, &lock_id, publication_token, &content_lock)
             .await
         {
-            let _ = self
-                .content_lock_ownership
-                .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
-                .await;
+            if newly_reserved {
+                let _ = self
+                    .content_lock_ownership
+                    .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
+                    .await;
+            }
             return Err(error);
         }
 
-        // Any returned external-write error is ambiguous: an identical payload may predate this
-        // attempt, while this PUT may still commit later. `?` deliberately retains reservation
-        // and intent so deletion stays fenced until completion is proved out of band.
-        self.content_locks
-            .upsert_content_lock(
-                request.creator.clone(),
-                content_lock_path.clone(),
-                content_lock.clone(),
-            )
-            .await?;
-
-        if !self
-            .content_lock_deletions
-            .mark_publication_written(&request.creator, &lock_id, publication_token)
-            .await?
-        {
-            return Err(ApplicationError::Storage {
-                message: "content lock publication write completion was not committed".to_owned(),
-            });
-        }
-
-        self.content_lock_ownership
-            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
-            .await?;
-        // An exact replay may have reconciled this intent after the PUT and ownership commit.
-        // Either outcome leaves this publisher's canonical write durably owned.
-        self.content_lock_deletions
-            .finish_publication(&request.creator, &lock_id, publication_token)
-            .await?;
+        self.publish_with_token(
+            &request.creator,
+            &lock_id,
+            &content_lock,
+            &guarded_paths,
+            publication_token,
+            newly_reserved,
+        )
+        .await?;
 
         Ok(CreatedContentLock {
             lock_id,
@@ -252,12 +263,92 @@ impl<'a> CreateContentLockUseCase<'a> {
         })
     }
 
+    async fn publish_with_token(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        content_lock: &ContentLock,
+        guarded_paths: &[String],
+        publication_token: Uuid,
+        compensate_ownership: bool,
+    ) -> Result<(), ApplicationError> {
+        let content_lock_path = content_lock.content_lock_path().map_err(|error| {
+            ApplicationError::ContentLockCanonicalization {
+                message: error.to_string(),
+            }
+        })?;
+        match self
+            .content_locks
+            .upsert_content_lock_classified(
+                creator.clone(),
+                content_lock_path,
+                content_lock.clone(),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(ContentLockWriteError::Ambiguous(error)) => return Err(error),
+            Err(ContentLockWriteError::NotStarted(error)) => {
+                if !compensate_ownership {
+                    // This retry did not dispatch, but an earlier ambiguous write may still land.
+                    return Err(error);
+                }
+                let ownership_compensation = self
+                    .content_lock_ownership
+                    .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                    .await;
+                let intent_compensated = self
+                    .content_lock_deletions
+                    .abandon_publication(creator, lock_id, publication_token)
+                    .await?;
+                if !intent_compensated {
+                    return Err(ApplicationError::Storage {
+                        message: "content lock publication compensation was not committed"
+                            .to_owned(),
+                    });
+                }
+                ownership_compensation?;
+                return Err(error);
+            }
+        }
+
+        if !self
+            .content_lock_deletions
+            .mark_publication_written(creator, lock_id, publication_token)
+            .await?
+        {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication write completion was not committed".to_owned(),
+            });
+        }
+        if !self
+            .content_lock_deletions
+            .reconcile_publication(creator, lock_id, content_lock, guarded_paths)
+            .await?
+        {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication reconciliation was not committed".to_owned(),
+            });
+        }
+        self.content_lock_ownership
+            .mark_paths_published(creator, guarded_paths, lock_id)
+            .await?;
+        Ok(())
+    }
+
     async fn resolve_owned_content_lock(
         &self,
         creator: &CreatorPubky,
         guarded_paths: &[String],
         requested: &ContentLock,
-    ) -> Result<Option<(ContentLock, ContentLockOwnershipStatus)>, ApplicationError> {
+    ) -> Result<
+        Option<(
+            ContentLock,
+            ContentLockOwnershipStatus,
+            Option<PublicationRecovery>,
+        )>,
+        ApplicationError,
+    > {
         // Reuse an earlier `created_at` only when every requested path has the
         // same owner and the published canonical payload matches every other
         // request field. Fully published ownership returns idempotently before
@@ -302,7 +393,70 @@ impl<'a> CreateContentLockUseCase<'a> {
             });
         }
 
+        // Retained canonical material authenticates exact retry even when an ambiguous PUT left no
+        // public object. A second recovery check after readback closes deletion admission races.
+        let recovery = self
+            .content_lock_deletions
+            .recover_publication(creator, &existing_lock_id, Uuid::new_v4(), requested)
+            .await?;
         let existing_path = ContentLockPath::from_lock_id(existing_lock_id.clone());
+        match recovery {
+            PublicationRecovery::RequestMismatch => {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: guarded_paths[0].clone(),
+                });
+            }
+            PublicationRecovery::RetryWithToken {
+                ref content_lock, ..
+            } => {
+                if self
+                    .content_locks
+                    .get_content_lock(creator, &existing_path)
+                    .await?
+                    .is_some_and(|published| published != *content_lock)
+                {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+                let ownership_status = if all_published {
+                    ContentLockOwnershipStatus::Published
+                } else {
+                    ContentLockOwnershipStatus::Reserved
+                };
+                return Ok(Some((
+                    content_lock.clone(),
+                    ownership_status,
+                    Some(recovery),
+                )));
+            }
+            PublicationRecovery::WriteCompleted {
+                ref content_lock, ..
+            } => {
+                if self
+                    .content_locks
+                    .get_content_lock(creator, &existing_path)
+                    .await?
+                    .is_none_or(|published| published != *content_lock)
+                {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+                let ownership_status = if all_published {
+                    ContentLockOwnershipStatus::Published
+                } else {
+                    ContentLockOwnershipStatus::Reserved
+                };
+                return Ok(Some((
+                    content_lock.clone(),
+                    ownership_status,
+                    Some(recovery),
+                )));
+            }
+            PublicationRecovery::None => {}
+        }
+
         let Some(existing) = self
             .content_locks
             .get_content_lock(creator, &existing_path)
@@ -330,7 +484,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         } else {
             ContentLockOwnershipStatus::Reserved
         };
-        Ok(Some((existing, ownership_status)))
+        Ok(Some((existing, ownership_status, None)))
     }
 }
 
@@ -699,7 +853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_failure_retains_reserved_path_ownership_and_intent() {
+    async fn pre_write_publication_failure_compensates_ownership_and_intent() {
         let fixture = Fixture::seeded().await;
         let use_case = CreateContentLockUseCase::new(
             &FailingContentLockRepository,
@@ -726,16 +880,8 @@ mod tests {
             .content_lock_ownership
             .get_path_ownership(&creator(), &guarded_path)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(ownership.status, ContentLockOwnershipStatus::Reserved);
-        assert!(
-            fixture
-                .content_lock_deletions
-                .publication_in_progress(&creator(), &ownership.lock_id)
-                .await
-                .unwrap()
-        );
+        assert_eq!(ownership, None);
     }
 
     #[tokio::test]
@@ -797,6 +943,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_republishes_absent_ambiguous_write_and_clears_fence() {
+        let fixture = Fixture::seeded().await;
+        let content_locks = AmbiguousThenSuccessfulContentLockRepository::default();
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &fixture.content_lock_deletions,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+        let original = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: request.creator.clone(),
+            primary_resource: request.primary_resource.clone(),
+            secondary_resources: request.secondary_resources.clone(),
+            criteria: request.criteria.clone(),
+            lock_logic: request.lock_logic.clone(),
+            access_policy: request.access_policy.clone(),
+            lock_server: request.lock_server.clone(),
+            created_at: fixture.clock.now(),
+        };
+        let original_lock_id = original.lock_id().unwrap();
+        let original_path = original.content_lock_path().unwrap();
+
+        assert!(matches!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message }) if message == "publication response lost"
+        ));
+        assert_eq!(
+            content_locks
+                .get_content_lock(&creator(), &original_path)
+                .await
+                .unwrap(),
+            None
+        );
+        fixture.clock.advance(time::Duration::seconds(1));
+        assert!(matches!(
+            use_case
+                .execute(content_lock_request_with_changed_criteria())
+                .await,
+            Err(ApplicationError::ContentLockPathConflict { .. })
+        ));
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .content_lock_deletions
+                .insert_job(
+                    crate::application::models::ContentLockDeletionJob::new(
+                        Uuid::new_v4(),
+                        original.clone(),
+                        fixture.clock.now(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(ApplicationError::ContentLockPublicationInProgress)
+        );
+        assert_eq!(
+            fixture
+                .content_lock_deletions
+                .prepare_force_deletion(
+                    &creator(),
+                    &original_lock_id,
+                    Some(&original),
+                    fixture.clock.now(),
+                )
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::PublicationInProgress
+        );
+        let recovered = use_case.execute(request).await.unwrap();
+
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 2);
+        assert_eq!(recovered.content_lock, original);
+        assert_eq!(
+            fixture
+                .content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+        assert!(
+            !fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &recovered.lock_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_retry_failure_keeps_earlier_ambiguous_write_fenced() {
+        let fixture = Fixture::seeded().await;
+        let content_locks = AmbiguousThenNotStartedContentLockRepository::default();
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &fixture.content_lock_deletions,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+
+        assert!(matches!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message }) if message == "publication response lost"
+        ));
+        assert_eq!(
+            use_case.execute(request).await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+
+        let ownership = fixture
+            .content_lock_ownership
+            .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ownership.status, ContentLockOwnershipStatus::Reserved);
+        assert!(
+            fixture
+                .content_lock_deletions
+                .publication_in_progress(&creator(), &ownership.lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .content_lock_deletions
+                .prepare_force_deletion(&creator(), &ownership.lock_id, None, fixture.clock.now(),)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::PublicationInProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replay_after_graceful_deletion_admission_is_rejected() {
+        let fixture = Fixture::seeded().await;
+        let request = content_lock_request(registered_guarded_resource());
+        let created = fixture.use_case().execute(request.clone()).await.unwrap();
+        fixture
+            .content_lock_deletions
+            .insert_job(
+                crate::application::models::ContentLockDeletionJob::new(
+                    Uuid::new_v4(),
+                    created.content_lock,
+                    fixture.clock.now(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.use_case().execute(request).await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+    }
+
+    #[tokio::test]
     async fn exact_retry_clears_retained_intent_only_after_publication_and_ownership_match() {
         let fixture = Fixture::seeded().await;
         let request = content_lock_request(registered_guarded_resource());
@@ -804,7 +1115,12 @@ mod tests {
         let retained_token = Uuid::new_v4();
         fixture
             .content_lock_deletions
-            .begin_publication(&creator(), &created.lock_id, retained_token)
+            .begin_publication(
+                &creator(),
+                &created.lock_id,
+                retained_token,
+                &created.content_lock,
+            )
             .await
             .unwrap();
         assert!(
@@ -838,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_published_retry_racing_force_does_not_republish_or_fail() {
+    async fn exact_published_retry_losing_force_fence_returns_deletion_in_progress() {
         let fixture = Fixture::seeded().await;
         let request = content_lock_request(registered_guarded_resource());
         let created = fixture.use_case().execute(request.clone()).await.unwrap();
@@ -880,7 +1196,10 @@ mod tests {
 
         let (retried, forced) = tokio::join!(retry, force);
 
-        assert_eq!(retried.unwrap(), created);
+        assert_eq!(
+            retried,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
         assert!(matches!(
             forced,
             PrepareForceDeletionResult::Synchronous(receipt)
@@ -969,7 +1288,7 @@ mod tests {
             .unwrap()
             .lock_id;
         assert!(
-            fixture
+            !fixture
                 .content_lock_deletions
                 .publication_in_progress(&creator(), &original_lock_id)
                 .await
@@ -1043,7 +1362,7 @@ mod tests {
             original_ownership
         );
         assert!(
-            fixture
+            !fixture
                 .content_lock_deletions
                 .publication_in_progress(&creator(), &original_ownership.lock_id)
                 .await
@@ -1098,7 +1417,7 @@ mod tests {
             .unwrap()
             .lock_id;
         assert!(
-            content_lock_deletions
+            !content_lock_deletions
                 .publication_in_progress(&creator(), &original_lock_id)
                 .await
                 .unwrap()
@@ -1122,6 +1441,117 @@ mod tests {
                 .unwrap()
                 .status,
             ContentLockOwnershipStatus::Published
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_exact_retry_republishes_absent_ambiguous_write_and_clears_fence() {
+        let database = TestDatabase::create().await;
+        let content_locks = AmbiguousThenSuccessfulContentLockRepository::default();
+        let content_lock_deletions =
+            PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let content_lock_ownership =
+            PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        let guarded_resources = InMemoryGuardedResourceRepository::new();
+        let clock = MutableClock::new(datetime!(2026-06-03 12:00:00 UTC));
+        let guarded_resource = registered_guarded_resource();
+        guarded_resources
+            .upsert_guarded_resource(GuardedResourceRecord {
+                creator: creator(),
+                path: guarded_resource.path.clone(),
+                hash: guarded_resource.hash,
+                content_type: guarded_resource.content_type.clone(),
+                size: guarded_resource.size,
+                bytes: b"guarded bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+        let use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &content_lock_deletions,
+            &content_lock_ownership,
+            &guarded_resources,
+            &clock,
+        );
+        let request = content_lock_request(guarded_resource);
+        let original = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: request.creator.clone(),
+            primary_resource: request.primary_resource.clone(),
+            secondary_resources: request.secondary_resources.clone(),
+            criteria: request.criteria.clone(),
+            lock_logic: request.lock_logic.clone(),
+            access_policy: request.access_policy.clone(),
+            lock_server: request.lock_server.clone(),
+            created_at: clock.now(),
+        };
+        let original_lock_id = original.lock_id().unwrap();
+        let original_path = original.content_lock_path().unwrap();
+
+        assert!(matches!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message }) if message == "publication response lost"
+        ));
+        assert_eq!(
+            content_locks
+                .get_content_lock(&creator(), &original_path)
+                .await
+                .unwrap(),
+            None
+        );
+        clock.advance(time::Duration::seconds(1));
+        assert!(matches!(
+            use_case
+                .execute(content_lock_request_with_changed_criteria())
+                .await,
+            Err(ApplicationError::ContentLockPathConflict { .. })
+        ));
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            content_lock_deletions
+                .insert_job(
+                    crate::application::models::ContentLockDeletionJob::new(
+                        Uuid::new_v4(),
+                        original.clone(),
+                        clock.now(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(ApplicationError::ContentLockPublicationInProgress)
+        );
+        assert_eq!(
+            content_lock_deletions
+                .prepare_force_deletion(
+                    &creator(),
+                    &original_lock_id,
+                    Some(&original),
+                    clock.now(),
+                )
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::PublicationInProgress
+        );
+
+        let recovered = use_case.execute(request).await.unwrap();
+
+        assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 2);
+        assert_eq!(recovered.content_lock, original);
+        assert_eq!(
+            content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+        assert!(
+            !content_lock_deletions
+                .publication_in_progress(&creator(), &recovered.lock_id)
+                .await
+                .unwrap()
         );
         database.cleanup().await;
     }
@@ -1245,7 +1675,7 @@ mod tests {
         assert!(matches!(
             retry,
             Err(ApplicationError::Storage { ref message })
-                if message == "content lock publication reconciliation was not committed"
+                if message == "publication response lost"
         ));
         assert_eq!(force, PrepareForceDeletionResult::PublicationInProgress);
         assert!(
@@ -1284,7 +1714,12 @@ mod tests {
         let created = fixture.use_case().execute(request.clone()).await.unwrap();
         fixture
             .content_lock_deletions
-            .begin_publication(&creator(), &created.lock_id, Uuid::new_v4())
+            .begin_publication(
+                &creator(),
+                &created.lock_id,
+                Uuid::new_v4(),
+                &created.content_lock,
+            )
             .await
             .unwrap();
         let mut replacement = created.content_lock.clone();
@@ -1462,6 +1897,117 @@ mod tests {
             Err(ApplicationError::Storage {
                 message: "publication response lost".to_owned(),
             })
+        }
+
+        async fn get_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            Ok(self
+                .published
+                .read()
+                .await
+                .as_ref()
+                .filter(|(stored_creator, stored_path, _)| {
+                    stored_creator == creator && stored_path == path
+                })
+                .map(|(_, _, content_lock)| content_lock.clone()))
+        }
+
+        async fn delete_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!("creation must not delete content locks")
+        }
+    }
+
+    #[derive(Default)]
+    struct AmbiguousThenSuccessfulContentLockRepository {
+        published: tokio::sync::RwLock<Option<(CreatorPubky, ContentLockPath, ContentLock)>>,
+        upsert_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContentLockRepository for AmbiguousThenSuccessfulContentLockRepository {
+        async fn upsert_content_lock(
+            &self,
+            creator: CreatorPubky,
+            path: ContentLockPath,
+            content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            if self.upsert_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ApplicationError::Storage {
+                    message: "publication response lost".to_owned(),
+                })
+            } else {
+                *self.published.write().await = Some((creator, path, content_lock));
+                Ok(())
+            }
+        }
+
+        async fn get_content_lock(
+            &self,
+            creator: &CreatorPubky,
+            path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            Ok(self
+                .published
+                .read()
+                .await
+                .as_ref()
+                .filter(|(stored_creator, stored_path, _)| {
+                    stored_creator == creator && stored_path == path
+                })
+                .map(|(_, _, content_lock)| content_lock.clone()))
+        }
+
+        async fn delete_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!("creation must not delete content locks")
+        }
+    }
+
+    #[derive(Default)]
+    struct AmbiguousThenNotStartedContentLockRepository {
+        published: tokio::sync::RwLock<Option<(CreatorPubky, ContentLockPath, ContentLock)>>,
+        upsert_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContentLockRepository for AmbiguousThenNotStartedContentLockRepository {
+        async fn upsert_content_lock(
+            &self,
+            _creator: CreatorPubky,
+            _path: ContentLockPath,
+            _content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            unreachable!("classified publication path must be used")
+        }
+
+        async fn upsert_content_lock_classified(
+            &self,
+            creator: CreatorPubky,
+            path: ContentLockPath,
+            content_lock: ContentLock,
+        ) -> Result<(), ContentLockWriteError> {
+            if self.upsert_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                *self.published.write().await = Some((creator, path, content_lock));
+                Err(ContentLockWriteError::Ambiguous(
+                    ApplicationError::Storage {
+                        message: "publication response lost".to_owned(),
+                    },
+                ))
+            } else {
+                Err(ContentLockWriteError::NotStarted(
+                    ApplicationError::CreatorAuthorityUnavailable,
+                ))
+            }
         }
 
         async fn get_content_lock(
@@ -1772,6 +2318,19 @@ mod tests {
             Err(ApplicationError::Storage {
                 message: "publication failed".to_owned(),
             })
+        }
+
+        async fn upsert_content_lock_classified(
+            &self,
+            _creator: CreatorPubky,
+            _path: ContentLockPath,
+            _content_lock: ContentLock,
+        ) -> Result<(), ContentLockWriteError> {
+            Err(ContentLockWriteError::NotStarted(
+                ApplicationError::Storage {
+                    message: "publication failed".to_owned(),
+                },
+            ))
         }
 
         async fn get_content_lock(

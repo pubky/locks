@@ -20,12 +20,18 @@ use crate::infrastructure::memory::verification_task_deletion_fence::{
 };
 
 /// In-memory verification task repository.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
     invoice_admissions: RwLock<HashMap<TaskId, MemoryInvoiceAdmission>>,
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     verification_task_claimer: SyncRwLock<Option<Weak<InMemoryVerificationTaskClaimer>>>,
+}
+
+impl Default for InMemoryVerificationTaskRepository {
+    fn default() -> Self {
+        Self::with_deletion_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +87,15 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&task.creator, &lock_id)
             .await;
+        if self
+            .deletion_fence
+            .deletion_cutoffs
+            .read()
+            .await
+            .contains(&(task.creator.clone(), lock_id.clone()))
+        {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if let Some(existing) = records.values().find(|existing| {
@@ -133,24 +148,11 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
-        let lock_id = task
-            .submitted_proof_bundle
-            .pubky_lock_resource
-            .lock_id()
-            .clone();
-        let _admission_guard = self
-            .deletion_fence
-            .acquire_lock_admission(&task.creator, &lock_id)
-            .await;
-        let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         if !records.contains_key(&task.task_id) {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
-        }
-        if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
-            fence_record.status = task.status;
         }
         records.insert(task.task_id, task);
         Ok(())
@@ -227,6 +229,15 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&task.creator, &lock_id)
             .await;
+        if self
+            .deletion_fence
+            .deletion_cutoffs
+            .read()
+            .await
+            .contains(&(task.creator.clone(), lock_id.clone()))
+        {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let mut fence_records = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;

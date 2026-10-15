@@ -16,6 +16,25 @@ use crate::application::{
     },
 };
 
+/// Fenced recovery state for an existing exact publication intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationRecovery {
+    /// No publication intent exists.
+    None,
+    /// Token owner recorded successful external write completion; reconciliation may proceed.
+    WriteCompleted {
+        publication_token: Uuid,
+        content_lock: ContentLock,
+    },
+    /// Caller owns the replaced intent token and must re-PUT exact canonical bytes.
+    RetryWithToken {
+        publication_token: Uuid,
+        content_lock: ContentLock,
+    },
+    /// Retained canonical publication material does not authenticate this retry.
+    RequestMismatch,
+}
+
 /// Durable repository and fenced worker lease boundary for content-lock deletion jobs.
 #[async_trait]
 pub trait ContentLockDeletionRepository: Send + Sync {
@@ -25,18 +44,11 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
+        original_content_lock: &ContentLock,
     ) -> Result<(), ApplicationError>;
 
     /// Records that the exact token-owned external write has returned before local finalization.
     async fn mark_publication_written(
-        &self,
-        creator: &CreatorPubky,
-        lock_id: &LockId,
-        publication_token: Uuid,
-    ) -> Result<bool, ApplicationError>;
-
-    /// Finalizes the exact publication reservation after external publication and ownership commit.
-    async fn finish_publication(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
@@ -51,8 +63,8 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Clears a retained write-complete intent from the early exact-published replay path, after
-    /// exact canonical bytes and the complete published ownership set match.
+    /// Validates and clears a retained write-complete intent against exact canonical bytes and
+    /// guarded paths. Ownership promotion follows only after this reconciliation succeeds.
     async fn reconcile_publication(
         &self,
         creator: &CreatorPubky,
@@ -67,6 +79,16 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
+
+    /// Checks deletion admission, authenticates retained canonical publication material, and
+    /// claims an uncompleted exact intent for safe identical retry.
+    async fn recover_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        replacement_token: Uuid,
+        requested_content_lock: &ContentLock,
+    ) -> Result<PublicationRecovery, ApplicationError>;
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError>;
 
@@ -179,4 +201,23 @@ pub(crate) fn publication_reconciliation_matches(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     expected_paths.len() == published_guarded_paths.len() && expected_paths == published_paths
+}
+
+pub(crate) fn publication_intent_matches_request(
+    creator: &CreatorPubky,
+    lock_id: &LockId,
+    original_content_lock: &ContentLock,
+    requested_content_lock: &ContentLock,
+) -> bool {
+    if &original_content_lock.creator != creator
+        || !original_content_lock
+            .lock_id()
+            .is_ok_and(|original_lock_id| &original_lock_id == lock_id)
+    {
+        return false;
+    }
+
+    let mut expected = requested_content_lock.clone();
+    expected.created_at = original_content_lock.created_at;
+    &expected == original_content_lock
 }

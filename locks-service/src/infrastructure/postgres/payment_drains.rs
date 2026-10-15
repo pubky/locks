@@ -55,6 +55,7 @@ struct DeletionOwnershipRow {
     claimed_by: Option<String>,
     claim_token: Option<Uuid>,
     claim_expires_at: Option<OffsetDateTime>,
+    database_now: OffsetDateTime,
 }
 
 #[derive(FromRow)]
@@ -243,7 +244,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM content_lock_deletion_jobs
                 WHERE job_id = $1 AND state = 'running' AND claimed_by = $2
-                  AND claim_token = $3 AND claim_expires_at >= $4
+                  AND claim_token = $3 AND claim_expires_at > clock_timestamp()
                   AND phase = 'drain_payments' AND force_requested_at IS NULL
                 FOR UPDATE
             )",
@@ -271,7 +272,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                   content_lock_deletion_task_snapshot AS snapshot
              WHERE deletion.job_id = $1 AND deletion.state = 'running'
                AND deletion.claimed_by = $2 AND deletion.claim_token = $3
-               AND deletion.claim_expires_at >= $4 AND deletion.phase = 'drain_payments'
+               AND deletion.claim_expires_at > clock_timestamp()
+               AND deletion.phase = 'drain_payments'
                AND deletion.force_requested_at IS NULL
                AND snapshot.deletion_job_id = deletion.job_id
                AND snapshot.verification_task_id = task.task_id
@@ -460,7 +462,8 @@ async fn lock_deletion_ownership(
     deletion_job_id: Uuid,
 ) -> Result<Option<DeletionOwnershipRow>, ApplicationError> {
     sqlx::query_as::<_, DeletionOwnershipRow>(
-        "SELECT state, phase, force_requested_at, claimed_by, claim_token, claim_expires_at
+        "SELECT state, phase, force_requested_at, claimed_by, claim_token, claim_expires_at,
+                clock_timestamp() AS database_now
          FROM content_lock_deletion_jobs
          WHERE job_id = $1
          FOR UPDATE",
@@ -475,7 +478,7 @@ fn owns_live_drain_claim(
     ownership: Option<&DeletionOwnershipRow>,
     worker_id: &str,
     claim_token: Uuid,
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
     phase: &str,
 ) -> bool {
     ownership.is_some_and(|ownership| {
@@ -486,7 +489,7 @@ fn owns_live_drain_claim(
             && ownership.claim_token == Some(claim_token)
             && ownership
                 .claim_expires_at
-                .is_some_and(|claim_expires_at| claim_expires_at >= now)
+                .is_some_and(|claim_expires_at| claim_expires_at > ownership.database_now)
     })
 }
 
@@ -597,20 +600,30 @@ fn storage_display(error: impl std::fmt::Display) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{collections::BTreeMap, str::FromStr};
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locks_core::ids::TaskId;
+    use locks_core::ids::{CreatorPubky, GuardedResourceHash, TaskId};
+    use locks_core::lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
+        LockServerConfig,
+    };
+
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::application::models::VerificationTaskStatus;
-    use crate::application::ports::{
-        PaymentDrainCleanupToken, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
-        PaymentDrainTerminalTransition,
+    use crate::application::models::{
+        ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
+        VerificationTaskStatus,
     };
-    use crate::infrastructure::postgres::testing::TestDatabase;
+    use crate::application::ports::{
+        ContentLockDeletionRepository, PaymentDrainCleanupToken, PaymentDrainRepository,
+        PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+    };
+    use crate::infrastructure::postgres::{
+        PostgresContentLockDeletionRepository, testing::TestDatabase,
+    };
 
     use super::PostgresPaymentDrainRepository;
 
@@ -700,6 +713,134 @@ mod tests {
         assert!(
             !repository
                 .reconcile_payment_drain(job_id, "worker", Uuid::new_v4(), now, &divergent)
+                .await
+                .unwrap()
+        );
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn store_and_reconcile_use_postgres_time_for_live_claim_with_skewed_app_clock() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        let skewed_now = now + time::Duration::days(1);
+        let claim_expires_at = skewed_now + time::Duration::minutes(5);
+        let content_lock = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            primary_resource: Some(
+                GuardedResource::new(
+                    "/priv/app.locks/content/skewed-clock.json".to_owned(),
+                    GuardedResourceHash::from_bytes([11; 32]),
+                    "application/json".to_owned(),
+                    42,
+                )
+                .unwrap(),
+            ),
+            secondary_resources: BTreeMap::new(),
+            criteria: vec![],
+            lock_logic: LockLogic::All { criteria: vec![] },
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig { override_: None },
+            created_at: now,
+        };
+        let job = ContentLockDeletionJob::new(job_id, content_lock, now).unwrap();
+        deletions.insert_job(job).await.unwrap();
+
+        let withdraw_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
+        let start_payment_drain = deletions
+            .advance_phase(
+                job_id,
+                "worker",
+                withdraw_claim.claim_token,
+                skewed_now,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(start_payment_drain.state, ContentLockDeletionState::Queued);
+        assert_eq!(
+            start_payment_drain.phase,
+            ContentLockDeletionPhase::StartPaymentDrain
+        );
+
+        let start_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
+        let token = PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([11_u8; 32])).unwrap();
+        let active = PaymentDrainSummary {
+            status: PaymentDrainStatus::Active,
+            accepted_count: 1,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            cleanup_token: token.clone(),
+        };
+        assert!(
+            repository
+                .store_payment_drain(
+                    job_id,
+                    "worker",
+                    start_claim.claim_token,
+                    skewed_now,
+                    &active,
+                )
+                .await
+                .unwrap()
+        );
+
+        let drain_payments = deletions
+            .advance_phase(
+                job_id,
+                "worker",
+                start_claim.claim_token,
+                skewed_now,
+                ContentLockDeletionPhase::DrainPayments,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(drain_payments.state, ContentLockDeletionState::Queued);
+        assert_eq!(
+            drain_payments.phase,
+            ContentLockDeletionPhase::DrainPayments
+        );
+        let drain_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = PaymentDrainSummary {
+            status: PaymentDrainStatus::Completed,
+            accepted_count: 0,
+            terminal_count: 1,
+            cancellation_enqueued_count: 0,
+            cleanup_token: token,
+        };
+        assert!(
+            repository
+                .reconcile_payment_drain(
+                    job_id,
+                    "worker",
+                    drain_claim.claim_token,
+                    skewed_now,
+                    &completed,
+                )
                 .await
                 .unwrap()
         );
