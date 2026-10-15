@@ -1,14 +1,14 @@
 use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use locks_service::application::models::AccessCredential;
 use locks_service::application::use_cases::issue_access_credential::{
     IssueAccessCredentialRequest, IssueAccessCredentialUseCase,
 };
 use locks_service::application::use_cases::proxy_read_guarded_resource::{
-    ProxyReadGuardedResourceRequest, ProxyReadGuardedResourceUseCase,
+    ProxiedGuardedResource, ProxyReadGuardedResourceRequest, ProxyReadGuardedResourceUseCase,
 };
 
 use crate::api::dtos::{IssueAccessCredentialHttpRequest, IssueAccessCredentialHttpResponse};
@@ -42,6 +42,7 @@ pub(super) async fn issue_access_credential(
 pub(super) async fn proxy_read_guarded_resource(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(tail): axum::extract::Path<String>,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -58,6 +59,22 @@ pub(super) async fn proxy_read_guarded_resource(
     let proxied = use_case
         .execute(ProxyReadGuardedResourceRequest { credential, path })
         .await?;
+    let response = match build_proxy_read_response(&proxied) {
+        Ok(response) => response,
+        Err(error) => {
+            use_case.release_prepared_deletion_read(&proxied).await?;
+            return Err(error);
+        }
+    };
+    if method == Method::HEAD {
+        use_case.release_prepared_deletion_read(&proxied).await?;
+    } else {
+        use_case.consume_prepared_deletion_read(&proxied).await?;
+    }
+    Ok(response)
+}
+
+fn build_proxy_read_response(proxied: &ProxiedGuardedResource) -> Result<Response, ApiError> {
     let content_type = HeaderValue::from_str(&proxied.content_type).map_err(|_| {
         ApiError::new(
             ApiErrorCode::InternalError,
@@ -88,7 +105,7 @@ pub(super) async fn proxy_read_guarded_resource(
                     .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "invalid etag"))?,
             ),
         ],
-        Body::from(proxied.bytes),
+        Body::from(proxied.bytes.clone()),
     )
         .into_response())
 }

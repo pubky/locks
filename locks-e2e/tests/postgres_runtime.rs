@@ -18,9 +18,9 @@ use locks_core::lock_policy::{
 };
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_server::api::routes::router;
-use locks_server::app_state::{AppState, ReaderPubkyResolver};
+use locks_server::app_state::{AppState, ReaderPubkyResolver, RuntimeSecretCiphers};
 use locks_server::config::{
-    ContentLocksConfig, CreatorAuthorityAcquisitionConfig, DatabaseConfig,
+    ContentLocksConfig, CreatorAuthorityAcquisitionConfig, DatabaseConfig, DeletionConfig,
     FilesystemLockServerIdentityProvider, LockServerCredentialsConfig, LockServerIdentityProvider,
     LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
     RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
@@ -36,6 +36,7 @@ use locks_service::application::models::{
 use locks_service::application::ports::{
     ContentLockDeletionRepository, VerificationTaskRepository,
 };
+use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
 use locks_service::infrastructure::memory::{
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
@@ -281,7 +282,10 @@ async fn deletion_first_proof_submission_returns_409_without_calling_paykit() {
     let state = AppState::new_with_postgres_runtime_and_creator_repositories(
         config,
         database.pool().clone(),
-        CreatorAuthoritySecretCipher::new([7; 32]),
+        RuntimeSecretCiphers::new(
+            CreatorAuthoritySecretCipher::new([7; 32]),
+            FinalCredentialCipher::new([8; 32]),
+        ),
         Arc::new(InMemoryContentLockRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
@@ -373,7 +377,10 @@ async fn ready_paykit_replay_ignores_tombstoned_lock_and_reader_resolution() {
     let initial_state = AppState::new_with_postgres_runtime_and_creator_repositories(
         config.clone(),
         database.pool().clone(),
-        CreatorAuthoritySecretCipher::new([7; 32]),
+        RuntimeSecretCiphers::new(
+            CreatorAuthoritySecretCipher::new([7; 32]),
+            FinalCredentialCipher::new([8; 32]),
+        ),
         Arc::new(InMemoryContentLockRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
@@ -439,7 +446,10 @@ async fn ready_paykit_replay_ignores_tombstoned_lock_and_reader_resolution() {
     let tombstoned_state = AppState::new_with_postgres_runtime_and_creator_repositories(
         config,
         database.pool().clone(),
-        CreatorAuthoritySecretCipher::new([7; 32]),
+        RuntimeSecretCiphers::new(
+            CreatorAuthoritySecretCipher::new([7; 32]),
+            FinalCredentialCipher::new([8; 32]),
+        ),
         Arc::new(InMemoryContentLockRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
@@ -558,7 +568,10 @@ fn app_state(pool: PgPool) -> AppState {
     AppState::new_with_postgres_runtime_and_creator_repositories(
         test_config(),
         pool,
-        CreatorAuthoritySecretCipher::new([7; 32]),
+        RuntimeSecretCiphers::new(
+            CreatorAuthoritySecretCipher::new([7; 32]),
+            FinalCredentialCipher::new([8; 32]),
+        ),
         std::sync::Arc::new(InMemoryContentLockRepository::new()),
         std::sync::Arc::new(InMemoryGuardedResourceRepository::new()),
         std::sync::Arc::new(InMemoryLockServicePointerRepository::new()),
@@ -596,6 +609,7 @@ fn test_config() -> LockServerRuntimeConfig {
             max_connections: 10,
             run_migrations_on_startup: true,
         },
+        deletion: DeletionConfig::default(),
         worker: WorkerConfig {
             enabled: true,
             poll_interval_ms: 250,

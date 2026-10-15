@@ -882,7 +882,7 @@ mod tests {
     fn create_content_lock_request_builder_rejects_invalid_paykit_payment_in() {
         let builder = complete_builder();
         builder.state.borrow_mut().primary_resource =
-            Some(resource("/priv/locks.app/content/example.txt", "hash", 13));
+            Some(resource("/priv/app.locks/content/example.txt", "hash", 13));
         builder.state.borrow_mut().criteria = Some(serde_json::json!([{
             "criterion_id": "payment",
             "verifier_type": "paykit-payment",
