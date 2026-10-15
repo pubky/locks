@@ -56,7 +56,10 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Removes the exact unfinalized reservation after a safely compensated publication failure.
+    /// Removes only the exact unfinalized intent after a safely compensated replacement failure.
+    ///
+    /// This preserves ownership from an earlier publication. It must not be used for absent-path
+    /// recovery of a first publication; use `compensate_publication` for that case.
     async fn abandon_publication(
         &self,
         creator: &CreatorPubky,
@@ -64,7 +67,11 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
-    /// Atomically removes an exact uncompleted intent and its reserved ownership set.
+    /// Atomically removes an exact uncompleted intent and only that lock's reserved ownership set.
+    ///
+    /// This is also the fenced operation for operator-confirmed absent-path recovery after all
+    /// possible publishers have been quiesced. Published ownership and write-complete intents are
+    /// retained.
     async fn compensate_publication(
         &self,
         creator: &CreatorPubky,

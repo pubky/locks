@@ -1958,6 +1958,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absent_path_operator_recovery_allows_identical_retry_to_publish() {
+        let fixture = Fixture::seeded().await;
+        let request = content_lock_request(registered_guarded_resource());
+        let content_lock = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: request.creator.clone(),
+            primary_resource: request.primary_resource.clone(),
+            secondary_resources: request.secondary_resources.clone(),
+            criteria: request.criteria.clone(),
+            lock_logic: request.lock_logic.clone(),
+            access_policy: request.access_policy.clone(),
+            lock_server: request.lock_server.clone(),
+            created_at: fixture.clock.now(),
+        };
+        let lock_id = content_lock.lock_id().unwrap();
+        let guarded_paths = resource_descriptors(&content_lock)
+            .into_iter()
+            .map(|resource| resource.path)
+            .collect::<Vec<_>>();
+        let publication_token = Uuid::new_v4();
+        fixture
+            .content_lock_ownership
+            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+            .await
+            .unwrap();
+        fixture
+            .content_lock_deletions
+            .begin_publication(&request.creator, &lock_id, publication_token, &content_lock)
+            .await
+            .unwrap();
+
+        assert!(
+            !fixture
+                .content_lock_deletions
+                .compensate_publication(&request.creator, &lock_id, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .content_lock_deletions
+                .compensate_publication(&request.creator, &lock_id, publication_token)
+                .await
+                .unwrap()
+        );
+
+        let created = fixture.use_case().execute(request).await.unwrap();
+        assert_eq!(created.lock_id, lock_id);
+        assert_eq!(
+            fixture
+                .content_lock_ownership
+                .get_path_ownership(&created.content_lock.creator, &guarded_paths[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+        assert_eq!(
+            fixture
+                .content_locks
+                .get_content_lock(&created.content_lock.creator, &created.content_lock_path)
+                .await
+                .unwrap(),
+            Some(created.content_lock)
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_compensation_is_atomic_with_retry_admission() {
         let database = TestDatabase::create().await;
         let compensation_started = Arc::new(Notify::new());
