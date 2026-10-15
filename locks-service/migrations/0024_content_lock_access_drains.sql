@@ -6,7 +6,7 @@ BEGIN
         WHERE state IN ('queued', 'running', 'failed')
     ) THEN
         RAISE EXCEPTION USING
-            MESSAGE = 'migration 0023 cannot classify pre-existing resumable deletion jobs; drain or explicitly reset pre-0023 deletion jobs before retrying',
+            MESSAGE = 'migration 0024 cannot classify pre-existing resumable deletion jobs; drain or explicitly reset pre-0024 deletion jobs before retrying',
             HINT = 'see docs/RUNTIME.md for the required drain/reset procedure';
     END IF;
 END
