@@ -5029,6 +5029,106 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
 }
 
 #[tokio::test]
+async fn connect_shell_points_the_ios_ring_link_at_the_top_frame_only_when_embedded() {
+    let ios_rule = r#"if (/iPhone|iPad|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1)) {
+        if (authorizeButton) {
+          authorizeButton.target = "_top";
+        }"#;
+    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
+        let state =
+            test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
+                .with_legacy_creator_connect_flow_client(Arc::new(
+                    CountingLegacyConnectFlowClient::default(),
+                ));
+        let response = router(state)
+            .oneshot(empty_request(
+                "GET",
+                &format!(
+                    "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s{delivery}"
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+        // Android and desktop keep the untargeted link; only the iOS branch of the script retargets it.
+        assert!(body.contains(
+            "<a class=\"authorize-btn\" href=\"pubkyauth://signin?secret=fake-secret-flow-url\">"
+        ));
+        assert_eq!(body.contains(ios_rule), embedded, "delivery={delivery:?}");
+    }
+}
+
+#[tokio::test]
+async fn embedded_grant_connect_shell_adds_a_hidden_bitkit_link_for_ios() {
+    let ios_reveal = r#"if (bitkitButton) {
+          bitkitButton.target = "_top";
+          bitkitButton.hidden = false;
+        }"#;
+    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
+        let mut config = test_config(RuntimeEnvironment::Development, true);
+        config.creator_authority_acquisition.enabled = true;
+        config.creator_authority_acquisition.method =
+            CreatorAuthorityAcquisitionMethod::GrantConnect;
+        config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+            client_id: "locks.example".to_owned(),
+            allowed_return_origins: vec!["https://pubky.app".to_owned()],
+        });
+        let state = AppState::new_empty_in_memory(config)
+            .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+            .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+        let response = router(state)
+            .oneshot(empty_request(
+                "GET",
+                &format!(
+                    "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s{delivery}"
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+        // The Ring link is unchanged; the Bitkit link carries the same query and starts hidden.
+        assert!(body.contains(
+            "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\">"
+        ));
+        assert_eq!(
+            body.contains(
+                "<a class=\"authorize-btn bitkit-btn\" href=\"bitkit://pubky-auth/signin?secret=fake-grant\" hidden>"
+            ),
+            embedded,
+            "delivery={delivery:?}"
+        );
+        assert_eq!(body.contains(ios_reveal), embedded, "delivery={delivery:?}");
+    }
+}
+
+#[tokio::test]
+async fn embedded_legacy_connect_shell_offers_no_bitkit_link() {
+    let state =
+        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
+            .with_legacy_creator_connect_flow_client(Arc::new(
+                CountingLegacyConnectFlowClient::default(),
+            ));
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert!(!body.contains("bitkit://pubky-auth"));
+}
+
+#[tokio::test]
 async fn grant_connect_shell_rejects_origin_allowed_only_for_legacy_connect() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.enabled = true;
