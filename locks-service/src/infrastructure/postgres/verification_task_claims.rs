@@ -56,6 +56,20 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                   AND creator = split_part(submitted_proof_bundle->>'pubky_lock_resource', '/', 1)
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
                   AND invoice_admission_phase = 'ready'
+                  AND deletion_job_id IS NULL
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(submitted_proof_bundle->'proofs') AS proof
+                          WHERE proof->>'verifier_type' = 'paykit-payment'
+                      )
+                      OR (
+                          invoice_admission_intent IS NOT NULL
+                          AND invoice_created_at IS NOT NULL
+                          AND payment_deadline IS NOT NULL
+                          AND payment_deadline > invoice_created_at
+                      )
+                  )
                 ORDER BY submitted_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -102,6 +116,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
               AND claimed_by = $2
               AND claim_token = $3
               AND claim_expires_at > clock_timestamp()
+              AND deletion_job_id IS NULL
             RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -166,6 +181,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                AND claimed_by = $2
                AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
+               AND deletion_job_id IS NULL
              RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -281,6 +297,7 @@ mod tests {
             bundle_id: pending.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: pending.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         repository
             .insert_invoice_pending_task(pending.clone(), intent)

@@ -59,6 +59,8 @@ struct InvoiceAdmissionMetadataRow {
     next_attempt_at: Option<time::OffsetDateTime>,
     attempt_count: i32,
     invoice_admission_retry_reason: Option<String>,
+    invoice_created_at: Option<time::OffsetDateTime>,
+    payment_deadline: Option<time::OffsetDateTime>,
 }
 
 pub(super) const VERIFICATION_TASK_ROW_COLUMNS: &str = "
@@ -166,7 +168,11 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 terminal_reason = $10,
                 entitlement_to_publish = $11,
                 updated_at = now()
-            WHERE task_id = $1::uuid",
+            WHERE task_id = $1::uuid
+              AND NOT EXISTS (
+                  SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
+                  WHERE snapshot.verification_task_id = verification_tasks.task_id
+              )",
         )
         .bind(row.task_id)
         .bind(row.creator)
@@ -339,7 +345,7 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         let metadata = sqlx::query_as::<_, InvoiceAdmissionMetadataRow>(
             "SELECT invoice_admission_phase, invoice_admission_intent,
                     admission_deadline_at, next_attempt_at, attempt_count,
-                    invoice_admission_retry_reason
+                    invoice_admission_retry_reason, invoice_created_at, payment_deadline
              FROM verification_tasks
              WHERE task_id = $1::uuid AND invoice_admission_intent IS NOT NULL",
         )
@@ -401,6 +407,8 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             next_attempt_at: metadata.next_attempt_at,
             attempt_count,
             retry_reason,
+            invoice_created_at: metadata.invoice_created_at,
+            payment_deadline: metadata.payment_deadline,
         }))
     }
 
@@ -474,7 +482,14 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         _now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
+        if payment_deadline <= invoice_created_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "invoice payment deadline must follow invoice creation".to_owned(),
+            });
+        }
         let updated_task_id: Option<String> = sqlx::query_scalar(
             "WITH locked AS MATERIALIZED (
                  SELECT task_id FROM verification_tasks
@@ -486,6 +501,8 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
              )
              UPDATE verification_tasks AS task
              SET invoice_admission_phase = 'ready',
+                 invoice_created_at = $4,
+                 payment_deadline = $5,
                  invoice_admission_retry_reason = NULL,
                  claimed_by = NULL,
                  claim_token = NULL,
@@ -504,6 +521,8 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         .bind(task_id.to_string())
         .bind(worker_id)
         .bind(claim_token)
+        .bind(invoice_created_at)
+        .bind(payment_deadline)
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_error)?;
@@ -1023,6 +1042,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
 
         let inserted = original_repo
@@ -1080,6 +1100,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         repo.insert_invoice_pending_task(task.clone(), intent)
             .await
@@ -1096,6 +1117,8 @@ mod tests {
                 "worker-a",
                 &uuid::Uuid::new_v4(),
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -1132,6 +1155,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -1160,6 +1185,7 @@ mod tests {
                 bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
                 lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
                 reader,
+                payment_in: 24,
             },
         )
         .await
@@ -1211,6 +1237,7 @@ mod tests {
                     .reader_public_key
                     .clone()
                     .unwrap(),
+                payment_in: 24,
             },
         )
         .await
@@ -1251,6 +1278,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         repo.insert_invoice_pending_task(task.clone(), intent)
             .await
@@ -1325,6 +1353,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         repo.insert_invoice_pending_task(task.clone(), intent)
             .await
@@ -1365,6 +1394,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -1402,6 +1433,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         repo.insert_invoice_pending_task(task.clone(), intent)
             .await
@@ -1428,6 +1460,8 @@ mod tests {
                     "worker-a",
                     &claim_token,
                     time::OffsetDateTime::now_utc(),
+                    task.submitted_at,
+                    task.submitted_at + time::Duration::hours(24),
                 )
                 .await
         });
@@ -1463,6 +1497,7 @@ mod tests {
             bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
             lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             reader,
+            payment_in: 24,
         };
         original_repo
             .insert_invoice_pending_task(task.clone(), intent)

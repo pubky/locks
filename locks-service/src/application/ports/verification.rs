@@ -44,6 +44,8 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
 
     /// Returns exact live lease to durable due state without resetting attempts.

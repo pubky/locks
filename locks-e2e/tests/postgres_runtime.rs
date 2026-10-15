@@ -10,7 +10,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::post;
 use locks_core::ids::{
-    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
+    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
@@ -31,16 +31,19 @@ use locks_server::worker::{
 use locks_service::application::models::{
     AccessCredential, AccessCredentialLookupKey, ContentLockDeletionJob,
     ContentLockOwnershipStatus, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret, VerificationTaskStatus,
+    CreatorAuthoritySecret, VerificationTaskRecord, VerificationTaskStatus,
 };
-use locks_service::application::ports::ContentLockDeletionRepository;
+use locks_service::application::ports::{
+    ContentLockDeletionRepository, VerificationTaskRepository,
+};
 use locks_service::infrastructure::memory::{
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
     guarded_resources::InMemoryGuardedResourceRepository,
     lock_service_pointers::InMemoryLockServicePointerRepository,
 };
 use locks_service::infrastructure::postgres::{
-    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository, run_migrations,
+    CreatorAuthoritySecretCipher, PostgresContentLockDeletionRepository,
+    PostgresVerificationTaskRepository, run_migrations,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -117,6 +120,56 @@ async fn postgres_runtime_state_survives_app_state_recreation() {
         .await
         .unwrap();
     assert!(stored_credential.is_some());
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn manual_completion_rejects_legacy_paykit_task_without_authoritative_window() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let submitted = paykit_submission_for(&paykit_content_lock());
+    let task = VerificationTaskRecord {
+        task_id: TaskId::from_str(&uuid::Uuid::new_v4().to_string()).unwrap(),
+        creator: submitted.pubky_lock_resource.creator().clone(),
+        submitted_proof_bundle: submitted.clone(),
+        status: VerificationTaskStatus::Pending,
+        submitted_at: datetime!(2026-08-12 06:00:00 UTC),
+        started_at: None,
+        completed_at: None,
+        failure_message: None,
+        terminal_reason: None,
+        entitlement_to_publish: None,
+    };
+    PostgresVerificationTaskRepository::new(database.pool().clone())
+        .insert_verification_task(task.clone())
+        .await
+        .unwrap();
+
+    let state = app_state(database.pool().clone());
+    seed_content_lock(&state, paykit_content_lock()).await;
+    let response = router(state)
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-completions",
+            json!({
+                "creator": submitted.pubky_lock_resource.creator(),
+                "bundle_id": submitted.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "unsupported_verifier_type",
+                "message": "unsupported verifier type"
+            }
+        })
+    );
 
     database.cleanup().await;
 }

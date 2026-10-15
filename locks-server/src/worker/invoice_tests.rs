@@ -21,7 +21,9 @@ use super::invoice::{
     InvoiceAdmissionWorker, InvoiceErrorAction, InvoiceRetryJitter, InvoiceWorkerTick,
     invoice_error_action,
 };
-use crate::paykit_http_client::{PaykitClientError, PaykitInvoiceCreator, PaykitInvoiceRequest};
+use crate::paykit_http_client::{
+    PaykitClientError, PaykitInvoiceCreator, PaykitInvoiceRequest, PaykitInvoiceWindow,
+};
 
 #[tokio::test]
 async fn invoice_worker_uses_persisted_shape_and_task_id_then_marks_ready() {
@@ -59,6 +61,7 @@ async fn invoice_worker_uses_persisted_shape_and_task_id_then_marks_ready() {
                     .as_ref()
                     .unwrap()
                     .to_string(),
+                payment_in: 24,
             },
         )]
     );
@@ -473,9 +476,9 @@ impl PaykitInvoiceCreator for DeadlineCrossingInvoiceCreator<'_> {
         &self,
         _request_id: Uuid,
         _request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceWindow, PaykitClientError> {
         self.clock.set(self.response_at);
-        Ok(())
+        Ok(invoice_window())
     }
 }
 
@@ -512,12 +515,17 @@ impl PaykitInvoiceCreator for RecordingInvoiceCreator {
         &self,
         request_id: Uuid,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceWindow, PaykitClientError> {
         self.calls
             .lock()
             .unwrap()
             .push((request_id, request.clone()));
-        self.results.lock().unwrap().pop_front().unwrap()
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap()
+            .map(|()| invoice_window())
     }
 }
 
@@ -560,6 +568,14 @@ fn invoice_intent(task: &VerificationTaskRecord) -> InvoiceAdmissionIntentV1 {
             .reader_public_key
             .clone()
             .unwrap(),
+        payment_in: 24,
+    }
+}
+
+fn invoice_window() -> PaykitInvoiceWindow {
+    PaykitInvoiceWindow {
+        invoice_created_at: datetime!(2026-05-29 12:00:00 UTC),
+        payment_deadline: datetime!(2026-05-30 12:00:00 UTC),
     }
 }
 

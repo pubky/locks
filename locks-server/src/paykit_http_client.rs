@@ -5,6 +5,11 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::PaykitPaymentAsset;
+use locks_service::application::ports::{
+    PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError, PaymentDrainStatus,
+    PaymentDrainSummary, PaymentObservation, PaymentRequestState, PaymentRequestStatus,
+    PaymentState,
+};
 use locks_service::infrastructure::verifiers::paykit_payment::{
     PaykitPaymentObservation, PaykitPaymentRequestState as ServicePaymentRequestState,
     PaykitPaymentState as ServicePaymentState, PaykitPaymentStatus, PaykitPaymentStatusClient,
@@ -30,6 +35,7 @@ const INVOICE_ERROR_BODY_LIMIT: usize = 1_024;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 const PAYMENT_STATUS_BODY_LIMIT: usize = 2_048;
+const PAYMENT_DRAIN_BODY_LIMIT: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaykitClientError {
@@ -134,6 +140,13 @@ pub struct PaykitInvoiceRequest {
     pub bundle_id: String,
     pub lock_resource: String,
     pub reader: String,
+    pub payment_in: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaykitInvoiceWindow {
+    pub invoice_created_at: OffsetDateTime,
+    pub payment_deadline: OffsetDateTime,
 }
 
 #[async_trait]
@@ -142,7 +155,7 @@ pub trait PaykitInvoiceCreator: Send + Sync {
         &self,
         request_id: Uuid,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError>;
+    ) -> Result<PaykitInvoiceWindow, PaykitClientError>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +163,21 @@ pub trait PaykitInvoiceCreator: Send + Sync {
 struct PaykitInvoiceResponse {
     invoice_created_at: String,
     payment_deadline: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentDrainRequest<'a> {
+    lock_resource: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentDrainResponse {
+    status: String,
+    accepted_count: u64,
+    terminal_count: u64,
+    cancellation_enqueued_count: u64,
+    cleanup_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,7 +349,7 @@ impl PaykitHttpClient {
         &self,
         request_id: Uuid,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceWindow, PaykitClientError> {
         let started = Instant::now();
         let response = match self
             .signed_post_with_request_id("invoices", request, Some(request_id))
@@ -387,7 +415,10 @@ impl PaykitHttpClient {
             elapsed_ms = elapsed_millis(started),
             "Paykit request completed"
         );
-        Ok(())
+        Ok(PaykitInvoiceWindow {
+            invoice_created_at,
+            payment_deadline,
+        })
     }
 
     pub async fn connection_status(
@@ -439,6 +470,37 @@ impl PaykitHttpClient {
             .json::<PaykitSetupStatus>()
             .await
             .map_err(PaykitClientError::InvalidStatusResponse)
+    }
+
+    async fn payment_drain(
+        &self,
+        path: &str,
+        lock_resource: &str,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+        let response = self
+            .signed_post(path, &PaymentDrainRequest { lock_resource })
+            .await
+            .map_err(|_| PaymentDrainClientError::Transport)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        map_payment_drain_status(response.status())?;
+        let body: PaymentDrainResponse = read_bounded_json(response, PAYMENT_DRAIN_BODY_LIMIT)
+            .await
+            .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+        let status = PaymentDrainStatus::parse(&body.status)
+            .ok_or(PaymentDrainClientError::MalformedSuccess)?;
+        if (status == PaymentDrainStatus::Completed) != (body.accepted_count == 0) {
+            return Err(PaymentDrainClientError::MalformedSuccess);
+        }
+        Ok(Some(PaymentDrainSummary {
+            status,
+            accepted_count: body.accepted_count,
+            terminal_count: body.terminal_count,
+            cancellation_enqueued_count: body.cancellation_enqueued_count,
+            cleanup_token: PaymentDrainCleanupToken::parse(&body.cleanup_token)
+                .ok_or(PaymentDrainClientError::MalformedSuccess)?,
+        }))
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -496,13 +558,122 @@ impl PaykitInvoiceCreator for PaykitHttpClient {
         &self,
         request_id: Uuid,
         request: &PaykitInvoiceRequest,
-    ) -> Result<(), PaykitClientError> {
+    ) -> Result<PaykitInvoiceWindow, PaykitClientError> {
         PaykitHttpClient::create_invoice(self, request_id, request).await
+    }
+}
+
+#[async_trait]
+impl PaymentDrainClient for PaykitHttpClient {
+    async fn start_payment_drain(
+        &self,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+    ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+        self.payment_drain("payment-request-drains", &lock_resource.to_string())
+            .await?
+            .ok_or(PaymentDrainClientError::NotFound)
+    }
+
+    async fn lookup_payment_drain(
+        &self,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+        self.payment_drain("payment-request-drain-lookups", &lock_resource.to_string())
+            .await
+    }
+
+    async fn payment_request_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+        let status = PaykitHttpClient::payment_request_status(
+            self,
+            &PaykitStatusRequest {
+                creator: creator.to_string(),
+                bundle_id: bundle_id.to_string(),
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            PaykitClientError::NonSuccess {
+                status: StatusCode::NOT_FOUND,
+                ..
+            } => PaymentDrainClientError::NotFound,
+            PaykitClientError::NonSuccess {
+                status: StatusCode::CONFLICT,
+                ..
+            } => PaymentDrainClientError::Conflict,
+            PaykitClientError::InvalidPaymentStatusJson(_)
+            | PaykitClientError::InvalidPaymentStatusResponse(_)
+            | PaykitClientError::StatusBodyTooLarge
+            | PaykitClientError::InvalidStatusTimestamps => {
+                PaymentDrainClientError::MalformedSuccess
+            }
+            _ => PaymentDrainClientError::Transport,
+        })?;
+        Ok(Some(PaymentRequestStatus {
+            request_state: match status.request_state {
+                PaykitPaymentRequestState::Proposed => PaymentRequestState::Proposed,
+                PaykitPaymentRequestState::ProposalExpired => PaymentRequestState::ProposalExpired,
+                PaykitPaymentRequestState::Accepted => PaymentRequestState::Accepted,
+                PaykitPaymentRequestState::Rejected => PaymentRequestState::Rejected,
+                PaykitPaymentRequestState::Canceled => PaymentRequestState::Canceled,
+                PaykitPaymentRequestState::ProofSubmitted => PaymentRequestState::ProofSubmitted,
+                PaykitPaymentRequestState::ActiveRecurring => PaymentRequestState::ActiveRecurring,
+            },
+            payment_state: match status.payment_state {
+                PaykitPaymentState::Undetected => PaymentState::Undetected,
+                PaykitPaymentState::Detected => PaymentState::Detected,
+                PaykitPaymentState::Confirmed => PaymentState::Confirmed,
+                PaykitPaymentState::Expired => PaymentState::Expired,
+            },
+            invoice_created_at: status.invoice_created_at,
+            payment_deadline: status.payment_deadline,
+            bitcoin: status.bitcoin.map(|payment| PaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
+            usdt_arbitrum: status.usdt_arbitrum.map(|payment| PaymentObservation {
+                confirmations: payment.confirmations,
+                amount_matched: payment.amount_matched,
+                paid_on_time: payment.paid_on_time,
+            }),
+        }))
     }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+async fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T, ()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| ())
+}
+
+fn map_payment_drain_status(status: StatusCode) -> Result<(), PaymentDrainClientError> {
+    match status {
+        StatusCode::OK => Ok(()),
+        StatusCode::CONFLICT => Err(PaymentDrainClientError::Conflict),
+        _ => Err(PaymentDrainClientError::Server),
+    }
 }
 
 fn safe_retry_after_seconds(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
@@ -809,7 +980,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(body).unwrap(),
             format!(
-                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"reader\":\"{READER}\"}}"
+                "{{\"bundle_id\":\"{BUNDLE_ID}\",\"lock_resource\":\"{LOCK_RESOURCE}\",\"payment_in\":24,\"reader\":\"{READER}\"}}"
             )
         );
     }
@@ -1300,6 +1471,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn payment_drain_status_preserves_bitcoin_and_usdt_observations() {
+        for (bitcoin, usdt_arbitrum) in [
+            (
+                json!({"confirmations": 6, "amount_matched": true, "paid_on_time": true}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::Value::Null,
+                json!({"confirmations": 1, "amount_matched": true, "paid_on_time": true, "finalized": false}),
+            ),
+        ] {
+            let bitcoin_present = !bitcoin.is_null();
+            let usdt_present = !usdt_arbitrum.is_null();
+            let body = json!({
+                "request_state": "accepted",
+                "payment_state": "confirmed",
+                "invoice_created_at": "2026-09-25T11:00:00Z",
+                "payment_deadline": "2026-09-25T12:00:00Z",
+                "bitcoin": bitcoin,
+                "usdt_arbitrum": usdt_arbitrum,
+            });
+            let server_url = spawn_configured_status_server(
+                StatusCode::OK,
+                Box::leak(body.to_string().into_boxed_str()),
+            )
+            .await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            let status = PaymentDrainClient::payment_request_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(status.bitcoin.is_some(), bitcoin_present);
+            assert_eq!(status.usdt_arbitrum.is_some(), usdt_present);
+            let observation = status.bitcoin.or(status.usdt_arbitrum).unwrap();
+            assert!(observation.amount_matched);
+            assert!(observation.paid_on_time);
+            assert!(observation.confirmations > 0);
+        }
+    }
+
     #[test]
     fn payment_request_status_rejects_invalid_bitcoin_observations() {
         for bitcoin in [
@@ -1516,6 +1739,7 @@ mod tests {
             bundle_id: BUNDLE_ID.to_owned(),
             lock_resource: LOCK_RESOURCE.to_owned(),
             reader: READER.to_owned(),
+            payment_in: 24,
         }
     }
 

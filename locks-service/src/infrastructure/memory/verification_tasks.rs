@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{RwLock as SyncRwLock, Weak};
+use std::sync::{Arc, RwLock as SyncRwLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -14,13 +14,23 @@ use crate::application::models::{
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
 use crate::infrastructure::memory::verification_task_claims::InMemoryVerificationTaskClaimer;
+use crate::infrastructure::memory::verification_task_deletion_fence::{
+    InMemoryVerificationTaskDeletionFence, InMemoryVerificationTaskFenceRecord,
+};
 
 /// In-memory verification task repository.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
     invoice_admissions: RwLock<HashMap<TaskId, MemoryInvoiceAdmission>>,
     verification_task_claimer: SyncRwLock<Option<Weak<InMemoryVerificationTaskClaimer>>>,
+    verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+}
+
+impl Default for InMemoryVerificationTaskRepository {
+    fn default() -> Self {
+        Self::with_verification_task_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +45,17 @@ impl InMemoryVerificationTaskRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_verification_task_fence(
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            invoice_admissions: RwLock::new(HashMap::new()),
+            verification_task_claimer: SyncRwLock::new(None),
+            verification_task_fence,
+        }
     }
 
     /// Connects tasks created here to the paired in-memory verification claimer.
@@ -57,6 +78,18 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let lock_key = (
+            task.creator.clone(),
+            task.submitted_proof_bundle
+                .pubky_lock_resource
+                .lock_id()
+                .clone(),
+        );
+        let deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.read().await;
+        if deletion_cutoffs.contains(&lock_key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let mut fence = self.verification_task_fence.records.write().await;
         let mut records = self.records.write().await;
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
@@ -76,8 +109,14 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 record: "verification_task",
             });
         }
+        fence.insert(
+            task.task_id,
+            InMemoryVerificationTaskFenceRecord::new(&task),
+        );
         records.insert(task.task_id, task.clone());
         drop(records);
+        drop(fence);
+        drop(deletion_cutoffs);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::Ready)
@@ -124,6 +163,11 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
     }
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
+        self.verification_task_fence
+            .records
+            .write()
+            .await
+            .remove(task_id);
         self.records.write().await.remove(task_id);
         self.invoice_admissions.write().await.remove(task_id);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -141,6 +185,18 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         intent: InvoiceAdmissionIntentV1,
     ) -> Result<InvoiceAdmissionRecord, ApplicationError> {
         validate_invoice_admission_inputs(&task, &intent)?;
+        let lock_key = (
+            task.creator.clone(),
+            task.submitted_proof_bundle
+                .pubky_lock_resource
+                .lock_id()
+                .clone(),
+        );
+        let deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.read().await;
+        if deletion_cutoffs.contains(&lock_key) {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let mut fence = self.verification_task_fence.records.write().await;
         let mut records = self.records.write().await;
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
@@ -172,6 +228,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             next_attempt_at: Some(task.submitted_at),
             attempt_count: 0,
             retry_reason: None,
+            invoice_created_at: None,
+            payment_deadline: None,
         };
         self.invoice_admissions.write().await.insert(
             task.task_id,
@@ -182,8 +240,14 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 claim_expires_at: None,
             },
         );
+        fence.insert(
+            task.task_id,
+            InMemoryVerificationTaskFenceRecord::new(&task),
+        );
         records.insert(task.task_id, task.clone());
         drop(records);
+        drop(fence);
+        drop(deletion_cutoffs);
         if let Some(claimer) = self.verification_task_claimer() {
             claimer
                 .register_task(task, InvoiceAdmissionPhase::InvoicePending)
@@ -253,7 +317,14 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError> {
+        if payment_deadline <= invoice_created_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "invoice payment deadline must follow invoice creation".to_owned(),
+            });
+        }
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
             state.record.phase == InvoiceAdmissionPhase::InvoicePending
@@ -266,6 +337,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             return Ok(None);
         };
         state.record.phase = InvoiceAdmissionPhase::Ready;
+        state.record.invoice_created_at = Some(invoice_created_at);
+        state.record.payment_deadline = Some(payment_deadline);
         state.record.next_attempt_at = None;
         state.record.retry_reason = None;
         state.claimed_by = None;
@@ -351,6 +424,7 @@ fn validate_invoice_admission_inputs(
     intent: &InvoiceAdmissionIntentV1,
 ) -> Result<(), ApplicationError> {
     if intent.version != INVOICE_ADMISSION_INTENT_VERSION
+        || intent.payment_in == 0
         || task.status != VerificationTaskStatus::Pending
         || task.creator != intent.creator
         || task.submitted_proof_bundle.bundle_id != intent.bundle_id
@@ -627,6 +701,8 @@ mod tests {
                 "worker-a",
                 &uuid::Uuid::new_v4(),
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -663,6 +739,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 task.submitted_at,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -939,6 +1017,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 inserted.admission_deadline_at + time::Duration::seconds(10),
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap()
@@ -999,6 +1079,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 after_lease,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -1016,6 +1098,8 @@ mod tests {
                 "worker-a",
                 &claim.claim_token,
                 after_lease,
+                task.submitted_at,
+                task.submitted_at + time::Duration::hours(24),
             )
             .await
             .unwrap(),
@@ -1075,6 +1159,7 @@ mod tests {
                 "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
             )
             .unwrap(),
+            payment_in: 24,
         }
     }
 }

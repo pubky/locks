@@ -237,7 +237,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=20).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=23).collect::<Vec<_>>());
 
         sqlx::query(
             "INSERT INTO frontend_sessions (token_hash, creator, created_at, expires_at)
@@ -253,6 +253,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_count, 1, "restart repeated the destructive reset");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn exact_pr18_migration_prefix_upgrades_through_pr19_without_collision() {
+        let database = TestDatabase::create_unmigrated().await;
+        let pr18 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(20).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+
+        pr18.run(database.pool()).await.unwrap();
+        let pr18_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(pr18_versions, (1..=20).collect::<Vec<_>>());
+
+        super::run_migrations(database.pool()).await.unwrap();
+        let upgraded_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(upgraded_versions, (1..=23).collect::<Vec<_>>());
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_changes_deletion_job_task_reference_to_set_null() {
+        let database = TestDatabase::create_unmigrated().await;
+        let prior_schema = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(22).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        prior_schema.run(database.pool()).await.unwrap();
+
+        let before: String = sqlx::query_scalar(
+            "SELECT confdeltype::text
+             FROM pg_constraint
+             WHERE conrelid = 'verification_tasks'::regclass
+               AND conname = 'verification_tasks_deletion_job_id_fkey'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(before, "a", "prior schema must retain NO ACTION semantics");
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        let after: String = sqlx::query_scalar(
+            "SELECT confdeltype::text
+             FROM pg_constraint
+             WHERE conrelid = 'verification_tasks'::regclass
+               AND conname = 'verification_tasks_deletion_job_id_fkey'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, "n", "upgrade must install ON DELETE SET NULL");
 
         database.cleanup().await;
     }

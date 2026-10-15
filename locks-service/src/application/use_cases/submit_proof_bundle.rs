@@ -122,6 +122,7 @@ impl<'a> SubmitProofBundleUseCase<'a> {
         &self,
         request: SubmitProofBundleRequest,
         admissions: &dyn InvoiceAdmissionRepository,
+        payment_in: u64,
     ) -> Result<SubmittedVerificationTask, ApplicationError> {
         let submitted_proof_bundle = request.submitted_proof_bundle;
         if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
@@ -153,6 +154,7 @@ impl<'a> SubmitProofBundleUseCase<'a> {
                     bundle_id: submitted_proof_bundle.bundle_id,
                     lock_resource: submitted_proof_bundle.pubky_lock_resource,
                     reader,
+                    payment_in,
                 },
             )
             .await?;

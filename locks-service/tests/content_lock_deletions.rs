@@ -297,7 +297,7 @@ async fn retry_due_time_and_force_receipts_are_durable_repository_facts() {
 }
 
 #[tokio::test]
-async fn synchronous_force_receipt_retains_manifest_until_explicit_completion() {
+async fn synchronous_force_receipt_retains_terminal_job_fence_and_manifest() {
     let repository = InMemoryContentLockDeletionRepository::new();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     repository.insert_job(job.clone()).await.unwrap();
@@ -335,7 +335,9 @@ async fn synchronous_force_receipt_retains_manifest_until_explicit_completion() 
             .get_job(&job.creator, &job.lock_id)
             .await
             .unwrap()
-            .is_some()
+            .is_some_and(|stored| {
+                stored.job_id == job.job_id && stored.state == ContentLockDeletionState::Failed
+            })
     );
 
     let reopened = repository

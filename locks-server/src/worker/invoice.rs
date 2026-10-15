@@ -103,13 +103,14 @@ impl<'a> InvoiceAdmissionWorker<'a> {
             bundle_id: intent.bundle_id.to_string(),
             lock_resource: intent.lock_resource.to_string(),
             reader: intent.reader.to_string(),
+            payment_in: intent.payment_in,
         };
         match self
             .paykit
             .create_invoice(task_id.as_uuid(), &request)
             .await
         {
-            Ok(()) => {
+            Ok(window) => {
                 let updated = self
                     .admissions
                     .mark_invoice_admission_ready(
@@ -117,6 +118,8 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                         &self.worker_id,
                         &claim.claim_token,
                         self.clock.now(),
+                        window.invoice_created_at,
+                        window.payment_deadline,
                     )
                     .await?;
                 Ok(if updated.is_some() {

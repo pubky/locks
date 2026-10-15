@@ -7,7 +7,10 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     CriterionVerificationOutcome, CriterionVerificationRequest, VerificationTerminalReason,
 };
-use crate::application::ports::CriterionVerifier;
+use crate::application::ports::{CriterionVerifier, payment_qualifies};
+pub use crate::application::ports::{
+    PaymentObservation as PaykitPaymentObservation, PaymentState as PaykitPaymentState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaykitPaymentRequestState {
@@ -21,27 +24,11 @@ pub enum PaykitPaymentRequestState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaykitPaymentState {
-    Undetected,
-    Detected,
-    Confirmed,
-    Expired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaykitPaymentStatus {
     pub request_state: PaykitPaymentRequestState,
     pub payment_state: PaykitPaymentState,
     pub bitcoin: Option<PaykitPaymentObservation>,
     pub usdt_arbitrum: Option<PaykitPaymentObservation>,
-}
-
-/// Current payment evidence verified by the Paykit server for one payment rail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaykitPaymentObservation {
-    pub confirmations: u32,
-    pub amount_matched: bool,
-    pub paid_on_time: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,33 +137,17 @@ fn payment_status_decision(
     if let Some(reason) = terminal_reason {
         return CriterionVerificationOutcome::TerminalUnsatisfied(reason);
     }
-    // Each rail must independently cover the full invoice within its payment window.
-    // Arbitrum inclusion is sufficient; Bitcoin keeps the operator's confirmation policy.
-    let bitcoin_paid = status.bitcoin.is_some_and(|payment| {
-        payment.amount_matched
-            && payment.paid_on_time
-            && payment.confirmations >= minimum_confirmations
-            && matches!(
-                (minimum_confirmations, status.payment_state),
-                (
-                    0,
-                    PaykitPaymentState::Detected | PaykitPaymentState::Confirmed
-                ) | (_, PaykitPaymentState::Confirmed)
-            )
-    });
-    let usdt_paid = status.usdt_arbitrum.is_some_and(|payment| {
-        payment.amount_matched
-            && payment.paid_on_time
-            && payment.confirmations > 0
-            && status.payment_state == PaykitPaymentState::Confirmed
-    });
-    let satisfied = (bitcoin_paid || usdt_paid)
-        && matches!(
-            status.request_state,
-            PaykitPaymentRequestState::Accepted
-                | PaykitPaymentRequestState::ProofSubmitted
-                | PaykitPaymentRequestState::ActiveRecurring
-        );
+    let satisfied = payment_qualifies(
+        status.payment_state,
+        status.bitcoin,
+        status.usdt_arbitrum,
+        minimum_confirmations,
+    ) && matches!(
+        status.request_state,
+        PaykitPaymentRequestState::Accepted
+            | PaykitPaymentRequestState::ProofSubmitted
+            | PaykitPaymentRequestState::ActiveRecurring
+    );
     if satisfied {
         CriterionVerificationOutcome::Satisfied(
             locks_core::verification::CriterionVerificationResult {

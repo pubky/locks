@@ -871,6 +871,7 @@ impl FakePaykitServer {
                 "bundle_id": BUNDLE_ID,
                 "lock_resource": lock_resource,
                 "reader": creator().to_string(),
+                "payment_in": 24,
             }))
         );
         let signature = state
