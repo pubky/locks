@@ -8,18 +8,24 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{ContentLockOwnership, ContentLockOwnershipStatus};
 use crate::application::ports::ContentLockOwnershipRepository;
 
-type OwnershipKey = (CreatorPubky, String);
+pub(super) type OwnershipKey = (CreatorPubky, String);
+pub(super) type OwnershipRecords =
+    std::sync::Arc<RwLock<HashMap<OwnershipKey, ContentLockOwnership>>>;
 
 /// In-memory exclusive guarded-path ownership repository for tests and ephemeral runtime.
 #[derive(Debug, Default)]
 pub struct InMemoryContentLockOwnershipRepository {
-    records: RwLock<HashMap<OwnershipKey, ContentLockOwnership>>,
+    records: OwnershipRecords,
 }
 
 impl InMemoryContentLockOwnershipRepository {
     /// Creates an empty repository.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn records(&self) -> OwnershipRecords {
+        self.records.clone()
     }
 }
 

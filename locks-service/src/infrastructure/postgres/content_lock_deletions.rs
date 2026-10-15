@@ -17,8 +17,8 @@ use crate::application::{
         PrepareForceDeletionResult,
     },
     ports::{
-        ContentLockDeletionRepository, PublicationRecovery, publication_intent_matches_request,
-        publication_reconciliation_matches,
+        ContentLockDeletionRepository, PublicationRecovery, publication_guarded_paths,
+        publication_intent_matches_request, publication_reconciliation_matches,
     },
 };
 use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
@@ -56,11 +56,30 @@ struct ForceDeletionReceiptRow {
 #[derive(Debug, Clone)]
 pub struct PostgresContentLockDeletionRepository {
     pool: PgPool,
+    #[cfg(test)]
+    compensation_barrier: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
 }
 
 impl PostgresContentLockDeletionRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            compensation_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_compensation_barrier(
+        mut self,
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.compensation_barrier = Some((started, release));
+        self
     }
 }
 
@@ -133,6 +152,73 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError> {
         delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
+    }
+
+    async fn compensate_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let original_content_lock = sqlx::query_as::<_, (Option<serde_json::Value>,)>(
+            "SELECT original_content_lock FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2 AND publication_token = $3
+               AND external_write_completed_at IS NULL
+             FOR UPDATE",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(publication_token)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some((original_content_lock,)) = original_content_lock else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        };
+        let original_content_lock =
+            original_content_lock.ok_or_else(|| ApplicationError::Storage {
+                message: "content lock publication intent lacks canonical material".to_owned(),
+            })?;
+        let original_content_lock = serde_json::from_value::<ContentLock>(original_content_lock)
+            .map_err(storage_display)?;
+        let guarded_paths = publication_guarded_paths(&original_content_lock);
+        #[cfg(test)]
+        if let Some((started, release)) = &self.compensation_barrier {
+            started.notify_one();
+            release.notified().await;
+        }
+        for guarded_path in guarded_paths
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            sqlx::query(
+                "DELETE FROM content_lock_ownership
+                 WHERE creator = $1 AND guarded_path = $2 AND lock_id = $3
+                   AND status = 'reserved'",
+            )
+            .bind(creator.to_string())
+            .bind(guarded_path)
+            .bind(lock_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        let removed = sqlx::query(
+            "DELETE FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2 AND publication_token = $3
+               AND external_write_completed_at IS NULL",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(publication_token)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(removed.rows_affected() == 1)
     }
 
     async fn reconcile_publication(
@@ -220,7 +306,6 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        replacement_token: Uuid,
         requested_content_lock: &ContentLock,
     ) -> Result<PublicationRecovery, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
@@ -273,20 +358,8 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                         content_lock: original_content_lock,
                     }
                 } else {
-                    sqlx::query(
-                        "UPDATE content_lock_publication_intents
-                         SET publication_token = $3
-                         WHERE creator = $1 AND lock_id = $2
-                           AND external_write_completed_at IS NULL",
-                    )
-                    .bind(creator.to_string())
-                    .bind(lock_id.to_string())
-                    .bind(replacement_token)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-                    PublicationRecovery::RetryWithToken {
-                        publication_token: replacement_token,
+                    PublicationRecovery::Pending {
+                        publication_token,
                         content_lock: original_content_lock,
                     }
                 }
@@ -1579,12 +1652,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .recover_publication(
-                    &graceful_lock.creator,
-                    &graceful_lock_id,
-                    Uuid::new_v4(),
-                    &graceful_lock,
-                )
+                .recover_publication(&graceful_lock.creator, &graceful_lock_id, &graceful_lock,)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
@@ -1613,12 +1681,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .recover_publication(
-                    &force_lock.creator,
-                    &force_lock_id,
-                    Uuid::new_v4(),
-                    &force_lock,
-                )
+                .recover_publication(&force_lock.creator, &force_lock_id, &force_lock,)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );

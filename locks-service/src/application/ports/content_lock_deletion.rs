@@ -26,8 +26,9 @@ pub enum PublicationRecovery {
         publication_token: Uuid,
         content_lock: ContentLock,
     },
-    /// Caller owns the replaced intent token and must re-PUT exact canonical bytes.
-    RetryWithToken {
+    /// Exact canonical material is retained, but write completion is still ambiguous.
+    /// Callers must neither trust readback from an unknown attempt nor dispatch another write.
+    Pending {
         publication_token: Uuid,
         content_lock: ContentLock,
     },
@@ -63,6 +64,14 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
+    /// Atomically removes an exact uncompleted intent and its reserved ownership set.
+    async fn compensate_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError>;
+
     /// Validates and clears a retained write-complete intent against exact canonical bytes and
     /// guarded paths. Ownership promotion follows only after this reconciliation succeeds.
     async fn reconcile_publication(
@@ -80,13 +89,13 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
 
-    /// Checks deletion admission, authenticates retained canonical publication material, and
-    /// claims an uncompleted exact intent for safe identical retry.
+    /// Checks deletion admission and authenticates retained canonical publication material.
+    /// Uncompleted intents retain their original token so concurrent or ambiguous writes cannot
+    /// be superseded and later escape the deletion fence.
     async fn recover_publication(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        replacement_token: Uuid,
         requested_content_lock: &ContentLock,
     ) -> Result<PublicationRecovery, ApplicationError>;
 
@@ -220,4 +229,13 @@ pub(crate) fn publication_intent_matches_request(
     let mut expected = requested_content_lock.clone();
     expected.created_at = original_content_lock.created_at;
     &expected == original_content_lock
+}
+
+pub(crate) fn publication_guarded_paths(content_lock: &ContentLock) -> Vec<String> {
+    content_lock
+        .primary_resource
+        .iter()
+        .map(|resource| resource.path.clone())
+        .chain(content_lock.secondary_resources.keys().cloned())
+        .collect()
 }

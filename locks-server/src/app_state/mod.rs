@@ -30,7 +30,6 @@ use locks_service::{
     infrastructure::{
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
-            content_lock_deletions::InMemoryContentLockDeletionRepository,
             content_lock_ownership::InMemoryContentLockOwnershipRepository,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
@@ -659,19 +658,24 @@ impl AppState {
                 ))
             })
         });
-        let content_lock_deletions: Arc<dyn ContentLockDeletionRepository> =
-            match postgres_pool.as_ref() {
-                Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
-                None => Arc::new(
-                    InMemoryContentLockDeletionRepository::with_verification_task_fence(
-                        private_runtime
-                            .verification_task_deletion_fence
-                            .as_ref()
-                            .cloned()
-                            .expect("in-memory runtime must share verification deletion fence"),
-                    ),
-                ),
-            };
+        let mut private_runtime = private_runtime;
+        let content_lock_deletions: Arc<dyn ContentLockDeletionRepository> = match postgres_pool
+            .as_ref()
+        {
+            Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
+            None => {
+                let verification_task_fence = private_runtime
+                    .verification_task_deletion_fence
+                    .as_ref()
+                    .cloned()
+                    .expect("in-memory runtime must share verification deletion fence");
+                let (deletions, ownership) = locks_service::infrastructure::memory::content_lock_publication_repositories_with_verification_task_fence(
+                        verification_task_fence,
+                    );
+                private_runtime.content_lock_ownership = Arc::new(ownership);
+                Arc::new(deletions)
+            }
+        };
         let payment_drains = postgres_pool.as_ref().map(|pool| {
             Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
                 as Arc<dyn PaymentDrainRepository>
