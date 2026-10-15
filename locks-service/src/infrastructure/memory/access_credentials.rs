@@ -413,19 +413,12 @@ impl InMemoryAccessCredentialStore {
             if !owns_live_no_paykit_claim(deletion, worker_id, claim_token, now) {
                 return Ok(false);
             }
-            if deletion
-                .bundle_snapshots
-                .values()
-                .any(|snapshot| snapshot.paykit_admission_required)
-            {
-                return Err(invalid_deletion_state(
-                    "non-Paykit deletion drain cannot process a Paykit snapshot",
-                ));
-            }
             deletion
                 .bundle_snapshots
                 .values()
-                .filter(|snapshot| snapshot.resolved_status.is_none())
+                .filter(|snapshot| {
+                    !snapshot.paykit_admission_required && snapshot.resolved_status.is_none()
+                })
                 .map(|snapshot| snapshot.task_id)
                 .collect::<Vec<_>>()
         };
@@ -456,7 +449,7 @@ impl InMemoryAccessCredentialStore {
             return Ok(false);
         }
         for snapshot in deletion.bundle_snapshots.values_mut() {
-            if snapshot.resolved_status.is_none() {
+            if !snapshot.paykit_admission_required && snapshot.resolved_status.is_none() {
                 snapshot.resolved_status = Some(VerificationTaskStatus::Expired);
                 snapshot.resolved_at = Some(now);
             }

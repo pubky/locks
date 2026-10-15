@@ -4,6 +4,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
+use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
     PrepareForceDeletionResult,
@@ -143,6 +144,12 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
     };
 
     validate_content_lock_identity(&content_lock, &creator, &lock_id)?;
+    content_lock.validate_resource_set().map_err(|error| {
+        ApiError::from(ApplicationError::InvalidGuardedResource {
+            message: error.to_string(),
+        })
+    })?;
+    validate_persisted_content_lock_limits(&content_lock, state.config().content_locks.clone())?;
 
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now())?;
     match state.content_lock_deletions().insert_job(job.clone()).await {
@@ -527,6 +534,42 @@ fn validate_content_lock_limits(
         total_size = total_size.saturating_add(primary_resource.size);
     }
     for secondary_resource in request.secondary_resources.values() {
+        validate_descriptor_size(secondary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(secondary_resource.size);
+    }
+    if total_size > limits.max_total_resource_bytes {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "content lock total resource size exceeds {} bytes",
+                limits.max_total_resource_bytes
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_persisted_content_lock_limits(
+    content_lock: &locks_core::lock_policy::ContentLock,
+    limits: crate::config::ContentLocksConfig,
+) -> Result<(), ApiError> {
+    if content_lock.resource_count() > limits.max_resources {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "content lock must include at most {} resources",
+                limits.max_resources
+            ),
+        ));
+    }
+
+    let mut total_size = 0_u64;
+    if let Some(primary_resource) = &content_lock.primary_resource {
+        validate_descriptor_size(primary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(primary_resource.size);
+    }
+    for secondary_resource in content_lock.secondary_resources.values() {
         validate_descriptor_size(secondary_resource.size, &limits)?;
         total_size = total_size.saturating_add(secondary_resource.size);
     }

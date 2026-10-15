@@ -67,6 +67,8 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
     ) -> DeletionPhaseExecution {
+        let job_id = claim.job.job_id;
+        let claim_token = claim.claim_token;
         let mut evidence = DeletionDependencyEvidence::none();
         match self
             .execute_claimed_observed(claim, worker_id, &mut evidence)
@@ -76,6 +78,44 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 .with_evidence(evidence),
             Ok(false) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Deferred)
                 .with_evidence(evidence),
+            Err(
+                ApplicationError::InvalidVerificationTaskState { .. }
+                | ApplicationError::InvalidContentLockDeletionState { .. },
+            ) => match self
+                .deletions
+                .finish(
+                    job_id,
+                    worker_id,
+                    claim_token,
+                    Some(crate::application::models::ContentLockDeletionFailureCode::StateCorrupt),
+                )
+                .await
+            {
+                Ok(Some(_)) => {
+                    DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::TerminalFailed)
+                        .with_evidence(evidence)
+                        .with_evidence(DeletionDependencyEvidence::healthy(
+                            DeletionDependencySource::RepositoryTerminalMutation,
+                        ))
+                }
+                Ok(None) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::ClaimLost)
+                    .with_evidence(evidence),
+                Err(finish_error) => {
+                    let outcome = match classify_deletion_execution_error(&finish_error) {
+                        DeletionExecutionErrorClass::TransientDependency => {
+                            DeletionPhaseExecutionOutcome::TransientDependencyFailure
+                        }
+                        DeletionExecutionErrorClass::Fatal => {
+                            DeletionPhaseExecutionOutcome::FatalFailure
+                        }
+                    };
+                    DeletionPhaseExecution::new(outcome)
+                        .with_evidence(evidence)
+                        .with_evidence(DeletionDependencyEvidence::unavailable(
+                            DeletionDependencySource::RepositoryTerminalMutation,
+                        ))
+                }
+            },
             Err(error) => {
                 let outcome = match classify_deletion_execution_error(&error) {
                     DeletionExecutionErrorClass::TransientDependency => {
@@ -113,6 +153,26 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         worker_id: &str,
         evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
+        if !self
+            .deletions
+            .expire_unresolved_non_paykit_tasks(claim.job.job_id, worker_id, claim.claim_token)
+            .await?
+        {
+            return Ok(false);
+        }
+        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+        let obligations = self.drains.list_obligations(claim.job.job_id).await?;
+        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+        if obligations.is_empty() {
+            return self
+                .advance_to(
+                    &claim,
+                    worker_id,
+                    ContentLockDeletionPhase::DrainPayments,
+                    evidence,
+                )
+                .await;
+        }
         let lock_resource = lock_resource(&claim);
         let summary = match self.paykit.start_payment_drain(&lock_resource).await {
             Ok(summary) => {
@@ -157,30 +217,13 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Err(error);
             }
         }
-        match self
-            .deletions
-            .advance_phase(
-                claim.job.job_id,
-                worker_id,
-                claim.claim_token,
-                ContentLockDeletionPhase::DrainPayments,
-            )
-            .await
-        {
-            Ok(AdvanceContentLockDeletionPhaseResult::Advanced(_)) => {
-                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
-                Ok(true)
-            }
-            Ok(AdvanceContentLockDeletionPhaseResult::ClaimLost) => Ok(false),
-            Ok(_) => {
-                observe_healthy(evidence, DeletionDependencySource::RepositoryPhaseMutation);
-                Ok(false)
-            }
-            Err(error) => {
-                observe_unavailable(evidence, DeletionDependencySource::RepositoryPhaseMutation);
-                Err(error)
-            }
-        }
+        self.advance_to(
+            &claim,
+            worker_id,
+            ContentLockDeletionPhase::DrainPayments,
+            evidence,
+        )
+        .await
     }
 
     async fn drain(
@@ -189,6 +232,29 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         worker_id: &str,
         evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
+        if !self
+            .deletions
+            .expire_unresolved_non_paykit_tasks(claim.job.job_id, worker_id, claim.claim_token)
+            .await?
+        {
+            return Ok(false);
+        }
+        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+        let obligations = match self.drains.list_obligations(claim.job.job_id).await {
+            Ok(obligations) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                obligations
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                return Err(error);
+            }
+        };
+        if obligations.is_empty() {
+            return self
+                .advance_completed_drain(claim, worker_id, evidence)
+                .await;
+        }
         let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
             Ok(Some(persisted)) => {
                 observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
@@ -199,16 +265,6 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Err(ApplicationError::InvalidContentLockDeletionState {
                     message: "payment drain cleanup token is missing".to_owned(),
                 });
-            }
-            Err(error) => {
-                observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
-                return Err(error);
-            }
-        };
-        let obligations = match self.drains.list_obligations(claim.job.job_id).await {
-            Ok(obligations) => {
-                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                obligations
             }
             Err(error) => {
                 observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
@@ -479,14 +535,25 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         worker_id: &str,
         evidence: &mut DeletionDependencyEvidence,
     ) -> Result<bool, ApplicationError> {
+        self.advance_to(
+            &claim,
+            worker_id,
+            ContentLockDeletionPhase::DrainExistingCredentials,
+            evidence,
+        )
+        .await
+    }
+
+    async fn advance_to(
+        &self,
+        claim: &ClaimedContentLockDeletionJob,
+        worker_id: &str,
+        next_phase: ContentLockDeletionPhase,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
         match self
             .deletions
-            .advance_phase(
-                claim.job.job_id,
-                worker_id,
-                claim.claim_token,
-                ContentLockDeletionPhase::DrainExistingCredentials,
-            )
+            .advance_phase(claim.job.job_id, worker_id, claim.claim_token, next_phase)
             .await
         {
             Ok(AdvanceContentLockDeletionPhaseResult::Advanced(_)) => {
@@ -932,8 +999,12 @@ mod tests {
             payment_state,
             invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
             payment_deadline: datetime!(2026-08-13 10:00:00 UTC),
-            confirmations,
-            amount_matched,
+            bitcoin: Some(crate::application::ports::PaymentObservation {
+                confirmations,
+                amount_matched,
+                paid_on_time: true,
+            }),
+            usdt_arbitrum: None,
         }
     }
 }

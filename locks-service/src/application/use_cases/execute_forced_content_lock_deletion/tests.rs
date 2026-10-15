@@ -488,10 +488,11 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: &CreatorPubky,
         _: &LockId,
         _: Uuid,
+        _: &ContentLock,
     ) -> Result<(), ApplicationError> {
         unreachable!()
     }
-    async fn finish_publication(
+    async fn mark_publication_written(
         &self,
         _: &CreatorPubky,
         _: &LockId,
@@ -505,6 +506,31 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: &LockId,
         _: Uuid,
     ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn compensate_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn reconcile_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: &ContentLock,
+        _: &[String],
+    ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn recover_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: &ContentLock,
+    ) -> Result<crate::application::ports::PublicationRecovery, ApplicationError> {
         unreachable!()
     }
     async fn publication_in_progress(

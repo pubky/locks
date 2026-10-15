@@ -246,12 +246,16 @@ async fn action_ownership_unexpected_error_is_fatal() {
 }
 
 #[tokio::test]
-async fn tombstone_storage_error_is_transient_but_unexpected_error_is_fatal() {
+async fn tombstone_dependency_errors_are_transient_but_internal_errors_are_fatal() {
     for (error, expected) in [
         (
             ApplicationError::Storage {
                 message: "temporary homeserver outage".to_owned(),
             },
+            DeletionPhaseExecutionOutcome::TransientDependencyFailure,
+        ),
+        (
+            ApplicationError::CreatorAuthorityUnavailable,
             DeletionPhaseExecutionOutcome::TransientDependencyFailure,
         ),
         (
@@ -682,10 +686,11 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: &CreatorPubky,
         _: &LockId,
         _: Uuid,
+        _: &ContentLock,
     ) -> Result<(), ApplicationError> {
         unreachable!()
     }
-    async fn finish_publication(
+    async fn mark_publication_written(
         &self,
         _: &CreatorPubky,
         _: &LockId,
@@ -699,6 +704,31 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: &LockId,
         _: Uuid,
     ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn compensate_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn reconcile_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: &ContentLock,
+        _: &[String],
+    ) -> Result<bool, ApplicationError> {
+        unreachable!()
+    }
+    async fn recover_publication(
+        &self,
+        _: &CreatorPubky,
+        _: &LockId,
+        _: &ContentLock,
+    ) -> Result<crate::application::ports::PublicationRecovery, ApplicationError> {
         unreachable!()
     }
     async fn publication_in_progress(
@@ -1010,6 +1040,14 @@ impl AccessCredentialStore for FakeAccess {
         &self,
         _: &AccessCredentialLookupKey,
     ) -> Result<Option<AccessCredentialRecord>, ApplicationError> {
+        unreachable!()
+    }
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        _: &AccessCredentialLookupKey,
+        _: &AccessCredentialRecord,
+        _: bool,
+    ) -> Result<crate::application::models::OrdinaryCredentialLookupResult, ApplicationError> {
         unreachable!()
     }
     async fn delete_access_credential(

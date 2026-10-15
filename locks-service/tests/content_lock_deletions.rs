@@ -20,13 +20,16 @@ use locks_service::{
             AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
             AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
             ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-            FinalAccessWindows, InitializeFinalAccessWindowsResult, PrepareForceDeletionResult,
-            VerificationTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+            FinalAccessWindows, INVOICE_ADMISSION_INTENT_VERSION,
+            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
+            PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
+            VerificationTerminalReason,
         },
         ports::{
             AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
             ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-            ContentLockDeletionRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            ContentLockDeletionRepository, InvoiceAdmissionRepository, VerificationTaskClaimer,
+            VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -130,6 +133,54 @@ impl Clock for MutableClock {
     fn now(&self) -> time::OffsetDateTime {
         *self.0.lock().unwrap()
     }
+}
+
+#[tokio::test]
+async fn pending_invoice_admission_defers_in_memory_payment_drain_start() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let tasks = InMemoryVerificationTaskRepository::with_deletion_fence(Arc::clone(&fence));
+    let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let mut task = verification_task(&job, VerificationTaskStatus::Pending);
+    let reader =
+        CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+            .unwrap();
+    task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+    tasks
+        .insert_invoice_pending_task(
+            task.clone(),
+            InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: task.creator.clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader,
+                payment_in: 24,
+            },
+        )
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = deletions
+        .claim_next("worker", time::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        deletions
+            .advance_phase(
+                job.job_id,
+                "worker",
+                claim.claim_token,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap(),
+        AdvanceContentLockDeletionPhaseResult::ObligationsPending
+    );
 }
 
 #[tokio::test]
@@ -622,7 +673,12 @@ async fn in_memory_active_force_completion_is_exactly_fenced_and_permanently_blo
     );
     assert_eq!(
         repository
-            .begin_publication(&job.creator, &job.lock_id, Uuid::new_v4())
+            .begin_publication(
+                &job.creator,
+                &job.lock_id,
+                Uuid::new_v4(),
+                &job.frozen_content_lock,
+            )
             .await,
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
     );
@@ -636,12 +692,7 @@ async fn in_memory_force_receipt_blocks_later_ordinary_credential() {
 
     assert!(matches!(
         deletions
-            .prepare_force_deletion(
-                &job.creator,
-                &job.lock_id,
-                Some(&job.frozen_content_lock),
-                NOW,
-            )
+            .prepare_force_deletion(&job.creator, &job.lock_id)
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)
@@ -1658,7 +1709,7 @@ async fn no_paykit_task_expiry_serializes_with_force_claim_revocation() {
 }
 
 #[tokio::test]
-async fn no_paykit_drain_rejects_paykit_snapshot() {
+async fn no_paykit_drain_preserves_paykit_snapshot_for_later_paykit_recovery() {
     let (verification_tasks, _access, deletions) = in_memory_access_stack();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     verification_tasks
@@ -1667,14 +1718,23 @@ async fn no_paykit_drain_rejects_paykit_snapshot() {
         .unwrap();
     deletions.insert_job(job.clone()).await.unwrap();
     let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
-    assert!(matches!(
+    assert!(
         NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
             .execute_claimed(claim, "worker")
-            .await,
-        Err(
-            locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
-        )
-    ));
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        verification_tasks
+            .get_verification_task(
+                &TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10",).unwrap()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        VerificationTaskStatus::Pending
+    );
 }
 
 #[tokio::test]

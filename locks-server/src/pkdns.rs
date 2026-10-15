@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::future::Future;
 use std::net::IpAddr;
 
 use pkarr::dns::Name;
@@ -68,19 +69,42 @@ impl LockServerKeyRepublisher {
 
     pub async fn run_until_shutdown(
         self,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), LockServerKeyRepublisherError> {
-        let mut interval = tokio::time::interval(self.interval);
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
+        run_periodic(self.interval, shutdown, || {
+            publish_once(&self.client, &self.signed_packet)
+        })
+        .await;
+        Ok(())
+    }
+}
+
+async fn run_periodic<P, F, E>(
+    period: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut publish: P,
+) where
+    P: FnMut() -> F,
+    F: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
                 }
-                _ = interval.tick() => {
-                    publish_once(&self.client, &self.signed_packet).await?;
+            }
+            _ = interval.tick() => {
+                if let Err(error) = publish().await {
+                    tracing::warn!(
+                        operation = "republish_lock_server_pkarr",
+                        error = %error,
+                        retrying = true,
+                        "periodic PKARR publication failed"
+                    );
                 }
             }
         }
@@ -181,6 +205,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -194,6 +220,33 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn failed_periodic_publication_is_retried_until_shutdown() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        run_periodic(
+            std::time::Duration::from_millis(1),
+            shutdown_rx,
+            move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                let shutdown_tx = shutdown_tx.clone();
+                async move {
+                    if attempt == 0 {
+                        Err("relay unavailable")
+                    } else {
+                        shutdown_tx.send(true).unwrap();
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn lock_server_republisher_uses_pubky_pkarr_relays() {

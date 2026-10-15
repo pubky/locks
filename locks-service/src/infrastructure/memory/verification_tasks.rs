@@ -128,6 +128,7 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                     .proofs
                     .iter()
                     .any(|proof| proof.verifier_type == VerifierType::PaykitPayment),
+                invoice_admission_ready: true,
                 status: task.status,
                 entitlement_publication_claim_token: None,
                 deletion_job_id: None,
@@ -321,6 +322,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 lock_id,
                 bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
                 paykit_admission_required: true,
+                invoice_admission_ready: false,
                 status: task.status,
                 entitlement_publication_claim_token: None,
                 deletion_job_id: None,
@@ -431,6 +433,9 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claim_expires_at = None;
         let record = state.record.clone();
         drop(admissions);
+        if let Some(fence_record) = self.deletion_fence.records.write().await.get_mut(task_id) {
+            fence_record.invoice_admission_ready = true;
+        }
         if let Some(claimer) = self.verification_task_claimer() {
             claimer.mark_invoice_admission_ready(task_id).await;
         }

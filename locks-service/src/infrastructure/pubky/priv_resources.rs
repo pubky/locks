@@ -4,7 +4,7 @@ use locks_core::lock_policy::{GuardedResource, PRIVATE_RESOURCE_CONTENT_PATH_PRE
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
-use crate::application::ports::GuardedResourceRepository;
+use crate::application::ports::{GuardedResourceReadback, GuardedResourceRepository};
 use crate::infrastructure::pubky::storage_client::{
     PubkyBytesResource, PubkyHomeserverStorageClient,
 };
@@ -132,6 +132,25 @@ where
         }
         Ok(existed)
     }
+
+    async fn read_guarded_resource_generation(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        expected_hash: &GuardedResourceHash,
+    ) -> Result<GuardedResourceReadback, ApplicationError> {
+        ensure_private_resource_path(path)?;
+        let Some(metadata) = self.client.get_metadata_as_creator(creator, path).await? else {
+            return Ok(GuardedResourceReadback::Missing);
+        };
+        Ok(
+            if metadata.content_hash.as_ref() == Some(expected_hash.as_bytes()) {
+                GuardedResourceReadback::Exact
+            } else {
+                GuardedResourceReadback::Replaced
+            },
+        )
+    }
 }
 
 fn ensure_private_resource_path(path: &str) -> Result<(), ApplicationError> {
@@ -185,7 +204,7 @@ mod tests {
     use super::PubkyPrivResourceRepository;
     use crate::application::errors::ApplicationError;
     use crate::application::models::GuardedResourceRecord;
-    use crate::application::ports::GuardedResourceRepository;
+    use crate::application::ports::{GuardedResourceReadback, GuardedResourceRepository};
     use crate::application::use_cases::register_guarded_resource::{
         RegisterGuardedResourceRequest, RegisterGuardedResourceUseCase,
     };
@@ -214,6 +233,32 @@ mod tests {
             ]
         );
         assert_eq!(repository.client().last_bytes(), record.bytes);
+    }
+
+    #[tokio::test]
+    async fn generation_read_uses_metadata_without_downloading_resource_bytes() {
+        let bytes = b"guarded bytes";
+        let expected = GuardedResourceHash::from_bytes(*blake3::hash(bytes).as_bytes());
+        let client = FakeStorageClient::default().with_metadata_read(Some(
+            PubkyResourceMetadata::from_bytes(bytes, Some("text/plain".to_owned())),
+        ));
+        let repository = PubkyPrivResourceRepository::new(client);
+
+        assert_eq!(
+            repository
+                .read_guarded_resource_generation(
+                    &creator(),
+                    "/priv/app.locks/content/example.txt",
+                    &expected,
+                )
+                .await
+                .unwrap(),
+            GuardedResourceReadback::Exact
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec!["get_metadata pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned()]
+        );
     }
 
     #[tokio::test]

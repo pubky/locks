@@ -110,7 +110,9 @@ where
         content_lock_path: &ContentLockPath,
     ) -> Result<(), ApplicationError> {
         let path = content_lock_path.to_string();
-        self.client.delete_as_creator(creator, &path).await?;
+        self.client
+            .delete_if_present_as_creator(creator, &path)
+            .await?;
         if self
             .client
             .get_bytes_as_creator(creator, &path)

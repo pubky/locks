@@ -190,7 +190,9 @@ pub(super) fn classify_deletion_execution_error(
     error: &ApplicationError,
 ) -> DeletionExecutionErrorClass {
     match error {
-        ApplicationError::Storage { .. } | ApplicationError::Verifier { .. } => {
+        ApplicationError::Storage { .. }
+        | ApplicationError::Verifier { .. }
+        | ApplicationError::CreatorAuthorityUnavailable => {
             DeletionExecutionErrorClass::TransientDependency
         }
         _ => DeletionExecutionErrorClass::Fatal,

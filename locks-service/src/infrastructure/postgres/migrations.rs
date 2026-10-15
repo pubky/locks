@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_pr18_migration_prefix_upgrades_through_pr19_without_collision() {
+    async fn exact_pr18_migration_prefix_upgrades_through_current_without_collision() {
         let database = TestDatabase::create_unmigrated().await;
         let pr18 = Migrator {
             migrations: Cow::Owned(super::MIGRATOR.iter().take(20).cloned().collect()),
@@ -518,13 +518,13 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=24).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=26).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
 
     #[tokio::test]
-    async fn exact_pr19_migration_prefix_upgrades_through_pr20_without_collision() {
+    async fn exact_pr19_migration_prefix_upgrades_through_current_without_collision() {
         let pr19 = exact_pr19_migrator();
         let database = TestDatabase::create_unmigrated().await;
         pr19.run(database.pool()).await.unwrap();
@@ -554,7 +554,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=24).collect::<Vec<_>>()
+            (1..=26).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..23],

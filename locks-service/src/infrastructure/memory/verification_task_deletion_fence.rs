@@ -28,6 +28,7 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
     pub(crate) lock_id: LockId,
     pub(crate) bundle_id: BundleId,
     pub(crate) paykit_admission_required: bool,
+    pub(crate) invoice_admission_ready: bool,
     pub(crate) status: VerificationTaskStatus,
     pub(crate) entitlement_publication_claim_token: Option<Uuid>,
     pub(crate) deletion_job_id: Option<Uuid>,

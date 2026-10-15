@@ -65,6 +65,7 @@ impl PostgresContentLockDeletionRepository {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_compensation_barrier(
         mut self,
         started: std::sync::Arc<tokio::sync::Notify>,
@@ -788,11 +789,8 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             .await
             .map_err(storage_error)?;
             if has_unready_invoice_admission {
-                return Err(ApplicationError::InvalidContentLockDeletionState {
-                    message:
-                        "payment drain cannot start while snapshotted invoice admissions are unready"
-                            .to_owned(),
-                });
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending);
             }
             sqlx::query(
                 "UPDATE content_lock_deletion_task_snapshot AS snapshot
@@ -863,20 +861,20 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 "non-Paykit deletion drain requires a payment drain phase",
             ));
         }
-        let has_paykit_or_unknown: bool = sqlx::query_scalar(
+        let has_unknown: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1 FROM content_lock_deletion_task_snapshot
                  WHERE deletion_job_id = $1
-                   AND paykit_admission_required IS DISTINCT FROM FALSE
+                   AND paykit_admission_required IS NULL
              )",
         )
         .bind(job_id)
         .fetch_one(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        if has_paykit_or_unknown {
+        if has_unknown {
             return Err(invalid_state(
-                "non-Paykit deletion drain cannot process a Paykit snapshot",
+                "deletion drain cannot classify a frozen obligation",
             ));
         }
         sqlx::query(
@@ -1111,6 +1109,13 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             .bind(creator.to_string())
             .bind(lock_id.to_string())
             .bind(forced_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            sqlx::query(
+                "UPDATE verification_tasks SET deletion_job_id = NULL WHERE deletion_job_id = $1",
+            )
+            .bind(job.job_id)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -1866,7 +1871,12 @@ mod tests {
         );
         assert_eq!(
             repository
-                .begin_publication(&job.creator, &job.lock_id, Uuid::new_v4())
+                .begin_publication(
+                    &job.creator,
+                    &job.lock_id,
+                    Uuid::new_v4(),
+                    &job.frozen_content_lock,
+                )
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
@@ -2145,7 +2155,9 @@ mod tests {
             tasks
                 .insert_verification_task(admitted_before.clone())
                 .await,
-            Err(ApplicationError::ContentLockDeletionInProgress)
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task"
+            })
         );
 
         let admitted_after = verification_task(&lock, BundleId::from_bytes([2; 16]));
@@ -2418,7 +2430,7 @@ mod tests {
         let token = Uuid::new_v4();
 
         repository
-            .begin_publication(&lock.creator, &lock_id, token)
+            .begin_publication(&lock.creator, &lock_id, token, &lock)
             .await
             .unwrap();
         assert_eq!(
@@ -2436,7 +2448,7 @@ mod tests {
         );
         assert!(
             repository
-                .finish_publication(&lock.creator, &lock_id, token)
+                .abandon_publication(&lock.creator, &lock_id, token)
                 .await
                 .unwrap()
         );
@@ -2449,7 +2461,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .begin_publication(&lock.creator, &lock_id, Uuid::new_v4())
+                .begin_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
@@ -2532,10 +2544,27 @@ mod tests {
             .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
             .await
             .unwrap();
-        PostgresContentLockDeletionRepository::new(database.pool().clone())
-            .insert_job(ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap())
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+
+        let deletion_claim = deletions
+            .claim_next("deletion-worker", time::Duration::minutes(1))
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(
+            deletions
+                .advance_phase(
+                    job.job_id,
+                    "deletion-worker",
+                    deletion_claim.claim_token,
+                    ContentLockDeletionPhase::StartPaymentDrain,
+                )
+                .await
+                .unwrap(),
+            AdvanceContentLockDeletionPhaseResult::ObligationsPending
+        );
 
         let claim = tasks
             .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
@@ -3544,8 +3573,12 @@ mod tests {
                 payment_state: PaymentState::Detected,
                 invoice_created_at,
                 payment_deadline,
-                confirmations: 0,
-                amount_matched: true,
+                bitcoin: Some(crate::application::ports::PaymentObservation {
+                    confirmations: 0,
+                    amount_matched: true,
+                    paid_on_time: true,
+                }),
+                usdt_arbitrum: None,
             }),
             fail_calls: AtomicBool::new(false),
             lookup_calls: AtomicUsize::new(0),
@@ -3748,7 +3781,7 @@ mod tests {
     #[tokio::test]
     async fn final_issuance_rejects_malformed_persisted_secondary_path_without_panicking() {
         let database = TestDatabase::create().await;
-        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let (job, task, access, _database_now) = eligible_final_credential_fixture(&database).await;
         let mut frozen: serde_json::Value = sqlx::query_scalar(
             "SELECT frozen_content_lock FROM content_lock_deletion_jobs WHERE job_id = $1",
         )
@@ -3777,7 +3810,7 @@ mod tests {
                     AccessCredential::new("malformed-frozen-manifest"),
                 )
                 .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
+            Err(ApplicationError::Storage { .. })
         ));
 
         database.cleanup().await;
@@ -4081,7 +4114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_paykit_drain_rejects_paykit_and_missing_paykit_aggregate_still_blocks() {
+    async fn non_paykit_expiry_skips_paykit_and_missing_paykit_aggregate_still_blocks() {
         let database = TestDatabase::create().await;
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
         let lock = content_lock();
@@ -4097,12 +4130,12 @@ mod tests {
             .bind(claim_token)
             .bind(database_now(&database).await + time::Duration::minutes(5))
             .execute(database.pool()).await.unwrap();
-        assert!(matches!(
+        assert!(
             repository
                 .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim_token)
-                .await,
-            Err(ApplicationError::InvalidContentLockDeletionState { .. })
-        ));
+                .await
+                .unwrap()
+        );
         sqlx::query("UPDATE content_lock_deletion_task_snapshot SET resolved_status = 'expired', resolved_at = $2 WHERE deletion_job_id = $1")
             .bind(job.job_id).bind(NOW).execute(database.pool()).await.unwrap();
         assert!(matches!(

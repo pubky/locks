@@ -132,6 +132,7 @@ impl InMemoryContentLockDeletionRepository {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_compensation_barrier(
         mut self,
         started: std::sync::Arc<tokio::sync::Notify>,
@@ -527,6 +528,21 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 message: "deletion phase must advance to its immediate successor".to_owned(),
             });
         }
+        if next_phase == ContentLockDeletionPhase::StartPaymentDrain
+            && self
+                .verification_task_fence
+                .records
+                .read()
+                .await
+                .values()
+                .any(|task| {
+                    task.deletion_job_id == Some(job_id)
+                        && task.paykit_admission_required
+                        && !task.invoice_admission_ready
+                })
+        {
+            return Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending);
+        }
         let access_status = self
             .access_credentials
             .check_phase_advance(job_id, stored.job.phase, next_phase, now)
@@ -751,9 +767,9 @@ async fn remove_publication_intent(
 ) -> Result<bool, ApplicationError> {
     let key = (creator.clone(), lock_id.clone());
     let mut intents = intents.write().await;
-    if !intents
+    if intents
         .get(&key)
-        .is_some_and(|intent| intent.token == publication_token)
+        .is_none_or(|intent| intent.token != publication_token)
     {
         return Ok(false);
     }

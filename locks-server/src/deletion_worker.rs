@@ -455,8 +455,8 @@ impl<'a> DeletionWorker<'a> {
         ))
     }
 
-    /// Runs until shutdown, sleeping only after idle polls. Shutdown prevents every future claim,
-    /// including when it arrives while claim acquisition is blocked.
+    /// Runs until shutdown, backing off after idle polls and lost claims. Shutdown prevents every
+    /// future claim, including when it arrives while claim acquisition is blocked.
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: watch::Receiver<bool>,
@@ -478,9 +478,18 @@ impl<'a> DeletionWorker<'a> {
                         _ = tokio::time::sleep(self.config.poll_interval) => {}
                     }
                 }
+                DeletionWorkerOutcome::ClaimLost => {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                        _ = tokio::time::sleep(self.config.poll_interval) => {}
+                    }
+                }
                 DeletionWorkerOutcome::Progressed
                 | DeletionWorkerOutcome::Deferred
-                | DeletionWorkerOutcome::ClaimLost
                 | DeletionWorkerOutcome::TerminalFailed
                 | DeletionWorkerOutcome::RetryScheduled
                 | DeletionWorkerOutcome::RetryExhausted => {}
@@ -511,6 +520,18 @@ impl<'a> DeletionWorker<'a> {
                 Ok(
                     execution @ DeletionWorkerExecution {
                         outcome: DeletionWorkerOutcome::Idle,
+                        ..
+                    },
+                ) => {
+                    recovery.record_outcome(execution.outcome, execution.evidence, readiness);
+                    tokio::select! {
+                        _ = shutdown.changed() => {}
+                        _ = tokio::time::sleep(self.config.poll_interval) => {}
+                    }
+                }
+                Ok(
+                    execution @ DeletionWorkerExecution {
+                        outcome: DeletionWorkerOutcome::ClaimLost,
                         ..
                     },
                 ) => {
@@ -866,6 +887,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(repository.claim_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_loss_backs_off_before_polling_for_another_claim() {
+        let repository = Arc::new(FakeRepository::with_claim(claim(1)));
+        let executor = Arc::new(FakeExecutor::new(DeletionPhaseExecutionOutcome::ClaimLost));
+        let worker = Arc::new(OwnedWorker::new(
+            Arc::clone(&repository),
+            Arc::clone(&executor),
+            Arc::new(FixedJitter(StdDuration::ZERO)),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run = {
+            let worker = Arc::clone(&worker);
+            tokio::spawn(async move { worker.run_until_shutdown(shutdown_rx).await })
+        };
+        while executor.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::task::yield_now().await;
+        assert_eq!(repository.claim_calls.load(Ordering::SeqCst), 1);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(StdDuration::from_millis(100), run)
+            .await
+            .expect("shutdown must interrupt claim-loss backoff")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1516,10 +1565,11 @@ mod tests {
             _: &CreatorPubky,
             _: &LockId,
             _: Uuid,
+            _: &ContentLock,
         ) -> Result<(), ApplicationError> {
             unreachable!()
         }
-        async fn finish_publication(
+        async fn mark_publication_written(
             &self,
             _: &CreatorPubky,
             _: &LockId,
@@ -1533,6 +1583,32 @@ mod tests {
             _: &LockId,
             _: Uuid,
         ) -> Result<bool, ApplicationError> {
+            unreachable!()
+        }
+        async fn compensate_publication(
+            &self,
+            _: &CreatorPubky,
+            _: &LockId,
+            _: Uuid,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!()
+        }
+        async fn reconcile_publication(
+            &self,
+            _: &CreatorPubky,
+            _: &LockId,
+            _: &ContentLock,
+            _: &[String],
+        ) -> Result<bool, ApplicationError> {
+            unreachable!()
+        }
+        async fn recover_publication(
+            &self,
+            _: &CreatorPubky,
+            _: &LockId,
+            _: &ContentLock,
+        ) -> Result<locks_service::application::ports::PublicationRecovery, ApplicationError>
+        {
             unreachable!()
         }
         async fn publication_in_progress(

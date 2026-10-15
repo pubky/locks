@@ -270,6 +270,16 @@ mod tests {
             unreachable!()
         }
 
+        async fn finish_ordinary_credential_lookup(
+            &self,
+            _lookup_key: &AccessCredentialLookupKey,
+            _expected: &AccessCredentialRecord,
+            _invalidate: bool,
+        ) -> Result<crate::application::models::OrdinaryCredentialLookupResult, ApplicationError>
+        {
+            unreachable!()
+        }
+
         async fn delete_access_credential(
             &self,
             _lookup_key: &AccessCredentialLookupKey,

@@ -600,8 +600,7 @@ mod tests {
             &self,
             _lookup_key: &AccessCredentialLookupKey,
             path: &str,
-            _now: OffsetDateTime,
-            _claim_expires_at: OffsetDateTime,
+            _claim_duration: time::Duration,
         ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
             let attempt = self.prepares.fetch_add(1, Ordering::SeqCst);
             Ok((attempt > 0).then(|| DeletionReadAuthorization {

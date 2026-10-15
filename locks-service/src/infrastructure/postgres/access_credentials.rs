@@ -508,6 +508,11 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             serde_json::from_value(frozen).map_err(|error| ApplicationError::Storage {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
             })?;
+        frozen
+            .validate_resource_set()
+            .map_err(|error| ApplicationError::Storage {
+                message: format!("invalid frozen content lock stored in Postgres: {error}"),
+            })?;
         let encrypted = cipher.encrypt(&context, &candidate)?;
         let lookup_key = AccessCredentialLookupKey::derive(&candidate);
         let credential_id = Uuid::new_v4();
@@ -711,6 +716,11 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             serde_json::from_value(frozen).map_err(|error| ApplicationError::Storage {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
             })?;
+        frozen
+            .validate_resource_set()
+            .map_err(|error| ApplicationError::Storage {
+                message: format!("invalid frozen content lock stored in Postgres: {error}"),
+            })?;
         let encrypted = cipher.encrypt(&context, &candidate)?;
         let lookup_key = AccessCredentialLookupKey::derive(&candidate);
         let credential_id = Uuid::new_v4();
@@ -751,8 +761,13 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
                 .into_iter()
                 .map(|(path, resource)| {
                     GuardedResource::new(path, resource.hash, resource.content_type, resource.size)
-                        .expect("persisted frozen manifest was validated at deletion admission")
-                }),
+                        .map_err(|error| ApplicationError::Storage {
+                            message: format!(
+                                "invalid frozen content lock stored in Postgres: {error}"
+                            ),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         );
         for resource in resources {
             sqlx::query(
