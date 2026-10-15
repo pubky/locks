@@ -90,6 +90,51 @@ struct FaultInjectingContentLockRepository {
     retain_on_delete: AtomicBool,
 }
 
+#[derive(Debug)]
+struct BlockingContentLockRepository {
+    inner: InMemoryContentLockRepository,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    completed: Arc<Notify>,
+    published_lock_id: Mutex<Option<LockId>>,
+}
+
+#[async_trait]
+impl ContentLockRepository for BlockingContentLockRepository {
+    async fn upsert_content_lock(
+        &self,
+        creator: CreatorPubky,
+        path: ContentLockPath,
+        content_lock: ContentLock,
+    ) -> Result<(), ApplicationError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        let lock_id = content_lock.lock_id().unwrap();
+        self.inner
+            .upsert_content_lock(creator, path, content_lock)
+            .await?;
+        *self.published_lock_id.lock().unwrap() = Some(lock_id);
+        self.completed.notify_one();
+        Ok(())
+    }
+
+    async fn get_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        path: &ContentLockPath,
+    ) -> Result<Option<ContentLock>, ApplicationError> {
+        self.inner.get_content_lock(creator, path).await
+    }
+
+    async fn delete_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError> {
+        self.inner.delete_content_lock(creator, path).await
+    }
+}
+
 #[async_trait]
 impl ContentLockRepository for FaultInjectingContentLockRepository {
     async fn upsert_content_lock(
@@ -3291,6 +3336,69 @@ async fn authenticated_creator_creates_content_lock_without_body_creator() {
         body["content_lock"]["creator"],
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
+}
+
+#[tokio::test]
+async fn cancelled_content_lock_request_finishes_publication_bookkeeping() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let completed = Arc::new(Notify::new());
+    let content_locks = Arc::new(BlockingContentLockRepository {
+        inner: InMemoryContentLockRepository::new(),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        completed: Arc::clone(&completed),
+        published_lock_id: Mutex::new(None),
+    });
+    let guarded_resources = Arc::new(InMemoryGuardedResourceRepository::new());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let mut request = creator_content_lock_request(registered_guarded_resource_json());
+    seed_guarded_resource_from_fixture(&state, &request).await;
+    request.as_object_mut().unwrap().remove("creator");
+    let app = router(state.clone());
+
+    let request_task = tokio::spawn(app.oneshot(authenticated_json_request(
+        "POST",
+        "/creator/content-locks",
+        request,
+        "frontend-session-secret",
+    )));
+    started.notified().await;
+    request_task.abort();
+    release.notify_one();
+    completed.notified().await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let lock_id = content_locks.published_lock_id.lock().unwrap().clone();
+            if let Some(lock_id) = lock_id {
+                let ownership = state
+                    .content_lock_ownership()
+                    .get_path_ownership(&creator(), "/priv/app.locks/content/example.txt")
+                    .await
+                    .unwrap();
+                let intent = state
+                    .content_lock_deletions()
+                    .publication_in_progress(&creator(), &lock_id)
+                    .await
+                    .unwrap();
+                if !intent
+                    && ownership
+                        .as_ref()
+                        .is_some_and(|record| record.status.as_str() == "published")
+                {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached publication task should finish bookkeeping");
 }
 
 #[tokio::test]

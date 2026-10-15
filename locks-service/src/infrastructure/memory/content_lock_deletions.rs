@@ -52,6 +52,12 @@ pub struct InMemoryContentLockDeletionRepository {
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<tokio::sync::Notify>,
     )>,
+    #[cfg(test)]
+    mark_publication_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    compensation_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    abandonment_failures: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for InMemoryContentLockDeletionRepository {
@@ -64,6 +70,12 @@ impl Default for InMemoryContentLockDeletionRepository {
             ownership_records: OwnershipRecords::default(),
             #[cfg(test)]
             compensation_barrier: None,
+            #[cfg(test)]
+            mark_publication_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            compensation_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            abandonment_failures: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -108,6 +120,33 @@ impl InMemoryContentLockDeletionRepository {
         self.compensation_barrier = Some((started, release));
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_publication_bookkeeping_failures(
+        self,
+        mark: usize,
+        compensate: usize,
+        abandon: usize,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+
+        self.mark_publication_failures.store(mark, Ordering::SeqCst);
+        self.compensation_failures
+            .store(compensate, Ordering::SeqCst);
+        self.abandonment_failures.store(abandon, Ordering::SeqCst);
+        self
+    }
+}
+
+#[cfg(test)]
+fn fail_injected_bookkeeping(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
 }
 
 #[async_trait]
@@ -158,6 +197,12 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         lock_id: &LockId,
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError> {
+        #[cfg(test)]
+        if fail_injected_bookkeeping(&self.mark_publication_failures) {
+            return Err(ApplicationError::Storage {
+                message: "injected publication mark failure".to_owned(),
+            });
+        }
         let mut intents = self.publication_intents.write().await;
         let Some(intent) = intents.get_mut(&(creator.clone(), lock_id.clone())) else {
             return Ok(false);
@@ -175,6 +220,12 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         lock_id: &LockId,
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError> {
+        #[cfg(test)]
+        if fail_injected_bookkeeping(&self.abandonment_failures) {
+            return Err(ApplicationError::Storage {
+                message: "injected publication abandonment failure".to_owned(),
+            });
+        }
         remove_publication_intent(
             &self.publication_intents,
             creator,
@@ -190,6 +241,12 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         lock_id: &LockId,
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError> {
+        #[cfg(test)]
+        if fail_injected_bookkeeping(&self.compensation_failures) {
+            return Err(ApplicationError::Storage {
+                message: "injected publication compensation failure".to_owned(),
+            });
+        }
         let key = (creator.clone(), lock_id.clone());
         let mut intents = self.publication_intents.write().await;
         let Some(intent) = intents.get(&key) else {

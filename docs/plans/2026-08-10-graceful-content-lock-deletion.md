@@ -84,7 +84,7 @@
 - Paykit polling latency can make a pre-deadline broadcast late.
 - Timely amount-matched payment can block deletion indefinitely while confirmations/reorg state remains unresolved.
 - Durable cancellation enqueue may precede actual counterparty delivery.
-- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death before publication; post-publication mark failures recover through an identical retry.
+- Content Lock publication runs past HTTP cancellation and retries token-owned bookkeeping three times. Typed pre-dispatch failures clear only state owned by that attempt. A possible dispatch, process termination, or exhausted bookkeeping retry stays fail-closed behind the publication intent; operator recovery must quiesce publishers, take the canonical per-lock advisory fence, compare retained canonical bytes with the public path, then either record exact write completion or remove only an exact absent uncompleted intent before an identical retry.
 - Force deletion deliberately abandons active payment/access obligations and may orphan content after a crash.
 
 ## Repository ownership matrix
