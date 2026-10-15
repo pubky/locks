@@ -123,7 +123,7 @@ jobs:
       - name: Postgres-backed tests
         run: |
           cargo nextest run -p locks-service --lib infrastructure::postgres
-          cargo nextest run -p locks-service --lib postgres_retry_recovers_original_identity_after_ownership_mark_failure
+          cargo nextest run -p locks-service --lib postgres_exact_retry_recovers_after_injected_ownership_commit_failure
 
       - name: Additional integration tests
         run: |

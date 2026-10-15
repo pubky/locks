@@ -35,3 +35,22 @@ pub trait EntitlementRepository: Send + Sync {
         bundle_id: &BundleId,
     ) -> Result<(), ApplicationError>;
 }
+
+pub(crate) fn same_entitlement_decision(
+    existing: &VerifiedProofBundle,
+    candidate: &VerifiedProofBundle,
+) -> bool {
+    if existing.verification_result.criteria.len() != candidate.verification_result.criteria.len() {
+        return false;
+    }
+    let mut normalized_candidate = candidate.clone();
+    for (candidate_result, existing_result) in normalized_candidate
+        .verification_result
+        .criteria
+        .iter_mut()
+        .zip(&existing.verification_result.criteria)
+    {
+        candidate_result.verified_at = existing_result.verified_at;
+    }
+    existing == &normalized_candidate
+}

@@ -9,12 +9,19 @@ use crate::application::models::{
     ClaimedVerificationTask, InvoiceAdmissionPhase, VerificationTaskRecord, VerificationTaskStatus,
 };
 use crate::application::ports::{VerificationTaskClaimer, VerificationTaskRepository};
+use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
 /// In-memory verification task claimer used to model worker lease semantics.
-#[derive(Default)]
 pub struct InMemoryVerificationTaskClaimer {
     records: RwLock<Vec<ClaimableVerificationTask>>,
     task_repository: Option<Arc<dyn VerificationTaskRepository>>,
+    verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+}
+
+impl Default for InMemoryVerificationTaskClaimer {
+    fn default() -> Self {
+        Self::new(vec![])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +37,16 @@ struct ClaimableVerificationTask {
 impl InMemoryVerificationTaskClaimer {
     /// Creates a claimer seeded with unclaimed task records.
     pub fn new(records: Vec<VerificationTaskRecord>) -> Self {
+        Self::with_verification_task_fence(
+            records,
+            Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+        )
+    }
+
+    pub fn with_verification_task_fence(
+        records: Vec<VerificationTaskRecord>,
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
         Self {
             records: RwLock::new(
                 records
@@ -45,6 +62,7 @@ impl InMemoryVerificationTaskClaimer {
                     .collect(),
             ),
             task_repository: None,
+            verification_task_fence,
         }
     }
 
@@ -54,6 +72,16 @@ impl InMemoryVerificationTaskClaimer {
         task_repository: Arc<dyn VerificationTaskRepository>,
     ) -> Self {
         let mut claimer = Self::new(records);
+        claimer.task_repository = Some(task_repository);
+        claimer
+    }
+
+    pub fn with_task_repository_and_deletion_fence(
+        records: Vec<VerificationTaskRecord>,
+        task_repository: Arc<dyn VerificationTaskRepository>,
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        let mut claimer = Self::with_verification_task_fence(records, verification_task_fence);
         claimer.task_repository = Some(task_repository);
         claimer
     }
@@ -75,6 +103,7 @@ impl InMemoryVerificationTaskClaimer {
                     .collect(),
             ),
             task_repository: None,
+            verification_task_fence: Arc::new(InMemoryVerificationTaskDeletionFence::new()),
         }
     }
 
@@ -99,6 +128,7 @@ impl InMemoryVerificationTaskClaimer {
                     .collect(),
             ),
             task_repository: None,
+            verification_task_fence: Arc::new(InMemoryVerificationTaskDeletionFence::new()),
         }
     }
 
@@ -155,11 +185,14 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         now: time::OffsetDateTime,
         claim_expires_at: time::OffsetDateTime,
     ) -> Result<Option<ClaimedVerificationTask>, ApplicationError> {
+        let fence = self.verification_task_fence.records.read().await;
         let mut records = self.records.write().await;
-        let Some(index) = records
-            .iter()
-            .position(|record| record.is_claimable_at(now))
-        else {
+        let Some(index) = records.iter().position(|record| {
+            record.is_claimable_at(now)
+                && fence
+                    .get(&record.task.task_id)
+                    .is_none_or(|record| record.deletion_job_id.is_none())
+        }) else {
             return Ok(None);
         };
 
@@ -196,6 +229,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         now: time::OffsetDateTime,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<VerificationTaskRecord>, ApplicationError> {
+        let fence = self.verification_task_fence.records.read().await;
         let mut records = self.records.write().await;
         let Some(record) = records.iter_mut().find(|record| {
             record.task.task_id == *task_id
@@ -205,6 +239,9 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 && record
                     .claim_expires_at
                     .is_some_and(|claim_expires_at| claim_expires_at > now)
+                && fence
+                    .get(&record.task.task_id)
+                    .is_none_or(|record| record.deletion_job_id.is_none())
         }) else {
             return Ok(None);
         };
@@ -251,6 +288,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
             }
             VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress => unreachable!(),
         };
+        let mut fence = self.verification_task_fence.records.write().await;
         let mut records = self.records.write().await;
         let Some(record) = records.iter_mut().find(|record| {
             record.task.task_id == task.task_id
@@ -260,6 +298,9 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 && record
                     .claim_expires_at
                     .is_some_and(|claim_expires_at| claim_expires_at > now)
+                && fence
+                    .get(&record.task.task_id)
+                    .is_none_or(|record| record.deletion_job_id.is_none())
         }) else {
             return Ok(None);
         };
@@ -269,6 +310,11 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
                 .await?;
         }
         record.task = task;
+        if let Some(fence_record) = fence.get_mut(&record.task.task_id) {
+            fence_record.entitlement_publication_claim_token = (record.task.status
+                == VerificationTaskStatus::PublishingEntitlement)
+                .then_some(*claim_token);
+        }
         if record.task.status != VerificationTaskStatus::PublishingEntitlement {
             record.claimed_by = None;
             record.claim_token = None;

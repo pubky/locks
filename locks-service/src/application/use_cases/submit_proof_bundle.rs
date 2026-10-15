@@ -122,6 +122,7 @@ impl<'a> SubmitProofBundleUseCase<'a> {
         &self,
         request: SubmitProofBundleRequest,
         admissions: &dyn InvoiceAdmissionRepository,
+        payment_in: u64,
     ) -> Result<SubmittedVerificationTask, ApplicationError> {
         let submitted_proof_bundle = request.submitted_proof_bundle;
         if let Some(existing) = self.find_existing(&submitted_proof_bundle).await? {
@@ -153,6 +154,7 @@ impl<'a> SubmitProofBundleUseCase<'a> {
                     bundle_id: submitted_proof_bundle.bundle_id,
                     lock_resource: submitted_proof_bundle.pubky_lock_resource,
                     reader,
+                    payment_in,
                 },
             )
             .await?;
@@ -325,6 +327,12 @@ mod tests {
                 datetime!(2026-05-29 12:01:00 UTC),
                 None,
             )
+            .unwrap()
+            .transition_to(
+                VerificationTaskStatus::Failed,
+                datetime!(2026-05-29 12:02:00 UTC),
+                Some("verifier rejected proof".to_owned()),
+            )
             .unwrap();
         let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
         let tasks = CapturingTaskRepository::with_insert_duplicate_race(existing);
@@ -338,8 +346,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.status, VerificationTaskStatus::InProgress);
+        assert_eq!(result.status, VerificationTaskStatus::Failed);
         assert_eq!(result.started_at, Some(datetime!(2026-05-29 12:01:00 UTC)));
+        assert_eq!(
+            result.completed_at,
+            Some(datetime!(2026-05-29 12:02:00 UTC))
+        );
+        assert_eq!(
+            result.failure_message,
+            Some("verifier rejected proof".to_owned())
+        );
         assert_eq!(task_ids.generate_count(), 1);
         assert_eq!(tasks.insert_count(), 1);
         assert_eq!(tasks.update_count(), 0);

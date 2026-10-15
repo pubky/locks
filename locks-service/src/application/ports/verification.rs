@@ -44,6 +44,8 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
         worker_id: &str,
         claim_token: &uuid::Uuid,
         now: time::OffsetDateTime,
+        invoice_created_at: time::OffsetDateTime,
+        payment_deadline: time::OffsetDateTime,
     ) -> Result<Option<InvoiceAdmissionRecord>, ApplicationError>;
 
     /// Returns exact live lease to durable due state without resetting attempts.
@@ -73,8 +75,13 @@ pub trait InvoiceAdmissionRepository: Send + Sync {
 pub trait VerificationTaskRepository: Send + Sync {
     /// Inserts a new verification task.
     ///
-    /// Returns `DuplicateRecord` if a task with the same Task ID or public
-    /// verification attempt handle (`creator`, `bundle_id`) already exists.
+    /// Exact replay of an existing public verification attempt handle
+    /// (`creator`, `bundle_id`) returns `DuplicateRecord` without replacing its lifecycle, so
+    /// callers re-read and return the canonical stored task.
+    /// Changed payload for that handle returns `VerificationTaskConflict`;
+    /// reuse of a Task ID for another handle returns `DuplicateRecord`.
+    /// PostgreSQL additionally returns `ContentLockDeletionInProgress` when the
+    /// authoritative deletion cutoff already exists for a new Bundle ID.
     async fn insert_verification_task(
         &self,
         task: VerificationTaskRecord,

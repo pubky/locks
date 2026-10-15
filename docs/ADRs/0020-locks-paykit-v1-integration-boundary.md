@@ -65,30 +65,31 @@ payment on one accepted method using Paykit's authenticated invoice status.
 
 1. apply rate limiting;
 2. validate proof shape;
-3. load and validate the current canonical Lock Resource and payment policy;
-4. resolve the current reader through Pubky discovery;
-5. compare any persisted lifecycle under `{ creator, bundle_id }`;
-6. reject changed submitted proof material with `409 task_state_conflict`;
-7. require configured Paykit and call its idempotent invoice endpoint only for new payment submissions; and
-8. insert the verification task with post-invoice race reconciliation.
+3. compare any durable lifecycle under `{ creator, bundle_id }` before mutable Lock Resource lookup;
+4. return an exact persisted replay or reject changed submitted proof material with `409 task_state_conflict`;
+5. only for a genuinely new identity, load and validate the current canonical Lock Resource and payment policy;
+6. require configured Paykit and atomically persist a pending verification task plus immutable invoice-admission intent, including `payment_in` copied from the validated canonical criterion, under the per-lock deletion/admission fence before Reader homeserver or Paykit I/O;
+7. return the pending lifecycle immediately; and
+8. let a separately claimed invoice-admission worker create or idempotently replay the Paykit invoice, apply durable retry or terminal-failure policy, then mark successful admission ready so the verification worker may claim it.
 
-Exact persisted payment replay returns the stored lifecycle without calling Paykit or repeating invoice side effects. Changed replay does not call Paykit. Clients needing another attempt must generate a new Bundle ID. Live Noise observation uses the dedicated task-bound lookup below.
+Exact persisted replay does not call Paykit and does not require configured Paykit; browser clients poll the existing lifecycle rather than resubmitting to drive invoice admission. Worker retry uses the persisted intent and stable task UUID as `X-Request-ID`. Changed replay conflicts without calling Paykit. Terminal lifecycle state is not restarted under the same identity; clients needing another attempt must generate a new Bundle ID. Live Noise observation uses the dedicated task-bound lookup below.
 
 ### Invoice request
 
-For a new lifecycle identity, Locks sends RFC 8785 canonical JSON to `POST /invoices`:
+For a claimed invoice-admission task, Locks sends RFC 8785 canonical JSON to `POST /invoices`:
 
 ```json
 {
   "bundle_id": "<reader-generated bundle id>",
   "lock_resource": "pubky<creator>/<canonical lock path>.json",
-  "reader": "pubky<reader>"
+  "reader": "pubky<reader>",
+  "payment_in": 24
 }
 ```
 
 Locks signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_canonical_body` with its existing Ed25519 keypair and sends the unpadded-base64url signature in `X-Paykit-Signature`. Body-only signatures are not supported.
 
-The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Exact proof submission replay returns the persisted verification lifecycle without calling Paykit. A different binding under the same identity returns Paykit `409 Conflict`, which Locks maps to `409 task_state_conflict`. Invoice creation and Noise state observation are separate operations.
+The durable Paykit invoice identity is `(creator, bundle_id)`, where Paykit derives `creator` from `lock_resource`. Paykit independently reads the canonical lock and rejects a request whose `payment_in` differs from the canonical criterion before side effects. Exact replay must return the original success without repeating mutable lookups, allocation, address creation, or delivery side effects. Success is exactly `200 OK` with a closed body containing RFC 3339 `invoice_created_at` and `payment_deadline`; Locks validates both timestamps and requires `payment_deadline > invoice_created_at` before marking admission ready. Transport failures, invalid or ambiguous success responses, typed Reader setup or registry failures, `429`, and `5xx` responses remain worker-owned durable retries within the DB-owned admission deadline. Paykit conflicts and other terminal admission errors make the pending lifecycle fail with a viewer-safe message; they are not synchronous `POST /proof-bundles` errors.
 
 For connection observation, the Reader sends its existing `{ creator, bundle_id }` task handle to Locks `POST /paykit-connection-state-lookups`. Locks loads the persisted task, rejects non-payment tasks, then sends signed canonical `{ creator, bundle_id }` to Paykit `POST /connections/status`. Paykit resolves its persisted invoice binding and returns exactly one local state: `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. Locks rejects missing, malformed, unknown, or extra successful response fields as `502 paykit_connection_state_unavailable`. Browser callers cannot probe arbitrary peer keys or receiver paths.
 
@@ -109,7 +110,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 
 ### Runtime boundary
 
-- New payment submissions require `[paykit]`; exact replay returns persisted lifecycle without calling Paykit. Dedicated connection-state lookup requires `[paykit]`.
+- A genuinely new payment lifecycle requires `[paykit]`; every exact persisted replay does not. Dedicated connection-state lookup also requires `[paykit]`.
 - Paykit HTTP connect timeout is 5 seconds and whole-request timeout is 20 seconds.
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
@@ -129,7 +130,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 
 - Both services must implement the same canonical-body signing contract.
 - Paykit must parse the public Locks payment criterion and therefore depends on its versioned shape.
-- Exact submission replay intentionally performs current canonical lock and reader preflight before returning persisted lifecycle state.
+- Snapshotted `invoice_pending` tasks must resolve before deletion may start the Paykit drain.
 - Terminal payment attempts require a fresh Bundle ID for retry; payment evidence remains owned and queryable by Paykit.
 
 ## Rejected alternatives

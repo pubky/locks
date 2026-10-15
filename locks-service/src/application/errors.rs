@@ -18,6 +18,18 @@ pub enum ApplicationError {
         /// Full creator-scoped guarded path for structured internal handling.
         guarded_path: String,
     },
+    /// A graceful deletion cutoff already blocks new proof Bundle IDs for the lock.
+    #[error("content lock deletion in progress")]
+    ContentLockDeletionInProgress,
+    /// A canonical publication reservation must reconcile before deletion can begin.
+    #[error("content lock publication in progress")]
+    ContentLockPublicationInProgress,
+    /// Persisted content-lock deletion state violates its internal invariants.
+    #[error("invalid content lock deletion state: {message}")]
+    InvalidContentLockDeletionState {
+        /// Secret-free invariant failure detail.
+        message: String,
+    },
     /// An update-only operation targeted a missing record.
     #[error("missing {record} record")]
     MissingRecord {

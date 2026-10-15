@@ -419,6 +419,9 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         ApplicationError::Storage { .. }
         | ApplicationError::DuplicateRecord { .. }
         | ApplicationError::ContentLockPathConflict { .. }
+        | ApplicationError::ContentLockDeletionInProgress
+        | ApplicationError::ContentLockPublicationInProgress
+        | ApplicationError::InvalidContentLockDeletionState { .. }
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending
@@ -1512,6 +1515,14 @@ mod tests {
             _content_lock_path: &ContentLockPath,
         ) -> Result<Option<ContentLock>, ApplicationError> {
             Ok(self.content_lock.clone())
+        }
+
+        async fn delete_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _content_lock_path: &ContentLockPath,
+        ) -> Result<bool, ApplicationError> {
+            unreachable!("completion must not delete content locks")
         }
     }
 

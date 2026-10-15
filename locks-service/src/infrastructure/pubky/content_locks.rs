@@ -3,7 +3,7 @@ use locks_core::ids::{ContentLockPath, CreatorPubky};
 use locks_core::lock_policy::ContentLock;
 
 use crate::application::errors::ApplicationError;
-use crate::application::ports::ContentLockRepository;
+use crate::application::ports::{ContentLockRepository, ContentLockWriteError};
 use crate::infrastructure::pubky::storage_client::PubkyHomeserverStorageClient;
 
 /// Pubky homeserver-backed repository for public content lock payloads.
@@ -44,6 +44,22 @@ where
             .await
     }
 
+    async fn upsert_content_lock_classified(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLock,
+    ) -> Result<(), ContentLockWriteError> {
+        let body = serde_json::to_value(content_lock).map_err(|error| {
+            ContentLockWriteError::NotStarted(ApplicationError::Storage {
+                message: format!("failed to serialize content lock for Pubky storage: {error}"),
+            })
+        })?;
+        self.client
+            .put_json_value_as_creator_classified(&creator, &content_lock_path.to_string(), body)
+            .await
+    }
+
     async fn get_content_lock(
         &self,
         creator: &CreatorPubky,
@@ -60,6 +76,26 @@ where
                 })
             })
             .transpose()
+    }
+
+    async fn delete_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<bool, ApplicationError> {
+        let path = content_lock_path.to_string();
+        let existed = self
+            .client
+            .get_json_value_as_creator(creator, &path)
+            .await?
+            .is_some();
+        if !existed {
+            return Ok(false);
+        }
+        self.client
+            .delete_if_present_as_creator(creator, &path)
+            .await?;
+        Ok(existed)
     }
 }
 
@@ -81,7 +117,7 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::ports::ContentLockRepository;
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
+        PubkyBytesResource, PubkyDeleteOutcome, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     #[tokio::test]
@@ -145,6 +181,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_content_lock_reads_and_deletes_the_exact_canonical_path() {
+        let requested_path = content_lock(900).content_lock_path().unwrap();
+        let repository = PubkyContentLockRepository::new(
+            FakeStorageClient::default().with_json_read(Some(json!({}))),
+        );
+
+        assert!(
+            repository
+                .delete_content_lock(&creator(), &requested_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!(
+                    "get_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+                ),
+                format!(
+                    "delete_if_present pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_content_lock_skips_delete_when_canonical_path_is_already_absent() {
+        let requested_path = content_lock(900).content_lock_path().unwrap();
+        let repository = PubkyContentLockRepository::new(FakeStorageClient::default());
+
+        assert!(
+            !repository
+                .delete_content_lock(&creator(), &requested_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec![format!(
+                "get_json pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy {requested_path}"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_content_lock_succeeds_when_resource_disappears_between_read_and_delete() {
+        let requested_path = content_lock(900).content_lock_path().unwrap();
+        let repository = PubkyContentLockRepository::new(
+            FakeStorageClient::default()
+                .with_json_read(Some(json!({})))
+                .with_delete_outcome(PubkyDeleteOutcome::NotFound),
+        );
+
+        assert!(
+            repository
+                .delete_content_lock(&creator(), &requested_path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec![
+                format!("get_json {} {requested_path}", creator()),
+                format!("delete_if_present {} {requested_path}", creator()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn storage_errors_are_propagated() {
         let repository = PubkyContentLockRepository::new(FakeStorageClient::default().with_error(
             ApplicationError::Storage {
@@ -170,6 +275,7 @@ mod tests {
         last_json_body: Mutex<Option<serde_json::Value>>,
         operations: Mutex<Vec<String>>,
         error: Mutex<Option<ApplicationError>>,
+        delete_outcome: Mutex<Option<PubkyDeleteOutcome>>,
     }
 
     impl FakeStorageClient {
@@ -180,6 +286,11 @@ mod tests {
 
         fn with_error(self, error: ApplicationError) -> Self {
             *self.error.lock().unwrap() = Some(error);
+            self
+        }
+
+        fn with_delete_outcome(self, outcome: PubkyDeleteOutcome) -> Self {
+            *self.delete_outcome.lock().unwrap() = Some(outcome);
             self
         }
 
@@ -261,10 +372,32 @@ mod tests {
 
         async fn delete_as_creator(
             &self,
-            _creator: &CreatorPubky,
-            _path: &str,
+            creator: &CreatorPubky,
+            path: &str,
         ) -> Result<(), ApplicationError> {
-            unimplemented!("not needed by content lock repository tests")
+            self.maybe_error()?;
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("delete {creator} {path}"));
+            Ok(())
+        }
+
+        async fn delete_if_present_as_creator(
+            &self,
+            creator: &CreatorPubky,
+            path: &str,
+        ) -> Result<PubkyDeleteOutcome, ApplicationError> {
+            self.maybe_error()?;
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("delete_if_present {creator} {path}"));
+            Ok(self
+                .delete_outcome
+                .lock()
+                .unwrap()
+                .unwrap_or(PubkyDeleteOutcome::Deleted))
         }
     }
 
