@@ -416,7 +416,8 @@ async fn post_proof_bundles_rejects_paykit_payment_when_paykit_is_not_configured
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(creator());
@@ -455,7 +456,8 @@ async fn post_proof_bundles_persists_pending_without_inline_paykit_invoice() {
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());
@@ -580,7 +582,8 @@ async fn verification_task_lookup_projects_reader_wallet_setup_needed_without_en
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());
@@ -746,7 +749,8 @@ async fn paykit_connection_state_lookup_returns_server_local_recovery_state() {
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());
@@ -1025,7 +1029,8 @@ async fn paykit_connection_state_lookup_maps_invalid_paykit_response_to_bad_gate
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());
@@ -1083,7 +1088,8 @@ async fn paykit_connection_state_lookup_maps_response_body_timeout_to_gateway_ti
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());
@@ -4087,7 +4093,8 @@ fn paykit_content_lock_and_bundle() -> (ContentLock, SubmittedProofBundle) {
     content_lock.criteria[0].params = json!({
         "recipient_pubky": creator().to_string(),
         "amount": "50000",
-        "asset": "BTC"
+        "asset": "BTC",
+        "payment_in": 24
     });
     let mut bundle = submitted_proof_bundle_for(&content_lock);
     bundle.reader_public_key = Some(other_creator());

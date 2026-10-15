@@ -17,25 +17,28 @@ use locks_service::{
         errors::ApplicationError,
         models::AccessCredentialPolicy,
         ports::{
-            AccessCredentialStore, Clock, ContentLockRepository, CreatorAuthorityManager,
-            CreatorAuthorityStore, CreatorConnectFlowStore, EntitlementRepository,
-            FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
-            GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
-            LockServicePointerRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            AccessCredentialStore, Clock, ContentLockOwnershipRepository, ContentLockRepository,
+            CreatorAuthorityManager, CreatorAuthorityStore, CreatorConnectFlowStore,
+            EntitlementRepository, FrontendSessionCodeStore, FrontendSessionStore,
+            GrantCreatorConnectFlowClient, GuardedResourceRepository, InvoiceAdmissionRepository,
+            LegacyCreatorConnectFlowClient, LockServicePointerRepository, VerificationTaskClaimer,
+            VerificationTaskRepository,
         },
         use_cases::start_creator_connect_flow::default_requested_scopes,
     },
     infrastructure::{
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
+            content_lock_ownership::InMemoryContentLockOwnershipRepository,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_tasks::InMemoryVerificationTaskRepository,
         },
         postgres::{
             CreatorAuthoritySecretCipher, PostgresAccessCredentialStore,
-            PostgresCreatorAuthorityStore, PostgresCreatorConnectFlowStore,
-            PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
-            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
+            PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
+            PostgresCreatorConnectFlowStore, PostgresFrontendSessionCodeStore,
+            PostgresFrontendSessionStore, PostgresVerificationTaskClaimer,
+            PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
@@ -241,6 +244,7 @@ pub struct AppState {
     content_locks: Arc<dyn ContentLockRepository>,
     guarded_resources: Arc<dyn GuardedResourceRepository>,
     lock_service_pointers: Arc<dyn LockServicePointerRepository>,
+    content_lock_ownership: Arc<dyn ContentLockOwnershipRepository>,
     invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
@@ -326,6 +330,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -378,6 +383,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -447,6 +453,7 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -495,6 +502,9 @@ impl AppState {
         );
 
         let private_runtime = PrivateRuntimeAdapters {
+            content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
+                pool.clone(),
+            )),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -547,6 +557,9 @@ impl AppState {
             entitlements,
         );
         let private_runtime = PrivateRuntimeAdapters {
+            content_lock_ownership: Arc::new(PostgresContentLockOwnershipRepository::new(
+                pool.clone(),
+            )),
             invoice_admissions: verification_tasks.clone(),
             verification_tasks,
             verification_task_claimer,
@@ -621,6 +634,7 @@ impl AppState {
             content_locks: creator_repositories.content_locks,
             guarded_resources: creator_repositories.guarded_resources,
             lock_service_pointers: creator_repositories.lock_service_pointers,
+            content_lock_ownership: private_runtime.content_lock_ownership,
             invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
@@ -669,6 +683,10 @@ impl AppState {
 
     pub fn guarded_resources(&self) -> &Arc<dyn GuardedResourceRepository> {
         &self.guarded_resources
+    }
+
+    pub fn content_lock_ownership(&self) -> &Arc<dyn ContentLockOwnershipRepository> {
+        &self.content_lock_ownership
     }
 
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {

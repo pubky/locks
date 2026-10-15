@@ -22,7 +22,7 @@ The primary gates are:
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --exclude locks-e2e --exclude locks-service --exclude locks-sdk-wasm
-cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres
+cargo nextest run -p locks-service --lib -- --skip postgres
 npm --prefix locks-sdk/bindings/js run test
 git diff --check
 ```

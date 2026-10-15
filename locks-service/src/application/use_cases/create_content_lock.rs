@@ -7,7 +7,9 @@ use locks_core::lock_policy::{
 };
 
 use crate::application::errors::ApplicationError;
-use crate::application::ports::{Clock, ContentLockRepository, GuardedResourceRepository};
+use crate::application::ports::{
+    Clock, ContentLockOwnershipRepository, ContentLockRepository, GuardedResourceRepository,
+};
 
 /// Request to create a local content lock for an already-registered guarded resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,7 @@ pub struct CreatedContentLock {
 /// Creates local content locks after verifying current guarded resource metadata.
 pub struct CreateContentLockUseCase<'a> {
     content_locks: &'a dyn ContentLockRepository,
+    content_lock_ownership: &'a dyn ContentLockOwnershipRepository,
     guarded_resources: &'a dyn GuardedResourceRepository,
     clock: &'a dyn Clock,
 }
@@ -50,11 +53,13 @@ impl<'a> CreateContentLockUseCase<'a> {
     /// Creates a content-lock use case from its application ports.
     pub fn new(
         content_locks: &'a dyn ContentLockRepository,
+        content_lock_ownership: &'a dyn ContentLockOwnershipRepository,
         guarded_resources: &'a dyn GuardedResourceRepository,
         clock: &'a dyn Clock,
     ) -> Self {
         Self {
             content_locks,
+            content_lock_ownership,
             guarded_resources,
             clock,
         }
@@ -65,7 +70,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         &self,
         request: CreateContentLockRequest,
     ) -> Result<CreatedContentLock, ApplicationError> {
-        let content_lock = ContentLock {
+        let mut content_lock = ContentLock {
             version: CONTENT_LOCK_VERSION,
             creator: request.creator.clone(),
             primary_resource: request.primary_resource,
@@ -105,6 +110,16 @@ impl<'a> CreateContentLockUseCase<'a> {
                 });
             }
         }
+        let guarded_paths = resource_descriptors(&content_lock)
+            .into_iter()
+            .map(|resource| resource.path)
+            .collect::<Vec<_>>();
+        if let Some(existing) = self
+            .resolve_owned_content_lock(&request.creator, &guarded_paths, &content_lock)
+            .await?
+        {
+            content_lock = existing;
+        }
         let lock_id = content_lock.lock_id().map_err(|error| {
             ApplicationError::ContentLockCanonicalization {
                 message: error.to_string(),
@@ -116,12 +131,49 @@ impl<'a> CreateContentLockUseCase<'a> {
             }
         })?;
 
-        self.content_locks
+        if let Err(error) = self
+            .content_lock_ownership
+            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+            .await
+        {
+            if matches!(error, ApplicationError::ContentLockPathConflict { .. })
+                && self
+                    .content_locks
+                    .get_content_lock(&request.creator, &content_lock_path)
+                    .await?
+                    .as_ref()
+                    == Some(&content_lock)
+            {
+                self.content_lock_ownership
+                    .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                    .await?;
+                return Ok(CreatedContentLock {
+                    lock_id,
+                    content_lock_path,
+                    content_lock,
+                });
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .content_locks
             .upsert_content_lock(
-                request.creator,
+                request.creator.clone(),
                 content_lock_path.clone(),
                 content_lock.clone(),
             )
+            .await
+        {
+            let _ = self
+                .content_lock_ownership
+                .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
+                .await;
+            return Err(error);
+        }
+
+        self.content_lock_ownership
+            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
             .await?;
 
         Ok(CreatedContentLock {
@@ -129,6 +181,65 @@ impl<'a> CreateContentLockUseCase<'a> {
             content_lock_path,
             content_lock,
         })
+    }
+
+    async fn resolve_owned_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        guarded_paths: &[String],
+        requested: &ContentLock,
+    ) -> Result<Option<ContentLock>, ApplicationError> {
+        // Reuse durable canonical identity only when every requested path has
+        // the same owner and every request field except `created_at` matches.
+        let mut ownership = Vec::with_capacity(guarded_paths.len());
+        for guarded_path in guarded_paths {
+            ownership.push(
+                self.content_lock_ownership
+                    .get_path_ownership(creator, guarded_path)
+                    .await?,
+            );
+        }
+        let Some(existing_lock_id) = ownership
+            .iter()
+            .find_map(|record| record.as_ref().map(|record| record.lock_id.clone()))
+        else {
+            return Ok(None);
+        };
+        for (guarded_path, record) in guarded_paths.iter().zip(&ownership) {
+            if !record
+                .as_ref()
+                .is_some_and(|record| record.lock_id == existing_lock_id)
+            {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: guarded_path.clone(),
+                });
+            }
+        }
+
+        let existing_path = ContentLockPath::from_lock_id(existing_lock_id.clone());
+        let Some(existing) = self
+            .content_locks
+            .get_content_lock(creator, &existing_path)
+            .await?
+        else {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
+        };
+        let canonical_lock_id =
+            existing
+                .lock_id()
+                .map_err(|error| ApplicationError::ContentLockCanonicalization {
+                    message: error.to_string(),
+                })?;
+        let mut expected = requested.clone();
+        expected.created_at = existing.created_at;
+        if canonical_lock_id != existing_lock_id || existing != expected {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
+        }
+        Ok(Some(existing))
     }
 }
 
@@ -168,7 +279,9 @@ fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use async_trait::async_trait;
     use serde_json::json;
     use time::OffsetDateTime;
     use time::macros::datetime;
@@ -178,15 +291,27 @@ mod tests {
 
     use super::*;
     use crate::application::models::GuardedResourceRecord;
-    use crate::application::ports::{Clock, ContentLockRepository, GuardedResourceRepository};
+    use crate::application::ports::{
+        Clock, ContentLockOwnershipRepository, ContentLockRepository, GuardedResourceRepository,
+    };
+    use crate::infrastructure::memory::content_lock_ownership::InMemoryContentLockOwnershipRepository;
     use crate::infrastructure::memory::content_locks::InMemoryContentLockRepository;
     use crate::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
+    use crate::infrastructure::postgres::{
+        PostgresContentLockOwnershipRepository, testing::TestDatabase,
+    };
 
     #[tokio::test]
     async fn create_content_lock_stores_payload_under_derived_path() {
         let fixture = Fixture::seeded().await;
         let use_case = fixture.use_case();
         let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
 
         let result = use_case.execute(request.clone()).await.unwrap();
 
@@ -219,6 +344,14 @@ mod tests {
                 .unwrap(),
             Some(result.content_lock)
         );
+        let ownership = fixture
+            .content_lock_ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ownership.lock_id, result.lock_id);
+        assert_eq!(ownership.status.as_str(), "published");
     }
 
     #[tokio::test]
@@ -304,20 +437,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_criteria_create_different_lock_id_and_path() {
+    async fn changed_criteria_rejects_path_owned_by_different_lock() {
         let fixture = Fixture::seeded().await;
         let use_case = fixture.use_case();
         let first_request = content_lock_request(registered_guarded_resource());
+        let guarded_path = first_request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
         let mut second_request = first_request.clone();
         second_request.criteria[0].params = json!({ "satisfied": false });
 
         let first = use_case.execute(first_request).await.unwrap();
-        let second = use_case.execute(second_request).await.unwrap();
+        let second = use_case.execute(second_request).await;
 
-        assert_ne!(second.lock_id, first.lock_id);
-        assert_ne!(second.content_lock_path, first.content_lock_path);
-        assert_ne!(second.content_lock, first.content_lock);
-        assert_eq!(fixture.content_locks_len().await, 2);
+        assert!(matches!(
+            second,
+            Err(ApplicationError::ContentLockPathConflict { guarded_path: ref conflicting_path })
+                if conflicting_path == &guarded_path
+        ));
+        assert_eq!(fixture.content_locks_len().await, 1);
+        let ownership = fixture
+            .content_lock_ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ownership.lock_id, first.lock_id);
     }
 
     #[tokio::test]
@@ -330,6 +478,7 @@ mod tests {
             "recipient_pubky": creator().to_string(),
             "amount": "0",
             "asset": "BTC",
+            "payment_in": 24,
         });
 
         let result = use_case.execute(request).await;
@@ -353,7 +502,8 @@ mod tests {
             params: json!({
                 "recipient_pubky": creator().to_string(),
                 "amount": "50000",
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         });
         request.lock_logic = LockLogic::All {
@@ -369,8 +519,256 @@ mod tests {
         assert_eq!(fixture.content_locks_len().await, 0);
     }
 
+    #[tokio::test]
+    async fn publication_failure_compensates_reserved_path_ownership() {
+        let fixture = Fixture::seeded().await;
+        let use_case = CreateContentLockUseCase::new(
+            &FailingContentLockRepository,
+            &fixture.content_lock_ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
+
+        let result = use_case.execute(request).await;
+
+        assert!(matches!(
+            result,
+            Err(ApplicationError::Storage { ref message }) if message == "publication failed"
+        ));
+        assert_eq!(
+            fixture
+                .content_lock_ownership
+                .get_path_ownership(&creator(), &guarded_path)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_retry_recovers_after_ownership_mark_failure() {
+        let fixture = Fixture::seeded().await;
+        let ownership = FailOnceMarkOwnershipRepository::new(&fixture.content_lock_ownership);
+        let first_use_case = CreateContentLockUseCase::new(
+            &fixture.content_locks,
+            &ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
+
+        assert_eq!(
+            first_use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage {
+                message: "ownership mark failed".to_owned(),
+            })
+        );
+        let reserved = ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.status.as_str(), "reserved");
+
+        let retry_clock = FixedClock(datetime!(2026-06-03 12:00:01 UTC));
+        let retry_use_case = CreateContentLockUseCase::new(
+            &fixture.content_locks,
+            &ownership,
+            &fixture.guarded_resources,
+            &retry_clock,
+        );
+
+        assert!(matches!(
+            retry_use_case
+                .execute(content_lock_request_with_changed_criteria())
+                .await,
+            Err(ApplicationError::ContentLockPathConflict { .. })
+        ));
+
+        let recovered = retry_use_case.execute(request).await.unwrap();
+        assert_eq!(recovered.lock_id, reserved.lock_id);
+        assert_eq!(recovered.content_lock.created_at, fixture.clock.now());
+        assert_eq!(
+            recovered.content_lock_path,
+            ContentLockPath::from_lock_id(reserved.lock_id.clone())
+        );
+        let published = ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.lock_id, recovered.lock_id);
+        assert_eq!(published.status.as_str(), "published");
+    }
+
+    #[tokio::test]
+    async fn postgres_retry_recovers_original_identity_after_ownership_mark_failure() {
+        let database = TestDatabase::create().await;
+        let content_locks = InMemoryContentLockRepository::new();
+        let content_lock_ownership =
+            PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        let ownership = FailOnceMarkOwnershipRepository::new(&content_lock_ownership);
+        let guarded_resources = InMemoryGuardedResourceRepository::new();
+        let guarded_resource = registered_guarded_resource();
+        guarded_resources
+            .upsert_guarded_resource(GuardedResourceRecord {
+                creator: creator(),
+                path: guarded_resource.path.clone(),
+                hash: guarded_resource.hash,
+                content_type: guarded_resource.content_type.clone(),
+                size: guarded_resource.size,
+                bytes: b"guarded bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+        let initial_clock = FixedClock(datetime!(2026-06-03 12:00:00 UTC));
+        let request = content_lock_request(guarded_resource);
+        let first_use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &ownership,
+            &guarded_resources,
+            &initial_clock,
+        );
+
+        assert!(matches!(
+            first_use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage { ref message })
+                if message == "ownership mark failed"
+        ));
+        let original = content_lock_ownership
+            .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let retry_clock = FixedClock(datetime!(2026-06-03 12:00:01 UTC));
+        let retry_use_case = CreateContentLockUseCase::new(
+            &content_locks,
+            &ownership,
+            &guarded_resources,
+            &retry_clock,
+        );
+        let recovered = retry_use_case.execute(request).await.unwrap();
+
+        assert_eq!(recovered.lock_id, original.lock_id);
+        assert_eq!(recovered.content_lock.created_at, initial_clock.now());
+        assert_eq!(
+            content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "published"
+        );
+        database.cleanup().await;
+    }
+
+    struct FailingContentLockRepository;
+
+    #[async_trait]
+    impl ContentLockRepository for FailingContentLockRepository {
+        async fn upsert_content_lock(
+            &self,
+            _creator: CreatorPubky,
+            _path: ContentLockPath,
+            _content_lock: ContentLock,
+        ) -> Result<(), ApplicationError> {
+            Err(ApplicationError::Storage {
+                message: "publication failed".to_owned(),
+            })
+        }
+
+        async fn get_content_lock(
+            &self,
+            _creator: &CreatorPubky,
+            _path: &ContentLockPath,
+        ) -> Result<Option<ContentLock>, ApplicationError> {
+            Ok(None)
+        }
+    }
+
+    struct FailOnceMarkOwnershipRepository<'a> {
+        inner: &'a dyn ContentLockOwnershipRepository,
+        fail_next_mark: AtomicBool,
+    }
+
+    impl<'a> FailOnceMarkOwnershipRepository<'a> {
+        fn new(inner: &'a dyn ContentLockOwnershipRepository) -> Self {
+            Self {
+                inner,
+                fail_next_mark: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContentLockOwnershipRepository for FailOnceMarkOwnershipRepository<'_> {
+        async fn reserve_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .reserve_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn mark_paths_published(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            if self.fail_next_mark.swap(false, Ordering::SeqCst) {
+                return Err(ApplicationError::Storage {
+                    message: "ownership mark failed".to_owned(),
+                });
+            }
+            self.inner
+                .mark_paths_published(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn compensate_reserved_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn get_path_ownership(
+            &self,
+            creator: &CreatorPubky,
+            guarded_path: &str,
+        ) -> Result<Option<crate::application::models::ContentLockOwnership>, ApplicationError>
+        {
+            self.inner.get_path_ownership(creator, guarded_path).await
+        }
+    }
+
     struct Fixture {
         content_locks: InMemoryContentLockRepository,
+        content_lock_ownership: InMemoryContentLockOwnershipRepository,
         guarded_resources: InMemoryGuardedResourceRepository,
         clock: FixedClock,
     }
@@ -379,6 +777,7 @@ mod tests {
         fn empty() -> Self {
             Self {
                 content_locks: InMemoryContentLockRepository::new(),
+                content_lock_ownership: InMemoryContentLockOwnershipRepository::new(),
                 guarded_resources: InMemoryGuardedResourceRepository::new(),
                 clock: FixedClock(datetime!(2026-06-03 12:00:00 UTC)),
             }
@@ -403,7 +802,12 @@ mod tests {
         }
 
         fn use_case(&self) -> CreateContentLockUseCase<'_> {
-            CreateContentLockUseCase::new(&self.content_locks, &self.guarded_resources, &self.clock)
+            CreateContentLockUseCase::new(
+                &self.content_locks,
+                &self.content_lock_ownership,
+                &self.guarded_resources,
+                &self.clock,
+            )
         }
 
         async fn content_locks_len(&self) -> usize {

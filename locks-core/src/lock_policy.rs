@@ -341,6 +341,10 @@ impl fmt::Display for VerifierType {
     }
 }
 
+/// Largest whole-hour payment window representable from the Unix epoch by the
+/// protocol's `time` timestamp representation.
+pub const MAX_PAYKIT_PAYMENT_IN_HOURS: u64 = 70_389_527;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PaykitPaymentParamsValidationError {
     #[error("paykit-payment params must be a JSON object")]
@@ -355,6 +359,35 @@ pub enum PaykitPaymentParamsValidationError {
     InvalidAmount,
     #[error("paykit-payment asset must be a non-empty string")]
     InvalidAsset,
+    #[error("paykit-payment payment_in must be a whole-hour JSON u64 between 1 and 70389527")]
+    InvalidPaymentIn,
+}
+
+/// Validated public parameters for a `paykit-payment` criterion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitPaymentParams {
+    recipient_pubky: CreatorPubky,
+    amount: String,
+    asset: String,
+    payment_in: u64,
+}
+
+impl PaykitPaymentParams {
+    pub fn recipient_pubky(&self) -> &CreatorPubky {
+        &self.recipient_pubky
+    }
+
+    pub fn amount(&self) -> &str {
+        &self.amount
+    }
+
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    pub fn payment_in(&self) -> u64 {
+        self.payment_in
+    }
 }
 
 /// Invalid v1 content-lock policy containing a `paykit-payment` criterion.
@@ -389,22 +422,32 @@ pub struct Criterion {
 impl Criterion {
     /// Validates verifier-specific public criterion params.
     pub fn validate_params(&self) -> Result<(), PaykitPaymentParamsValidationError> {
+        self.paykit_payment_params().map(|_| ())
+    }
+
+    /// Returns typed parameters when this is a `paykit-payment` criterion.
+    pub fn paykit_payment_params(
+        &self,
+    ) -> Result<Option<PaykitPaymentParams>, PaykitPaymentParamsValidationError> {
         match self.verifier_type {
-            VerifierType::DevStatic => Ok(()),
-            VerifierType::PaykitPayment => validate_paykit_payment_params(&self.params),
+            VerifierType::DevStatic => Ok(None),
+            VerifierType::PaykitPayment => validate_paykit_payment_params(&self.params).map(Some),
         }
     }
 }
 
 fn validate_paykit_payment_params(
     params: &Value,
-) -> Result<(), PaykitPaymentParamsValidationError> {
+) -> Result<PaykitPaymentParams, PaykitPaymentParamsValidationError> {
     let object = params
         .as_object()
         .ok_or(PaykitPaymentParamsValidationError::NotObject)?;
 
     for key in object.keys() {
-        if !matches!(key.as_str(), "recipient_pubky" | "amount" | "asset") {
+        if !matches!(
+            key.as_str(),
+            "recipient_pubky" | "amount" | "asset" | "payment_in"
+        ) {
             return Err(PaykitPaymentParamsValidationError::UnknownField(
                 key.clone(),
             ));
@@ -417,7 +460,7 @@ fn validate_paykit_payment_params(
         .ok_or(PaykitPaymentParamsValidationError::MissingField(
             "recipient_pubky",
         ))?;
-    CreatorPubky::from_str(recipient_pubky)
+    let recipient_pubky = CreatorPubky::from_str(recipient_pubky)
         .map_err(|_| PaykitPaymentParamsValidationError::InvalidRecipientPubky)?;
 
     let amount = object
@@ -441,7 +484,21 @@ fn validate_paykit_payment_params(
         return Err(PaykitPaymentParamsValidationError::InvalidAsset);
     }
 
-    Ok(())
+    let payment_in = object
+        .get("payment_in")
+        .ok_or(PaykitPaymentParamsValidationError::MissingField(
+            "payment_in",
+        ))?
+        .as_u64()
+        .filter(|payment_in| (1..=MAX_PAYKIT_PAYMENT_IN_HOURS).contains(payment_in))
+        .ok_or(PaykitPaymentParamsValidationError::InvalidPaymentIn)?;
+
+    Ok(PaykitPaymentParams {
+        recipient_pubky,
+        amount: amount.to_owned(),
+        asset: asset.to_owned(),
+        payment_in,
+    })
 }
 
 /// Logic expression over criterion identifiers.
@@ -491,10 +548,10 @@ mod tests {
     use crate::lock_policy::{
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockValidationError, Criterion,
         GuardedResource, GuardedResourceValidationError, LockLogic, LockServerConfig,
-        PRIVATE_PROOF_BUNDLE_PATH_PREFIX, PRIVATE_RESOURCE_CONTENT_PATH_PREFIX,
-        PUBLIC_LOCKS_APP_PATH_PREFIX, PaykitPaymentParamsValidationError,
-        PaykitPaymentPolicyValidationError, SecondaryGuardedResource, VerifierType,
-        verified_proof_bundle_path,
+        MAX_PAYKIT_PAYMENT_IN_HOURS, PRIVATE_PROOF_BUNDLE_PATH_PREFIX,
+        PRIVATE_RESOURCE_CONTENT_PATH_PREFIX, PUBLIC_LOCKS_APP_PATH_PREFIX, PaykitPaymentParams,
+        PaykitPaymentParamsValidationError, PaykitPaymentPolicyValidationError,
+        SecondaryGuardedResource, VerifierType, verified_proof_bundle_path,
     };
 
     fn test_pubky_identity() -> String {
@@ -569,7 +626,8 @@ mod tests {
             params: json!({
                 "recipient_pubky": recipient_pubky.to_string(),
                 "amount": "50000",
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         }
     }
@@ -887,76 +945,132 @@ mod tests {
                 "recipient_pubky": test_pubky_identity(),
                 "amount": "50000",
                 "asset": "BTC",
+                "payment_in": 24,
             }),
         };
 
         assert_eq!(criterion.validate_params(), Ok(()));
+        let params = criterion.paykit_payment_params().unwrap().unwrap();
+        assert_eq!(params.amount(), "50000");
+        assert_eq!(params.asset(), "BTC");
+        assert_eq!(params.payment_in(), 24);
+        assert_eq!(
+            params.recipient_pubky().to_string(),
+            criterion.params["recipient_pubky"]
+        );
+        let _: PaykitPaymentParams = params;
+    }
+
+    #[test]
+    fn paykit_payment_in_rejects_unrepresentable_deadline_window() {
+        let recipient = test_pubky_identity();
+        assert!(
+            time::OffsetDateTime::UNIX_EPOCH
+                .checked_add(time::Duration::hours(MAX_PAYKIT_PAYMENT_IN_HOURS as i64))
+                .is_some()
+        );
+        assert!(
+            time::OffsetDateTime::UNIX_EPOCH
+                .checked_add(time::Duration::hours(
+                    MAX_PAYKIT_PAYMENT_IN_HOURS as i64 + 1
+                ))
+                .is_none()
+        );
+        let maximum = Criterion {
+            criterion_id: "criterion-1".to_owned(),
+            verifier_type: VerifierType::PaykitPayment,
+            params: json!({
+                "recipient_pubky": recipient,
+                "amount": "50000",
+                "asset": "BTC",
+                "payment_in": 70_389_527,
+            }),
+        };
+        let too_large = Criterion {
+            params: json!({
+                "recipient_pubky": recipient,
+                "amount": "50000",
+                "asset": "BTC",
+                "payment_in": 70_389_528,
+            }),
+            ..maximum.clone()
+        };
+
+        assert_eq!(maximum.validate_params(), Ok(()));
+        assert_eq!(
+            too_large.validate_params(),
+            Err(PaykitPaymentParamsValidationError::InvalidPaymentIn)
+        );
     }
 
     #[test]
     fn paykit_payment_params_reject_invalid_shapes() {
+        let recipient = test_pubky_identity();
+        let overflow = serde_json::from_str(&format!(
+            r#"{{"recipient_pubky":"{recipient}","amount":"50000","asset":"BTC","payment_in":18446744073709551616}}"#
+        ))
+        .unwrap();
         for (params, expected) in [
             (json!(null), PaykitPaymentParamsValidationError::NotObject),
             (
-                json!({
-                    "recipient_pubky": test_pubky_identity(),
-                    "amount": "50000",
-                    "asset": "BTC",
-                    "memo": "extra",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC", "payment_in": 24, "memo": "extra" }),
                 PaykitPaymentParamsValidationError::UnknownField("memo".to_owned()),
             ),
             (
-                json!({ "amount": "50000", "asset": "BTC" }),
+                json!({ "amount": "50000", "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::MissingField("recipient_pubky"),
             ),
             (
-                json!({ "recipient_pubky": test_pubky_identity(), "asset": "BTC" }),
+                json!({ "recipient_pubky": recipient, "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::MissingField("amount"),
             ),
             (
-                json!({ "recipient_pubky": test_pubky_identity(), "amount": "50000" }),
+                json!({ "recipient_pubky": recipient, "amount": "50000", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::MissingField("asset"),
             ),
             (
-                json!({
-                    "recipient_pubky": "not-a-pubky",
-                    "amount": "50000",
-                    "asset": "BTC",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC" }),
+                PaykitPaymentParamsValidationError::MissingField("payment_in"),
+            ),
+            (
+                json!({ "recipient_pubky": "not-a-pubky", "amount": "50000", "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::InvalidRecipientPubky,
             ),
             (
-                json!({
-                    "recipient_pubky": test_pubky_identity(),
-                    "amount": "0",
-                    "asset": "BTC",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": "0", "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::InvalidAmount,
             ),
             (
-                json!({
-                    "recipient_pubky": test_pubky_identity(),
-                    "amount": "0.5",
-                    "asset": "BTC",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": "0.5", "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::InvalidAmount,
             ),
             (
-                json!({
-                    "recipient_pubky": test_pubky_identity(),
-                    "amount": 50000,
-                    "asset": "BTC",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": 50000, "asset": "BTC", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::InvalidAmount,
             ),
             (
-                json!({
-                    "recipient_pubky": test_pubky_identity(),
-                    "amount": "50000",
-                    "asset": "",
-                }),
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "", "payment_in": 24 }),
                 PaykitPaymentParamsValidationError::InvalidAsset,
+            ),
+            (
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC", "payment_in": 0 }),
+                PaykitPaymentParamsValidationError::InvalidPaymentIn,
+            ),
+            (
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC", "payment_in": -1 }),
+                PaykitPaymentParamsValidationError::InvalidPaymentIn,
+            ),
+            (
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC", "payment_in": 1.5 }),
+                PaykitPaymentParamsValidationError::InvalidPaymentIn,
+            ),
+            (
+                json!({ "recipient_pubky": recipient, "amount": "50000", "asset": "BTC", "payment_in": "24" }),
+                PaykitPaymentParamsValidationError::InvalidPaymentIn,
+            ),
+            (
+                overflow,
+                PaykitPaymentParamsValidationError::InvalidPaymentIn,
             ),
         ] {
             let criterion = Criterion {
@@ -1232,5 +1346,18 @@ mod tests {
             with_override.lock_id().unwrap(),
             without_override.lock_id().unwrap()
         );
+    }
+
+    #[test]
+    fn changing_paykit_payment_in_changes_lock_id() {
+        let mut shorter = content_lock_fixture();
+        shorter.criteria = vec![paykit_criterion("payment", &shorter.creator)];
+        shorter.lock_logic = LockLogic::All {
+            criteria: vec!["payment".to_owned()],
+        };
+        let mut longer = shorter.clone();
+        longer.criteria[0].params["payment_in"] = json!(25);
+
+        assert_ne!(shorter.lock_id().unwrap(), longer.lock_id().unwrap());
     }
 }

@@ -8,9 +8,11 @@ for (const [asset, input, atomic, display] of [
   ['USD', '184467440737095516.15', '18446744073709551615', '184467440737095516.15 USD'],
 ]) {
   const policy = buildCreatorLockPolicy({ lockType: 'paykit-payment', criterionId: 'payment',
-    amount: input, asset, recipientPubky: 'authenticated-creator', paykitSetupComplete: true });
+    amount: input, asset, paymentIn: 24,
+    recipientPubky: 'authenticated-creator', paykitSetupComplete: true });
   assert.equal(policy.criteria[0].params.amount, atomic);
   assert.equal(policy.criteria[0].params.asset, asset);
+  assert.equal(policy.criteria[0].params.payment_in, 24);
   assert.equal(formatPaymentAmount(atomic, asset), display);
 }
 for (const [amount, asset] of [
