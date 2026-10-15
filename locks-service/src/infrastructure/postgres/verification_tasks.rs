@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use locks_core::ids::{BundleId, CreatorPubky, LockId, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId, PubkyLockResource, TaskId};
 use locks_core::verification::{SubmittedProofBundle, VerifiedProofBundle};
 
 use crate::application::errors::ApplicationError;
@@ -596,6 +596,36 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             return Err(ApplicationError::InvalidVerificationTaskFailureMessage);
         }
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let identity: Option<(String, String)> = sqlx::query_as(
+            "SELECT creator, submitted_proof_bundle->>'pubky_lock_resource'
+             FROM verification_tasks
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some((creator, lock_resource)) = identity else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
+        let creator =
+            CreatorPubky::from_str(&creator).map_err(|error| ApplicationError::Storage {
+                message: format!("invalid invoice admission creator stored in Postgres: {error}"),
+            })?;
+        let lock_resource = PubkyLockResource::from_str(&lock_resource).map_err(|error| {
+            ApplicationError::Storage {
+                message: format!(
+                    "invalid invoice admission lock resource stored in Postgres: {error}"
+                ),
+            }
+        })?;
+        if lock_resource.creator() != &creator {
+            return Err(ApplicationError::Storage {
+                message: "invoice admission creator diverges from its lock resource".to_owned(),
+            });
+        }
+        lock_proof_admission(&mut transaction, &creator, lock_resource.lock_id()).await?;
         let updated: Option<(Uuid, Option<Uuid>, time::OffsetDateTime)> = sqlx::query_as(
             "WITH locked AS MATERIALIZED (
                  SELECT task_id FROM verification_tasks

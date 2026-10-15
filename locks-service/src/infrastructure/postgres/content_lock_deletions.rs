@@ -1850,11 +1850,13 @@ mod tests {
             VerificationResult, VerifiedProofBundle,
         },
     };
+    use sqlx::PgPool;
     use time::macros::datetime;
     use uuid::Uuid;
 
     use super::{
-        ForceDeletionReceiptRow, PostgresContentLockDeletionRepository, row_to_force_receipt,
+        ForceDeletionReceiptRow, PostgresContentLockDeletionRepository,
+        ensure_all_frozen_snapshots_terminal, row_to_force_receipt,
     };
     use crate::{
         application::{
@@ -3093,6 +3095,155 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_invoice_admission_failure_resolves_the_deletion_snapshot() {
+        const FAILURE_BLOCK_LOCK: i64 = 7_319_406_281;
+
+        let database = TestDatabase::create().await;
+        let pool = database.pool().clone();
+        let tasks = PostgresVerificationTaskRepository::new(pool.clone());
+        let deletions = PostgresContentLockDeletionRepository::new(pool.clone());
+        let lock = content_lock();
+        let task = paykit_verification_task(&lock, BundleId::from_bytes([14; 16]));
+        tasks
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let admission_claim = tasks
+            .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE FUNCTION block_invoice_admission_failure() RETURNS trigger AS $trigger$
+             BEGIN
+                 IF OLD.invoice_admission_phase = 'invoice_pending'
+                    AND NEW.invoice_admission_phase = 'failed' THEN
+                     PERFORM pg_advisory_xact_lock(7319406281);
+                 END IF;
+                 RETURN NEW;
+             END
+             $trigger$ LANGUAGE plpgsql;
+             CREATE TRIGGER block_invoice_admission_failure
+             BEFORE UPDATE ON verification_tasks
+             FOR EACH ROW EXECUTE FUNCTION block_invoice_admission_failure();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut failure_blocker = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(FAILURE_BLOCK_LOCK)
+            .execute(&mut *failure_blocker)
+            .await
+            .unwrap();
+
+        let failing = tokio::spawn({
+            let tasks = tasks.clone();
+            let task_id = task.task_id;
+            let claim_token = admission_claim.claim_token;
+            async move {
+                tasks
+                    .mark_invoice_admission_failed(
+                        &task_id,
+                        "invoice-worker",
+                        &claim_token,
+                        NOW,
+                        "admission exhausted",
+                    )
+                    .await
+            }
+        });
+        let failure_backend_pid = wait_for_advisory_lock_waiter(&pool, FAILURE_BLOCK_LOCK).await;
+
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let inserting = tokio::spawn({
+            let deletions = deletions.clone();
+            let job = job.clone();
+            async move { deletions.insert_job(job).await }
+        });
+        wait_until_blocked_by(&pool, failure_backend_pid).await;
+
+        let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(FAILURE_BLOCK_LOCK)
+            .fetch_one(&mut *failure_blocker)
+            .await
+            .unwrap();
+        assert!(unlocked);
+        failing.await.unwrap().unwrap().unwrap();
+        inserting.await.unwrap().unwrap();
+
+        let snapshot: (String, Option<String>) = sqlx::query_as(
+            "SELECT status_at_cutoff, resolved_status
+             FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1 AND verification_task_id = $2",
+        )
+        .bind(job.job_id)
+        .bind(task.task_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        let drain_guard = ensure_all_frozen_snapshots_terminal(&mut transaction, job.job_id).await;
+        transaction.rollback().await.unwrap();
+
+        drop(failure_blocker);
+        database.cleanup().await;
+
+        assert_eq!(snapshot, ("failed".to_owned(), Some("failed".to_owned())));
+        drain_guard.expect("restart must observe a terminal snapshot instead of state_corrupt");
+    }
+
+    async fn wait_for_advisory_lock_waiter(pool: &PgPool, key: i64) -> i32 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiter: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid
+                     FROM pg_locks
+                     WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
+                       AND classid = ($1::bigint >> 32)::oid
+                       AND objid = ($1::bigint & 4294967295)::oid
+                     LIMIT 1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                if let Some(waiter) = waiter {
+                    return waiter;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invoice admission failure did not reach the test advisory lock")
+    }
+
+    async fn wait_until_blocked_by(pool: &PgPool, blocker_pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid))
+                     )",
+                )
+                .bind(blocker_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion insertion did not overlap the invoice admission failure");
     }
 
     #[tokio::test]
