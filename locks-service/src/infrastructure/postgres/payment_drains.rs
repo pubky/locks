@@ -604,10 +604,13 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locks_core::ids::{CreatorPubky, GuardedResourceHash, TaskId};
+    use locks_core::ids::{BundleId, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId};
     use locks_core::lock_policy::{
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
         LockServerConfig,
+    };
+    use locks_core::verification::{
+        EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
     };
 
     use time::OffsetDateTime;
@@ -615,7 +618,7 @@ mod tests {
 
     use crate::application::models::{
         ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-        VerificationTaskStatus,
+        VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::ports::{
         ContentLockDeletionRepository, PaymentDrainCleanupToken, PaymentDrainRepository,
@@ -1228,6 +1231,223 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_intent_replays_exactly_and_completed_row_satisfies_constraints() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let (job_id, claim_token, task_id, now) = insert_obligation(database.pool(), 1).await;
+        let entitlement = entitlement(1);
+
+        let first_token = repository
+            .begin_entitlement_publication(
+                job_id,
+                "worker",
+                claim_token,
+                now,
+                &task_id,
+                &entitlement,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let replay_token = repository
+            .begin_entitlement_publication(
+                job_id,
+                "worker",
+                claim_token,
+                now,
+                &task_id,
+                &entitlement,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay_token, first_token);
+        let obligations = repository.list_obligations(job_id).await.unwrap();
+        assert_eq!(
+            obligations[0].status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert_eq!(
+            obligations[0].entitlement_to_publish,
+            Some(entitlement.clone())
+        );
+
+        assert!(
+            repository
+                .persist_terminal_obligation(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    now,
+                    &task_id,
+                    PaymentDrainTerminalTransition {
+                        status: VerificationTaskStatus::Completed,
+                        entitlement_publication_token: Some(first_token),
+                        terminal_reason: None,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let (status, stored, reason): (String, Option<serde_json::Value>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, entitlement_to_publish, terminal_reason
+                 FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_id.to_string().parse::<Uuid>().unwrap())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(stored, Some(serde_json::to_value(entitlement).unwrap()));
+        assert_eq!(reason, None);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn every_typed_expiry_row_satisfies_constraints() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        for (index, reason) in [
+            VerificationTerminalReason::PaymentRequestRejected,
+            VerificationTerminalReason::PaymentRequestCanceled,
+            VerificationTerminalReason::ProposalExpired,
+            VerificationTerminalReason::PaymentDeadlineExpired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (job_id, claim_token, task_id, now) =
+                insert_obligation(database.pool(), u8::try_from(index + 2).unwrap()).await;
+            assert!(
+                repository
+                    .persist_terminal_obligation(
+                        job_id,
+                        "worker",
+                        claim_token,
+                        now,
+                        &task_id,
+                        PaymentDrainTerminalTransition {
+                            status: VerificationTaskStatus::Expired,
+                            entitlement_publication_token: None,
+                            terminal_reason: Some(reason),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            );
+            let (status, stored_reason): (String, Option<String>) = sqlx::query_as(
+                "SELECT status, terminal_reason FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_id.to_string().parse::<Uuid>().unwrap())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(status, "expired");
+            assert_eq!(stored_reason.as_deref(), Some(reason.as_str()));
+            sqlx::query(
+                "DELETE FROM content_lock_deletion_task_snapshot WHERE deletion_job_id = $1",
+            )
+            .bind(job_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM verification_tasks WHERE deletion_job_id = $1")
+                .bind(job_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
+                .bind(job_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        database.cleanup().await;
+    }
+
+    async fn insert_obligation(
+        pool: &sqlx::PgPool,
+        discriminator: u8,
+    ) -> (Uuid, Uuid, TaskId, OffsetDateTime) {
+        let job_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let task_uuid = Uuid::new_v4();
+        let task_id = TaskId::from_str(&task_uuid.to_string()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let bundle_id = format!("000G40R40M30E209185GR38E{:02X}", discriminator);
+        let lock_resource = format!(
+            "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+        );
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase, claimed_by, claim_token, claim_expires_at)
+             VALUES ($1, $2, 'lock', '{}'::jsonb, $3,
+                     'running', 'drain_payments', 'worker', $4, $5)",
+        )
+        .bind(job_id)
+        .bind(creator)
+        .bind(now)
+        .bind(claim_token)
+        .bind(now + time::Duration::minutes(5))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                  submitted_at, deletion_job_id)
+             VALUES ($1, $2, $3, 'pending', '{}'::jsonb, $4, $5)",
+        )
+        .bind(task_uuid)
+        .bind(creator)
+        .bind(&bundle_id)
+        .bind(now)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, criterion_id, status_at_cutoff,
+                  paykit_admission_required, invoice_created_at, payment_deadline)
+             VALUES ($1, $2, $3, $4, $5, 'criterion-1', 'pending', TRUE, $6, $7)",
+        )
+        .bind(job_id)
+        .bind(task_uuid)
+        .bind(creator)
+        .bind(bundle_id)
+        .bind(lock_resource)
+        .bind(now)
+        .bind(now + time::Duration::hours(1))
+        .execute(pool)
+        .await
+        .unwrap();
+        (job_id, claim_token, task_id, now)
+    }
+
+    fn entitlement(discriminator: u8) -> VerifiedProofBundle {
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        VerifiedProofBundle {
+            version: VERIFIED_PROOF_BUNDLE_VERSION,
+            bundle_id: BundleId::from_str(&format!(
+                "000G40R40M30E209185GR38E{:02X}",
+                discriminator
+            ))
+            .unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            ))
+            .unwrap(),
+            verification_result: VerificationResult { criteria: vec![] },
+            entitlement_lifetime: EntitlementLifetime::Unbounded,
+        }
     }
 
     async fn insert_terminal_obligation(

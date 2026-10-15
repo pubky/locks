@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0023_rejects_every_preexisting_resumable_deletion_state() {
+    async fn migration_0024_rejects_every_preexisting_resumable_deletion_state() {
         for (state, failure_code) in [
             ("queued", None),
             ("running", None),
@@ -416,24 +416,129 @@ mod tests {
             .unwrap();
             let migration = super::MIGRATOR
                 .iter()
-                .find(|migration| migration.version == 23)
-                .expect("migration 0023 exists");
+                .find(|migration| migration.version == 24)
+                .expect("migration 0024 exists");
 
             let error = sqlx::raw_sql(migration.sql.as_ref())
                 .execute(database.pool())
                 .await
                 .expect_err(
-                    "0023 must fail closed instead of misclassifying a resumable deletion job",
+                    "0024 must fail closed instead of misclassifying a resumable deletion job",
                 );
             assert!(
                 error
                     .to_string()
-                    .contains("drain or explicitly reset pre-0023 deletion jobs"),
+                    .contains("drain or explicitly reset pre-0024 deletion jobs"),
                 "unexpected migration error for {state}: {error}"
             );
 
             database.cleanup().await;
         }
+    }
+
+    #[tokio::test]
+    async fn exact_pr18_migration_prefix_upgrades_through_pr19_without_collision() {
+        let database = TestDatabase::create_unmigrated().await;
+        let pr18 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(20).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+
+        pr18.run(database.pool()).await.unwrap();
+        let pr18_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(pr18_versions, (1..=20).collect::<Vec<_>>());
+
+        super::run_migrations(database.pool()).await.unwrap();
+        let upgraded_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(upgraded_versions, (1..=24).collect::<Vec<_>>());
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn exact_pr19_migration_prefix_upgrades_through_pr20_without_collision() {
+        let database = TestDatabase::create_unmigrated().await;
+        let pr19 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(23).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        pr19.run(database.pool()).await.unwrap();
+        let before: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            before.iter().map(|row| row.0).collect::<Vec<_>>(),
+            (1..=23).collect::<Vec<_>>()
+        );
+
+        super::run_migrations(database.pool()).await.unwrap();
+        let after: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            after.iter().map(|row| row.0).collect::<Vec<_>>(),
+            (1..=24).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &after[..23],
+            before.as_slice(),
+            "PR19 migration checksums changed"
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_changes_deletion_job_task_reference_to_set_null() {
+        let database = TestDatabase::create_unmigrated().await;
+        let prior_schema = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(22).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        prior_schema.run(database.pool()).await.unwrap();
+
+        let before: String = sqlx::query_scalar(
+            "SELECT confdeltype::text
+             FROM pg_constraint
+             WHERE conrelid = 'verification_tasks'::regclass
+               AND conname = 'verification_tasks_deletion_job_id_fkey'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(before, "a", "prior schema must retain NO ACTION semantics");
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        let after: String = sqlx::query_scalar(
+            "SELECT confdeltype::text
+             FROM pg_constraint
+             WHERE conrelid = 'verification_tasks'::regclass
+               AND conname = 'verification_tasks_deletion_job_id_fkey'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, "n", "upgrade must install ON DELETE SET NULL");
+
+        database.cleanup().await;
     }
 
     async fn assert_table_exists(

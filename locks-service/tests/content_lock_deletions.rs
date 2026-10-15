@@ -27,8 +27,8 @@ use locks_service::{
             VerificationTaskStatus,
         },
         ports::{
-            AccessCredentialStore, Clock, ContentLockDeletionRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            AccessCredentialStore, Clock, ContentLockDeletionRepository, PublicationRecovery,
+            VerificationTaskClaimer, VerificationTaskRepository,
         },
     },
     infrastructure::memory::{
@@ -323,6 +323,90 @@ async fn in_memory_force_receipt_blocks_later_ordinary_credential() {
             )
             .await,
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
+async fn in_memory_force_active_revokes_reads_final_issuance_and_worker_window_claim() {
+    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let completed = completed_verification_task(&job);
+    let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
+    verification_tasks
+        .insert_verification_task(completed)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
+    assert!(
+        access
+            .initialize_final_access_windows(
+                job.job_id,
+                "worker-final",
+                claimed.claim_token,
+                NOW,
+                NOW + time::Duration::minutes(15),
+                NOW + time::Duration::minutes(30),
+            )
+            .await
+            .unwrap()
+    );
+    let issued = access
+        .issue_or_replay_final_credential(
+            &job.creator,
+            &bundle_id,
+            NOW,
+            AccessCredential::new("pre-force-final"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Active(_)
+    ));
+
+    let lookup = AccessCredentialLookupKey::derive(&issued.credential);
+    assert!(
+        access
+            .prepare_deletion_read(
+                &lookup,
+                "/priv/app.locks/content/post.json",
+                NOW,
+                NOW + time::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        access
+            .issue_or_replay_final_credential(
+                &job.creator,
+                &bundle_id,
+                NOW,
+                AccessCredential::new("must-not-replay-after-force"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !access
+            .initialize_final_access_windows(
+                job.job_id,
+                "worker-final",
+                claimed.claim_token,
+                NOW,
+                NOW + time::Duration::minutes(15),
+                NOW + time::Duration::minutes(30),
+            )
+            .await
+            .unwrap()
     );
 }
 
@@ -942,6 +1026,129 @@ async fn in_memory_final_issue_and_replay_use_storage_clock() {
 }
 
 #[tokio::test]
+async fn in_memory_claimer_completion_is_authoritative_at_graceful_cutoff() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let access = Arc::new(
+        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            verification_tasks.clone(),
+            Arc::clone(&fence),
+        ),
+    );
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access.clone(),
+            Arc::clone(&fence),
+        );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let pending = verification_task(&job, VerificationTaskStatus::Pending);
+    let bundle_id = pending.submitted_proof_bundle.bundle_id.clone();
+    verification_tasks
+        .insert_verification_task(pending.clone())
+        .await
+        .unwrap();
+    let claimer = InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
+        vec![pending],
+        verification_tasks.clone(),
+        Arc::clone(&fence),
+    );
+    let claim = claimer
+        .claim_next_verification_task("verification-worker", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = complete_verification_task(claim.task.clone());
+    let publishing = claim
+        .task
+        .begin_entitlement_publication(completed.entitlement_to_publish.clone().unwrap())
+        .unwrap();
+    claimer
+        .persist_claimed_verification_task_transition(
+            publishing,
+            "verification-worker",
+            &claim.claim_token,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    claimer
+        .persist_claimed_verification_task_transition(
+            completed,
+            "verification-worker",
+            &claim.claim_token,
+            NOW,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
+    access
+        .initialize_final_access_windows(
+            job.job_id,
+            "worker-final",
+            claimed.claim_token,
+            NOW,
+            NOW + time::Duration::minutes(15),
+            NOW + time::Duration::minutes(30),
+        )
+        .await
+        .unwrap();
+    assert!(
+        access
+            .final_credential_available(&job.creator, &bundle_id, NOW)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn in_memory_repository_completion_is_authoritative_at_graceful_cutoff() {
+    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let pending = verification_task(&job, VerificationTaskStatus::Pending);
+    let bundle_id = pending.submitted_proof_bundle.bundle_id.clone();
+    verification_tasks
+        .insert_verification_task(pending.clone())
+        .await
+        .unwrap();
+    verification_tasks
+        .update_verification_task(complete_verification_task(
+            pending
+                .transition_to(VerificationTaskStatus::InProgress, NOW, None)
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
+    access
+        .initialize_final_access_windows(
+            job.job_id,
+            "worker-final",
+            claimed.claim_token,
+            NOW,
+            NOW + time::Duration::minutes(15),
+            NOW + time::Duration::minutes(30),
+        )
+        .await
+        .unwrap();
+    assert!(
+        access
+            .final_credential_available(&job.creator, &bundle_id, NOW)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot() {
     let (verification_tasks, access, deletions) = in_memory_access_stack();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
@@ -1448,6 +1655,268 @@ async fn in_memory_final_credential_rejects_completed_non_paykit_snapshot() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn lease_expiry_is_half_open_for_claim_retry_advance_and_finish() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claimed = repository
+        .claim_next("worker-a", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        repository
+            .schedule_retry(
+                job.job_id,
+                "worker-a",
+                claimed.claim_token,
+                LEASE_END,
+                LEASE_END + time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .advance_phase(
+                job.job_id,
+                "worker-a",
+                claimed.claim_token,
+                LEASE_END,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .finish(job.job_id, "worker-a", claimed.claim_token, LEASE_END, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let reclaimed = repository
+        .claim_next(
+            "worker-b",
+            LEASE_END,
+            LEASE_END + time::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(claimed.claim_token, reclaimed.claim_token);
+}
+
+#[tokio::test]
+async fn synchronous_force_receipt_retains_terminal_job_fence_and_manifest() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let claimed = repository
+        .claim_next("worker-a", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    repository
+        .finish(
+            job.job_id,
+            "worker-a",
+            claimed.claim_token,
+            NOW,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let prepared = repository
+        .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+        .await
+        .unwrap();
+    let PrepareForceDeletionResult::Synchronous(receipt) = prepared else {
+        panic!("terminal job must become synchronous force");
+    };
+    assert_eq!(
+        receipt.frozen_content_lock,
+        Some(job.frozen_content_lock.clone())
+    );
+    assert!(receipt.completed_at.is_none());
+    assert!(
+        repository
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|stored| {
+                stored.job_id == job.job_id && stored.state == ContentLockDeletionState::Failed
+            })
+    );
+
+    let reopened = repository
+        .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(reopened, PrepareForceDeletionResult::Synchronous(receipt));
+    assert!(
+        repository
+            .complete_force_deletion(&job.creator, &job.lock_id, NOW)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completed_at
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let lock = content_lock();
+    let lock_id = lock.lock_id().unwrap();
+    let publication_token = Uuid::new_v4();
+    repository
+        .begin_publication(&lock.creator, &lock_id, publication_token, &lock)
+        .await
+        .unwrap();
+
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap();
+    assert_eq!(
+        repository.insert_job(job.clone()).await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockPublicationInProgress)
+    );
+    let mut mismatched_lock = lock.clone();
+    mismatched_lock
+        .access_policy
+        .requested_credential_ttl_seconds += 1;
+    assert!(
+        !repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &mismatched_lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .reconcile_publication(&lock.creator, &lock_id, &lock, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .publication_in_progress(&lock.creator, &lock_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .mark_publication_written(&lock.creator, &lock_id, publication_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
+            .await
+            .unwrap()
+    );
+    repository.insert_job(job).await.unwrap();
+    assert_eq!(
+        repository
+            .publication_in_progress(&lock.creator, &lock_id)
+            .await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
+async fn publication_recovery_replaces_only_uncompleted_token_and_requires_write_marker() {
+    let repository = InMemoryContentLockDeletionRepository::new();
+    let lock = content_lock();
+    let lock_id = lock.lock_id().unwrap();
+    let original_token = Uuid::new_v4();
+    let recovery_token = Uuid::new_v4();
+    repository
+        .begin_publication(&lock.creator, &lock_id, original_token, &lock)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, recovery_token, &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::RetryWithToken {
+            publication_token: recovery_token,
+            content_lock: lock.clone(),
+        }
+    );
+    assert!(
+        !repository
+            .mark_publication_written(&lock.creator, &lock_id, original_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        repository
+            .mark_publication_written(&lock.creator, &lock_id, recovery_token)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .abandon_publication(&lock.creator, &lock_id, recovery_token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::WriteCompleted {
+            publication_token: recovery_token,
+            content_lock: lock.clone(),
+        }
+    );
+    assert!(
+        repository
+            .reconcile_publication(
+                &lock.creator,
+                &lock_id,
+                &lock,
+                &["/priv/app.locks/content/post.json".to_owned()],
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        repository
+            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .await
+            .unwrap(),
+        PublicationRecovery::None
     );
 }
 

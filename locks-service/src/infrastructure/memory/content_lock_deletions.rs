@@ -254,6 +254,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         job.deletion_started_at = self.verification_task_fence.authoritative_cutoff();
         let mut deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.write().await;
         let mut verification_tasks = self.verification_task_fence.records.write().await;
+        let current_statuses = self.verification_task_fence.current_statuses.read().await;
         let intents = self.publication_intents.read().await;
         let mut jobs = self.jobs.write().await;
         let receipts = self.force_receipts.read().await;
@@ -280,7 +281,11 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 verification_tasks.get(task_id).map(|task| {
                     (
                         task.bundle_id.clone(),
-                        (*task_id, task.paykit_admission_required, task.status),
+                        (
+                            *task_id,
+                            task.paykit_admission_required,
+                            current_statuses[task_id],
+                        ),
                     )
                 })
             })
@@ -545,6 +550,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 drop(jobs);
                 drop(intents);
                 drop(verification_tasks);
+                self.access_credentials
+                    .synchronize_job(&job, None, None, None)
+                    .await;
                 self.access_credentials
                     .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
                     .await;

@@ -4673,6 +4673,50 @@ mod tests {
         .expect("second Postgres connection must wait on the canonical advisory fence");
     }
 
+    async fn wait_for_blocked_connection(transaction: &mut Transaction<'_, Postgres>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiter_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity
+                        WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                    )",
+                )
+                .fetch_one(&mut **transaction)
+                .await
+                .unwrap();
+                if waiter_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion admission must wait for the worker-owned task row");
+    }
+
+    async fn set_short_lease(pool: &sqlx::PgPool, job_id: Uuid) {
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp() + INTERVAL '200 milliseconds'
+             WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn lock_job_row(pool: &sqlx::PgPool, job_id: Uuid) -> Transaction<'_, Postgres> {
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        transaction
+    }
+
     async fn insert_deletion_cutoff(
         transaction: &mut Transaction<'_, Postgres>,
         job: &ContentLockDeletionJob,
@@ -4770,6 +4814,307 @@ mod tests {
             reader,
             payment_in: 24,
         }
+    }
+
+    #[tokio::test]
+    async fn claim_reclaims_at_equality_and_derives_expiry_from_repository_time() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let first = repository
+            .claim_next("worker-a", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET claim_expires_at = clock_timestamp()
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let reclaimed = repository
+            .claim_next("worker-b", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first.claim_token, reclaimed.claim_token);
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT claim_expires_at > clock_timestamp() + INTERVAL '4 minutes'
+             FROM content_lock_deletion_jobs WHERE job_id = $1",
+            )
+            .bind(job.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn retry_advance_and_finish_are_fenced_when_row_lock_wait_crosses_expiry() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let claimed = repository
+            .claim_next("worker-a", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let retry_repository = repository.clone();
+        let mut retry = tokio::spawn(async move {
+            retry_repository
+                .schedule_retry(
+                    job.job_id,
+                    "worker-a",
+                    claimed.claim_token,
+                    NOW,
+                    NOW + time::Duration::minutes(1),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut retry)
+                .await
+                .is_err(),
+            "retry must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(retry.await.unwrap().unwrap().is_none());
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let advance_repository = repository.clone();
+        let mut advance = tokio::spawn(async move {
+            advance_repository
+                .advance_phase(
+                    job.job_id,
+                    "worker-a",
+                    claimed.claim_token,
+                    NOW,
+                    ContentLockDeletionPhase::StartPaymentDrain,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut advance)
+                .await
+                .is_err(),
+            "advance must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(advance.await.unwrap().unwrap().is_none());
+
+        set_short_lease(database.pool(), job.job_id).await;
+        let blocker = lock_job_row(database.pool(), job.job_id).await;
+        let finish_repository = repository.clone();
+        let mut finish = tokio::spawn(async move {
+            finish_repository
+                .finish(job.job_id, "worker-a", claimed.claim_token, NOW, None)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut finish)
+                .await
+                .is_err(),
+            "finish must remain blocked while the row lock is held"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        blocker.commit().await.unwrap();
+        assert!(finish.await.unwrap().unwrap().is_none());
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_waits_for_terminal_worker_and_captures_one_consistent_task_version() {
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([7; 16]));
+        tasks.insert_verification_task(task.clone()).await.unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+
+        let mut worker = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT task_id FROM verification_tasks WHERE task_id = $1 FOR UPDATE")
+            .bind(task.task_id.as_uuid())
+            .fetch_one(&mut *worker)
+            .await
+            .unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let inserted_job = job.clone();
+        let insertion = tokio::spawn(async move { repository.insert_job(inserted_job).await });
+        wait_for_blocked_connection(&mut worker).await;
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET status = 'failed', started_at = $2, completed_at = $2,
+                 failure_message = 'worker failure', updated_at = $2
+             WHERE task_id = $1 AND deletion_job_id IS NULL",
+        )
+        .bind(task.task_id.as_uuid())
+        .bind(NOW)
+        .execute(&mut *worker)
+        .await
+        .unwrap();
+        worker.commit().await.unwrap();
+        insertion.await.unwrap().unwrap();
+
+        let (status_at_cutoff, deletion_job_id): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT snapshot.status_at_cutoff, task.deletion_job_id
+             FROM content_lock_deletion_task_snapshot AS snapshot
+             JOIN verification_tasks AS task
+               ON task.task_id = snapshot.verification_task_id
+             WHERE snapshot.deletion_job_id = $1 AND task.task_id = $2",
+        )
+        .bind(job.job_id)
+        .bind(task.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(status_at_cutoff, "failed");
+        assert_eq!(deletion_job_id, Some(job.job_id));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_force_waits_for_publication_marker_then_retries_after_terminalization() {
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([8; 16]));
+        tasks.insert_verification_task(task.clone()).await.unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let mut publication = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM content_lock_deletion_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(job.job_id)
+            .fetch_one(&mut *publication)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE verification_tasks SET status = 'publishing_entitlement',
+             started_at = $3, entitlement_to_publish = '{}'::jsonb,
+             entitlement_publication_claim_token = $2 WHERE task_id = $1",
+        )
+        .bind(task.task_id.as_uuid())
+        .bind(Uuid::new_v4())
+        .bind(NOW)
+        .execute(&mut *publication)
+        .await
+        .unwrap();
+
+        let force_repository = repository.clone();
+        let force_creator = job.creator.clone();
+        let force_lock_id = job.lock_id.clone();
+        let force = tokio::spawn(async move {
+            force_repository
+                .prepare_force_deletion(&force_creator, &force_lock_id, None, NOW)
+                .await
+        });
+        wait_for_blocked_connection(&mut publication).await;
+        assert!(
+            repository
+                .get_force_receipt(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        publication.commit().await.unwrap();
+        assert_eq!(
+            force.await.unwrap().unwrap(),
+            PrepareForceDeletionResult::PublicationInProgress
+        );
+        assert!(
+            repository
+                .get_force_receipt(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query(
+            "UPDATE verification_tasks SET status = 'completed',
+             completed_at = $2, entitlement_publication_claim_token = NULL WHERE task_id = $1",
+        )
+        .bind(task.task_id.as_uuid())
+        .bind(NOW)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Active(_)
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn force_of_terminal_job_retains_job_and_task_ownership() {
+        let database = TestDatabase::create().await;
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let task = verification_task(&lock, BundleId::from_bytes([9; 16]));
+        tasks.insert_verification_task(task.clone()).await.unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        let claim = repository
+            .claim_next("worker", NOW, NOW + time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .finish(
+                job.job_id,
+                "worker",
+                claim.claim_token,
+                NOW,
+                Some(ContentLockDeletionFailureCode::StateCorrupt),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(_)
+        ));
+        assert!(
+            repository
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .is_some_and(|stored| {
+                    stored.job_id == job.job_id && stored.state == ContentLockDeletionState::Failed
+                })
+        );
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT deletion_job_id FROM verification_tasks WHERE task_id = $1")
+                .bind(task.task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(owner, Some(job.job_id));
+        database.cleanup().await;
     }
 
     fn entitlement(task: &VerificationTaskRecord) -> VerifiedProofBundle {

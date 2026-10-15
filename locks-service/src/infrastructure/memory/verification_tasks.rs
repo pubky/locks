@@ -97,6 +97,7 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
@@ -132,8 +133,10 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 deletion_job_id: None,
             },
         );
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task.clone());
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -148,12 +151,14 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         if !records.contains_key(&task.task_id) {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
         }
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task);
         Ok(())
     }
@@ -196,13 +201,16 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             None
         };
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         fence_records.remove(task_id);
+        current_statuses.remove(task_id);
         records.remove(task_id);
         admissions.remove(task_id);
         drop(admissions);
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -239,6 +247,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         if let Some(existing) = records.values().find(|existing| {
@@ -294,9 +303,11 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 deletion_job_id: None,
             },
         );
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task.clone());
         drop(admissions);
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -457,6 +468,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             )
             .await;
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
@@ -478,6 +490,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claim_token = None;
         state.claim_expires_at = None;
         records.insert(*task_id, state.record.task.clone());
+        current_statuses.insert(*task_id, VerificationTaskStatus::Failed);
         if let Some(fence_record) = fence_records.get_mut(task_id) {
             fence_record.status = VerificationTaskStatus::Failed;
         }
