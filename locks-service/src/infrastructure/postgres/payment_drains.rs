@@ -537,11 +537,15 @@ fn storage_display(error: impl std::fmt::Display) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{collections::BTreeMap, str::FromStr};
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locks_core::ids::{BundleId, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId};
+    use locks_core::lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
+        LockServerConfig,
+    };
     use locks_core::verification::{
         EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
     };
@@ -549,12 +553,17 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
-    use crate::application::ports::{
-        PaymentDrainCleanupToken, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
-        PaymentDrainTerminalTransition,
+    use crate::application::models::{
+        ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
+        VerificationTaskStatus, VerificationTerminalReason,
     };
-    use crate::infrastructure::postgres::testing::TestDatabase;
+    use crate::application::ports::{
+        ContentLockDeletionRepository, PaymentDrainCleanupToken, PaymentDrainRepository,
+        PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+    };
+    use crate::infrastructure::postgres::{
+        PostgresContentLockDeletionRepository, testing::TestDatabase,
+    };
 
     use super::PostgresPaymentDrainRepository;
 
@@ -655,23 +664,65 @@ mod tests {
     async fn store_and_reconcile_use_postgres_time_for_live_claim_with_skewed_app_clock() {
         let database = TestDatabase::create().await;
         let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
         let job_id = Uuid::new_v4();
-        let claim_token = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
-        sqlx::query(
-            "INSERT INTO content_lock_deletion_jobs
-                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
-                  state, phase, claimed_by, claim_token, claim_expires_at)
-             VALUES ($1, 'creator', 'lock', '{}'::jsonb, $2,
-                     'running', 'start_payment_drain', 'worker', $3,
-                     clock_timestamp() + INTERVAL '5 minutes')",
-        )
-        .bind(job_id)
-        .bind(now)
-        .bind(claim_token)
-        .execute(database.pool())
-        .await
-        .unwrap();
+        let skewed_now = now + time::Duration::days(1);
+        let claim_expires_at = skewed_now + time::Duration::minutes(5);
+        let content_lock = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            primary_resource: Some(
+                GuardedResource::new(
+                    "/priv/app.locks/content/skewed-clock.json".to_owned(),
+                    GuardedResourceHash::from_bytes([11; 32]),
+                    "application/json".to_owned(),
+                    42,
+                )
+                .unwrap(),
+            ),
+            secondary_resources: BTreeMap::new(),
+            criteria: vec![],
+            lock_logic: LockLogic::All { criteria: vec![] },
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig { override_: None },
+            created_at: now,
+        };
+        let job = ContentLockDeletionJob::new(job_id, content_lock, now).unwrap();
+        deletions.insert_job(job).await.unwrap();
+
+        let withdraw_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
+        let start_payment_drain = deletions
+            .advance_phase(
+                job_id,
+                "worker",
+                withdraw_claim.claim_token,
+                skewed_now,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(start_payment_drain.state, ContentLockDeletionState::Queued);
+        assert_eq!(
+            start_payment_drain.phase,
+            ContentLockDeletionPhase::StartPaymentDrain
+        );
+
+        let start_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
         let token = PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([11_u8; 32])).unwrap();
         let active = PaymentDrainSummary {
             status: PaymentDrainStatus::Active,
@@ -680,21 +731,40 @@ mod tests {
             cancellation_enqueued_count: 0,
             cleanup_token: token.clone(),
         };
-        let skewed_now = now + time::Duration::days(1);
         assert!(
             repository
-                .store_payment_drain(job_id, "worker", claim_token, skewed_now, &active)
+                .store_payment_drain(
+                    job_id,
+                    "worker",
+                    start_claim.claim_token,
+                    skewed_now,
+                    &active,
+                )
                 .await
                 .unwrap()
         );
 
-        sqlx::query(
-            "UPDATE content_lock_deletion_jobs SET phase = 'drain_payments' WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
+        let drain_payments = deletions
+            .advance_phase(
+                job_id,
+                "worker",
+                start_claim.claim_token,
+                skewed_now,
+                ContentLockDeletionPhase::DrainPayments,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(drain_payments.state, ContentLockDeletionState::Queued);
+        assert_eq!(
+            drain_payments.phase,
+            ContentLockDeletionPhase::DrainPayments
+        );
+        let drain_claim = deletions
+            .claim_next("worker", skewed_now, claim_expires_at)
+            .await
+            .unwrap()
+            .unwrap();
         let completed = PaymentDrainSummary {
             status: PaymentDrainStatus::Completed,
             accepted_count: 0,
@@ -704,7 +774,13 @@ mod tests {
         };
         assert!(
             repository
-                .reconcile_payment_drain(job_id, "worker", claim_token, skewed_now, &completed)
+                .reconcile_payment_drain(
+                    job_id,
+                    "worker",
+                    drain_claim.claim_token,
+                    skewed_now,
+                    &completed,
+                )
                 .await
                 .unwrap()
         );
