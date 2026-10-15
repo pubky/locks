@@ -1659,25 +1659,28 @@ mod tests {
                 AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
                 AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
                 ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-                InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
-                PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
+                ContentLockOwnershipStatus, InitializeFinalAccessWindowsResult,
+                InvoiceAdmissionIntentV1, PrepareForceDeletionResult, VerificationTaskRecord,
+                VerificationTaskStatus,
             },
             ports::{
                 AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
                 ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-                ContentLockDeletionRepository, EntitlementRepository, InvoiceAdmissionRepository,
-                PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError,
-                PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
-                PaymentDrainTerminalTransition, PaymentRequestState, PaymentRequestStatus,
-                PaymentState, VerificationTaskClaimer, VerificationTaskRepository,
+                ContentLockDeletionRepository, ContentLockOwnershipRepository,
+                EntitlementRepository, InvoiceAdmissionRepository, PaymentDrainCleanupToken,
+                PaymentDrainClient, PaymentDrainClientError, PaymentDrainRepository,
+                PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+                PaymentRequestState, PaymentRequestStatus, PaymentState, VerificationTaskClaimer,
+                VerificationTaskRepository,
             },
             use_cases::drain_lock_payments::DrainLockPaymentsUseCase,
         },
         infrastructure::memory::entitlements::InMemoryEntitlementRepository,
         infrastructure::postgres::{
             PostgresAccessCredentialStore, PostgresContentLockDeletionActionOwnership,
-            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
-            PostgresVerificationTaskRepository, testing::TestDatabase,
+            PostgresContentLockOwnershipRepository, PostgresPaymentDrainRepository,
+            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
+            testing::TestDatabase,
         },
     };
 
@@ -2341,6 +2344,163 @@ mod tests {
 
             database.cleanup().await;
         }
+    }
+
+    #[tokio::test]
+    async fn absent_publication_recovery_removes_only_exact_uncompleted_reserved_ownership() {
+        let database = TestDatabase::create().await;
+        let publications = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let ownership = PostgresContentLockOwnershipRepository::new(database.pool().clone());
+
+        let completed_lock = content_lock();
+        let completed_lock_id = completed_lock.lock_id().unwrap();
+        let completed_paths = guarded_paths(&completed_lock);
+        let completed_token = Uuid::new_v4();
+        ownership
+            .reserve_paths(
+                &completed_lock.creator,
+                &completed_paths,
+                &completed_lock_id,
+            )
+            .await
+            .unwrap();
+        publications
+            .begin_publication(
+                &completed_lock.creator,
+                &completed_lock_id,
+                completed_token,
+                &completed_lock,
+            )
+            .await
+            .unwrap();
+        assert!(
+            publications
+                .mark_publication_written(
+                    &completed_lock.creator,
+                    &completed_lock_id,
+                    completed_token,
+                )
+                .await
+                .unwrap()
+        );
+        ownership
+            .mark_paths_published(
+                &completed_lock.creator,
+                &completed_paths,
+                &completed_lock_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !publications
+                .compensate_publication(
+                    &completed_lock.creator,
+                    &completed_lock_id,
+                    completed_token,
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut recoverable_lock = completed_lock.clone();
+        recoverable_lock.primary_resource.as_mut().unwrap().path =
+            "/priv/app.locks/content/recoverable.json".to_owned();
+        let recoverable_lock_id = recoverable_lock.lock_id().unwrap();
+        let recoverable_paths = guarded_paths(&recoverable_lock);
+        let recoverable_token = Uuid::new_v4();
+        ownership
+            .reserve_paths(
+                &recoverable_lock.creator,
+                &recoverable_paths,
+                &recoverable_lock_id,
+            )
+            .await
+            .unwrap();
+        publications
+            .begin_publication(
+                &recoverable_lock.creator,
+                &recoverable_lock_id,
+                recoverable_token,
+                &recoverable_lock,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !publications
+                .compensate_publication(
+                    &recoverable_lock.creator,
+                    &recoverable_lock_id,
+                    Uuid::new_v4(),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            publications
+                .publication_in_progress(&recoverable_lock.creator, &recoverable_lock_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ownership
+                .get_path_ownership(&recoverable_lock.creator, &recoverable_paths[0])
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !publications
+                .compensate_publication(
+                    &completed_lock.creator,
+                    &completed_lock_id,
+                    recoverable_token,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            publications
+                .compensate_publication(
+                    &recoverable_lock.creator,
+                    &recoverable_lock_id,
+                    recoverable_token,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !publications
+                .publication_in_progress(&recoverable_lock.creator, &recoverable_lock_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            ownership
+                .get_path_ownership(&recoverable_lock.creator, &recoverable_paths[0])
+                .await
+                .unwrap(),
+            None
+        );
+        let completed_ownership = ownership
+            .get_path_ownership(&completed_lock.creator, &completed_paths[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_ownership.lock_id, completed_lock_id);
+        assert_eq!(
+            completed_ownership.status,
+            ContentLockOwnershipStatus::Published
+        );
+        assert!(
+            publications
+                .publication_in_progress(&completed_lock.creator, &completed_lock_id)
+                .await
+                .unwrap()
+        );
+
+        database.cleanup().await;
     }
 
     #[tokio::test]
@@ -4907,5 +5067,14 @@ mod tests {
             lock_server: LockServerConfig { override_: None },
             created_at: datetime!(2026-08-12 04:00:00 UTC),
         }
+    }
+
+    fn guarded_paths(content_lock: &ContentLock) -> Vec<String> {
+        content_lock
+            .primary_resource
+            .iter()
+            .map(|resource| resource.path.clone())
+            .chain(content_lock.secondary_resources.keys().cloned())
+            .collect()
     }
 }

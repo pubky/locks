@@ -220,6 +220,16 @@ pub trait CreatorScopedPubkyStorage: Send + Sync {
         body: serde_json::Value,
     ) -> Result<(), ApplicationError>;
 
+    async fn put_json_value_classified(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        self.put_json_value(path, body)
+            .await
+            .map_err(ContentLockWriteError::Ambiguous)
+    }
+
     async fn get_json_value(
         &self,
         path: &str,
@@ -589,6 +599,26 @@ impl CreatorScopedPubkyStorage for SdkCreatorScopedPubkyStorage {
             .map_err(|error| self.map_error("put", path, error))
     }
 
+    async fn put_json_value_classified(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), ContentLockWriteError> {
+        self.storage
+            .put_json(path, &body)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                let not_started = pubky_put_failure_is_not_started(&error);
+                let error = self.map_error("put", path, error);
+                if not_started {
+                    ContentLockWriteError::NotStarted(error)
+                } else {
+                    ContentLockWriteError::Ambiguous(error)
+                }
+            })
+    }
+
     async fn get_json_value(
         &self,
         path: &str,
@@ -785,10 +815,43 @@ where
             .storage_for_creator(creator)
             .await
             .map_err(ContentLockWriteError::NotStarted)?;
-        let result = acquired.storage.put_json_value(path, body).await;
-        self.finish_operation(creator, acquired.generation, result)
+        let generation = acquired.generation;
+        let result = acquired
+            .storage
+            .put_json_value_classified(path, body.clone())
+            .await;
+        let retry = generation.is_some()
+            && matches!(
+                &result,
+                Err(ContentLockWriteError::NotStarted(
+                    ApplicationError::CreatorAuthorityUnavailable
+                ))
+            );
+        if let Some(generation) = generation
+            && content_lock_write_requires_session_invalidation(&result)
+        {
+            self.provider
+                .invalidate_creator_session(creator, generation)
+                .await;
+        }
+        if !retry {
+            return result;
+        }
+
+        let acquired = self
+            .provider
+            .storage_for_creator(creator)
             .await
-            .map_err(ContentLockWriteError::Ambiguous)
+            .map_err(ContentLockWriteError::NotStarted)?;
+        let result = acquired.storage.put_json_value_classified(path, body).await;
+        if let Some(generation) = acquired.generation
+            && content_lock_write_requires_session_invalidation(&result)
+        {
+            self.provider
+                .invalidate_creator_session(creator, generation)
+                .await;
+        }
+        result
     }
 
     async fn get_json_value_as_creator(
@@ -976,6 +1039,35 @@ where
     }
 }
 
+fn content_lock_write_requires_session_invalidation(
+    result: &Result<(), ContentLockWriteError>,
+) -> bool {
+    matches!(
+        result,
+        Err(
+            ContentLockWriteError::NotStarted(ApplicationError::CreatorAuthorityUnavailable)
+                | ContentLockWriteError::Ambiguous(ApplicationError::CreatorAuthorityUnavailable)
+        )
+    )
+}
+
+fn pubky_put_failure_is_not_started(error: &pubky::Error) -> bool {
+    matches!(error, pubky::Error::Authentication(_))
+        || matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+                if matches!(
+                    *status,
+                    pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN
+                )
+        )
+        || matches!(
+            error,
+            pubky::Error::Request(pubky::errors::RequestError::Transport(error))
+                if error.is_connect()
+        )
+}
+
 fn is_pubky_not_found(error: &pubky::Error) -> bool {
     matches!(
         error,
@@ -1109,8 +1201,8 @@ mod tests {
         CreatorScopedPubkyStorage, CreatorScopedPubkyStorageProvider, ImportedPubkySession,
         LegacyCookieCreatorScopedPubkyStorageProvider, ProviderBackedPubkyHomeserverStorageClient,
         PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
-        PubkySessionImporter, is_pubky_not_found, pubky_storage_error,
-        pubky_storage_error_for_grant,
+        PubkySessionImporter, is_pubky_not_found, pubky_put_failure_is_not_started,
+        pubky_storage_error, pubky_storage_error_for_grant,
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
@@ -1500,6 +1592,84 @@ mod tests {
             *provider.invalidations.lock().unwrap(),
             vec![(creator(), 7)]
         );
+    }
+
+    #[tokio::test]
+    async fn classified_content_lock_write_retries_stale_cached_session_once() {
+        let provider =
+            RetryTestProvider::cached([Err(ApplicationError::CreatorAuthorityUnavailable), Ok(())]);
+        let client = ProviderBackedPubkyHomeserverStorageClient::new(provider.clone());
+
+        client
+            .put_json_value_as_creator_classified(
+                &creator(),
+                "/pub/app.locks/example.json",
+                json!({"version": 1}),
+            )
+            .await
+            .unwrap();
+
+        provider.assert_counts(2, 2, &[1]);
+    }
+
+    #[test]
+    fn classified_put_only_marks_typed_auth_rejections_as_not_started() {
+        let server_error = |status| {
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status,
+                message: "upstream body".to_owned(),
+            })
+        };
+
+        assert!(pubky_put_failure_is_not_started(&server_error(
+            pubky::StatusCode::UNAUTHORIZED
+        )));
+        assert!(pubky_put_failure_is_not_started(&server_error(
+            pubky::StatusCode::FORBIDDEN
+        )));
+        assert!(!pubky_put_failure_is_not_started(&server_error(
+            pubky::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!pubky_put_failure_is_not_started(&server_error(
+            pubky::StatusCode::REQUEST_TIMEOUT
+        )));
+    }
+
+    #[tokio::test]
+    async fn classified_put_separates_connect_from_ambiguous_transport_timeout() {
+        let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_address = unused_listener.local_addr().unwrap();
+        drop(unused_listener);
+        let connect = reqwest::Client::new()
+            .put(format!("http://{unused_address}/lock"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(connect.is_connect());
+        assert!(pubky_put_failure_is_not_started(&pubky::Error::Request(
+            pubky::errors::RequestError::Transport(connect)
+        )));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let timeout = reqwest::Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .put(format!("http://{address}/lock"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(timeout.is_timeout());
+        assert!(!pubky_put_failure_is_not_started(&pubky::Error::Request(
+            pubky::errors::RequestError::Transport(timeout)
+        )));
+        server.abort();
     }
 
     #[tokio::test]
@@ -2336,6 +2506,19 @@ mod tests {
             _: serde_json::Value,
         ) -> Result<(), ApplicationError> {
             self.result()
+        }
+
+        async fn put_json_value_classified(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<(), ContentLockWriteError> {
+            self.result().map_err(|error| match error {
+                ApplicationError::CreatorAuthorityUnavailable => {
+                    ContentLockWriteError::NotStarted(error)
+                }
+                _ => ContentLockWriteError::Ambiguous(error),
+            })
         }
 
         async fn get_json_value(

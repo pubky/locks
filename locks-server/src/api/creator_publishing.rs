@@ -449,24 +449,34 @@ pub(super) async fn create_content_lock_for_authenticated_creator(
     let authenticated_creator = authenticated_creator_from_headers(&state, &headers).await?;
     let request = parse_json(request)?;
     validate_content_lock_limits(&request, state.config().content_locks.clone())?;
-    let use_case = CreateContentLockUseCase::new(
-        state.content_locks().as_ref(),
-        state.content_lock_deletions().as_ref(),
-        state.content_lock_ownership().as_ref(),
-        state.guarded_resources().as_ref(),
-        state.clock().as_ref(),
-    );
-    let created = use_case
-        .execute(CreateContentLockRequest {
-            creator: authenticated_creator,
-            primary_resource: request.primary_resource,
-            secondary_resources: request.secondary_resources,
-            criteria: request.criteria,
-            lock_logic: request.lock_logic,
-            access_policy: request.access_policy,
-            lock_server: request.lock_server,
-        })
-        .await?;
+    let create_request = CreateContentLockRequest {
+        creator: authenticated_creator,
+        primary_resource: request.primary_resource,
+        secondary_resources: request.secondary_resources,
+        criteria: request.criteria,
+        lock_logic: request.lock_logic,
+        access_policy: request.access_policy,
+        lock_server: request.lock_server,
+    };
+    let creation_state = state.clone();
+    let created = tokio::spawn(async move {
+        let use_case = CreateContentLockUseCase::new(
+            creation_state.content_locks().as_ref(),
+            creation_state.content_lock_deletions().as_ref(),
+            creation_state.content_lock_ownership().as_ref(),
+            creation_state.guarded_resources().as_ref(),
+            creation_state.clock().as_ref(),
+        );
+        use_case.execute(create_request).await
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "content lock publication task failed");
+        ApiError::new(
+            ApiErrorCode::InternalError,
+            "content lock publication failed",
+        )
+    })??;
 
     Ok(Json(CreateContentLockHttpResponse {
         lock_id: created.lock_id,

@@ -93,7 +93,7 @@ jobs:
       - name: Unit tests
         run: |
           cargo nextest run --workspace --exclude locks-e2e --exclude locks-service --exclude locks-sdk-wasm
-          cargo nextest run -p locks-service --lib -- --skip infrastructure::postgres
+          cargo nextest run -p locks-service --lib -- --skip postgres
 
       - name: E2E tests
         run: |
@@ -121,7 +121,9 @@ jobs:
         run: npm --prefix locks-sdk/bindings/js run test
 
       - name: Postgres-backed tests
-        run: cargo nextest run -p locks-service --lib infrastructure::postgres
+        run: |
+          cargo nextest run -p locks-service --lib infrastructure::postgres
+          cargo nextest run -p locks-service --lib postgres_exact_retry_recovers_after_injected_ownership_commit_failure
 
       - name: Additional integration tests
         run: |

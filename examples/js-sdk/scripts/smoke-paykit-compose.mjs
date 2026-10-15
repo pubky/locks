@@ -28,7 +28,7 @@ import {
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-const locksReleaseVersion = '0.1.0-rc13';
+const locksReleaseVersion = '0.1.0-rc14';
 assert.equal(PAYKIT_SERVER_REF, '4cc8e7b836dba28446a8d821f593ee40bb4acbeb');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,

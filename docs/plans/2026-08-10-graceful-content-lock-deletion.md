@@ -84,7 +84,7 @@
 - Paykit polling latency can make a pre-deadline broadcast late.
 - Timely amount-matched payment can block deletion indefinitely while confirmations/reorg state remains unresolved.
 - Durable cancellation enqueue may precede actual counterparty delivery.
-- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death.
+- Content Lock publication runs past HTTP cancellation and retries token-owned bookkeeping three times. Typed pre-dispatch failures clear only state owned by that attempt. A possible dispatch, process termination, or exhausted bookkeeping retry stays fail-closed behind the publication intent; operator recovery must quiesce publishers, take `pg_advisory_xact_lock(hashtextextended('locks:proof-admission:v1:<creator>:<lock_id>', 0))`, compare the public JSON and retained JSONB by decoding both as `ContentLock` and validating creator plus derived Lock ID, then either record exact write completion or atomically remove the exact absent uncompleted intent together with only that lock's `Reserved` ownership before an identical retry. Intent-only removal is forbidden for a first publication.
 - Force deletion deliberately abandons active payment/access obligations and may orphan content after a crash.
 
 ## Repository ownership matrix

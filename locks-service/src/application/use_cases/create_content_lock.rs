@@ -14,6 +14,8 @@ use crate::application::ports::{
     ContentLockWriteError, GuardedResourceRepository, PublicationRecovery,
 };
 
+const PUBLICATION_BOOKKEEPING_ATTEMPTS: usize = 3;
+
 /// Request to create a local content lock for an already-registered guarded resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateContentLockRequest {
@@ -268,12 +270,19 @@ impl<'a> CreateContentLockUseCase<'a> {
             Err(ContentLockWriteError::Ambiguous(error)) => return Err(error),
             Err(ContentLockWriteError::NotStarted(error)) => {
                 if !compensate_ownership {
-                    // This retry did not dispatch, but an earlier ambiguous write may still land.
+                    if !self
+                        .abandon_publication_with_retry(creator, lock_id, publication_token)
+                        .await?
+                    {
+                        return Err(ApplicationError::Storage {
+                            message: "content lock publication abandonment was not committed"
+                                .to_owned(),
+                        });
+                    }
                     return Err(error);
                 }
                 let publication_compensated = self
-                    .content_lock_deletions
-                    .compensate_publication(creator, lock_id, publication_token)
+                    .compensate_publication_with_retry(creator, lock_id, publication_token)
                     .await?;
                 if !publication_compensated {
                     return Err(ApplicationError::Storage {
@@ -286,8 +295,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         }
 
         if !self
-            .content_lock_deletions
-            .mark_publication_written(creator, lock_id, publication_token)
+            .mark_publication_written_with_retry(creator, lock_id, publication_token)
             .await?
         {
             return Err(ApplicationError::Storage {
@@ -307,6 +315,69 @@ impl<'a> CreateContentLockUseCase<'a> {
             .mark_paths_published(creator, guarded_paths, lock_id)
             .await?;
         Ok(())
+    }
+
+    async fn mark_publication_written_with_retry(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self
+                .content_lock_deletions
+                .mark_publication_written(creator, lock_id, publication_token)
+                .await
+            {
+                Ok(committed) => return Ok(committed),
+                Err(error) if attempts == PUBLICATION_BOOKKEEPING_ATTEMPTS => return Err(error),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    async fn compensate_publication_with_retry(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self
+                .content_lock_deletions
+                .compensate_publication(creator, lock_id, publication_token)
+                .await
+            {
+                Ok(committed) => return Ok(committed),
+                Err(error) if attempts == PUBLICATION_BOOKKEEPING_ATTEMPTS => return Err(error),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    async fn abandon_publication_with_retry(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self
+                .content_lock_deletions
+                .abandon_publication(creator, lock_id, publication_token)
+                .await
+            {
+                Ok(committed) => return Ok(committed),
+                Err(error) if attempts == PUBLICATION_BOOKKEEPING_ATTEMPTS => return Err(error),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
     }
 
     async fn resolve_owned_content_lock(
