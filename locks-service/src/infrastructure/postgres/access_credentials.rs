@@ -186,38 +186,89 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         issuance_deadline: OffsetDateTime,
         read_deadline: OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
-        if issuance_deadline <= now || read_deadline <= issuance_deadline {
+        let issuance_window = issuance_deadline - now;
+        let read_window = read_deadline - issuance_deadline;
+        if !issuance_window.is_positive() || !read_window.is_positive() {
             return Err(ApplicationError::Storage {
                 message: "invalid final access window ordering".to_owned(),
             });
         }
-        let updated = sqlx::query(
-            "UPDATE content_lock_deletion_jobs
-             SET final_issuance_started_at = COALESCE(final_issuance_started_at, $4),
-                 final_credential_issuance_deadline =
-                     COALESCE(final_credential_issuance_deadline, $5),
-                 final_read_deadline = COALESCE(final_read_deadline, $6)
-             WHERE job_id = $1 AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > $4 AND state = 'running'
-               AND force_requested_at IS NULL AND phase = 'issue_final_credentials'",
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let job = sqlx::query(
+            "SELECT state, phase, force_requested_at, claimed_by, claim_token,
+                    claim_expires_at, final_issuance_started_at
+             FROM content_lock_deletion_jobs
+             WHERE job_id = $1
+             FOR UPDATE",
         )
         .bind(deletion_job_id)
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(now)
-        .bind(issuance_deadline)
-        .bind(read_deadline)
-        .execute(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        Ok(updated.rows_affected() == 1)
+        let Some(job) = job else {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(false);
+        };
+        let database_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        let owns_live_claim = job.try_get::<String, _>("state").map_err(storage_error)?
+            == "running"
+            && job.try_get::<String, _>("phase").map_err(storage_error)?
+                == "issue_final_credentials"
+            && job
+                .try_get::<Option<OffsetDateTime>, _>("force_requested_at")
+                .map_err(storage_error)?
+                .is_none()
+            && job
+                .try_get::<Option<String>, _>("claimed_by")
+                .map_err(storage_error)?
+                .as_deref()
+                == Some(worker_id)
+            && job
+                .try_get::<Option<Uuid>, _>("claim_token")
+                .map_err(storage_error)?
+                == Some(claim_token)
+            && job
+                .try_get::<Option<OffsetDateTime>, _>("claim_expires_at")
+                .map_err(storage_error)?
+                .is_some_and(|claim_expires_at| claim_expires_at > database_now);
+        if !owns_live_claim {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        if job
+            .try_get::<Option<OffsetDateTime>, _>("final_issuance_started_at")
+            .map_err(storage_error)?
+            .is_none()
+        {
+            let issuance_deadline = database_now + issuance_window;
+            let read_deadline = issuance_deadline + read_window;
+            sqlx::query(
+                "UPDATE content_lock_deletion_jobs
+                 SET final_issuance_started_at = $2,
+                     final_credential_issuance_deadline = $3,
+                     final_read_deadline = $4
+                 WHERE job_id = $1",
+            )
+            .bind(deletion_job_id)
+            .bind(database_now)
+            .bind(issuance_deadline)
+            .bind(read_deadline)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(true)
     }
 
     async fn issue_or_replay_final_credential(
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
         let cipher = match &self.final_credential_cipher {
@@ -233,7 +284,6 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
                AND job.state IN ('queued', 'running')
                AND job.force_requested_at IS NULL
                AND job.phase IN ('issue_final_credentials', 'drain_final_reads')
-               AND job.final_read_deadline > $3
                AND EXISTS (
                    SELECT 1
                    FROM content_lock_deletion_task_snapshot AS snapshot
@@ -246,7 +296,6 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         )
         .bind(creator.to_string())
         .bind(bundle_id.to_string())
-        .bind(now)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -261,6 +310,14 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             .map_err(storage_error)?;
         let expires_at: OffsetDateTime =
             job.try_get("final_read_deadline").map_err(storage_error)?;
+        let database_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if database_now >= expires_at {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(None);
+        }
         let snapshot_exists = sqlx::query_scalar::<_, bool>(
             "SELECT TRUE
              FROM content_lock_deletion_task_snapshot
@@ -306,7 +363,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
                 expires_at,
             }));
         }
-        if phase != "issue_final_credentials" || now >= issuance_deadline {
+        if phase != "issue_final_credentials" || database_now >= issuance_deadline {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(None);
         }
@@ -343,7 +400,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .bind(lookup_key.as_bytes().as_slice())
         .bind(creator.to_string())
         .bind(bundle_id.to_string())
-        .bind(now)
+        .bind(database_now)
         .bind(expires_at)
         .bind(encrypted.as_str())
         .execute(&mut *transaction)
@@ -380,7 +437,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         )
         .bind(deletion_job_id)
         .bind(bundle_id.to_string())
-        .bind(now)
+        .bind(database_now)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

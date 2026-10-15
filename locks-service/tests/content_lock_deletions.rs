@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use locks_core::{
     ids::{
@@ -49,6 +53,21 @@ struct FixedClock(time::OffsetDateTime);
 impl Clock for FixedClock {
     fn now(&self) -> time::OffsetDateTime {
         self.0
+    }
+}
+
+#[derive(Debug)]
+struct MutableClock(Mutex<time::OffsetDateTime>);
+
+impl MutableClock {
+    fn set(&self, now: time::OffsetDateTime) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl Clock for MutableClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -304,6 +323,77 @@ async fn in_memory_force_receipt_blocks_later_ordinary_credential() {
             )
             .await,
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+    );
+}
+
+#[tokio::test]
+async fn in_memory_incomplete_force_receipt_retains_terminal_task_fence() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let access = Arc::new(
+        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            verification_tasks.clone(),
+            Arc::clone(&fence),
+        ),
+    );
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access,
+            Arc::clone(&fence),
+        );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task(&job, VerificationTaskStatus::Pending);
+    verification_tasks
+        .insert_verification_task(task.clone())
+        .await
+        .unwrap();
+    let claimer = InMemoryVerificationTaskClaimer::with_verification_task_fence(
+        vec![task],
+        Arc::clone(&fence),
+    );
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claim = deletions
+        .claim_next("deletion-worker", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    deletions
+        .finish(
+            job.job_id,
+            "deletion-worker",
+            claim.claim_token,
+            NOW,
+            Some(ContentLockDeletionFailureCode::TombstoneMissing),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id, None, NOW)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    assert!(
+        deletions
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    );
+    assert!(
+        claimer
+            .claim_next_verification_task("ordinary-worker", NOW, LEASE_END)
+            .await
+            .unwrap()
+            .is_none(),
+        "terminal deletion ownership must fence ordinary task reclaim until force completes"
     );
 }
 
@@ -772,6 +862,86 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
 }
 
 #[tokio::test]
+async fn in_memory_final_window_initialization_uses_storage_clock_after_state_lock() {
+    let (clock, verification_tasks, access, deletions) =
+        in_memory_access_stack_with_mutable_clock();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    verification_tasks
+        .insert_verification_task(completed_verification_task(&job))
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
+    clock.set(LEASE_END);
+
+    assert!(
+        !access
+            .initialize_final_access_windows(
+                job.job_id,
+                "worker-final",
+                claimed.claim_token,
+                NOW,
+                NOW + time::Duration::minutes(15),
+                NOW + time::Duration::minutes(30),
+            )
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn in_memory_final_issue_and_replay_use_storage_clock() {
+    let (clock, verification_tasks, access, deletions) =
+        in_memory_access_stack_with_mutable_clock();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let completed = completed_verification_task(&job);
+    let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
+    verification_tasks
+        .insert_verification_task(completed)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = advance_to_final_issuance(&deletions, &access, job.job_id).await;
+    access
+        .initialize_final_access_windows(
+            job.job_id,
+            "worker-final",
+            claimed.claim_token,
+            NOW - time::Duration::days(1),
+            NOW - time::Duration::days(1) + time::Duration::minutes(15),
+            NOW - time::Duration::days(1) + time::Duration::minutes(30),
+        )
+        .await
+        .unwrap();
+
+    let issued = access
+        .issue_or_replay_final_credential(
+            &job.creator,
+            &bundle_id,
+            NOW + time::Duration::days(1),
+            AccessCredential::new("storage-clock-winner"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(issued.expires_at, NOW + time::Duration::minutes(30));
+
+    clock.set(NOW + time::Duration::minutes(30));
+    assert!(
+        access
+            .issue_or_replay_final_credential(
+                &job.creator,
+                &bundle_id,
+                NOW,
+                AccessCredential::new("must-not-replay-at-read-deadline"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot() {
     let (verification_tasks, access, deletions) = in_memory_access_stack();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
@@ -1023,7 +1193,8 @@ async fn in_memory_payment_drain_waits_for_completed_aggregate() {
 
 #[tokio::test]
 async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations() {
-    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let (clock, verification_tasks, access, deletions) =
+        in_memory_access_stack_with_mutable_clock();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
     let completed = completed_verification_task(&job);
     let bundle_id = completed.submitted_proof_bundle.bundle_id.clone();
@@ -1075,6 +1246,7 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
             locks_service::application::errors::ApplicationError::InvalidContentLockDeletionState { .. }
         )
     ));
+    clock.set(deadline);
     assert!(
         access
             .issue_or_replay_final_credential(
@@ -1302,6 +1474,33 @@ fn in_memory_access_stack() -> (
             fence,
         );
     (verification_tasks, access, deletions)
+}
+
+fn in_memory_access_stack_with_mutable_clock() -> (
+    Arc<MutableClock>,
+    Arc<InMemoryVerificationTaskRepository>,
+    Arc<InMemoryAccessCredentialStore>,
+    InMemoryContentLockDeletionRepository,
+) {
+    let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+        clock.clone(),
+    ));
+    let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let access = Arc::new(
+        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            verification_tasks.clone(),
+            Arc::clone(&fence),
+        ),
+    );
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            Arc::clone(&access),
+            fence,
+        );
+    (clock, verification_tasks, access, deletions)
 }
 
 async fn advance_to_phase(

@@ -3037,6 +3037,11 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let window_initialized_before: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
         assert!(
             access
                 .initialize_final_access_windows(
@@ -3064,13 +3069,18 @@ mod tests {
         .fetch_one(database.pool())
         .await
         .unwrap();
+        let persisted_start = persisted_windows.0.unwrap();
+        let persisted_issuance_deadline = persisted_windows.1.unwrap();
+        let persisted_read_deadline = persisted_windows.2.unwrap();
+        assert!(persisted_start >= window_start);
+        assert!(persisted_start <= window_initialized_before);
         assert_eq!(
-            persisted_windows,
-            (
-                Some(window_start),
-                Some(issuance_deadline),
-                Some(read_deadline)
-            )
+            persisted_issuance_deadline - persisted_start,
+            time::Duration::minutes(15)
+        );
+        assert_eq!(
+            persisted_read_deadline - persisted_issuance_deadline,
+            time::Duration::minutes(15)
         );
         let first = access
             .issue_or_replay_final_credential(
@@ -3093,8 +3103,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.credential, replay.credential);
-        assert_eq!(first.expires_at, read_deadline);
-        assert_eq!(replay.expires_at, read_deadline);
+        assert_eq!(first.expires_at, persisted_read_deadline);
+        assert_eq!(replay.expires_at, persisted_read_deadline);
         let late_replay = access
             .issue_or_replay_final_credential(
                 &job.creator,
@@ -4190,12 +4200,15 @@ mod tests {
     async fn issuance_deadline_is_half_open_and_transition_preserves_only_exact_replay() {
         let database = TestDatabase::create().await;
         let (job, task, access) = eligible_final_credential_fixture(&database).await;
-        let issuance_deadline: time::OffsetDateTime = sqlx::query_scalar(
-            "SELECT final_credential_issuance_deadline
-             FROM content_lock_deletion_jobs WHERE job_id = $1",
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET final_issuance_started_at = clock_timestamp() - INTERVAL '2 seconds',
+                 final_credential_issuance_deadline =
+                     clock_timestamp() - INTERVAL '1 second'
+             WHERE job_id = $1",
         )
         .bind(job.job_id)
-        .fetch_one(database.pool())
+        .execute(database.pool())
         .await
         .unwrap();
 
@@ -4204,7 +4217,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &job.creator,
                     &task.submitted_proof_bundle.bundle_id,
-                    issuance_deadline,
+                    NOW - time::Duration::days(1),
                     AccessCredential::new("must-not-insert-at-deadline"),
                 )
                 .await
@@ -4221,11 +4234,21 @@ mod tests {
         .unwrap();
         assert_eq!(final_count, 0);
 
+        let issuance_deadline: time::OffsetDateTime = sqlx::query_scalar(
+            "UPDATE content_lock_deletion_jobs
+             SET final_credential_issuance_deadline = clock_timestamp() + INTERVAL '15 minutes'
+             WHERE job_id = $1
+             RETURNING final_credential_issuance_deadline",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
         let issued = access
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
-                issuance_deadline - time::Duration::seconds(1),
+                NOW + time::Duration::days(1),
                 AccessCredential::new("persisted-before-transition"),
             )
             .await
@@ -4268,6 +4291,167 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(replay, issued);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn final_window_initialization_rechecks_claim_expiry_after_job_lock_wait() {
+        let database = TestDatabase::create().await;
+        let (job, _task, access) = eligible_final_credential_fixture(&database).await;
+        let claim_token = Uuid::new_v4();
+        let mut holder = database.pool().begin().await.unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET state = 'running', claimed_by = 'window-worker', claim_token = $2,
+                 claim_expires_at = clock_timestamp() + INTERVAL '100 milliseconds',
+                 final_issuance_started_at = NULL,
+                 final_credential_issuance_deadline = NULL,
+                 final_read_deadline = NULL
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .bind(claim_token)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let initializing = tokio::spawn(async move {
+            access
+                .initialize_final_access_windows(
+                    job.job_id,
+                    "window-worker",
+                    claim_token,
+                    NOW,
+                    NOW + time::Duration::minutes(15),
+                    NOW + time::Duration::minutes(30),
+                )
+                .await
+        });
+        wait_for_row_lock_waiter(database.pool(), holder_pid).await;
+        sqlx::query("SELECT pg_sleep(0.2)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        assert!(!initializing.await.unwrap().unwrap());
+        let windows: (
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+        ) = sqlx::query_as(
+            "SELECT final_issuance_started_at,
+                    final_credential_issuance_deadline,
+                    final_read_deadline
+             FROM content_lock_deletion_jobs WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(windows, (None, None, None));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn final_first_issuance_rechecks_deadline_after_job_lock_wait() {
+        let database = TestDatabase::create().await;
+        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let mut holder = database.pool().begin().await.unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET final_credential_issuance_deadline =
+                     clock_timestamp() + INTERVAL '100 milliseconds'
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let issuing = tokio::spawn(async move {
+            access
+                .issue_or_replay_final_credential(
+                    &job.creator,
+                    &task.submitted_proof_bundle.bundle_id,
+                    NOW,
+                    AccessCredential::new("must-not-cross-issuance-deadline"),
+                )
+                .await
+        });
+        wait_for_row_lock_waiter(database.pool(), holder_pid).await;
+        sqlx::query("SELECT pg_sleep(0.2)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        assert!(issuing.await.unwrap().unwrap().is_none());
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn final_replay_rechecks_read_deadline_after_job_lock_wait() {
+        let database = TestDatabase::create().await;
+        let (job, task, access) = eligible_final_credential_fixture(&database).await;
+        let first = access
+            .issue_or_replay_final_credential(
+                &job.creator,
+                &task.submitted_proof_bundle.bundle_id,
+                NOW,
+                AccessCredential::new("winner-before-read-deadline"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut holder = database.pool().begin().await.unwrap();
+        let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET final_issuance_started_at = clock_timestamp() - INTERVAL '2 seconds',
+                 final_credential_issuance_deadline =
+                     clock_timestamp() - INTERVAL '1 second',
+                 final_read_deadline = clock_timestamp() + INTERVAL '100 milliseconds'
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let replaying = tokio::spawn(async move {
+            access
+                .issue_or_replay_final_credential(
+                    &job.creator,
+                    &task.submitted_proof_bundle.bundle_id,
+                    NOW,
+                    AccessCredential::new("must-not-replay-after-read-deadline"),
+                )
+                .await
+        });
+        wait_for_row_lock_waiter(database.pool(), holder_pid).await;
+        sqlx::query("SELECT pg_sleep(0.2)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        assert!(replaying.await.unwrap().unwrap().is_none());
+        assert_eq!(first.credential.as_str(), "winner-before-read-deadline");
 
         database.cleanup().await;
     }
@@ -4429,6 +4613,31 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    async fn wait_for_row_lock_waiter(pool: &sqlx::PgPool, holder_pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiter_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM pg_stat_activity
+                         WHERE pid <> $1
+                           AND $1 = ANY(pg_blocking_pids(pid))
+                     )",
+                )
+                .bind(holder_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiter_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second Postgres connection must wait on the deletion job row");
     }
 
     async fn wait_for_advisory_waiter(transaction: &mut Transaction<'_, Postgres>) {

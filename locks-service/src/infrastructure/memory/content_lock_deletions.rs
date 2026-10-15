@@ -504,7 +504,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .acquire_lock_admission(creator, lock_id)
             .await;
         let mut deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.write().await;
-        let mut verification_tasks = self.verification_task_fence.records.write().await;
+        let verification_tasks = self.verification_task_fence.records.write().await;
         let intents = self.publication_intents.read().await;
         if intents.contains_key(&key) {
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
@@ -559,12 +559,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             };
             receipts.insert(key, receipt.clone());
             let terminal_job_id = stored.job.job_id;
-            jobs.remove(&(creator.clone(), lock_id.clone()));
-            for task in verification_tasks.values_mut() {
-                if task.deletion_job_id == Some(terminal_job_id) {
-                    task.deletion_job_id = None;
-                }
-            }
             drop(receipts);
             drop(jobs);
             drop(intents);

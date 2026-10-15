@@ -178,6 +178,14 @@ impl InMemoryAccessCredentialStore {
         }
     }
 
+    fn authoritative_now(&self) -> OffsetDateTime {
+        self.verification_task_deletion_fence
+            .as_ref()
+            .map_or_else(OffsetDateTime::now_utc, |fence| {
+                fence.authoritative_cutoff()
+            })
+    }
+
     pub(crate) async fn register_deletion(
         &self,
         job: &ContentLockDeletionJob,
@@ -598,12 +606,15 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
         issuance_deadline: OffsetDateTime,
         read_deadline: OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
-        if issuance_deadline <= now || read_deadline <= issuance_deadline {
+        let issuance_window = issuance_deadline - now;
+        let read_window = read_deadline - issuance_deadline;
+        if !issuance_window.is_positive() || !read_window.is_positive() {
             return Err(ApplicationError::Storage {
                 message: "invalid final access window ordering".to_owned(),
             });
         }
         let mut state = self.state.write().await;
+        let now = self.authoritative_now();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -618,6 +629,8 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
         if !owns_live_claim {
             return Ok(false);
         }
+        let issuance_deadline = now + issuance_window;
+        let read_deadline = issuance_deadline + read_window;
         deletion.issuance_deadline.get_or_insert(issuance_deadline);
         deletion.read_deadline.get_or_insert(read_deadline);
         Ok(true)
@@ -627,10 +640,11 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
         let mut state = self.state.write().await;
+        let now = self.authoritative_now();
         let Some((deletion_job_id, _)) = state.deletions.iter().find(|(_, deletion)| {
             deletion.creator == *creator && deletion.bundle_snapshots.contains_key(bundle_id)
         }) else {
