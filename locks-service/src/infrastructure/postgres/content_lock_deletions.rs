@@ -2879,6 +2879,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_ready_paykit_snapshot_completes_its_payment_drain() {
+        let database = TestDatabase::create().await;
+        let pool = database.pool().clone();
+        let tasks = PostgresVerificationTaskRepository::new(pool.clone());
+        let deletions = PostgresContentLockDeletionRepository::new(pool.clone());
+        let drains = PostgresPaymentDrainRepository::new(pool);
+        let lock = content_lock();
+        let terminal =
+            insert_ready_terminal_paykit_task(&tasks, &lock, BundleId::from_bytes([13; 16])).await;
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        advance_withdraw_to_payment_drain(&deletions, job.job_id).await;
+
+        let obligations = drains.list_obligations(job.job_id).await.unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].task_id, terminal.task_id);
+
+        let paykit_calls = complete_payment_drain(&deletions, &drains, &job).await;
+        assert_eq!(paykit_calls, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_failed_admission_and_terminal_ready_snapshot_drains_only_ready_task() {
+        let database = TestDatabase::create().await;
+        let pool = database.pool().clone();
+        let tasks = PostgresVerificationTaskRepository::new(pool.clone());
+        let deletions = PostgresContentLockDeletionRepository::new(pool.clone());
+        let drains = PostgresPaymentDrainRepository::new(pool);
+        let lock = content_lock();
+        let failed = paykit_verification_task(&lock, BundleId::from_bytes([14; 16]));
+        tasks
+            .insert_invoice_pending_task(failed.clone(), invoice_intent(&failed))
+            .await
+            .unwrap();
+        let failed_claim = tasks
+            .claim_next_invoice_admission("failed-invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        tasks
+            .mark_invoice_admission_failed(
+                &failed.task_id,
+                "failed-invoice-worker",
+                &failed_claim.claim_token,
+                NOW,
+                "admission exhausted",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal =
+            insert_ready_terminal_paykit_task(&tasks, &lock, BundleId::from_bytes([15; 16])).await;
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        advance_withdraw_to_payment_drain(&deletions, job.job_id).await;
+
+        let obligations = drains.list_obligations(job.job_id).await.unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].task_id, terminal.task_id);
+
+        let paykit_calls = complete_payment_drain(&deletions, &drains, &job).await;
+        assert_eq!(paykit_calls, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn deletion_preserves_unclaimed_invoice_admission_retry_schedule() {
         let database = TestDatabase::create().await;
         let lock = content_lock();
@@ -5217,6 +5286,134 @@ mod tests {
                 .unwrap(),
             payment_in: 24,
         }
+    }
+
+    async fn insert_ready_terminal_paykit_task(
+        tasks: &PostgresVerificationTaskRepository,
+        lock: &ContentLock,
+        bundle_id: BundleId,
+    ) -> VerificationTaskRecord {
+        let task = paykit_verification_task(lock, bundle_id);
+        tasks
+            .insert_invoice_pending_task(task.clone(), invoice_intent(&task))
+            .await
+            .unwrap();
+        let claim = tasks
+            .claim_next_invoice_admission("ready-invoice-worker", NOW, time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        tasks
+            .mark_invoice_admission_ready(
+                &task.task_id,
+                "ready-invoice-worker",
+                &claim.claim_token,
+                NOW,
+                NOW,
+                NOW + time::Duration::hours(24),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut terminal = tasks
+            .get_verification_task(&task.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        terminal.status = VerificationTaskStatus::Completed;
+        terminal.started_at = Some(NOW);
+        terminal.completed_at = Some(NOW);
+        terminal.entitlement_to_publish = Some(entitlement(&terminal));
+        tasks
+            .update_verification_task(terminal.clone())
+            .await
+            .unwrap();
+        terminal
+    }
+
+    async fn advance_withdraw_to_payment_drain(
+        deletions: &PostgresContentLockDeletionRepository,
+        job_id: Uuid,
+    ) {
+        let withdraw = deletions
+            .claim_next("deletion-worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        deletions
+            .advance_phase(
+                job_id,
+                "deletion-worker",
+                withdraw.claim_token,
+                ContentLockDeletionPhase::StartPaymentDrain,
+            )
+            .await
+            .unwrap()
+            .advanced()
+            .expect("ready invoice admission must permit payment drain progression");
+    }
+
+    async fn complete_payment_drain(
+        deletions: &PostgresContentLockDeletionRepository,
+        drains: &PostgresPaymentDrainRepository,
+        job: &ContentLockDeletionJob,
+    ) -> usize {
+        let paykit = ReclaimingPaymentDrainClient {
+            summary: PaymentDrainSummary {
+                status: PaymentDrainStatus::Completed,
+                accepted_count: 0,
+                terminal_count: 0,
+                cancellation_enqueued_count: 0,
+                cleanup_token: PaymentDrainCleanupToken::parse(
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
+                .unwrap(),
+            },
+            start_calls: AtomicUsize::new(0),
+        };
+        let entitlements = InMemoryEntitlementRepository::new();
+        let use_case = DrainLockPaymentsUseCase::new(
+            deletions,
+            drains,
+            &paykit,
+            &entitlements,
+            &FixedClock(NOW),
+            LockServerPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+                .unwrap(),
+            6,
+        );
+        let start = deletions
+            .claim_next("deletion-worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            use_case
+                .execute_claimed(start, "deletion-worker")
+                .await
+                .unwrap()
+        );
+        let drain = deletions
+            .claim_next("deletion-worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            use_case
+                .execute_claimed(drain, "deletion-worker")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            deletions
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            ContentLockDeletionPhase::DrainExistingCredentials
+        );
+        paykit.start_calls.load(Ordering::SeqCst)
     }
 
     fn entitlement(task: &VerificationTaskRecord) -> VerifiedProofBundle {

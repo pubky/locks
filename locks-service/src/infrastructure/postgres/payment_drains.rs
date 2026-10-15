@@ -214,8 +214,8 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
              JOIN verification_tasks AS task
                ON task.task_id = snapshot.verification_task_id
              WHERE snapshot.deletion_job_id = $1
-               AND snapshot.paykit_admission_required = TRUE
-               AND snapshot.resolved_status IS NULL
+               AND snapshot.paykit_admission_required IS DISTINCT FROM FALSE
+               AND task.invoice_admission_phase <> 'failed'
              ORDER BY snapshot.verification_task_id",
         )
         .bind(deletion_job_id)
