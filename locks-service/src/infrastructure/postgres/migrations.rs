@@ -428,7 +428,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("drain or explicitly reset pre-0021 deletion jobs"),
+                    .contains("drain or explicitly reset pre-0023 deletion jobs"),
                 "unexpected migration error for {state}: {error}"
             );
 
