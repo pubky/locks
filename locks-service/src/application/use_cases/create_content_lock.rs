@@ -271,19 +271,16 @@ impl<'a> CreateContentLockUseCase<'a> {
                     // This retry did not dispatch, but an earlier ambiguous write may still land.
                     return Err(error);
                 }
-                let intent_compensated = self
+                let publication_compensated = self
                     .content_lock_deletions
-                    .abandon_publication(creator, lock_id, publication_token)
+                    .compensate_publication(creator, lock_id, publication_token)
                     .await?;
-                if !intent_compensated {
+                if !publication_compensated {
                     return Err(ApplicationError::Storage {
                         message: "content lock publication compensation was not committed"
                             .to_owned(),
                     });
                 }
-                self.content_lock_ownership
-                    .compensate_reserved_paths(creator, guarded_paths, lock_id)
-                    .await?;
                 return Err(error);
             }
         }
@@ -411,7 +408,26 @@ impl<'a> CreateContentLockUseCase<'a> {
                     Some(recovery),
                 )));
             }
-            PublicationRecovery::None => {}
+            PublicationRecovery::None => {
+                // Compensation may have committed while the ownership snapshot waited on the
+                // publication fence. Re-read before using that snapshot to admit a retry.
+                let mut current_ownership = Vec::with_capacity(guarded_paths.len());
+                for guarded_path in guarded_paths {
+                    current_ownership.push(
+                        self.content_lock_ownership
+                            .get_path_ownership(creator, guarded_path)
+                            .await?,
+                    );
+                }
+                if current_ownership.iter().all(Option::is_none) {
+                    return Ok(None);
+                }
+                if current_ownership != ownership {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+            }
         }
 
         let Some(existing) = self
@@ -481,8 +497,8 @@ fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -501,10 +517,13 @@ mod tests {
         Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository,
         ContentLockRepository, GuardedResourceRepository,
     };
-    use crate::infrastructure::memory::content_lock_deletions::InMemoryContentLockDeletionRepository;
-    use crate::infrastructure::memory::content_lock_ownership::InMemoryContentLockOwnershipRepository;
     use crate::infrastructure::memory::content_locks::InMemoryContentLockRepository;
     use crate::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
+    use crate::infrastructure::memory::{
+        content_lock_deletions::InMemoryContentLockDeletionRepository,
+        content_lock_ownership::InMemoryContentLockOwnershipRepository,
+        content_lock_publication_repositories,
+    };
     use crate::infrastructure::postgres::{
         PostgresContentLockDeletionRepository, PostgresContentLockOwnershipRepository,
         testing::TestDatabase,
@@ -1689,23 +1708,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_memory_pre_dispatch_failure_cannot_compensate_retry_ownership() {
+    async fn memory_compensation_is_atomic_with_retry_admission() {
+        let (content_lock_deletions, content_lock_ownership) =
+            content_lock_publication_repositories();
+        let compensation_started = Arc::new(Notify::new());
+        let release_compensation = Arc::new(Notify::new());
+        let content_lock_deletions = content_lock_deletions
+            .with_compensation_barrier(compensation_started.clone(), release_compensation.clone());
         let fixture = Fixture::seeded().await;
 
-        assert_slow_pre_dispatch_failure_cannot_compensate_retry_ownership(
-            &fixture.content_lock_deletions,
-            &fixture.content_lock_ownership,
+        assert_compensation_is_atomic_with_retry_admission(
+            &content_lock_deletions,
+            &content_lock_ownership,
             &fixture.guarded_resources,
             &fixture.clock,
+            compensation_started,
+            release_compensation,
         )
         .await;
     }
 
     #[tokio::test]
-    async fn slow_postgres_pre_dispatch_failure_cannot_compensate_retry_ownership() {
+    async fn postgres_compensation_is_atomic_with_retry_admission() {
         let database = TestDatabase::create().await;
+        let compensation_started = Arc::new(Notify::new());
+        let release_compensation = Arc::new(Notify::new());
         let content_lock_deletions =
-            PostgresContentLockDeletionRepository::new(database.pool().clone());
+            PostgresContentLockDeletionRepository::new(database.pool().clone())
+                .with_compensation_barrier(
+                    compensation_started.clone(),
+                    release_compensation.clone(),
+                );
         let content_lock_ownership =
             PostgresContentLockOwnershipRepository::new(database.pool().clone());
         let guarded_resources = InMemoryGuardedResourceRepository::new();
@@ -1723,23 +1756,49 @@ mod tests {
             .await
             .unwrap();
 
-        assert_slow_pre_dispatch_failure_cannot_compensate_retry_ownership(
+        assert_compensation_is_atomic_with_retry_admission(
             &content_lock_deletions,
             &content_lock_ownership,
             &guarded_resources,
             &clock,
+            compensation_started,
+            release_compensation,
         )
         .await;
         database.cleanup().await;
     }
 
-    async fn assert_slow_pre_dispatch_failure_cannot_compensate_retry_ownership(
+    async fn assert_compensation_is_atomic_with_retry_admission(
         content_lock_deletions: &dyn ContentLockDeletionRepository,
         content_lock_ownership: &dyn ContentLockOwnershipRepository,
         guarded_resources: &dyn GuardedResourceRepository,
         clock: &dyn Clock,
+        compensation_started: Arc<Notify>,
+        release_compensation: Arc<Notify>,
     ) {
         let stored_content_locks = InMemoryContentLockRepository::new();
+        let request = content_lock_request(registered_guarded_resource());
+        let content_lock = ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: request.creator.clone(),
+            primary_resource: request.primary_resource.clone(),
+            secondary_resources: request.secondary_resources.clone(),
+            criteria: request.criteria.clone(),
+            lock_logic: request.lock_logic.clone(),
+            access_policy: request.access_policy.clone(),
+            lock_server: request.lock_server.clone(),
+            created_at: clock.now(),
+        };
+        let lock_id = content_lock.lock_id().unwrap();
+        let content_lock_path = content_lock.content_lock_path().unwrap();
+        stored_content_locks
+            .upsert_content_lock(
+                request.creator.clone(),
+                content_lock_path.clone(),
+                content_lock.clone(),
+            )
+            .await
+            .unwrap();
         let content_locks = BlockingSuccessfulUpsertContentLockRepository {
             inner: &stored_content_locks,
             first_started: Notify::new(),
@@ -1754,37 +1813,27 @@ mod tests {
             guarded_resources,
             clock,
         );
-        let request = content_lock_request(registered_guarded_resource());
 
         let original = use_case.execute(request.clone());
         let retry = async {
             content_locks.first_started.notified().await;
-            let result = use_case.execute(request.clone()).await;
-            assert_eq!(
-                result,
-                Err(ApplicationError::ContentLockPublicationInProgress)
-            );
-            assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
-            assert!(
-                content_lock_ownership
-                    .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
             content_locks.release_first.notify_one();
+            compensation_started.notified().await;
+
+            let retry = use_case.execute(request.clone());
+            tokio::pin!(retry);
+            tokio::select! {
+                biased;
+                result = &mut retry => panic!("retry crossed in-flight compensation: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            release_compensation.notify_one();
+            retry.await
         };
 
-        let (original, ()) = tokio::join!(original, retry);
+        let (original, retry) = tokio::join!(original, retry);
         assert_eq!(original, Err(ApplicationError::CreatorAuthorityUnavailable));
-        assert!(
-            content_lock_ownership
-                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let created = use_case.execute(request).await.unwrap();
+        let created = retry.unwrap();
         assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 2);
         assert_eq!(
             content_lock_ownership
@@ -1794,6 +1843,28 @@ mod tests {
                 .unwrap()
                 .lock_id,
             created.lock_id
+        );
+        assert_eq!(
+            content_lock_ownership
+                .get_path_ownership(&creator(), "/priv/app.locks/content/hello.txt")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentLockOwnershipStatus::Published
+        );
+        assert_eq!(
+            stored_content_locks
+                .get_content_lock(&creator(), &content_lock_path)
+                .await
+                .unwrap(),
+            Some(content_lock)
+        );
+        assert!(
+            !content_lock_deletions
+                .publication_in_progress(&creator(), &lock_id)
+                .await
+                .unwrap()
         );
     }
 
@@ -2617,10 +2688,12 @@ mod tests {
 
     impl Fixture {
         fn empty() -> Self {
+            let (content_lock_deletions, content_lock_ownership) =
+                content_lock_publication_repositories();
             Self {
                 content_locks: InMemoryContentLockRepository::new(),
-                content_lock_deletions: InMemoryContentLockDeletionRepository::new(),
-                content_lock_ownership: InMemoryContentLockOwnershipRepository::new(),
+                content_lock_deletions,
+                content_lock_ownership,
                 guarded_resources: InMemoryGuardedResourceRepository::new(),
                 clock: MutableClock::new(datetime!(2026-06-03 12:00:00 UTC)),
             }

@@ -29,7 +29,6 @@ use locks_service::{
     infrastructure::{
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
-            content_lock_deletions::InMemoryContentLockDeletionRepository,
             content_lock_ownership::InMemoryContentLockOwnershipRepository,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_tasks::InMemoryVerificationTaskRepository,
@@ -625,10 +624,16 @@ impl AppState {
                 ))
             })
         });
+        let mut private_runtime = private_runtime;
         let content_lock_deletions: Arc<dyn ContentLockDeletionRepository> =
             match postgres_pool.as_ref() {
                 Some(pool) => Arc::new(PostgresContentLockDeletionRepository::new(pool.clone())),
-                None => Arc::new(InMemoryContentLockDeletionRepository::new()),
+                None => {
+                    let (deletions, ownership) =
+                    locks_service::infrastructure::memory::content_lock_publication_repositories();
+                    private_runtime.content_lock_ownership = Arc::new(ownership);
+                    Arc::new(deletions)
+                }
             };
         let paykit_setup_status_provider = paykit_http_client
             .as_ref()
