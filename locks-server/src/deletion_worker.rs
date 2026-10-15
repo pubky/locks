@@ -1768,6 +1768,9 @@ mod tests {
         ) -> Result<PrepareForceDeletionResult, ApplicationError> {
             unreachable!()
         }
+        async fn has_paykit_snapshots(&self, _: Uuid) -> Result<bool, ApplicationError> {
+            Ok(false)
+        }
         async fn complete_force_deletion(
             &self,
             _: Uuid,

@@ -264,6 +264,7 @@ impl From<ApplicationError> for ApiError {
             | ApplicationError::VerificationDependencyUnavailable
             | ApplicationError::FinalCredentialSecret { .. }
             | ApplicationError::InvalidContentLockDeletionState { .. }
+            | ApplicationError::CorruptContentLockDeletionManifest { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }
             | ApplicationError::ContentLockCanonicalization { .. }

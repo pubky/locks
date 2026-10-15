@@ -161,9 +161,12 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             return Ok(false);
         }
         observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-        let obligations = self.drains.list_obligations(claim.job.job_id).await?;
+        let has_paykit_snapshots = self
+            .deletions
+            .has_paykit_snapshots(claim.job.job_id)
+            .await?;
         observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-        if obligations.is_empty() {
+        if !has_paykit_snapshots {
             return self
                 .advance_to(
                     &claim,

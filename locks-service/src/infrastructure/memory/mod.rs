@@ -30,6 +30,25 @@ pub fn content_lock_publication_repositories() -> (
     )
 }
 
+#[cfg(test)]
+pub(crate) fn content_lock_publication_repositories_with_bookkeeping_failures(
+    mark: usize,
+    compensate: usize,
+    abandon: usize,
+) -> (
+    InMemoryContentLockDeletionRepository,
+    InMemoryContentLockOwnershipRepository,
+) {
+    let ownership = InMemoryContentLockOwnershipRepository::new();
+    let deletions = InMemoryContentLockDeletionRepository::with_dependencies(
+        Arc::new(InMemoryAccessCredentialStore::new()),
+        Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+        ownership.records(),
+    )
+    .with_publication_bookkeeping_failures(mark, compensate, abandon);
+    (deletions, ownership)
+}
+
 /// Creates publication repositories sharing ownership and deletion runtime dependencies.
 pub fn content_lock_publication_repositories_with_dependencies(
     access_credentials: Arc<InMemoryAccessCredentialStore>,

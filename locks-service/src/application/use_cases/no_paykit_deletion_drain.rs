@@ -51,6 +51,13 @@ impl<'a> NoPaykitDeletionDrainUseCase<'a> {
             }
         };
         let _now = self.clock.now();
+        if self
+            .deletions
+            .has_paykit_snapshots(claim.job.job_id)
+            .await?
+        {
+            return Ok(false);
+        }
         if !self
             .deletions
             .expire_unresolved_non_paykit_tasks(claim.job.job_id, worker_id, claim.claim_token)
@@ -94,6 +101,26 @@ impl ContentLockPaymentDrainExecutor for NoPaykitDeletionDrainUseCase<'_> {
         };
         let _now = self.clock.now();
         let mut evidence = DeletionDependencyEvidence::none();
+        match self.deletions.has_paykit_snapshots(claim.job.job_id).await {
+            Ok(true) => {
+                return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Deferred)
+                    .with_evidence(DeletionDependencyEvidence::healthy(
+                        DeletionDependencySource::PaymentDrainRepository,
+                    ));
+            }
+            Ok(false) => {
+                evidence = evidence.merge(DeletionDependencyEvidence::healthy(
+                    DeletionDependencySource::PaymentDrainRepository,
+                ));
+            }
+            Err(error) => {
+                return observed_error(
+                    &error,
+                    DeletionDependencySource::PaymentDrainRepository,
+                    evidence,
+                );
+            }
+        }
         match self
             .deletions
             .expire_unresolved_non_paykit_tasks(claim.job.job_id, worker_id, claim.claim_token)

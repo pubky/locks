@@ -504,15 +504,16 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         }
         let frozen: serde_json::Value =
             job.try_get("frozen_content_lock").map_err(storage_error)?;
-        let frozen: ContentLock =
-            serde_json::from_value(frozen).map_err(|error| ApplicationError::Storage {
+        let frozen: ContentLock = serde_json::from_value(frozen).map_err(|error| {
+            ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
-            })?;
-        frozen
-            .validate_resource_set()
-            .map_err(|error| ApplicationError::Storage {
+            }
+        })?;
+        frozen.validate_resource_set().map_err(|error| {
+            ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
-            })?;
+            }
+        })?;
         let encrypted = cipher.encrypt(&context, &candidate)?;
         let lookup_key = AccessCredentialLookupKey::derive(&candidate);
         let credential_id = Uuid::new_v4();
@@ -712,15 +713,16 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         }
         let frozen: serde_json::Value =
             job.try_get("frozen_content_lock").map_err(storage_error)?;
-        let frozen: ContentLock =
-            serde_json::from_value(frozen).map_err(|error| ApplicationError::Storage {
+        let frozen: ContentLock = serde_json::from_value(frozen).map_err(|error| {
+            ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
-            })?;
-        frozen
-            .validate_resource_set()
-            .map_err(|error| ApplicationError::Storage {
+            }
+        })?;
+        frozen.validate_resource_set().map_err(|error| {
+            ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
-            })?;
+            }
+        })?;
         let encrypted = cipher.encrypt(&context, &candidate)?;
         let lookup_key = AccessCredentialLookupKey::derive(&candidate);
         let credential_id = Uuid::new_v4();

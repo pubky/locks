@@ -422,6 +422,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::ContentLockDeletionInProgress
         | ApplicationError::ContentLockPublicationInProgress
         | ApplicationError::InvalidContentLockDeletionState { .. }
+        | ApplicationError::CorruptContentLockDeletionManifest { .. }
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }
         | ApplicationError::VerificationPending

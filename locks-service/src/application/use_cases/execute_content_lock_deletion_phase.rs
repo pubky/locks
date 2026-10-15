@@ -516,6 +516,14 @@ impl<'a> ContentLockDeletionPhaseExecutor<'a> {
                 self.advance(claim, worker_id, ContentLockDeletionPhase::DrainFinalReads)
                     .await
             }
+            Err(ApplicationError::CorruptContentLockDeletionManifest { .. }) => {
+                self.finish_terminal(
+                    claim,
+                    worker_id,
+                    ContentLockDeletionFailureCode::StateCorrupt,
+                )
+                .await
+            }
             Err(error) => error_outcome(&error),
         }
     }

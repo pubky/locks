@@ -13,7 +13,7 @@ use crate::application::{
     models::{
         AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
         ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-        PrepareForceDeletionResult,
+        ForceDeletionReceipt, PrepareForceDeletionResult,
     },
 };
 
@@ -160,6 +160,10 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         })
     }
 
+    /// Returns whether frozen deletion snapshot includes a Paykit-classified obligation.
+    /// Failed admission remains included because Paykit may already hold its request.
+    async fn has_paykit_snapshots(&self, job_id: Uuid) -> Result<bool, ApplicationError>;
+
     /// Persists terminal completion or a stable secret-free failure under the exact lease.
     async fn finish(
         &self,
@@ -183,6 +187,38 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
     ) -> Result<PrepareForceDeletionResult, ApplicationError>;
+
+    /// Atomically persists the live manifest for synchronous force retries when no job exists.
+    /// Implementations that do not support receipt-owned manifests may retain the legacy behavior.
+    async fn prepare_force_deletion_with_manifest(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        frozen_content_lock: Option<&ContentLock>,
+    ) -> Result<PrepareForceDeletionResult, ApplicationError> {
+        let _ = frozen_content_lock;
+        self.prepare_force_deletion(creator, lock_id).await
+    }
+
+    async fn get_force_receipt(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError> {
+        let _ = (creator, lock_id);
+        Ok(None)
+    }
+
+    /// Marks a synchronous receipt complete after every cleanup postcondition succeeds.
+    async fn complete_synchronous_force_deletion(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let _ = (creator, lock_id, completed_at);
+        Ok(false)
+    }
 
     /// Finalizes force deletion only for the exact live worker claim that observed the effects.
     async fn complete_force_deletion(

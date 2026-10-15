@@ -30,6 +30,12 @@ pub enum ApplicationError {
         /// Secret-free invariant failure detail.
         message: String,
     },
+    /// Frozen deletion manifest cannot satisfy canonical resource invariants.
+    #[error("corrupt content lock deletion manifest: {message}")]
+    CorruptContentLockDeletionManifest {
+        /// Secret-free corruption detail.
+        message: String,
+    },
     /// An update-only operation targeted a missing record.
     #[error("missing {record} record")]
     MissingRecord {

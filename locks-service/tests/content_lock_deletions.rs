@@ -1820,10 +1820,19 @@ async fn no_paykit_drain_preserves_paykit_snapshot_for_later_paykit_recovery() {
     deletions.insert_job(job.clone()).await.unwrap();
     let claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
     assert!(
-        NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
+        !NoPaykitDeletionDrainUseCase::new(&deletions, &FixedClock(NOW))
             .execute_claimed(claim, "worker")
             .await
             .unwrap()
+    );
+    assert_eq!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        ContentLockDeletionPhase::StartPaymentDrain
     );
     assert_eq!(
         verification_tasks

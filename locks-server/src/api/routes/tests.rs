@@ -17,7 +17,7 @@ use locks_core::ids::{
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, PaykitPaymentAsset, VerifierType,
+    LockServerConfig, PaykitPaymentAsset, SecondaryGuardedResource, VerifierType,
 };
 use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
@@ -34,6 +34,7 @@ use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockRepository, GrantCreatorConnectFlowClient,
     GuardedResourceRepository, LegacyCreatorConnectFlowClient,
 };
+
 use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -60,6 +61,7 @@ use crate::config::{
     PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
     VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
+
 use crate::paykit_http_client::{
     PaykitHttpClient, PaykitSetupStatusKind, PaykitSetupStatusProvider,
     PaykitSetupStatusProviderError,
@@ -894,7 +896,7 @@ async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
 }
 
 #[tokio::test]
-async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_manifest() {
+async fn force_after_terminal_graceful_failure_requeues_frozen_manifest() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
     let content_lock = content_lock(true);
@@ -945,22 +947,15 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
         ))
         .await
         .unwrap();
-    assert_eq!(forced.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(forced).await,
-        json!({
-            "lock_id": lock_id,
-            "lock_deleted": true,
-            "failed_resource_paths": []
-        })
-    );
+    assert_eq!(forced.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(forced).await["status"], "queued");
     assert!(
         state
             .content_locks()
             .get_content_lock(&creator(), &path)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         state
@@ -968,10 +963,10 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
             .get_current_guarded_resource(&creator(), &resource.path)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
-        state
+        !state
             .content_lock_deletions()
             .has_force_receipt(&creator(), &lock_id)
             .await
@@ -6150,7 +6145,6 @@ async fn assert_force_status(app: &axum::Router, lock_id: &LockId, expected: &st
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 receipt shape; PR21 uses permanent force receipts.
 async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_cleanup() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -6212,7 +6206,6 @@ async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_clea
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 resumable-receipt contract.
 async fn force_delete_error_keeps_receipt_pending_and_retries_from_frozen_manifest() {
     let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
     content_locks
@@ -6250,7 +6243,6 @@ async fn force_delete_error_keeps_receipt_pending_and_retries_from_frozen_manife
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 resumable-receipt contract.
 async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
     let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
     content_locks
@@ -6295,7 +6287,7 @@ async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
         .unwrap();
 
     let response = force_delete_request(&app, &lock_id).await;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert!(
         state
             .verification_task_claimer()
@@ -6317,7 +6309,7 @@ async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
             .is_some()
     );
     assert!(
-        state
+        !state
             .content_lock_deletions()
             .has_force_receipt(&creator(), &lock_id)
             .await
@@ -6372,7 +6364,7 @@ async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
 }
 
 #[tokio::test]
-async fn force_from_failed_job_uses_frozen_manifest_after_resource_limits_are_lowered() {
+async fn force_from_failed_job_requeues_frozen_manifest_after_resource_limits_are_lowered() {
     let state = test_state_with_content_lock_limits(ContentLocksConfig {
         max_resource_bytes: 1,
         max_resources: 0,
@@ -6413,14 +6405,15 @@ async fn force_from_failed_job_uses_frozen_manifest_after_resource_limits_are_lo
 
     let response = force_delete_request(&app, &lock_id).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(response).await["status"], "queued");
     assert!(
         state
             .content_locks()
             .get_content_lock(&creator(), &path)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         state
@@ -6428,13 +6421,12 @@ async fn force_from_failed_job_uses_frozen_manifest_after_resource_limits_are_lo
             .get_current_guarded_resource(&creator(), &resource.path)
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    assert_force_status(&app, &lock_id, "completed").await;
+    assert_force_status(&app, &lock_id, "queued").await;
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 receipt-owned manifest contract.
 async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_resumable() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -6484,7 +6476,6 @@ async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_r
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 resumable-receipt contract.
 async fn force_readback_error_does_not_complete_before_retry_cleanup() {
     let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
     content_locks
@@ -6516,7 +6507,6 @@ async fn force_readback_error_does_not_complete_before_retry_cleanup() {
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 resumable-receipt contract.
 async fn force_readback_still_present_keeps_receipt_pending() {
     let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
     content_locks.retain_on_delete.store(true, Ordering::SeqCst);
@@ -6549,7 +6539,6 @@ async fn force_readback_still_present_keeps_receipt_pending() {
 }
 
 #[tokio::test]
-#[cfg(any())] // Retired PR20 resumable-receipt contract.
 async fn guarded_partial_failure_keeps_receipt_pending_until_repeated_force_finishes() {
     let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
     let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());

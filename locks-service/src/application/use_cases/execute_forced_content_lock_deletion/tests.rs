@@ -584,6 +584,9 @@ impl ContentLockDeletionRepository for FakeDeletions {
     ) -> Result<AdvanceContentLockDeletionPhaseResult, ApplicationError> {
         unreachable!()
     }
+    async fn has_paykit_snapshots(&self, _: Uuid) -> Result<bool, ApplicationError> {
+        Ok(false)
+    }
     async fn finish(
         &self,
         _: Uuid,

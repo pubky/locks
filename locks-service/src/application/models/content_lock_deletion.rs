@@ -112,6 +112,16 @@ pub struct ClaimedContentLockDeletionJob {
     pub claim_token: Uuid,
 }
 
+/// Durable synchronous-force admission fence and retained retry material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceDeletionReceipt {
+    pub creator: CreatorPubky,
+    pub lock_id: LockId,
+    pub frozen_content_lock: Option<ContentLock>,
+    pub forced_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+}
+
 /// Transactionally authoritative result of a requested deletion phase advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvanceContentLockDeletionPhaseResult {
