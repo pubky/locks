@@ -33,8 +33,6 @@ use locks_service::{
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
             content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
-            content_lock_deletions::InMemoryContentLockDeletionRepository,
-            content_lock_ownership::InMemoryContentLockOwnershipRepository,
             content_lock_tombstones::InMemoryContentLockTombstoneRepository,
             content_locks::InMemoryContentLockRepository,
             public_content_locks::InMemoryPublicContentLockStore,
@@ -388,14 +386,14 @@ impl AppState {
             Arc::new(PubkyEntitlementRepository::new(unavailable_storage)),
         );
 
-        let content_lock_deletions = Arc::new(
-            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+        let (content_lock_deletions, content_lock_ownership) =
+            locks_service::infrastructure::memory::content_lock_publication_repositories_with_dependencies(
                 Arc::clone(&access_credentials),
                 verification_task_deletion_fence,
-            ),
-        );
+            );
+        let content_lock_deletions = Arc::new(content_lock_deletions);
         let private_runtime = PrivateRuntimeAdapters {
-            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            content_lock_ownership: Arc::new(content_lock_ownership),
             invoice_admissions: verification_tasks.clone(),
             content_lock_deletions: content_lock_deletions.clone(),
             content_lock_deletion_action_ownership: Arc::new(
@@ -464,14 +462,14 @@ impl AppState {
             entitlements,
         );
 
-        let content_lock_deletions = Arc::new(
-            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+        let (content_lock_deletions, content_lock_ownership) =
+            locks_service::infrastructure::memory::content_lock_publication_repositories_with_dependencies(
                 Arc::clone(&access_credentials),
                 verification_task_deletion_fence,
-            ),
-        );
+            );
+        let content_lock_deletions = Arc::new(content_lock_deletions);
         let private_runtime = PrivateRuntimeAdapters {
-            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            content_lock_ownership: Arc::new(content_lock_ownership),
             invoice_admissions: verification_tasks.clone(),
             content_lock_deletions: content_lock_deletions.clone(),
             content_lock_deletion_action_ownership: Arc::new(
@@ -553,14 +551,14 @@ impl AppState {
             Arc::new(PubkyEntitlementRepository::new(authorizing_storage)),
         );
 
-        let content_lock_deletions = Arc::new(
-            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+        let (content_lock_deletions, content_lock_ownership) =
+            locks_service::infrastructure::memory::content_lock_publication_repositories_with_dependencies(
                 Arc::clone(&access_credentials),
                 verification_task_deletion_fence,
-            ),
-        );
+            );
+        let content_lock_deletions = Arc::new(content_lock_deletions);
         let private_runtime = PrivateRuntimeAdapters {
-            content_lock_ownership: Arc::new(InMemoryContentLockOwnershipRepository::new()),
+            content_lock_ownership: Arc::new(content_lock_ownership),
             invoice_admissions: verification_tasks.clone(),
             content_lock_deletions: content_lock_deletions.clone(),
             content_lock_deletion_action_ownership: Arc::new(
@@ -760,7 +758,6 @@ impl AppState {
                 ))
             })
         });
-
         let payment_drains = postgres_pool.as_ref().map(|pool| {
             Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
                 as Arc<dyn PaymentDrainRepository>

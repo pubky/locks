@@ -644,22 +644,16 @@ pub(crate) fn classify_payment_task(
         return Ok(Some((VerificationTaskStatus::Expired, Some(reason))));
     }
 
-    if status.request_state != PaymentRequestState::Accepted || !status.amount_matched {
+    if status.request_state != PaymentRequestState::Accepted {
         return Ok(None);
     }
-
-    if minimum_confirmations == 0
-        && matches!(
-            status.payment_state,
-            PaymentState::Detected | PaymentState::Confirmed
-        )
-    {
-        return Ok(Some((VerificationTaskStatus::Completed, None)));
-    }
-
-    Ok((status.payment_state == PaymentState::Confirmed
-        && status.confirmations >= minimum_confirmations)
-        .then_some((VerificationTaskStatus::Completed, None)))
+    Ok(crate::application::ports::payment_qualifies(
+        status.payment_state,
+        status.bitcoin,
+        status.usdt_arbitrum,
+        minimum_confirmations,
+    )
+    .then_some((VerificationTaskStatus::Completed, None)))
 }
 
 #[cfg(test)]

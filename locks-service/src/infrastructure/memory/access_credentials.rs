@@ -21,8 +21,8 @@ use crate::application::{
         ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
         DeletionReadAuthorization, EncryptedFinalCredential, FinalAccessWindows,
         FinalCredentialContext, FinalCredentialMaterialization, InitializeFinalAccessWindowsResult,
-        IssuedDeletionCredential, VerificationTaskStatus, VerificationTerminalReason,
-        OrdinaryCredentialLookupResult,
+        IssuedDeletionCredential, OrdinaryCredentialLookupResult, VerificationTaskStatus,
+        VerificationTerminalReason,
     },
     ports::{AccessCredentialStore, FinalCredentialWorkerIssueRequest, VerificationTaskRepository},
 };

@@ -16,11 +16,13 @@ use crate::application::{
     },
     ports::{
         ContentLockDeletionActionClaim, ContentLockDeletionRepository, PublicationRecovery,
-        publication_intent_matches_request, publication_reconciliation_matches,
+        publication_guarded_paths, publication_intent_matches_request,
+        publication_reconciliation_matches,
     },
 };
 use crate::infrastructure::memory::{
     access_credentials::{AccessPhaseAdvanceStatus, InMemoryAccessCredentialStore},
+    content_lock_ownership::OwnershipRecords,
     verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
 };
 
@@ -47,16 +49,23 @@ pub struct InMemoryContentLockDeletionRepository {
     jobs: RwLock<HashMap<JobKey, StoredJob>>,
     force_receipts: RwLock<HashMap<JobKey, OffsetDateTime>>,
     publication_intents: RwLock<HashMap<JobKey, PublicationIntent>>,
+    ownership_records: OwnershipRecords,
     claim_transition_gate: Mutex<()>,
     verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     access_credentials: Arc<InMemoryAccessCredentialStore>,
+    #[cfg(test)]
+    compensation_barrier: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
 }
 
 impl Default for InMemoryContentLockDeletionRepository {
     fn default() -> Self {
-        Self::with_access_credentials_and_verification_task_fence(
+        Self::with_dependencies(
             Arc::new(InMemoryAccessCredentialStore::new()),
             Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+            OwnershipRecords::default(),
         )
     }
 }
@@ -79,13 +88,28 @@ impl InMemoryContentLockDeletionRepository {
         access_credentials: Arc<InMemoryAccessCredentialStore>,
         verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     ) -> Self {
+        Self::with_dependencies(
+            access_credentials,
+            verification_task_fence,
+            OwnershipRecords::default(),
+        )
+    }
+
+    pub(super) fn with_dependencies(
+        access_credentials: Arc<InMemoryAccessCredentialStore>,
+        verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+        ownership_records: OwnershipRecords,
+    ) -> Self {
         Self {
             jobs: RwLock::new(HashMap::new()),
             force_receipts: RwLock::new(HashMap::new()),
             publication_intents: RwLock::new(HashMap::new()),
+            ownership_records,
             claim_transition_gate: Mutex::new(()),
             verification_task_fence,
             access_credentials,
+            #[cfg(test)]
+            compensation_barrier: None,
         }
     }
 
@@ -105,6 +129,16 @@ impl InMemoryContentLockDeletionRepository {
                     .is_some_and(|expires_at| expires_at > now)
                 && (stored.job.force_requested_at.is_some() == claim.force)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_compensation_barrier(
+        mut self,
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.compensation_barrier = Some((started, release));
+        self
     }
 }
 
@@ -180,6 +214,41 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             publication_token,
         )
         .await
+    }
+
+    async fn compensate_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        publication_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let key = (creator.clone(), lock_id.clone());
+        let mut intents = self.publication_intents.write().await;
+        let Some(intent) = intents.get(&key) else {
+            return Ok(false);
+        };
+        if intent.token != publication_token || intent.write_completed {
+            return Ok(false);
+        }
+        let guarded_paths = publication_guarded_paths(&intent.original_content_lock);
+        let mut ownership = self.ownership_records.write().await;
+        #[cfg(test)]
+        if let Some((started, release)) = &self.compensation_barrier {
+            started.notify_one();
+            release.notified().await;
+        }
+        for guarded_path in guarded_paths {
+            let ownership_key = (creator.clone(), guarded_path);
+            if ownership.get(&ownership_key).is_some_and(|record| {
+                record.lock_id == *lock_id
+                    && record.status
+                        == crate::application::models::ContentLockOwnershipStatus::Reserved
+            }) {
+                ownership.remove(&ownership_key);
+            }
+        }
+        intents.remove(&key);
+        Ok(true)
     }
 
     async fn reconcile_publication(
