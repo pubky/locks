@@ -261,9 +261,9 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 }
                 Ok(None) => {
                     observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
-                    return Err(ApplicationError::InvalidContentLockDeletionState {
-                        message: "payment drain cleanup token is missing".to_owned(),
-                    });
+                    return self
+                        .advance_completed_drain(claim, worker_id, evidence)
+                        .await;
                 }
                 Err(error) => {
                     observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);

@@ -1151,8 +1151,20 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 .await
                 .map_err(storage_error)?;
             }
+            let sql = format!(
+                "SELECT {ROW_COLUMNS} FROM content_lock_deletion_jobs
+                 WHERE creator = $1 AND lock_id = $2"
+            );
+            let current = sqlx::query_as::<_, DeletionJobRow>(&sql)
+                .bind(creator.to_string())
+                .bind(lock_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
             transaction.commit().await.map_err(storage_error)?;
-            return Ok(PrepareForceDeletionResult::Synchronous(None));
+            return Ok(PrepareForceDeletionResult::Synchronous(fetch_optional_job(
+                current,
+            )?));
         }
         let sql = format!(
             "SELECT {ROW_COLUMNS} FROM content_lock_deletion_jobs
@@ -4921,6 +4933,117 @@ mod tests {
         );
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn paykit_enabled_drain_advances_without_aggregate_for_zero_or_non_paykit_obligations() {
+        for include_non_paykit_task in [false, true] {
+            let database = TestDatabase::create().await;
+            let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+            let lock = content_lock();
+            if include_non_paykit_task {
+                tasks
+                    .insert_verification_task(verification_task(
+                        &lock,
+                        BundleId::from_bytes([64; 16]),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+            let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+            let drains = PostgresPaymentDrainRepository::new(database.pool().clone());
+            deletions.insert_job(job.clone()).await.unwrap();
+            sqlx::query(
+                "UPDATE content_lock_deletion_jobs SET phase = 'start_payment_drain' WHERE job_id = $1",
+            )
+            .bind(job.job_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            let paykit = NoCallPaymentDrainClient::default();
+            let entitlements = InMemoryEntitlementRepository::new();
+            let use_case = DrainLockPaymentsUseCase::new(
+                &deletions,
+                &drains,
+                &paykit,
+                &entitlements,
+                &FixedClock(NOW),
+                LockServerPubky::from_str(
+                    "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                )
+                .unwrap(),
+                6,
+            );
+
+            let start = deletions
+                .claim_next("deletion", time::Duration::minutes(5))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(use_case.execute_claimed(start, "deletion").await.unwrap());
+            let drain = deletions
+                .claim_next("deletion", time::Duration::minutes(5))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(use_case.execute_claimed(drain, "deletion").await.unwrap());
+
+            let persisted = deletions
+                .get_job(&job.creator, &job.lock_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                persisted.phase,
+                ContentLockDeletionPhase::DrainExistingCredentials
+            );
+            assert_eq!(persisted.state, ContentLockDeletionState::Queued);
+            assert_eq!(persisted.failure_code, None);
+            assert!(
+                drains
+                    .get_payment_drain(job.job_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(paykit.calls.load(Ordering::SeqCst), 0);
+
+            database.cleanup().await;
+        }
+    }
+
+    #[derive(Default)]
+    struct NoCallPaymentDrainClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PaymentDrainClient for NoCallPaymentDrainClient {
+        async fn start_payment_drain(
+            &self,
+            _: &PubkyLockResource,
+        ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("zero-obligation drain must not start Paykit")
+        }
+
+        async fn lookup_payment_drain(
+            &self,
+            _: &PubkyLockResource,
+        ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("zero-obligation drain must not look up Paykit")
+        }
+
+        async fn payment_request_status(
+            &self,
+            _: &CreatorPubky,
+            _: &BundleId,
+        ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            unreachable!("zero-obligation drain must not query Paykit tasks")
+        }
     }
 
     #[tokio::test]

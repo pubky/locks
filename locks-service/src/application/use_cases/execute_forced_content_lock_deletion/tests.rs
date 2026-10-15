@@ -363,6 +363,13 @@ impl ContentLockDeletionActionOwnership for FakeActions {
             )))
         }
     }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        _: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
 }
 
 struct FakeTombstones {

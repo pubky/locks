@@ -156,6 +156,25 @@ impl InMemoryContentLockDeletionRepository {
         })
     }
 
+    pub(super) async fn synchronous_force_action_is_live(&self, job_id: Uuid) -> bool {
+        let jobs = self.jobs.read().await;
+        let Some((key, stored)) = jobs.iter().find(|(_, stored)| stored.job.job_id == job_id)
+        else {
+            return false;
+        };
+        if !matches!(
+            stored.job.state,
+            ContentLockDeletionState::Failed | ContentLockDeletionState::Completed
+        ) {
+            return false;
+        }
+        self.force_receipts
+            .read()
+            .await
+            .get(key)
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn with_compensation_barrier(

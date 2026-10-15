@@ -23,15 +23,16 @@ use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedP
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     AccessCredentialLookupKey, AccessCredentialRecord, ContentLockDeletionFailureCode,
-    ContentLockDeletionJob, ContentLockDeletionState, CreatorAuthorityAuthKind,
-    CreatorAuthorityRecord, CreatorAuthoritySecret, CreatorConnectAuthorizationUrl,
-    CreatorConnectFlowId, DeletionReadAuthorization, FrontendSessionRecord, FrontendSessionToken,
-    GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
-    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, OrdinaryCredentialLookupResult,
-    PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
+    ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
+    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, DeletionReadAuthorization,
+    FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+    GuardedResourceRecord, InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval,
+    OrdinaryCredentialLookupResult, PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
 };
 use locks_service::application::ports::{
-    AccessCredentialStore, Clock, ContentLockRepository, GrantCreatorConnectFlowClient,
+    AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
+    ContentLockDeletionActionClaim, ContentLockRepository, GrantCreatorConnectFlowClient,
     GuardedResourceRepository, LegacyCreatorConnectFlowClient,
 };
 
@@ -970,6 +971,127 @@ async fn force_after_terminal_graceful_failure_completes_synchronously() {
             .has_force_receipt(&creator(), &lock_id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn terminal_job_force_defers_until_stale_worker_releases_action_lane() {
+    for failure_code in [Some(ContentLockDeletionFailureCode::StateCorrupt), None] {
+        assert_terminal_job_force_defers_until_stale_worker_releases_action_lane(failure_code)
+            .await;
+    }
+}
+
+async fn assert_terminal_job_force_defers_until_stale_worker_releases_action_lane(
+    failure_code: Option<ContentLockDeletionFailureCode>,
+) {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let mut job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    if failure_code.is_none() {
+        job.phase = ContentLockDeletionPhase::PurgeOperationalState;
+    }
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("stale-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_guard = match state
+        .content_lock_deletion_action_ownership()
+        .try_acquire(ContentLockDeletionActionClaim {
+            job_id: claim.job.job_id,
+            worker_id: "stale-worker",
+            claim_token: claim.claim_token,
+            expected_phase: claim.job.phase,
+            force: false,
+        })
+        .await
+        .unwrap()
+    {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        ContentLockDeletionActionAcquireResult::Busy => panic!("first action lane must be free"),
+        ContentLockDeletionActionAcquireResult::ClaimLost => panic!("claim must still be live"),
+    };
+    state
+        .content_lock_deletions()
+        .finish(job.job_id, "stale-worker", claim.claim_token, failure_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+
+    let deferred = force_delete_request(&app, &lock_id).await;
+    assert_eq!(deferred.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response_json(deferred).await,
+        json!({ "lock_id": lock_id, "status": "queued" })
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    );
+
+    stale_guard.release().await.unwrap();
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_some())
     );
 }
 

@@ -78,6 +78,50 @@ impl ContentLockDeletionActionOwnership for PostgresContentLockDeletionActionOwn
             },
         )))
     }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        job_id: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        let lock_key = action_lock_key(job_id);
+        let mut pooled = self.pool.acquire().await.map_err(storage_error)?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *pooled)
+            .await
+            .map_err(storage_error)?;
+        if !acquired {
+            return Ok(ContentLockDeletionActionAcquireResult::Busy);
+        }
+
+        let mut connection = pooled.detach();
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM content_lock_deletion_jobs AS job
+                 JOIN content_lock_force_deletion_receipts AS receipt
+                   ON receipt.creator = job.creator AND receipt.lock_id = job.lock_id
+                 WHERE job.job_id = $1
+                   AND job.state IN ('failed', 'completed')
+                   AND receipt.completed_at IS NULL
+             )",
+        )
+        .bind(job_id)
+        .fetch_one(&mut connection)
+        .await
+        .map_err(storage_error)?;
+        if !live {
+            unlock_and_close(connection, lock_key).await?;
+            return Ok(ContentLockDeletionActionAcquireResult::ClaimLost);
+        }
+
+        Ok(ContentLockDeletionActionAcquireResult::Acquired(Box::new(
+            PostgresContentLockDeletionActionGuard {
+                connection: Some(connection),
+                lock_key,
+            },
+        )))
+    }
 }
 
 struct PostgresContentLockDeletionActionGuard {

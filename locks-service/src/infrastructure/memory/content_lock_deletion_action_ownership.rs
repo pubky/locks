@@ -65,6 +65,41 @@ impl ContentLockDeletionActionOwnership for InMemoryContentLockDeletionActionOwn
             },
         )))
     }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        job_id: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        {
+            let mut owned_jobs = self
+                .owned_jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !owned_jobs.insert(job_id) {
+                return Ok(ContentLockDeletionActionAcquireResult::Busy);
+            }
+        }
+
+        if !self
+            .deletions
+            .synchronous_force_action_is_live(job_id)
+            .await
+        {
+            self.owned_jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&job_id);
+            return Ok(ContentLockDeletionActionAcquireResult::ClaimLost);
+        }
+
+        Ok(ContentLockDeletionActionAcquireResult::Acquired(Box::new(
+            InMemoryContentLockDeletionActionGuard {
+                job_id,
+                owned_jobs: Arc::clone(&self.owned_jobs),
+                released: false,
+            },
+        )))
+    }
 }
 
 struct InMemoryContentLockDeletionActionGuard {

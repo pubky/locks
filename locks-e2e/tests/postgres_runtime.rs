@@ -124,6 +124,95 @@ async fn postgres_deletion_action_ownership_excludes_overlap_and_reacquires_afte
 }
 
 #[tokio::test]
+async fn postgres_terminal_force_waits_for_expired_worker_action_before_receipt_completion() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let stale_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let force_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+    let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+    let job = ContentLockDeletionJob::new(
+        uuid::Uuid::new_v4(),
+        content_lock(),
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let claimed = deletions
+        .claim_next("stale-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_guard = expect_action_acquired(
+        stale_owner
+            .try_acquire(deletion_action_claim(&claimed, "stale-worker", false))
+            .await
+            .unwrap(),
+    );
+    expire_deletion_claim(database.pool(), job.job_id).await;
+    sqlx::query(
+        "UPDATE content_lock_deletion_jobs
+         SET state = 'failed', failure_code = 'state_corrupt', claimed_by = NULL,
+             claim_token = NULL, claim_expires_at = NULL
+         WHERE job_id = $1",
+    )
+    .bind(job.job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+
+    assert!(matches!(
+        force_owner
+            .try_acquire_synchronous_force(job.job_id)
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::Busy
+    ));
+    assert!(
+        deletions
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    );
+
+    stale_guard.release().await.unwrap();
+    let force_guard = expect_action_acquired(
+        force_owner
+            .try_acquire_synchronous_force(job.job_id)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        deletions
+            .complete_synchronous_force_deletion(
+                &job.creator,
+                &job.lock_id,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+    );
+    force_guard.release().await.unwrap();
+    assert!(
+        deletions
+            .get_force_receipt(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_some())
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn postgres_missed_final_issuance_terminalizes_with_closed_creator_failure_without_external_action()
  {
     let Some(database) = TestDatabase::create().await else {
