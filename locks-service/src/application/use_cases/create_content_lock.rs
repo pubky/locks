@@ -125,9 +125,30 @@ impl<'a> CreateContentLockUseCase<'a> {
             .map(|resource| resource.path)
             .collect::<Vec<_>>();
 
-        self.content_lock_ownership
+        if let Err(error) = self
+            .content_lock_ownership
             .reserve_paths(&request.creator, &guarded_paths, &lock_id)
-            .await?;
+            .await
+        {
+            if matches!(error, ApplicationError::ContentLockPathConflict { .. })
+                && self
+                    .content_locks
+                    .get_content_lock(&request.creator, &content_lock_path)
+                    .await?
+                    .as_ref()
+                    == Some(&content_lock)
+            {
+                self.content_lock_ownership
+                    .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                    .await?;
+                return Ok(CreatedContentLock {
+                    lock_id,
+                    content_lock_path,
+                    content_lock,
+                });
+            }
+            return Err(error);
+        }
 
         if let Err(error) = self
             .content_locks
@@ -193,6 +214,7 @@ fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -462,6 +484,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn identical_retry_recovers_after_ownership_mark_failure() {
+        let fixture = Fixture::seeded().await;
+        let ownership = FailOnceMarkOwnershipRepository::new();
+        let use_case = CreateContentLockUseCase::new(
+            &fixture.content_locks,
+            &ownership,
+            &fixture.guarded_resources,
+            &fixture.clock,
+        );
+        let request = content_lock_request(registered_guarded_resource());
+        let guarded_path = request
+            .primary_resource
+            .as_ref()
+            .expect("fixture has a primary resource")
+            .path
+            .clone();
+
+        assert_eq!(
+            use_case.execute(request.clone()).await,
+            Err(ApplicationError::Storage {
+                message: "ownership mark failed".to_owned(),
+            })
+        );
+        let reserved = ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.status.as_str(), "reserved");
+
+        assert!(matches!(
+            use_case
+                .execute(content_lock_request_with_changed_criteria())
+                .await,
+            Err(ApplicationError::ContentLockPathConflict { .. })
+        ));
+
+        let recovered = use_case.execute(request).await.unwrap();
+        assert_eq!(recovered.lock_id, reserved.lock_id);
+        let published = ownership
+            .get_path_ownership(&creator(), &guarded_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.lock_id, recovered.lock_id);
+        assert_eq!(published.status.as_str(), "published");
+    }
+
     struct FailingContentLockRepository;
 
     #[async_trait]
@@ -483,6 +554,70 @@ mod tests {
             _path: &ContentLockPath,
         ) -> Result<Option<ContentLock>, ApplicationError> {
             Ok(None)
+        }
+    }
+
+    struct FailOnceMarkOwnershipRepository {
+        inner: InMemoryContentLockOwnershipRepository,
+        fail_next_mark: AtomicBool,
+    }
+
+    impl FailOnceMarkOwnershipRepository {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryContentLockOwnershipRepository::new(),
+                fail_next_mark: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ContentLockOwnershipRepository for FailOnceMarkOwnershipRepository {
+        async fn reserve_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .reserve_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn mark_paths_published(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            if self.fail_next_mark.swap(false, Ordering::SeqCst) {
+                return Err(ApplicationError::Storage {
+                    message: "ownership mark failed".to_owned(),
+                });
+            }
+            self.inner
+                .mark_paths_published(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn compensate_reserved_paths(
+            &self,
+            creator: &CreatorPubky,
+            guarded_paths: &[String],
+            lock_id: &LockId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                .await
+        }
+
+        async fn get_path_ownership(
+            &self,
+            creator: &CreatorPubky,
+            guarded_path: &str,
+        ) -> Result<Option<crate::application::models::ContentLockOwnership>, ApplicationError>
+        {
+            self.inner.get_path_ownership(creator, guarded_path).await
         }
     }
 

@@ -402,7 +402,7 @@ Every referenced guarded resource must currently exist for the same creator/path
 }
 ```
 
-`recipient_pubky` must be a valid Pubky public key string equal to the content-lock creator, `amount` must be a positive base-unit integer encoded as a string, `asset` must be a non-empty string, and `payment_in` must be a positive whole-hour JSON `u64`. The lock params do not include Paykit server URLs, account IDs, memos, expiry, payment references, or reader identity. A v1 content lock that uses `paykit-payment` must contain exactly that one criterion, and its `all` or `any` lock logic must reference that criterion exactly once. Mixed criteria, multiple payment criteria, recipient/creator mismatch, and duplicate or mismatched logic references return `400 invalid_request`.
+`recipient_pubky` must be a valid Pubky public key string equal to the content-lock creator, `amount` must be a positive base-unit integer encoded as a string, `asset` must be a non-empty string, and `payment_in` must be a whole-hour JSON `u64` from 1 through 70,389,527. That ceiling is the largest whole-hour window from the Unix epoch to the maximum protocol timestamp; invoice creation still uses checked timestamp addition against its actual creation time. The lock params do not include Paykit server URLs, account IDs, memos, expiry, payment references, or reader identity. A v1 content lock that uses `paykit-payment` must contain exactly that one criterion, and its `all` or `any` lock logic must reference that criterion exactly once. Mixed criteria, multiple payment criteria, recipient/creator mismatch, and duplicate or mismatched logic references return `400 invalid_request`.
 
 #### Request
 

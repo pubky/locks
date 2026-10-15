@@ -99,6 +99,10 @@
             <span id="paykit-amount-label">Bitcoin Amount (sats)</span>
             <input id="paykit-amount" type="text" inputmode="decimal" autocomplete="off" />
           </label>
+          <label>
+            Payment window (whole hours)
+            <input id="paykit-payment-in" type="number" min="1" max="70389527" step="1" value="24" />
+          </label>
           <p class="muted">Recipient is the authenticated content creator. Available payment methods and the exact quote appear in Bitkit.</p>
           <p id="paykit-setup-status" class="muted">Paykit setup is required for this creator.</p>
           <button id="retry-paykit-setup" type="button" hidden>Retry Paykit setup</button>

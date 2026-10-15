@@ -23,7 +23,7 @@
 ### Explicit requirements and confirmed decisions
 
 1. `paykit-payment` criterion params gain required `payment_in`.
-2. `payment_in` is a nonzero JSON `u64` integer measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. There is no product maximum beyond checked duration/timestamp representation.
+2. `payment_in` is a JSON `u64` integer from 1 through 70,389,527 measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. The maximum is the largest whole-hour window from the Unix epoch to the maximum protocol timestamp; invoice creation still checks addition against its actual creation time.
 3. Locks includes `payment_in` in the signed invoice request. Paykit independently reads the canonical lock and rejects a mismatch before side effects.
 4. Paykit commits `invoice_created_at` and `payment_deadline = checked(invoice_created_at + payment_in hours)` atomically with invoice creation. Exact replay returns the original timestamps.
 5. Locks persists the returned timestamps before admitting the verification task. Retry never restarts the payment window.
@@ -59,7 +59,7 @@
 25. Creator-visible job status is only `queued|running|completed|failed`; failed responses include a stable secret-free `failure_code` only.
 26. Missing or replaced tombstone before destructive work halts as failed. Creator restores the exact tombstone and repeats graceful DELETE to resume the same job.
 27. Guarded paths are exclusive to one managed lock. Enforce unique `(creator, guarded_path)` ownership in PostgreSQL. There is no historical backfill.
-28. Lock publication uses best-effort reservation compensation and accepts crash-orphaned ownership requiring operator cleanup; do not claim cross-system atomicity.
+28. Lock publication uses best-effort reservation compensation. If publication succeeds but ownership marking fails, an identical retry verifies the live canonical lock before completing the mark. A process death before publication can still leave orphaned ownership requiring operator cleanup; do not claim cross-system atomicity.
 29. Graceful final cleanup deletes guarded content first and tombstone last, purges Locks authorization/task/job state, asks Paykit to remove operational drain state, and releases path ownership. It forgets the deletion so the same canonical Lock ID may later be published fresh with new Bundle IDs.
 30. Paykit retains terminal financial invoice/payment history; delayed old lifecycle events cannot reactivate a fresh publication.
 31. New force deletion is synchronous: persist a permanent minimal blocking receipt, delete lock/tombstone first, then best-effort guarded resources. Do not drain Paykit/tasks/credentials. Return failed paths. A force-deleted Lock ID can never be republished.
@@ -82,7 +82,7 @@
 - Paykit polling latency can make a pre-deadline broadcast late.
 - Timely amount-matched payment can block deletion indefinitely while confirmations/reorg state remains unresolved.
 - Durable cancellation enqueue may precede actual counterparty delivery.
-- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death.
+- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death before publication; post-publication mark failures recover through an identical retry.
 - Force deletion deliberately abandons active payment/access obligations and may orphan content after a crash.
 
 ## Repository ownership matrix
