@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use uuid::Uuid;
 
 use locks_core::ids::{BundleId, CreatorPubky, LockId, TaskId};
 use locks_core::verification::{SubmittedProofBundle, VerifiedProofBundle};
@@ -594,7 +595,8 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
         if message.is_empty() {
             return Err(ApplicationError::InvalidVerificationTaskFailureMessage);
         }
-        let updated: Option<String> = sqlx::query_scalar(
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let updated: Option<(Uuid, Option<Uuid>, time::OffsetDateTime)> = sqlx::query_as(
             "WITH locked AS MATERIALIZED (
                  SELECT task_id FROM verification_tasks
                  WHERE task_id = $1::uuid
@@ -616,18 +618,41 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
                AND task.status = 'pending'
                AND task.claimed_by = $2 AND task.claim_token = $3
                AND task.claim_expires_at > timing.winner_time
-             RETURNING task.task_id::text",
+             RETURNING task.task_id, task.deletion_job_id, task.completed_at",
         )
         .bind(task_id.to_string())
         .bind(worker_id)
         .bind(claim_token)
         .bind(message)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        if updated.is_none() {
+        let Some((updated_task_id, deletion_job_id, completed_at)) = updated else {
+            transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
+        };
+        if let Some(deletion_job_id) = deletion_job_id {
+            let resolved = sqlx::query(
+                "UPDATE content_lock_deletion_task_snapshot
+                 SET resolved_status = 'failed', resolved_at = $3,
+                     final_credential_eligible_at = NULL
+                 WHERE deletion_job_id = $1 AND verification_task_id = $2
+                   AND resolved_status IS NULL",
+            )
+            .bind(deletion_job_id)
+            .bind(updated_task_id)
+            .bind(completed_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if resolved.rows_affected() != 1 {
+                return Err(ApplicationError::InvalidContentLockDeletionState {
+                    message: "terminal invoice admission lost its deletion snapshot fence"
+                        .to_owned(),
+                });
+            }
         }
+        transaction.commit().await.map_err(storage_error)?;
         self.get_invoice_admission(task_id).await
     }
 }

@@ -398,6 +398,24 @@ impl<'a> DeletionWorker<'a> {
             ));
         }
 
+        if claim.job.attempt_count > self.config.retry_max_attempts {
+            let outcome = self.retry_or_exhaust(claim).await.map_err(|error| {
+                DeletionWorkerFailure::repository(
+                    error,
+                    DeletionDependencySource::RepositoryTerminalMutation,
+                    repository_healthy,
+                )
+            })?;
+            let mutation_evidence = mutation_success_evidence(
+                outcome,
+                DeletionDependencySource::RepositoryTerminalMutation,
+            );
+            return Ok(DeletionWorkerExecution::new(
+                outcome,
+                repository_healthy.merge(mutation_evidence),
+            ));
+        }
+
         let claim_for_write = claim.clone();
         let execution = self
             .executor
@@ -701,7 +719,7 @@ fn to_time_duration(duration: StdDuration) -> Duration {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         str::FromStr,
         sync::{
             Arc, Mutex,
@@ -961,6 +979,31 @@ mod tests {
             worker.run_once(&shutdown_rx).await.unwrap(),
             DeletionWorkerOutcome::RetryExhausted
         );
+        assert!(repository.retries.lock().unwrap().is_empty());
+        assert_eq!(
+            repository.finishes.lock().unwrap().as_slice(),
+            &[Some(ContentLockDeletionFailureCode::RetryExhausted)]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_claim_expiry_is_bounded_before_more_external_work() {
+        let repository = FakeRepository::with_claims((1..=5).map(claim));
+        let executor = FakeExecutor::new(DeletionPhaseExecutionOutcome::ClaimLost);
+        let worker = worker(&repository, &executor, &FixedJitter(StdDuration::ZERO));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        for _ in 0..4 {
+            assert_eq!(
+                worker.run_once(&shutdown_rx).await.unwrap(),
+                DeletionWorkerOutcome::ClaimLost
+            );
+        }
+        assert_eq!(
+            worker.run_once(&shutdown_rx).await.unwrap(),
+            DeletionWorkerOutcome::RetryExhausted
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
         assert!(repository.retries.lock().unwrap().is_empty());
         assert_eq!(
             repository.finishes.lock().unwrap().as_slice(),
@@ -1518,7 +1561,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRepository {
-        claim: Mutex<Option<ClaimedContentLockDeletionJob>>,
+        claims: Mutex<VecDeque<ClaimedContentLockDeletionJob>>,
         claim_error: Mutex<Option<ApplicationError>>,
         claim_calls: AtomicUsize,
         block_claim: AtomicBool,
@@ -1540,8 +1583,12 @@ mod tests {
 
     impl FakeRepository {
         fn with_claim(claim: ClaimedContentLockDeletionJob) -> Self {
+            Self::with_claims([claim])
+        }
+
+        fn with_claims(claims: impl IntoIterator<Item = ClaimedContentLockDeletionJob>) -> Self {
             Self {
-                claim: Mutex::new(Some(claim)),
+                claims: Mutex::new(claims.into_iter().collect()),
                 ..Self::default()
             }
         }
@@ -1642,7 +1689,7 @@ mod tests {
                 self.claim_entered.notify_one();
                 self.claim_release.notified().await;
             }
-            Ok(self.claim.lock().unwrap().take())
+            Ok(self.claims.lock().unwrap().pop_front())
         }
 
         async fn schedule_retry(

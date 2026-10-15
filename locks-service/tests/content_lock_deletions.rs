@@ -184,6 +184,70 @@ async fn pending_invoice_admission_defers_in_memory_payment_drain_start() {
 }
 
 #[tokio::test]
+async fn failed_invoice_admission_allows_in_memory_payment_drain_start() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let tasks = InMemoryVerificationTaskRepository::with_deletion_fence(Arc::clone(&fence));
+    let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let mut task = verification_task(&job, VerificationTaskStatus::Pending);
+    let reader =
+        CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+            .unwrap();
+    task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+    tasks
+        .insert_invoice_pending_task(
+            task.clone(),
+            InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: task.creator.clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader,
+                payment_in: 24,
+            },
+        )
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let admission_claim = tasks
+        .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    tasks
+        .mark_invoice_admission_failed(
+            &task.task_id,
+            "invoice-worker",
+            &admission_claim.claim_token,
+            NOW,
+            "admission exhausted",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let claim = deletions
+        .claim_next("deletion-worker", time::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let advanced = deletions
+        .advance_phase(
+            job.job_id,
+            "deletion-worker",
+            claim.claim_token,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        )
+        .await
+        .unwrap()
+        .advanced()
+        .expect("terminal admission failure must not remain an external obligation");
+    assert_eq!(advanced.phase, ContentLockDeletionPhase::StartPaymentDrain);
+}
+
+#[tokio::test]
 async fn in_memory_action_ownership_is_exclusive_and_reacquirable() {
     let repository = Arc::new(
         InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
@@ -400,6 +464,43 @@ async fn due_claims_reclaim_with_fresh_tokens_and_fence_stale_writes() {
         failed.failure_code,
         Some(ContentLockDeletionFailureCode::TombstoneMissing)
     );
+}
+
+#[tokio::test]
+async fn repeated_in_memory_claim_expiry_increments_attempts_and_fences_every_stale_worker() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let repository = InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::new(
+        InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
+    ));
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    repository.insert_job(job.clone()).await.unwrap();
+    let mut prior_claim: Option<(String, Uuid)> = None;
+
+    for attempt in 1..=5 {
+        let worker = format!("worker-{attempt}");
+        let claim = repository
+            .claim_next(&worker, time::Duration::seconds(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.job.attempt_count, attempt);
+        if let Some((prior_worker, prior_token)) = prior_claim {
+            assert!(
+                repository
+                    .finish(
+                        job.job_id,
+                        &prior_worker,
+                        prior_token,
+                        Some(ContentLockDeletionFailureCode::RetryExhausted),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        prior_claim = Some((worker, claim.claim_token));
+        clock.set(NOW + time::Duration::seconds(attempt.into()));
+    }
 }
 
 #[tokio::test]

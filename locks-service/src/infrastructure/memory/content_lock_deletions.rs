@@ -12,7 +12,7 @@ use crate::application::{
     models::{
         AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
         ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-        ContentLockDeletionState, PrepareForceDeletionResult,
+        ContentLockDeletionState, PrepareForceDeletionResult, VerificationTaskStatus,
     },
     ports::{
         ContentLockDeletionActionClaim, ContentLockDeletionRepository, PublicationRecovery,
@@ -539,6 +539,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                     task.deletion_job_id == Some(job_id)
                         && task.paykit_admission_required
                         && !task.invoice_admission_ready
+                        && task.status != VerificationTaskStatus::Failed
                 })
         {
             return Ok(AdvanceContentLockDeletionPhaseResult::ObligationsPending);

@@ -215,6 +215,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                ON task.task_id = snapshot.verification_task_id
              WHERE snapshot.deletion_job_id = $1
                AND snapshot.paykit_admission_required = TRUE
+               AND snapshot.resolved_status IS NULL
              ORDER BY snapshot.verification_task_id",
         )
         .bind(deletion_job_id)
