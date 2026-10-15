@@ -8,9 +8,10 @@ use locks_core::lock_policy::{
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
+use crate::application::models::ContentLockOwnershipStatus;
 use crate::application::ports::{
     Clock, ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
-    GuardedResourceRepository,
+    ContentLockWriteError, GuardedResourceRepository, PublicationRecovery,
 };
 
 /// Request to create a local content lock for an already-registered guarded resource.
@@ -75,7 +76,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         &self,
         request: CreateContentLockRequest,
     ) -> Result<CreatedContentLock, ApplicationError> {
-        let content_lock = ContentLock {
+        let mut content_lock = ContentLock {
             version: CONTENT_LOCK_VERSION,
             creator: request.creator.clone(),
             primary_resource: request.primary_resource,
@@ -115,6 +116,20 @@ impl<'a> CreateContentLockUseCase<'a> {
                 });
             }
         }
+        let guarded_paths = resource_descriptors(&content_lock)
+            .into_iter()
+            .map(|resource| resource.path)
+            .collect::<Vec<_>>();
+        let mut ownership_status = None;
+        let mut recovered_publication = None;
+        if let Some((existing, existing_status, recovery)) = self
+            .resolve_owned_content_lock(&request.creator, &guarded_paths, &content_lock)
+            .await?
+        {
+            content_lock = existing;
+            ownership_status = Some(existing_status);
+            recovered_publication = recovery;
+        }
         let lock_id = content_lock.lock_id().map_err(|error| {
             ApplicationError::ContentLockCanonicalization {
                 message: error.to_string(),
@@ -125,91 +140,308 @@ impl<'a> CreateContentLockUseCase<'a> {
                 message: error.to_string(),
             }
         })?;
-        let guarded_paths = resource_descriptors(&content_lock)
-            .into_iter()
-            .map(|resource| resource.path)
-            .collect::<Vec<_>>();
+        if let Some(existing_status) = ownership_status {
+            let recovery = match recovered_publication {
+                Some(recovery) => recovery,
+                None => {
+                    self.content_lock_deletions
+                        .recover_publication(&request.creator, &lock_id, &content_lock)
+                        .await?
+                }
+            };
+            match recovery {
+                PublicationRecovery::None
+                    if existing_status == ContentLockOwnershipStatus::Published =>
+                {
+                    return Ok(CreatedContentLock {
+                        lock_id,
+                        content_lock_path,
+                        content_lock,
+                    });
+                }
+                PublicationRecovery::WriteCompleted {
+                    content_lock: recovered_content_lock,
+                    ..
+                } => {
+                    content_lock = recovered_content_lock;
+                    if !self
+                        .content_lock_deletions
+                        .reconcile_publication(
+                            &request.creator,
+                            &lock_id,
+                            &content_lock,
+                            &guarded_paths,
+                        )
+                        .await?
+                    {
+                        return Err(ApplicationError::Storage {
+                            message: "content lock publication reconciliation was not committed"
+                                .to_owned(),
+                        });
+                    }
+                    if existing_status == ContentLockOwnershipStatus::Reserved {
+                        self.content_lock_ownership
+                            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                            .await?;
+                    }
+                    return Ok(CreatedContentLock {
+                        lock_id,
+                        content_lock_path,
+                        content_lock,
+                    });
+                }
+                PublicationRecovery::Pending { .. } => {
+                    return Err(ApplicationError::ContentLockPublicationInProgress);
+                }
+                PublicationRecovery::RequestMismatch => {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+                PublicationRecovery::None => {}
+            }
+        }
 
-        self.content_lock_ownership
-            .reserve_paths(&request.creator, &guarded_paths, &lock_id)
-            .await?;
+        let newly_reserved = ownership_status.is_none();
+        if newly_reserved {
+            self.content_lock_ownership
+                .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+                .await?;
+        }
 
         let publication_token = Uuid::new_v4();
         if let Err(error) = self
             .content_lock_deletions
-            .begin_publication(&request.creator, &lock_id, publication_token)
+            .begin_publication(&request.creator, &lock_id, publication_token, &content_lock)
             .await
         {
-            let _ = self
-                .content_lock_ownership
-                .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
-                .await;
-            return Err(error);
-        }
-
-        if let Err(error) = self
-            .content_locks
-            .upsert_content_lock(
-                request.creator.clone(),
-                content_lock_path.clone(),
-                content_lock.clone(),
-            )
-            .await
-        {
-            match self
-                .content_locks
-                .get_content_lock(&request.creator, &content_lock_path)
-                .await
-            {
-                Ok(Some(published)) if published == content_lock => {
-                    if self
-                        .content_lock_ownership
-                        .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
-                        .await
-                        .is_ok()
-                    {
-                        let _ = self
-                            .content_lock_deletions
-                            .finish_publication(&request.creator, &lock_id, publication_token)
-                            .await;
-                    }
-                }
-                Ok(None) => {
-                    if self
-                        .content_lock_ownership
-                        .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
-                        .await
-                        .is_ok()
-                    {
-                        let _ = self
-                            .content_lock_deletions
-                            .abandon_publication(&request.creator, &lock_id, publication_token)
-                            .await;
-                    }
-                }
-                Ok(Some(_)) | Err(_) => {}
+            if newly_reserved {
+                let _ = self
+                    .content_lock_ownership
+                    .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
+                    .await;
             }
             return Err(error);
         }
 
-        self.content_lock_ownership
-            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
-            .await?;
-        if !self
-            .content_lock_deletions
-            .finish_publication(&request.creator, &lock_id, publication_token)
-            .await?
-        {
-            return Err(ApplicationError::Storage {
-                message: "content lock publication intent was lost".to_owned(),
-            });
-        }
+        self.publish_with_token(
+            &request.creator,
+            &lock_id,
+            &content_lock,
+            &guarded_paths,
+            publication_token,
+            newly_reserved,
+        )
+        .await?;
 
         Ok(CreatedContentLock {
             lock_id,
             content_lock_path,
             content_lock,
         })
+    }
+
+    async fn publish_with_token(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        content_lock: &ContentLock,
+        guarded_paths: &[String],
+        publication_token: Uuid,
+        compensate_ownership: bool,
+    ) -> Result<(), ApplicationError> {
+        let content_lock_path = content_lock.content_lock_path().map_err(|error| {
+            ApplicationError::ContentLockCanonicalization {
+                message: error.to_string(),
+            }
+        })?;
+        match self
+            .content_locks
+            .upsert_content_lock_classified(
+                creator.clone(),
+                content_lock_path,
+                content_lock.clone(),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(ContentLockWriteError::Ambiguous(error)) => return Err(error),
+            Err(ContentLockWriteError::NotStarted(error)) => {
+                if !compensate_ownership {
+                    // This retry did not dispatch, but an earlier ambiguous write may still land.
+                    return Err(error);
+                }
+                let intent_compensated = self
+                    .content_lock_deletions
+                    .abandon_publication(creator, lock_id, publication_token)
+                    .await?;
+                if !intent_compensated {
+                    return Err(ApplicationError::Storage {
+                        message: "content lock publication compensation was not committed"
+                            .to_owned(),
+                    });
+                }
+                self.content_lock_ownership
+                    .compensate_reserved_paths(creator, guarded_paths, lock_id)
+                    .await?;
+                return Err(error);
+            }
+        }
+
+        if !self
+            .content_lock_deletions
+            .mark_publication_written(creator, lock_id, publication_token)
+            .await?
+        {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication write completion was not committed".to_owned(),
+            });
+        }
+        if !self
+            .content_lock_deletions
+            .reconcile_publication(creator, lock_id, content_lock, guarded_paths)
+            .await?
+        {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication reconciliation was not committed".to_owned(),
+            });
+        }
+        self.content_lock_ownership
+            .mark_paths_published(creator, guarded_paths, lock_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_owned_content_lock(
+        &self,
+        creator: &CreatorPubky,
+        guarded_paths: &[String],
+        requested: &ContentLock,
+    ) -> Result<
+        Option<(
+            ContentLock,
+            ContentLockOwnershipStatus,
+            Option<PublicationRecovery>,
+        )>,
+        ApplicationError,
+    > {
+        // Reuse an earlier `created_at` only when every requested path has the
+        // same owner and the published canonical payload matches every other
+        // request field. Fully published ownership returns idempotently before
+        // admission; uniformly reserved ownership still follows recovery below.
+        let mut ownership = Vec::with_capacity(guarded_paths.len());
+        for guarded_path in guarded_paths {
+            ownership.push(
+                self.content_lock_ownership
+                    .get_path_ownership(creator, guarded_path)
+                    .await?,
+            );
+        }
+        let Some(existing_lock_id) = ownership
+            .iter()
+            .find_map(|record| record.as_ref().map(|record| record.lock_id.clone()))
+        else {
+            return Ok(None);
+        };
+        for (guarded_path, record) in guarded_paths.iter().zip(&ownership) {
+            if !record
+                .as_ref()
+                .is_some_and(|record| record.lock_id == existing_lock_id)
+            {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: guarded_path.clone(),
+                });
+            }
+        }
+        let all_published = ownership.iter().all(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.status == ContentLockOwnershipStatus::Published)
+        });
+        let all_reserved = ownership.iter().all(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.status == ContentLockOwnershipStatus::Reserved)
+        });
+        if !all_published && !all_reserved {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
+        }
+
+        // Retained canonical material authenticates exact retry, but only the original token owner
+        // may record write completion. Readback cannot identify which attempt wrote those bytes.
+        let recovery = self
+            .content_lock_deletions
+            .recover_publication(creator, &existing_lock_id, requested)
+            .await?;
+        let existing_path = ContentLockPath::from_lock_id(existing_lock_id.clone());
+        match recovery {
+            PublicationRecovery::RequestMismatch => {
+                return Err(ApplicationError::ContentLockPathConflict {
+                    guarded_path: guarded_paths[0].clone(),
+                });
+            }
+            PublicationRecovery::Pending { .. } => {
+                // Exact readback cannot prove this token's dispatched PUT has returned: the bytes
+                // may predate the intent while its write is still in flight or may land again.
+                return Err(ApplicationError::ContentLockPublicationInProgress);
+            }
+            PublicationRecovery::WriteCompleted {
+                ref content_lock, ..
+            } => {
+                if self
+                    .content_locks
+                    .get_content_lock(creator, &existing_path)
+                    .await?
+                    .is_none_or(|published| published != *content_lock)
+                {
+                    return Err(ApplicationError::ContentLockPathConflict {
+                        guarded_path: guarded_paths[0].clone(),
+                    });
+                }
+                let ownership_status = if all_published {
+                    ContentLockOwnershipStatus::Published
+                } else {
+                    ContentLockOwnershipStatus::Reserved
+                };
+                return Ok(Some((
+                    content_lock.clone(),
+                    ownership_status,
+                    Some(recovery),
+                )));
+            }
+            PublicationRecovery::None => {}
+        }
+
+        let Some(existing) = self
+            .content_locks
+            .get_content_lock(creator, &existing_path)
+            .await?
+        else {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
+        };
+        let canonical_lock_id =
+            existing
+                .lock_id()
+                .map_err(|error| ApplicationError::ContentLockCanonicalization {
+                    message: error.to_string(),
+                })?;
+        let mut expected = requested.clone();
+        expected.created_at = existing.created_at;
+        if canonical_lock_id != existing_lock_id || existing != expected {
+            return Err(ApplicationError::ContentLockPathConflict {
+                guarded_path: guarded_paths[0].clone(),
+            });
+        }
+        let ownership_status = if all_published {
+            ContentLockOwnershipStatus::Published
+        } else {
+            ContentLockOwnershipStatus::Reserved
+        };
+        Ok(Some((existing, ownership_status, None)))
     }
 }
 

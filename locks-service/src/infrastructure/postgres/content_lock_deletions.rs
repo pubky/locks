@@ -16,7 +16,10 @@ use crate::application::{
         ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
         ContentLockDeletionState, PrepareForceDeletionResult,
     },
-    ports::ContentLockDeletionRepository,
+    ports::{
+        ContentLockDeletionRepository, PublicationRecovery, publication_intent_matches_request,
+        publication_reconciliation_matches,
+    },
 };
 use crate::infrastructure::postgres::proof_admission::lock_proof_admission;
 
@@ -60,7 +63,20 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
+        original_content_lock: &ContentLock,
     ) -> Result<(), ApplicationError> {
+        if !publication_intent_matches_request(
+            creator,
+            lock_id,
+            original_content_lock,
+            original_content_lock,
+        ) {
+            return Err(ApplicationError::Storage {
+                message: "content lock publication intent identity mismatch".to_owned(),
+            });
+        }
+        let original_content_lock =
+            serde_json::to_value(original_content_lock).map_err(storage_display)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
         let deletion_exists = sqlx::query_scalar::<_, bool>(
@@ -72,19 +88,34 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         if deletion_exists {
             return Err(ApplicationError::ContentLockDeletionInProgress);
         }
-        sqlx::query("INSERT INTO content_lock_publication_intents (creator, lock_id, publication_token) VALUES ($1, $2, $3)")
+        sqlx::query("INSERT INTO content_lock_publication_intents (creator, lock_id, publication_token, original_content_lock) VALUES ($1, $2, $3, $4)")
             .bind(creator.to_string()).bind(lock_id.to_string()).bind(publication_token)
+            .bind(original_content_lock)
             .execute(&mut *transaction).await.map_err(map_publication_insert_error)?;
         transaction.commit().await.map_err(storage_error)
     }
 
-    async fn finish_publication(
+    async fn mark_publication_written(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
     ) -> Result<bool, ApplicationError> {
-        delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let result = sqlx::query(
+            "UPDATE content_lock_publication_intents
+             SET external_write_completed_at = COALESCE(external_write_completed_at, clock_timestamp())
+             WHERE creator = $1 AND lock_id = $2 AND publication_token = $3",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(publication_token)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn abandon_publication(
@@ -96,6 +127,56 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         delete_publication_intent(&self.pool, creator, lock_id, publication_token).await
     }
 
+    async fn reconcile_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        published_content_lock: &ContentLock,
+        published_guarded_paths: &[String],
+    ) -> Result<bool, ApplicationError> {
+        if !publication_reconciliation_matches(
+            creator,
+            lock_id,
+            published_content_lock,
+            published_guarded_paths,
+        ) {
+            return Ok(false);
+        }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let intent = sqlx::query_as::<_, (bool, Option<serde_json::Value>)>(
+            "SELECT external_write_completed_at IS NOT NULL, original_content_lock
+             FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2
+             FOR UPDATE",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some((true, Some(original_content_lock))) = intent else {
+            return Ok(false);
+        };
+        let original_content_lock = serde_json::from_value::<ContentLock>(original_content_lock)
+            .map_err(storage_display)?;
+        if original_content_lock != *published_content_lock {
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            "DELETE FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2
+               AND external_write_completed_at IS NOT NULL",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn publication_in_progress(
         &self,
         creator: &CreatorPubky,
@@ -103,6 +184,18 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
     ) -> Result<bool, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let deletion_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts WHERE creator = $1 AND lock_id = $2)
+             OR EXISTS (SELECT 1 FROM content_lock_deletion_jobs WHERE creator = $1 AND lock_id = $2)",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if deletion_exists {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2)",
         )
@@ -113,6 +206,73 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(exists)
+    }
+
+    async fn recover_publication(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        requested_content_lock: &ContentLock,
+    ) -> Result<PublicationRecovery, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_proof_admission(&mut transaction, creator, lock_id).await?;
+        let deletion_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_force_deletion_receipts WHERE creator = $1 AND lock_id = $2)
+             OR EXISTS (SELECT 1 FROM content_lock_deletion_jobs WHERE creator = $1 AND lock_id = $2)",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if deletion_exists {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let intent = sqlx::query_as::<_, (Uuid, bool, Option<serde_json::Value>)>(
+            "SELECT publication_token, external_write_completed_at IS NOT NULL,
+                    original_content_lock
+             FROM content_lock_publication_intents
+             WHERE creator = $1 AND lock_id = $2
+             FOR UPDATE",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let recovery = match intent {
+            None => PublicationRecovery::None,
+            Some((publication_token, write_completed, original_content_lock)) => {
+                let original_content_lock =
+                    original_content_lock.ok_or_else(|| ApplicationError::Storage {
+                        message: "content lock publication intent lacks canonical material"
+                            .to_owned(),
+                    })?;
+                let original_content_lock =
+                    serde_json::from_value::<ContentLock>(original_content_lock)
+                        .map_err(storage_display)?;
+                if !publication_intent_matches_request(
+                    creator,
+                    lock_id,
+                    &original_content_lock,
+                    requested_content_lock,
+                ) {
+                    PublicationRecovery::RequestMismatch
+                } else if write_completed {
+                    PublicationRecovery::WriteCompleted {
+                        publication_token,
+                        content_lock: original_content_lock,
+                    }
+                } else {
+                    PublicationRecovery::Pending {
+                        publication_token,
+                        content_lock: original_content_lock,
+                    }
+                }
+            }
+        };
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(recovery)
     }
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError> {
