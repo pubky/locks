@@ -20,12 +20,18 @@ use crate::infrastructure::memory::verification_task_deletion_fence::{
 };
 
 /// In-memory verification task repository.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryVerificationTaskRepository {
     records: RwLock<HashMap<TaskId, VerificationTaskRecord>>,
     invoice_admissions: RwLock<HashMap<TaskId, MemoryInvoiceAdmission>>,
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     verification_task_claimer: SyncRwLock<Option<Weak<InMemoryVerificationTaskClaimer>>>,
+}
+
+impl Default for InMemoryVerificationTaskRepository {
+    fn default() -> Self {
+        Self::with_deletion_fence(Arc::new(InMemoryVerificationTaskDeletionFence::new()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,15 +87,32 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&task.creator, &lock_id)
             .await;
-        let mut fence_records = self.deletion_fence.records.write().await;
-        let mut records = self.records.write().await;
-        if records.contains_key(&task.task_id)
-            || records.values().any(|existing| {
-                existing.creator == task.creator
-                    && existing.submitted_proof_bundle.bundle_id
-                        == task.submitted_proof_bundle.bundle_id
-            })
+        if self
+            .deletion_fence
+            .deletion_cutoffs
+            .read()
+            .await
+            .contains(&(task.creator.clone(), lock_id.clone()))
         {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
+        let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
+        let mut records = self.records.write().await;
+        if let Some(existing) = records.values().find(|existing| {
+            existing.creator == task.creator
+                && existing.submitted_proof_bundle.bundle_id
+                    == task.submitted_proof_bundle.bundle_id
+        }) {
+            return if existing.submitted_proof_bundle == task.submitted_proof_bundle {
+                Err(ApplicationError::DuplicateRecord {
+                    record: "verification_task",
+                })
+            } else {
+                Err(ApplicationError::VerificationTaskConflict)
+            };
+        }
+        if records.contains_key(&task.task_id) {
             return Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             });
@@ -110,8 +133,10 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 deletion_job_id: None,
             },
         );
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task.clone());
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -126,25 +151,14 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         &self,
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
-        let lock_id = task
-            .submitted_proof_bundle
-            .pubky_lock_resource
-            .lock_id()
-            .clone();
-        let _admission_guard = self
-            .deletion_fence
-            .acquire_lock_admission(&task.creator, &lock_id)
-            .await;
-        let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         if !records.contains_key(&task.task_id) {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
         }
-        if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
-            fence_record.status = task.status;
-        }
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task);
         Ok(())
     }
@@ -210,13 +224,16 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             None
         };
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         fence_records.remove(task_id);
+        current_statuses.remove(task_id);
         records.remove(task_id);
         admissions.remove(task_id);
         drop(admissions);
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -243,7 +260,17 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&task.creator, &lock_id)
             .await;
+        if self
+            .deletion_fence
+            .deletion_cutoffs
+            .read()
+            .await
+            .contains(&(task.creator.clone(), lock_id.clone()))
+        {
+            return Err(ApplicationError::ContentLockDeletionInProgress);
+        }
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         if let Some(existing) = records.values().find(|existing| {
@@ -299,9 +326,11 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
                 deletion_job_id: None,
             },
         );
+        current_statuses.insert(task.task_id, task.status);
         records.insert(task.task_id, task.clone());
         drop(admissions);
         drop(records);
+        drop(current_statuses);
         drop(fence_records);
         drop(_admission_guard);
         if let Some(claimer) = self.verification_task_claimer() {
@@ -462,6 +491,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
             )
             .await;
         let mut fence_records = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
         let Some(state) = admissions.get_mut(task_id).filter(|state| {
@@ -483,6 +513,7 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claim_token = None;
         state.claim_expires_at = None;
         records.insert(*task_id, state.record.task.clone());
+        current_statuses.insert(*task_id, VerificationTaskStatus::Failed);
         if let Some(fence_record) = fence_records.get_mut(task_id) {
             fence_record.status = VerificationTaskStatus::Failed;
         }
@@ -558,7 +589,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.insert_verification_task(pending).await,
+            repo.insert_verification_task(pending.clone()).await,
             Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             })
@@ -685,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_rejects_duplicate_public_handle_even_with_distinct_task_id() {
+    async fn insert_replays_exact_public_handle_and_rejects_changed_payload() {
         let repo = InMemoryVerificationTaskRepository::new();
         let original = task_with(
             TASK_ID,
@@ -703,18 +734,36 @@ mod tests {
         repo.insert_verification_task(original.clone())
             .await
             .unwrap();
+        let started = original
+            .clone()
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
 
         assert_eq!(
-            repo.insert_verification_task(duplicate_handle).await,
+            repo.insert_verification_task(duplicate_handle.clone())
+                .await,
             Err(ApplicationError::DuplicateRecord {
                 record: "verification_task",
             })
+        );
+        let mut changed = duplicate_handle;
+        changed.submitted_proof_bundle.proofs.clear();
+        assert_eq!(
+            repo.insert_verification_task(changed).await,
+            Err(ApplicationError::VerificationTaskConflict)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(TASK_ID).unwrap())
                 .await
                 .unwrap(),
-            Some(original)
+            Some(started)
         );
         assert_eq!(
             repo.get_verification_task(&TaskId::from_str(OTHER_TASK_ID).unwrap())

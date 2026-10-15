@@ -143,7 +143,13 @@ impl CreatorLocks {
     }
 
     pub fn get_content_lock_deletion(&self, lock_id: LockId) -> SdkRequest {
-        self.empty_request("GET", format!("/creator/content-locks/{lock_id}/deletion"))
+        SdkRequest {
+            method: "GET",
+            path: format!("/creator/content-locks/{lock_id}/deletion"),
+            authorization: self.session.authorization_header_value(),
+            content_type: String::new(),
+            body: SdkRequestBody::Empty,
+        }
     }
 
     pub fn create_content_lock_request(&self, request: CreateContentLockRequest) -> SdkRequest {

@@ -348,11 +348,13 @@ impl AppState {
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(
@@ -433,11 +435,13 @@ impl AppState {
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(
@@ -506,11 +510,13 @@ impl AppState {
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
-        let verification_task_claimer =
-            Arc::new(InMemoryVerificationTaskClaimer::with_task_repository(
+        let verification_task_claimer = Arc::new(
+            InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
                 verification_tasks.clone(),
-            ));
+                Arc::clone(&verification_task_deletion_fence),
+            ),
+        );
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(

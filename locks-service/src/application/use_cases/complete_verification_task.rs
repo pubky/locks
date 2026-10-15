@@ -420,6 +420,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::DuplicateRecord { .. }
         | ApplicationError::ContentLockPathConflict { .. }
         | ApplicationError::ContentLockDeletionInProgress
+        | ApplicationError::ContentLockPublicationInProgress
         | ApplicationError::InvalidContentLockDeletionState { .. }
         | ApplicationError::MissingRecord { .. }
         | ApplicationError::InvalidVerificationTaskTransition { .. }

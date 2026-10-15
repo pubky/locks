@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use locks_core::ids::{BundleId, CreatorPubky, LockId, TaskId};
 use time::OffsetDateTime;
@@ -32,6 +36,8 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
+    pub(crate) current_statuses: RwLock<HashMap<TaskId, VerificationTaskStatus>>,
+    pub(crate) deletion_cutoffs: RwLock<HashSet<LockKey>>,
     lock_admissions: Mutex<HashMap<LockKey, Arc<Mutex<()>>>>,
     clock: Arc<dyn Clock>,
 }
@@ -41,6 +47,8 @@ impl fmt::Debug for InMemoryVerificationTaskDeletionFence {
         formatter
             .debug_struct("InMemoryVerificationTaskDeletionFence")
             .field("records", &self.records)
+            .field("current_statuses", &self.current_statuses)
+            .field("deletion_cutoffs", &self.deletion_cutoffs)
             .field("lock_admissions", &self.lock_admissions)
             .field("clock", &"<clock>")
             .finish()
@@ -61,6 +69,8 @@ impl InMemoryVerificationTaskDeletionFence {
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
+            current_statuses: RwLock::new(HashMap::new()),
+            deletion_cutoffs: RwLock::new(HashSet::new()),
             lock_admissions: Mutex::new(HashMap::new()),
             clock,
         }
