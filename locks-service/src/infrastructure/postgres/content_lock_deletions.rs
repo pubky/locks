@@ -220,7 +220,6 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        replacement_token: Uuid,
         requested_content_lock: &ContentLock,
     ) -> Result<PublicationRecovery, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
@@ -273,20 +272,8 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                         content_lock: original_content_lock,
                     }
                 } else {
-                    sqlx::query(
-                        "UPDATE content_lock_publication_intents
-                         SET publication_token = $3
-                         WHERE creator = $1 AND lock_id = $2
-                           AND external_write_completed_at IS NULL",
-                    )
-                    .bind(creator.to_string())
-                    .bind(lock_id.to_string())
-                    .bind(replacement_token)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
-                    PublicationRecovery::RetryWithToken {
-                        publication_token: replacement_token,
+                    PublicationRecovery::Pending {
+                        publication_token,
                         content_lock: original_content_lock,
                     }
                 }
@@ -1438,12 +1425,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .recover_publication(
-                    &graceful_lock.creator,
-                    &graceful_lock_id,
-                    Uuid::new_v4(),
-                    &graceful_lock,
-                )
+                .recover_publication(&graceful_lock.creator, &graceful_lock_id, &graceful_lock,)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );
@@ -1472,12 +1454,7 @@ mod tests {
         );
         assert_eq!(
             repository
-                .recover_publication(
-                    &force_lock.creator,
-                    &force_lock_id,
-                    Uuid::new_v4(),
-                    &force_lock,
-                )
+                .recover_publication(&force_lock.creator, &force_lock_id, &force_lock,)
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );

@@ -430,12 +430,11 @@ async fn publication_intent_reconciliation_and_job_admission_are_distinct() {
 }
 
 #[tokio::test]
-async fn publication_recovery_replaces_only_uncompleted_token_and_requires_write_marker() {
+async fn publication_recovery_retains_uncompleted_token_and_requires_write_marker() {
     let repository = InMemoryContentLockDeletionRepository::new();
     let lock = content_lock();
     let lock_id = lock.lock_id().unwrap();
     let original_token = Uuid::new_v4();
-    let recovery_token = Uuid::new_v4();
     repository
         .begin_publication(&lock.creator, &lock_id, original_token, &lock)
         .await
@@ -443,39 +442,33 @@ async fn publication_recovery_replaces_only_uncompleted_token_and_requires_write
 
     assert_eq!(
         repository
-            .recover_publication(&lock.creator, &lock_id, recovery_token, &lock)
+            .recover_publication(&lock.creator, &lock_id, &lock)
             .await
             .unwrap(),
-        PublicationRecovery::RetryWithToken {
-            publication_token: recovery_token,
+        PublicationRecovery::Pending {
+            publication_token: original_token,
             content_lock: lock.clone(),
         }
     );
     assert!(
-        !repository
+        repository
             .mark_publication_written(&lock.creator, &lock_id, original_token)
             .await
             .unwrap()
     );
     assert!(
-        repository
-            .mark_publication_written(&lock.creator, &lock_id, recovery_token)
-            .await
-            .unwrap()
-    );
-    assert!(
         !repository
-            .abandon_publication(&lock.creator, &lock_id, recovery_token)
+            .abandon_publication(&lock.creator, &lock_id, original_token)
             .await
             .unwrap()
     );
     assert_eq!(
         repository
-            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .recover_publication(&lock.creator, &lock_id, &lock)
             .await
             .unwrap(),
         PublicationRecovery::WriteCompleted {
-            publication_token: recovery_token,
+            publication_token: original_token,
             content_lock: lock.clone(),
         }
     );
@@ -492,7 +485,7 @@ async fn publication_recovery_replaces_only_uncompleted_token_and_requires_write
     );
     assert_eq!(
         repository
-            .recover_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+            .recover_publication(&lock.creator, &lock_id, &lock)
             .await
             .unwrap(),
         PublicationRecovery::None

@@ -170,7 +170,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        replacement_token: Uuid,
         requested_content_lock: &ContentLock,
     ) -> Result<PublicationRecovery, ApplicationError> {
         let key = (creator.clone(), lock_id.clone());
@@ -197,9 +196,8 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 content_lock: intent.original_content_lock.clone(),
             });
         }
-        intent.token = replacement_token;
-        Ok(PublicationRecovery::RetryWithToken {
-            publication_token: replacement_token,
+        Ok(PublicationRecovery::Pending {
+            publication_token: intent.token,
             content_lock: intent.original_content_lock.clone(),
         })
     }

@@ -26,8 +26,9 @@ pub enum PublicationRecovery {
         publication_token: Uuid,
         content_lock: ContentLock,
     },
-    /// Caller owns the replaced intent token and must re-PUT exact canonical bytes.
-    RetryWithToken {
+    /// Exact canonical material is retained, but write completion is still ambiguous.
+    /// Callers must neither trust readback from an unknown attempt nor dispatch another write.
+    Pending {
         publication_token: Uuid,
         content_lock: ContentLock,
     },
@@ -80,13 +81,13 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
 
-    /// Checks deletion admission, authenticates retained canonical publication material, and
-    /// claims an uncompleted exact intent for safe identical retry.
+    /// Checks deletion admission and authenticates retained canonical publication material.
+    /// Uncompleted intents retain their original token so concurrent or ambiguous writes cannot
+    /// be superseded and later escape the deletion fence.
     async fn recover_publication(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        replacement_token: Uuid,
         requested_content_lock: &ContentLock,
     ) -> Result<PublicationRecovery, ApplicationError>;
 
