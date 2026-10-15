@@ -23,7 +23,7 @@
 ### Explicit requirements and confirmed decisions
 
 1. `paykit-payment` criterion params gain required `payment_in`.
-2. `payment_in` is a nonzero JSON `u64` integer measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. There is no product maximum beyond checked duration/timestamp representation.
+2. `payment_in` is a JSON `u64` integer from 1 through 70,389,527 measured in whole hours. Zero, fractional, negative, string, and out-of-range values are invalid. The maximum is the largest whole-hour window from the Unix epoch to the maximum protocol timestamp; invoice creation still checks addition against its actual creation time.
 3. Locks includes the persisted `payment_in` from the validated canonical criterion in the signed invoice request. Paykit independently reads the canonical lock and rejects a mismatch before side effects.
 4. Paykit commits `invoice_created_at` and `payment_deadline = checked(invoice_created_at + payment_in hours)` atomically with invoice creation. Exact replay returns the original timestamps.
 5. Locks validates the returned timestamps before marking invoice admission ready. Paykit remains authoritative for the timestamps and returns them on later status reads; exact invoice replay never restarts the payment window.
@@ -84,7 +84,7 @@
 - Paykit polling latency can make a pre-deadline broadcast late.
 - Timely amount-matched payment can block deletion indefinitely while confirmations/reorg state remains unresolved.
 - Durable cancellation enqueue may precede actual counterparty delivery.
-- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death.
+- Best-effort lock-publication reservation compensation can leave operator-cleaned orphan ownership after process death before publication; post-publication mark failures recover through an identical retry.
 - Force deletion deliberately abandons active payment/access obligations and may orphan content after a crash.
 
 ## Repository ownership matrix
