@@ -84,7 +84,7 @@ async fn deletes_public_path_first_then_attempts_sorted_deduplicated_resources_a
 }
 
 #[tokio::test]
-async fn resource_errors_are_best_effort_and_still_complete_the_force_receipt() {
+async fn resource_errors_attempt_every_path_but_keep_force_receipt_pending() {
     let h = Harness::new();
     h.resources
         .fail_paths
@@ -94,8 +94,11 @@ async fn resource_errors_are_best_effort_and_still_complete_the_force_receipt() 
 
     let outcome = h.execute().await;
 
-    assert_eq!(outcome, ForcedContentLockDeletionOutcome::Completed);
-    assert_eq!(h.deletions.complete_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        outcome,
+        ForcedContentLockDeletionOutcome::TransientDependencyFailure
+    );
+    assert_eq!(h.deletions.complete_calls.load(Ordering::SeqCst), 0);
     assert!(
         h.operations()
             .iter()

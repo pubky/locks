@@ -1179,28 +1179,67 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 .await
                 .map_err(storage_error)?;
                 if entitlement_publication_in_progress {
+                    if job.state != ContentLockDeletionState::Failed {
+                        transaction.commit().await.map_err(storage_error)?;
+                        return Ok(PrepareForceDeletionResult::PublicationInProgress);
+                    }
+                    let sql = format!(
+                        "UPDATE content_lock_deletion_jobs
+                         SET state = 'queued', attempt_count = 0, next_attempt_at = NULL,
+                             failure_code = NULL, claimed_by = NULL, claim_token = NULL,
+                             claim_expires_at = NULL, updated_at = $3
+                         WHERE creator = $1 AND lock_id = $2 RETURNING {ROW_COLUMNS}"
+                    );
+                    let resumed = sqlx::query_as::<_, DeletionJobRow>(&sql)
+                        .bind(creator.to_string())
+                        .bind(lock_id.to_string())
+                        .bind(forced_at)
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(storage_error)?;
                     transaction.commit().await.map_err(storage_error)?;
-                    return Ok(PrepareForceDeletionResult::PublicationInProgress);
+                    return Ok(PrepareForceDeletionResult::Active(row_to_job(resumed)?));
                 }
-                revoke_read_claims(&mut transaction, job.job_id).await?;
-                let sql = format!(
-                    "UPDATE content_lock_deletion_jobs
-                     SET force_requested_at = COALESCE(force_requested_at, $3),
-                         state = 'queued', attempt_count = 0, next_attempt_at = NULL,
-                         failure_code = NULL,
-                         claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
-                         updated_at = $3
-                     WHERE creator = $1 AND lock_id = $2 RETURNING {ROW_COLUMNS}"
-                );
-                let active = sqlx::query_as::<_, DeletionJobRow>(&sql)
-                    .bind(creator.to_string())
-                    .bind(lock_id.to_string())
-                    .bind(forced_at)
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(storage_error)?;
+                if matches!(
+                    job.state,
+                    ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+                ) {
+                    revoke_read_claims(&mut transaction, job.job_id).await?;
+                    let sql = format!(
+                        "UPDATE content_lock_deletion_jobs
+                         SET force_requested_at = COALESCE(force_requested_at, $3),
+                             state = 'queued', attempt_count = 0, next_attempt_at = NULL,
+                             failure_code = NULL,
+                             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                             updated_at = $3
+                         WHERE creator = $1 AND lock_id = $2 RETURNING {ROW_COLUMNS}"
+                    );
+                    let active = sqlx::query_as::<_, DeletionJobRow>(&sql)
+                        .bind(creator.to_string())
+                        .bind(lock_id.to_string())
+                        .bind(forced_at)
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(storage_error)?;
+                    transaction.commit().await.map_err(storage_error)?;
+                    return Ok(PrepareForceDeletionResult::Active(row_to_job(active)?));
+                }
+                let frozen =
+                    serde_json::to_value(&job.frozen_content_lock).map_err(storage_display)?;
+                sqlx::query(
+                    "INSERT INTO content_lock_force_deletion_receipts
+                         (creator, lock_id, forced_at, frozen_content_lock)
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (creator, lock_id) DO NOTHING",
+                )
+                .bind(creator.to_string())
+                .bind(lock_id.to_string())
+                .bind(forced_at)
+                .bind(frozen)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
                 transaction.commit().await.map_err(storage_error)?;
-                return Ok(PrepareForceDeletionResult::Active(row_to_job(active)?));
+                return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
             }
         }
         let frozen = frozen_content_lock
@@ -1645,11 +1684,16 @@ fn row_to_force_receipt(
 ) -> Result<ForceDeletionReceipt, ApplicationError> {
     let creator = CreatorPubky::from_str(&row.creator).map_err(storage_display)?;
     let lock_id = LockId::from_str(&row.lock_id).map_err(storage_display)?;
-    let frozen_content_lock = row
-        .frozen_content_lock
-        .map(serde_json::from_value::<ContentLock>)
-        .transpose()
-        .map_err(storage_display)?;
+    let frozen_content_lock = if row.completed_at.is_some() {
+        None
+    } else {
+        row.frozen_content_lock
+            .map(serde_json::from_value::<ContentLock>)
+            .transpose()
+            .map_err(|_| ApplicationError::CorruptContentLockDeletionManifest {
+                message: "force deletion manifest cannot be decoded".to_owned(),
+            })?
+    };
     Ok(ForceDeletionReceipt {
         creator,
         lock_id,
@@ -1797,7 +1841,9 @@ mod tests {
     use time::macros::datetime;
     use uuid::Uuid;
 
-    use super::PostgresContentLockDeletionRepository;
+    use super::{
+        ForceDeletionReceiptRow, PostgresContentLockDeletionRepository, row_to_force_receipt,
+    };
     use crate::{
         application::{
             errors::ApplicationError,
@@ -1832,6 +1878,38 @@ mod tests {
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const NOW: time::OffsetDateTime = datetime!(2026-08-12 05:00:00 UTC);
+
+    #[test]
+    fn completed_force_receipt_ignores_unparseable_retained_manifest() {
+        let receipt = row_to_force_receipt(ForceDeletionReceiptRow {
+            creator: CREATOR.to_owned(),
+            lock_id: "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG".to_owned(),
+            forced_at: NOW,
+            frozen_content_lock: Some(serde_json::json!({"future_schema": true})),
+            completed_at: Some(NOW),
+        })
+        .unwrap();
+
+        assert!(receipt.frozen_content_lock.is_none());
+        assert_eq!(receipt.completed_at, Some(NOW));
+    }
+
+    #[test]
+    fn pending_force_receipt_maps_unparseable_manifest_to_state_corrupt() {
+        let error = row_to_force_receipt(ForceDeletionReceiptRow {
+            creator: CREATOR.to_owned(),
+            lock_id: "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG".to_owned(),
+            forced_at: NOW,
+            frozen_content_lock: Some(serde_json::json!({"future_schema": true})),
+            completed_at: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplicationError::CorruptContentLockDeletionManifest { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn healthy_defer_restores_the_postgres_attempt_budget_and_fences_stale_tokens() {
@@ -2954,18 +3032,9 @@ mod tests {
             .advanced()
             .expect("terminal admission failure must permit payment drain progression");
 
-        let paykit = ReclaimingPaymentDrainClient {
-            summary: PaymentDrainSummary {
-                status: PaymentDrainStatus::Completed,
-                accepted_count: 0,
-                terminal_count: 0,
-                cancellation_enqueued_count: 0,
-                cleanup_token: PaymentDrainCleanupToken::parse(
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                )
-                .unwrap(),
-            },
+        let paykit = FailedAdmissionPaymentDrainClient {
             start_calls: AtomicUsize::new(0),
+            lookup_calls: AtomicUsize::new(0),
         };
         let use_case = DrainLockPaymentsUseCase::new(
             &reopened_deletions,
@@ -3000,6 +3069,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(paykit.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(paykit.lookup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             reopened_deletions
                 .get_job(&job.creator, &job.lock_id)
@@ -3033,6 +3103,68 @@ mod tests {
 
         let paykit_calls = complete_payment_drain(&deletions, &drains, &job).await;
         assert_eq!(paykit_calls, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn force_on_failed_job_with_publication_claim_resumes_gracefully() {
+        let database = TestDatabase::create().await;
+        let pool = database.pool().clone();
+        let tasks = PostgresVerificationTaskRepository::new(pool.clone());
+        let deletions = PostgresContentLockDeletionRepository::new(pool.clone());
+        let lock = content_lock();
+        let task =
+            insert_ready_terminal_paykit_task(&tasks, &lock, BundleId::from_bytes([41; 16])).await;
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        let claim = deletions
+            .claim_next("deletion-worker", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        deletions
+            .finish(
+                job.job_id,
+                "deletion-worker",
+                claim.claim_token,
+                Some(ContentLockDeletionFailureCode::RetryExhausted),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let publication_token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET entitlement_publication_claim_token = $2
+             WHERE task_id = $1",
+        )
+        .bind(task.task_id.as_uuid())
+        .bind(publication_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = deletions
+            .prepare_force_deletion(&job.creator, &job.lock_id)
+            .await
+            .unwrap();
+
+        let PrepareForceDeletionResult::Active(resumed) = result else {
+            panic!("failed publication claim must resume graceful reconciliation");
+        };
+        assert_eq!(resumed.state, ContentLockDeletionState::Queued);
+        assert_eq!(resumed.force_requested_at, None);
+        assert_eq!(resumed.failure_code, None);
+        let retained_token: Option<Uuid> = sqlx::query_scalar(
+            "SELECT entitlement_publication_claim_token
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(task.task_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_token, Some(publication_token));
 
         database.cleanup().await;
     }
@@ -3257,21 +3389,20 @@ mod tests {
                 .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Active(active)
-                if active.job_id == job.job_id
-                    && active.state == ContentLockDeletionState::Queued
-                    && active.attempt_count == 0
-                    && active.failure_code.is_none()
+            PrepareForceDeletionResult::Synchronous(Some(terminal))
+                if terminal.job_id == job.job_id
+                    && terminal.state == ContentLockDeletionState::Failed
+                    && terminal.failure_code == Some(ContentLockDeletionFailureCode::TombstoneMissing)
         ));
         assert!(matches!(
             reopened
                 .prepare_force_deletion(&job.creator, &job.lock_id)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Active(active) if active.job_id == job.job_id
+            PrepareForceDeletionResult::Synchronous(_)
         ));
         assert!(
-            !reopened
+            reopened
                 .has_force_receipt(&job.creator, &job.lock_id)
                 .await
                 .unwrap()
@@ -3283,13 +3414,6 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            !reopened
-                .has_force_receipt(&job.creator, &job.lock_id)
-                .await
-                .unwrap()
-        );
-
         database.cleanup().await;
     }
 
@@ -4017,6 +4141,56 @@ mod tests {
             _lock_resource: &PubkyLockResource,
         ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
             Ok(Some(self.summary.clone()))
+        }
+
+        async fn payment_request_status(
+            &self,
+            _creator: &CreatorPubky,
+            _bundle_id: &BundleId,
+        ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+            unreachable!()
+        }
+    }
+
+    struct FailedAdmissionPaymentDrainClient {
+        start_calls: AtomicUsize,
+        lookup_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PaymentDrainClient for FailedAdmissionPaymentDrainClient {
+        async fn start_payment_drain(
+            &self,
+            _lock_resource: &PubkyLockResource,
+        ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PaymentDrainSummary {
+                status: PaymentDrainStatus::Active,
+                accepted_count: 1,
+                terminal_count: 0,
+                cancellation_enqueued_count: 1,
+                cleanup_token: PaymentDrainCleanupToken::parse(
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
+                .unwrap(),
+            })
+        }
+
+        async fn lookup_payment_drain(
+            &self,
+            _lock_resource: &PubkyLockResource,
+        ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(PaymentDrainSummary {
+                status: PaymentDrainStatus::Completed,
+                accepted_count: 0,
+                terminal_count: 1,
+                cancellation_enqueued_count: 1,
+                cleanup_token: PaymentDrainCleanupToken::parse(
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                )
+                .unwrap(),
+            }))
         }
 
         async fn payment_request_status(

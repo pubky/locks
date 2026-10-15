@@ -242,7 +242,7 @@ async fn force_delete_content_lock(
     } else {
         None
     };
-    let published_content_lock = if existing_job.is_none() {
+    let published_content_lock = if existing_receipt.is_none() && existing_job.is_none() {
         state
             .content_locks()
             .get_content_lock(&creator, &path)
@@ -252,6 +252,12 @@ async fn force_delete_content_lock(
     };
     if let Some(content_lock) = published_content_lock.as_ref() {
         validate_content_lock_identity(content_lock, &creator, &lock_id)?;
+        content_lock.validate_resource_set().map_err(|error| {
+            ApiError::from(ApplicationError::InvalidGuardedResource {
+                message: error.to_string(),
+            })
+        })?;
+        validate_persisted_content_lock_limits(content_lock, state.config().content_locks.clone())?;
     }
     match state
         .content_lock_deletions()

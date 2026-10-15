@@ -260,11 +260,13 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::RateLimited => {
                 Self::new(ApiErrorCode::RateLimited, "rate limit exceeded")
             }
+            ApplicationError::CorruptContentLockDeletionManifest { .. } => {
+                Self::new(ApiErrorCode::InternalError, "state_corrupt")
+            }
             ApplicationError::Storage { .. }
             | ApplicationError::VerificationDependencyUnavailable
             | ApplicationError::FinalCredentialSecret { .. }
             | ApplicationError::InvalidContentLockDeletionState { .. }
-            | ApplicationError::CorruptContentLockDeletionManifest { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }
             | ApplicationError::ContentLockCanonicalization { .. }

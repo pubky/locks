@@ -149,9 +149,9 @@ impl AdvanceContentLockDeletionPhaseResult {
 pub enum PrepareForceDeletionResult {
     /// A pre-existing publication intent must reconcile before force can begin.
     PublicationInProgress,
-    /// An active graceful job was durably marked for asynchronous force processing.
+    /// A pre-existing graceful job was durably requeued for asynchronous processing.
     Active(ContentLockDeletionJob),
-    /// A permanent force receipt was established. A terminal frozen job is returned when present.
+    /// A permanent force receipt was established for synchronous cleanup.
     Synchronous(Option<ContentLockDeletionJob>),
 }
 

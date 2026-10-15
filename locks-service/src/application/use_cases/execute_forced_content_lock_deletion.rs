@@ -163,6 +163,7 @@ impl<'a> ExecuteForcedContentLockDeletionUseCase<'a> {
 
         let mut evidence =
             DeletionDependencyEvidence::healthy(DeletionDependencySource::PubkyForcePublic);
+        let mut resource_delete_failed = false;
         for path in frozen_resource_paths(claim) {
             evidence = evidence.merge(
                 match self
@@ -174,11 +175,21 @@ impl<'a> ExecuteForcedContentLockDeletionUseCase<'a> {
                     Ok(_) => {
                         DeletionDependencyEvidence::healthy(DeletionDependencySource::PubkyResource)
                     }
-                    Err(_) => DeletionDependencyEvidence::unavailable(
-                        DeletionDependencySource::PubkyResource,
-                    ),
+                    Err(_) => {
+                        resource_delete_failed = true;
+                        DeletionDependencyEvidence::unavailable(
+                            DeletionDependencySource::PubkyResource,
+                        )
+                    }
                 },
             );
+        }
+
+        if resource_delete_failed {
+            return ForcedContentLockDeletionExecution::new(
+                ForcedContentLockDeletionOutcome::TransientDependencyFailure,
+            )
+            .with_evidence(evidence);
         }
 
         let execution = match self

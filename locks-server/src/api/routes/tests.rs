@@ -896,7 +896,7 @@ async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
 }
 
 #[tokio::test]
-async fn force_after_terminal_graceful_failure_requeues_frozen_manifest() {
+async fn force_after_terminal_graceful_failure_completes_synchronously() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
     let content_lock = content_lock(true);
@@ -947,15 +947,14 @@ async fn force_after_terminal_graceful_failure_requeues_frozen_manifest() {
         ))
         .await
         .unwrap();
-    assert_eq!(forced.status(), StatusCode::ACCEPTED);
-    assert_eq!(response_json(forced).await["status"], "queued");
+    assert_eq!(forced.status(), StatusCode::OK);
     assert!(
         state
             .content_locks()
             .get_content_lock(&creator(), &path)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
     assert!(
         state
@@ -963,10 +962,10 @@ async fn force_after_terminal_graceful_failure_requeues_frozen_manifest() {
             .get_current_guarded_resource(&creator(), &resource.path)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
     assert!(
-        !state
+        state
             .content_lock_deletions()
             .has_force_receipt(&creator(), &lock_id)
             .await
@@ -6287,7 +6286,7 @@ async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
         .unwrap();
 
     let response = force_delete_request(&app, &lock_id).await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
         state
             .verification_task_claimer()
@@ -6308,6 +6307,54 @@ async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
             .unwrap()
             .is_some()
     );
+    assert!(
+        state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_rejects_invalid_live_resource_set_before_freezing_receipt() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_rejects_live_manifest_over_limits_before_freezing_receipt() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
         !state
             .content_lock_deletions()
@@ -6334,7 +6381,7 @@ async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion(&creator(), &lock_id)
+            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)
@@ -6364,7 +6411,7 @@ async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
 }
 
 #[tokio::test]
-async fn force_from_failed_job_requeues_frozen_manifest_after_resource_limits_are_lowered() {
+async fn force_from_failed_job_synchronously_uses_manifest_after_resource_limits_are_lowered() {
     let state = test_state_with_content_lock_limits(ContentLocksConfig {
         max_resource_bytes: 1,
         max_resources: 0,
@@ -6405,15 +6452,14 @@ async fn force_from_failed_job_requeues_frozen_manifest_after_resource_limits_ar
 
     let response = force_delete_request(&app, &lock_id).await;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(response_json(response).await["status"], "queued");
+    assert_eq!(response.status(), StatusCode::OK);
     assert!(
         state
             .content_locks()
             .get_content_lock(&creator(), &path)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
     assert!(
         state
@@ -6421,9 +6467,9 @@ async fn force_from_failed_job_requeues_frozen_manifest_after_resource_limits_ar
             .get_current_guarded_resource(&creator(), &resource.path)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
-    assert_force_status(&app, &lock_id, "queued").await;
+    assert_force_status(&app, &lock_id, "completed").await;
 }
 
 #[tokio::test]
@@ -6439,7 +6485,7 @@ async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_r
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion(&creator(), &lock_id)
+            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)

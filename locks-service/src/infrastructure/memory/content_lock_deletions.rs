@@ -743,14 +743,12 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             return Ok(PrepareForceDeletionResult::PublicationInProgress);
         }
         let verification_tasks = self.verification_task_fence.records.read().await;
-        if verification_tasks.values().any(|task| {
+        let entitlement_publication_in_progress = verification_tasks.values().any(|task| {
             task.creator == *creator
                 && task.lock_id == *lock_id
                 && task.deletion_job_id.is_some()
                 && task.entitlement_publication_claim_token.is_some()
-        }) {
-            return Ok(PrepareForceDeletionResult::PublicationInProgress);
-        }
+        });
         drop(verification_tasks);
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
@@ -766,16 +764,50 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             ));
         }
         if let Some(stored) = jobs.get_mut(&key) {
-            stored.job.force_requested_at.get_or_insert(forced_at);
-            stored.job.state = ContentLockDeletionState::Queued;
-            stored.job.attempt_count = 0;
-            stored.job.next_attempt_at = None;
-            stored.job.failure_code = None;
-            clear_claim(stored);
+            if entitlement_publication_in_progress {
+                if stored.job.state != ContentLockDeletionState::Failed {
+                    return Ok(PrepareForceDeletionResult::PublicationInProgress);
+                }
+                stored.job.state = ContentLockDeletionState::Queued;
+                stored.job.attempt_count = 0;
+                stored.job.next_attempt_at = None;
+                stored.job.failure_code = None;
+                clear_claim(stored);
+                self.access_credentials
+                    .synchronize_job(&stored.job, None, None, None)
+                    .await;
+                return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
+            }
+            if matches!(
+                stored.job.state,
+                ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+            ) {
+                stored.job.force_requested_at.get_or_insert(forced_at);
+                stored.job.state = ContentLockDeletionState::Queued;
+                stored.job.attempt_count = 0;
+                stored.job.next_attempt_at = None;
+                stored.job.failure_code = None;
+                clear_claim(stored);
+                self.access_credentials
+                    .synchronize_job(&stored.job, None, None, None)
+                    .await;
+                return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
+            }
+            let job = stored.job.clone();
             self.access_credentials
-                .synchronize_job(&stored.job, None, None, None)
+                .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
                 .await;
-            return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
+            receipts.insert(
+                key,
+                ForceDeletionReceipt {
+                    creator: creator.clone(),
+                    lock_id: lock_id.clone(),
+                    frozen_content_lock: Some(job.frozen_content_lock.clone()),
+                    forced_at,
+                    completed_at: None,
+                },
+            );
+            return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
         }
         self.access_credentials
             .block_key_and_disable_job(creator, lock_id, None)

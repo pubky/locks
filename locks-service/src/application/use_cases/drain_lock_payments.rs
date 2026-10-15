@@ -254,6 +254,63 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             }
         };
         if obligations.is_empty() {
+            let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
+                Ok(Some(persisted)) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    persisted
+                }
+                Ok(None) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(ApplicationError::InvalidContentLockDeletionState {
+                        message: "payment drain cleanup token is missing".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(error);
+                }
+            };
+            if persisted.status == PaymentDrainStatus::Completed {
+                return self
+                    .advance_completed_drain(claim, worker_id, evidence)
+                    .await;
+            }
+
+            let lock_resource = lock_resource(&claim);
+            let summary = match self.paykit.lookup_payment_drain(&lock_resource).await {
+                Ok(Some(summary)) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                    summary
+                }
+                Ok(None) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                    return Err(ApplicationError::Verifier {
+                        message: "Paykit payment drain not found".to_owned(),
+                    });
+                }
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                    return Err(map_client_error(error));
+                }
+            };
+            validate_aggregate_progress(&persisted, &summary)?;
+            match self
+                .drains
+                .reconcile_payment_drain(claim.job.job_id, worker_id, claim.claim_token, &summary)
+                .await
+            {
+                Ok(true) => {
+                    observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository)
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    observe_unavailable(evidence, DeletionDependencySource::PaymentDrainRepository);
+                    return Err(error);
+                }
+            }
+            if summary.status != PaymentDrainStatus::Completed {
+                return Ok(false);
+            }
             return self
                 .advance_completed_drain(claim, worker_id, evidence)
                 .await;
