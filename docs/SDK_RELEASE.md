@@ -4,7 +4,7 @@ This document tracks what remains before the JS/WASM browser SDK can be publishe
 
 ## Current status
 
-The SDK API foundation is implemented. Public release policy uses `@synonymdev/locks-sdk`, public npm access, and the `rc` dist-tag for release candidates.
+The SDK API foundation is implemented. Public release policy uses `@synonymdev/locks-sdk`, public npm access, the `rc` dist-tag for release candidates, and the `latest` dist-tag for stable releases.
 
 Run the metadata audit:
 
@@ -18,7 +18,7 @@ The command is intentionally informational and exits 0. It reports blockers with
 
 The public package is `@synonymdev/locks-sdk`. Its root manifest exports generated wasm-pack JS, declarations, and WASM from `pkg/`. The internal generated package name remains `locks-sdk-wasm`; it is not published as a separate package.
 
-Release-candidate publication must use npm's `rc` dist-tag so prereleases never replace `latest`.
+Release-candidate publication must use npm's `rc` dist-tag so prereleases never replace `latest`. Stable publication uses `latest`.
 
 ## Pre-publish checklist
 
@@ -47,10 +47,10 @@ git diff --check
 5. Publish from an authenticated account with `@synonymdev` package permission:
 
 ```bash
-npm publish ./locks-sdk/bindings/js --access public --tag rc
+npm publish ./locks-sdk/bindings/js --access public --tag latest
 ```
 
-6. Read back registry metadata and verify package version, public access, and `rc` dist-tag.
+6. Read back registry metadata and verify package version, public access, and `latest` dist-tag.
 
 ## Explicit non-goals
 
