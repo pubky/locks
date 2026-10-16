@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -9,7 +8,6 @@ import { pathToFileURL } from 'node:url';
 
 const repoRoot = resolve(new URL('../../../..', import.meta.url).pathname);
 const examplesDir = join(repoRoot, 'examples', 'js-sdk');
-const wasmPkgDir = join(repoRoot, 'locks-sdk', 'bindings', 'js', 'pkg');
 await import(pathToFileURL(join(examplesDir, 'scripts/test-payment-amount.mjs')).href);
 const files = {
   rootReadme: join(repoRoot, 'README.md'),
@@ -823,7 +821,6 @@ assert.deepEqual(
     criterionId: 'payment-1',
     amount: '00018446744073709551615',
     asset: 'BTC',
-    paymentIn: 24,
     recipientPubky: creatorPubky,
     paykitSetupComplete: true,
   }),
@@ -835,52 +832,11 @@ assert.deepEqual(
         recipient_pubky: creatorPubky,
         amount: '18446744073709551615',
         asset: 'BTC',
-        payment_in: 24,
       },
     }],
     lockLogic: { type: 'all', criteria: ['payment-1'] },
   },
 );
-
-const wasmSdk = await import(pathToFileURL(join(wasmPkgDir, 'locks_sdk_wasm.js')).href);
-await wasmSdk.default(await readFile(join(wasmPkgDir, 'locks_sdk_wasm_bg.wasm')));
-const paykitPolicy = buildCreatorLockPolicy({
-  lockType: 'paykit-payment',
-  criterionId: 'payment-1',
-  amount: '50000',
-  asset: 'BTC',
-  paymentIn: 24,
-  recipientPubky: creatorPubky,
-  paykitSetupComplete: true,
-});
-const paykitRequest = new wasmSdk.CreateContentLockRequestBuilder()
-  .primaryResource({
-    path: '/priv/app.locks/content/example.txt',
-    hash: '0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G',
-    content_type: 'text/plain',
-    size: 7,
-  })
-  .criteria(paykitPolicy.criteria)
-  .lockLogic(paykitPolicy.lockLogic)
-  .accessPolicy({ requested_credential_ttl_seconds: 900 })
-  .lockServer({ override: null })
-  .build();
-assert.deepEqual(paykitRequest.criteria, paykitPolicy.criteria);
-
-for (const paymentIn of [0, -1, 1.5, 70_389_528, '24', null, undefined]) {
-  assert.throws(
-    () => buildCreatorLockPolicy({
-      lockType: 'paykit-payment',
-      criterionId: 'payment-1',
-      amount: '1',
-      asset: 'BTC',
-      paymentIn,
-      recipientPubky: creatorPubky,
-      paykitSetupComplete: true,
-    }),
-    /payment window/,
-  );
-}
 
 for (const amount of ['', '0', '000', '-1', '1.5', '1e3', ' 1', '1 ', '18446744073709551616']) {
   assert.throws(
@@ -889,7 +845,6 @@ for (const amount of ['', '0', '000', '-1', '1.5', '1e3', ' 1', '1 ', '184467440
       criterionId: 'payment-1',
       amount,
       asset: 'BTC',
-      paymentIn: 24,
       recipientPubky: creatorPubky,
       paykitSetupComplete: true,
     }),
@@ -903,7 +858,6 @@ for (const amount of [1, null, undefined]) {
       criterionId: 'payment-1',
       amount,
       asset: 'BTC',
-      paymentIn: 24,
       recipientPubky: creatorPubky,
       paykitSetupComplete: true,
     }),

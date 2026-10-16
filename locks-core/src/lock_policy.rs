@@ -341,10 +341,6 @@ impl fmt::Display for VerifierType {
     }
 }
 
-/// Largest whole-hour payment window representable from the Unix epoch by the
-/// protocol's `time` timestamp representation.
-pub const MAX_PAYKIT_PAYMENT_IN_HOURS: u64 = 70_389_527;
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PaykitPaymentParamsValidationError {
     #[error("paykit-payment params must be a JSON object")]
@@ -359,7 +355,7 @@ pub enum PaykitPaymentParamsValidationError {
     InvalidAmount,
     #[error("paykit-payment asset must be a non-empty string")]
     InvalidAsset,
-    #[error("paykit-payment payment_in must be a whole-hour JSON u64 between 1 and 70389527")]
+    #[error("paykit-payment payment_in must be a positive whole-hour JSON u64")]
     InvalidPaymentIn,
 }
 
@@ -490,7 +486,7 @@ fn validate_paykit_payment_params(
             "payment_in",
         ))?
         .as_u64()
-        .filter(|payment_in| (1..=MAX_PAYKIT_PAYMENT_IN_HOURS).contains(payment_in))
+        .filter(|payment_in| *payment_in > 0)
         .ok_or(PaykitPaymentParamsValidationError::InvalidPaymentIn)?;
 
     Ok(PaykitPaymentParams {
@@ -548,10 +544,10 @@ mod tests {
     use crate::lock_policy::{
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockValidationError, Criterion,
         GuardedResource, GuardedResourceValidationError, LockLogic, LockServerConfig,
-        MAX_PAYKIT_PAYMENT_IN_HOURS, PRIVATE_PROOF_BUNDLE_PATH_PREFIX,
-        PRIVATE_RESOURCE_CONTENT_PATH_PREFIX, PUBLIC_LOCKS_APP_PATH_PREFIX, PaykitPaymentParams,
-        PaykitPaymentParamsValidationError, PaykitPaymentPolicyValidationError,
-        SecondaryGuardedResource, VerifierType, verified_proof_bundle_path,
+        PRIVATE_PROOF_BUNDLE_PATH_PREFIX, PRIVATE_RESOURCE_CONTENT_PATH_PREFIX,
+        PUBLIC_LOCKS_APP_PATH_PREFIX, PaykitPaymentParams, PaykitPaymentParamsValidationError,
+        PaykitPaymentPolicyValidationError, SecondaryGuardedResource, VerifierType,
+        verified_proof_bundle_path,
     };
 
     fn test_pubky_identity() -> String {
@@ -959,48 +955,6 @@ mod tests {
             criterion.params["recipient_pubky"]
         );
         let _: PaykitPaymentParams = params;
-    }
-
-    #[test]
-    fn paykit_payment_in_rejects_unrepresentable_deadline_window() {
-        let recipient = test_pubky_identity();
-        assert!(
-            time::OffsetDateTime::UNIX_EPOCH
-                .checked_add(time::Duration::hours(MAX_PAYKIT_PAYMENT_IN_HOURS as i64))
-                .is_some()
-        );
-        assert!(
-            time::OffsetDateTime::UNIX_EPOCH
-                .checked_add(time::Duration::hours(
-                    MAX_PAYKIT_PAYMENT_IN_HOURS as i64 + 1
-                ))
-                .is_none()
-        );
-        let maximum = Criterion {
-            criterion_id: "criterion-1".to_owned(),
-            verifier_type: VerifierType::PaykitPayment,
-            params: json!({
-                "recipient_pubky": recipient,
-                "amount": "50000",
-                "asset": "BTC",
-                "payment_in": 70_389_527,
-            }),
-        };
-        let too_large = Criterion {
-            params: json!({
-                "recipient_pubky": recipient,
-                "amount": "50000",
-                "asset": "BTC",
-                "payment_in": 70_389_528,
-            }),
-            ..maximum.clone()
-        };
-
-        assert_eq!(maximum.validate_params(), Ok(()));
-        assert_eq!(
-            too_large.validate_params(),
-            Err(PaykitPaymentParamsValidationError::InvalidPaymentIn)
-        );
     }
 
     #[test]

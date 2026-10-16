@@ -822,10 +822,10 @@ mod tests {
             "started_at": "2026-06-01T12:00:01Z",
             "completed_at": "2026-06-01T12:00:02Z",
             "failure_message": null,
-            "terminal_reason": "payment_deadline_expired"
+            "terminal_reason": "content_lock_deleted"
         }))
         .unwrap();
-        assert_eq!(expired["terminal_reason"], "payment_deadline_expired");
+        assert_eq!(expired["terminal_reason"], "content_lock_deleted");
 
         let credential = validate_access_credential_response_for_tests(json!({
             "credential": "raw-access-credential",

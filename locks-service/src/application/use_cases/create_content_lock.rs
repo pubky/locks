@@ -672,12 +672,7 @@ mod tests {
         let lock_id = content_lock.lock_id().unwrap();
         fixture
             .content_lock_deletions
-            .prepare_force_deletion(
-                &request.creator,
-                &lock_id,
-                Some(&content_lock),
-                fixture.clock.now(),
-            )
+            .prepare_force_deletion(&request.creator, &lock_id)
             .await
             .unwrap();
 
@@ -1111,12 +1106,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(
-                    &creator(),
-                    &original_lock_id,
-                    Some(&original),
-                    fixture.clock.now(),
-                )
+                .prepare_force_deletion(&creator(), &original_lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -1186,7 +1176,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &ownership.lock_id, None, fixture.clock.now(),)
+                .prepare_force_deletion(&creator(), &ownership.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -1287,12 +1277,7 @@ mod tests {
             content_locks.snapshot_taken.notified().await;
             let prepared = fixture
                 .content_lock_deletions
-                .prepare_force_deletion(
-                    &creator(),
-                    &created.lock_id,
-                    Some(&created.content_lock),
-                    fixture.clock.now(),
-                )
+                .prepare_force_deletion(&creator(), &created.lock_id)
                 .await
                 .unwrap();
             fixture
@@ -1312,8 +1297,7 @@ mod tests {
         );
         assert!(matches!(
             forced,
-            PrepareForceDeletionResult::Synchronous(receipt)
-                if receipt.completed_at.is_none()
+            PrepareForceDeletionResult::Synchronous(None)
         ));
         assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 0);
         assert!(
@@ -1731,12 +1715,7 @@ mod tests {
         );
         assert_eq!(
             content_lock_deletions
-                .prepare_force_deletion(
-                    &creator(),
-                    &original_lock_id,
-                    Some(&original),
-                    clock.now(),
-                )
+                .prepare_force_deletion(&creator(), &original_lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -1894,7 +1873,7 @@ mod tests {
             assert_eq!(content_locks.upsert_count.load(Ordering::SeqCst), 1);
             assert_eq!(
                 content_lock_deletions
-                    .prepare_force_deletion(&creator(), &ownership.lock_id, None, clock.now())
+                    .prepare_force_deletion(&creator(), &ownership.lock_id)
                     .await
                     .unwrap(),
                 PrepareForceDeletionResult::PublicationInProgress
@@ -1913,12 +1892,7 @@ mod tests {
         );
         assert!(matches!(
             content_lock_deletions
-                .prepare_force_deletion(
-                    &creator(),
-                    &created.lock_id,
-                    Some(&created.content_lock),
-                    clock.now(),
-                )
+                .prepare_force_deletion(&creator(), &created.lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::Synchronous(_)
@@ -2233,7 +2207,7 @@ mod tests {
 
         let retry = use_case.execute(request.clone()).await;
         let force = content_lock_deletions
-            .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+            .prepare_force_deletion(&creator(), &lock_id)
             .await
             .unwrap();
 
@@ -2255,7 +2229,7 @@ mod tests {
         );
         assert_eq!(
             content_lock_deletions
-                .prepare_force_deletion(&creator(), &lock_id, Some(&content_lock), clock.now())
+                .prepare_force_deletion(&creator(), &lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -2364,7 +2338,7 @@ mod tests {
         assert_eq!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(&creator(), &lock_id, None, fixture.clock.now())
+                .prepare_force_deletion(&creator(), &lock_id)
                 .await
                 .unwrap(),
             PrepareForceDeletionResult::PublicationInProgress
@@ -2376,7 +2350,6 @@ mod tests {
         let fixture = Fixture::seeded().await;
         let probe = PublicationRaceProbe {
             deletions: &fixture.content_lock_deletions,
-            now: fixture.clock.now(),
         };
         let use_case = CreateContentLockUseCase::new(
             &probe,
@@ -2394,22 +2367,15 @@ mod tests {
         assert!(matches!(
             fixture
                 .content_lock_deletions
-                .prepare_force_deletion(
-                    &creator(),
-                    &created.lock_id,
-                    None,
-                    fixture.clock.now(),
-                )
+                .prepare_force_deletion(&creator(), &created.lock_id)
                 .await
                 .unwrap(),
-            PrepareForceDeletionResult::Synchronous(receipt)
-                if receipt.frozen_content_lock.is_none() && receipt.completed_at.is_none()
+            PrepareForceDeletionResult::Synchronous(None)
         ));
     }
 
     struct PublicationRaceProbe<'a> {
         deletions: &'a InMemoryContentLockDeletionRepository,
-        now: OffsetDateTime,
     }
 
     #[async_trait]
@@ -2423,7 +2389,7 @@ mod tests {
             let lock_id = content_lock.lock_id().unwrap();
             assert_eq!(
                 self.deletions
-                    .prepare_force_deletion(&creator, &lock_id, None, self.now)
+                    .prepare_force_deletion(&creator, &lock_id)
                     .await?,
                 PrepareForceDeletionResult::PublicationInProgress
             );

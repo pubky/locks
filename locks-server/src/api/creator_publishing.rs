@@ -4,10 +4,12 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
+use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
     PrepareForceDeletionResult,
 };
+use locks_service::application::ports::ContentLockDeletionActionAcquireResult;
 use locks_service::application::use_cases::create_content_lock::{
     CreateContentLockRequest, CreateContentLockUseCase,
 };
@@ -146,12 +148,13 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
         ));
     };
 
-    validate_content_lock_identity(
-        &content_lock,
-        &creator,
-        &lock_id,
-        state.config().content_locks.clone(),
-    )?;
+    validate_content_lock_identity(&content_lock, &creator, &lock_id)?;
+    content_lock.validate_resource_set().map_err(|error| {
+        ApiError::from(ApplicationError::InvalidGuardedResource {
+            message: error.to_string(),
+        })
+    })?;
+    validate_persisted_content_lock_limits(&content_lock, state.config().content_locks.clone())?;
 
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now())?;
     match state.content_lock_deletions().insert_job(job.clone()).await {
@@ -190,17 +193,21 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
             ))
         }
         Err(
-            locks_service::application::errors::ApplicationError::ContentLockPublicationInProgress,
-        ) => Err(ApiError::new(
-            ApiErrorCode::ContentLockPathConflict,
-            "content lock publication is in progress",
-        )),
-        Err(
-            locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress,
-        ) => Err(ApiError::new(
-            ApiErrorCode::ContentLockDeletionInProgress,
-            "content lock deletion is in progress",
-        )),
+            error @ locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress,
+        ) => {
+            match state
+                .content_lock_deletions()
+                .get_force_receipt(&creator, &lock_id)
+                .await?
+            {
+                Some(receipt) if receipt.completed_at.is_some() => Ok((
+                    StatusCode::OK,
+                    Json(json!({ "lock_id": lock_id, "status": "completed" })),
+                )),
+                Some(_) => force_delete_content_lock(&state, creator, lock_id).await,
+                None => Err(error.into()),
+            }
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -245,21 +252,17 @@ async fn force_delete_content_lock(
         None
     };
     if let Some(content_lock) = published_content_lock.as_ref() {
-        validate_content_lock_identity(
-            content_lock,
-            &creator,
-            &lock_id,
-            state.config().content_locks.clone(),
-        )?;
+        validate_content_lock_identity(content_lock, &creator, &lock_id)?;
+        content_lock.validate_resource_set().map_err(|error| {
+            ApiError::from(ApplicationError::InvalidGuardedResource {
+                message: error.to_string(),
+            })
+        })?;
+        validate_persisted_content_lock_limits(content_lock, state.config().content_locks.clone())?;
     }
-    let content_lock = match state
+    let synchronous_job = match state
         .content_lock_deletions()
-        .prepare_force_deletion(
-            &creator,
-            &lock_id,
-            published_content_lock.as_ref(),
-            state.clock().now(),
-        )
+        .prepare_force_deletion_with_manifest(&creator, &lock_id, published_content_lock.as_ref())
         .await?
     {
         PrepareForceDeletionResult::PublicationInProgress => {
@@ -274,30 +277,104 @@ async fn force_delete_content_lock(
                 Json(deletion_status_json(lock_id, job.state, job.failure_code)),
             ));
         }
-        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_some() => {
-            return Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "lock_id": lock_id,
-                    "lock_deleted": true,
-                    "failed_resource_paths": []
-                })),
-            ));
-        }
-        PrepareForceDeletionResult::Synchronous(receipt) => receipt.frozen_content_lock,
+        PrepareForceDeletionResult::Synchronous(job) => job,
     };
 
+    let receipt = state
+        .content_lock_deletions()
+        .get_force_receipt(&creator, &lock_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::InternalError,
+                "content lock deletion receipt unavailable",
+            )
+        })?;
+    if receipt.completed_at.is_some() {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "lock_id": lock_id,
+                "lock_deleted": true,
+                "failed_resource_paths": []
+            })),
+        ));
+    }
+    let content_lock = receipt.frozen_content_lock;
     if let Some(content_lock) = content_lock.as_ref() {
         validate_frozen_content_lock_identity(content_lock, &creator, &lock_id)?;
     }
 
+    let action_guard = if let Some(job) = synchronous_job {
+        match state
+            .content_lock_deletion_action_ownership()
+            .try_acquire_synchronous_force(job.job_id)
+            .await?
+        {
+            ContentLockDeletionActionAcquireResult::Acquired(guard) => Some(guard),
+            ContentLockDeletionActionAcquireResult::Busy => {
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({ "lock_id": lock_id, "status": "queued" })),
+                ));
+            }
+            ContentLockDeletionActionAcquireResult::ClaimLost => {
+                if state
+                    .content_lock_deletions()
+                    .get_force_receipt(&creator, &lock_id)
+                    .await?
+                    .is_some_and(|receipt| receipt.completed_at.is_some())
+                {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({
+                            "lock_id": lock_id,
+                            "lock_deleted": true,
+                            "failed_resource_paths": []
+                        })),
+                    ));
+                }
+                return Err(ApiError::new(
+                    ApiErrorCode::InternalError,
+                    "content lock deletion action unavailable",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let cleanup =
+        execute_synchronous_force_cleanup(state, &creator, &lock_id, &path, content_lock).await;
+    if let Some(guard) = action_guard {
+        guard.release().await?;
+    }
+    let failed_resource_paths = cleanup?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": failed_resource_paths
+        })),
+    ))
+}
+
+async fn execute_synchronous_force_cleanup(
+    state: &AppState,
+    creator: &CreatorPubky,
+    lock_id: &LockId,
+    path: &ContentLockPath,
+    content_lock: Option<locks_core::lock_policy::ContentLock>,
+) -> Result<Vec<String>, ApiError> {
     state
         .content_locks()
-        .delete_content_lock(&creator, &path)
+        .delete_content_lock(creator, path)
         .await?;
     if state
         .content_locks()
-        .get_content_lock(&creator, &path)
+        .get_content_lock(creator, path)
         .await?
         .is_some()
     {
@@ -322,7 +399,7 @@ async fn force_delete_content_lock(
         for resource_path in resource_paths {
             if state
                 .guarded_resources()
-                .delete_guarded_resource(&creator, &resource_path)
+                .delete_guarded_resource(creator, &resource_path)
                 .await
                 .is_err()
             {
@@ -334,7 +411,7 @@ async fn force_delete_content_lock(
     if failed_resource_paths.is_empty()
         && !state
             .content_lock_deletions()
-            .complete_force_deletion(&creator, &lock_id, state.clock().now())
+            .complete_synchronous_force_deletion(creator, lock_id, state.clock().now())
             .await?
     {
         return Err(ApiError::new(
@@ -342,42 +419,14 @@ async fn force_delete_content_lock(
             "content lock deletion receipt unavailable",
         ));
     }
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "lock_id": lock_id,
-            "lock_deleted": true,
-            "failed_resource_paths": failed_resource_paths
-        })),
-    ))
+    Ok(failed_resource_paths)
 }
 
 fn validate_content_lock_identity(
     content_lock: &locks_core::lock_policy::ContentLock,
     creator: &CreatorPubky,
     expected_lock_id: &LockId,
-    limits: crate::config::ContentLocksConfig,
 ) -> Result<(), ApiError> {
-    content_lock.validate_resource_set().map_err(|error| {
-        locks_service::application::errors::ApplicationError::InvalidGuardedResource {
-            message: error.to_string(),
-        }
-    })?;
-    validate_content_lock_resource_limits(
-        content_lock.resource_count(),
-        content_lock
-            .primary_resource
-            .iter()
-            .map(|resource| resource.size)
-            .chain(
-                content_lock
-                    .secondary_resources
-                    .values()
-                    .map(|resource| resource.size),
-            ),
-        limits,
-    )?;
     let actual_lock_id = content_lock
         .lock_id()
         .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "content lock unavailable"))?;
@@ -623,27 +672,6 @@ fn validate_content_lock_limits(
 ) -> Result<(), ApiError> {
     let primary_count = usize::from(request.primary_resource.is_some());
     let resource_count = primary_count + request.secondary_resources.len();
-    validate_content_lock_resource_limits(
-        resource_count,
-        request
-            .primary_resource
-            .iter()
-            .map(|resource| resource.size)
-            .chain(
-                request
-                    .secondary_resources
-                    .values()
-                    .map(|resource| resource.size),
-            ),
-        limits,
-    )
-}
-
-fn validate_content_lock_resource_limits(
-    resource_count: usize,
-    resource_sizes: impl IntoIterator<Item = u64>,
-    limits: crate::config::ContentLocksConfig,
-) -> Result<(), ApiError> {
     if resource_count > limits.max_resources {
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
@@ -655,9 +683,49 @@ fn validate_content_lock_resource_limits(
     }
 
     let mut total_size = 0_u64;
-    for resource_size in resource_sizes {
-        validate_descriptor_size(resource_size, &limits)?;
-        total_size = total_size.saturating_add(resource_size);
+    if let Some(primary_resource) = &request.primary_resource {
+        validate_descriptor_size(primary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(primary_resource.size);
+    }
+    for secondary_resource in request.secondary_resources.values() {
+        validate_descriptor_size(secondary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(secondary_resource.size);
+    }
+    if total_size > limits.max_total_resource_bytes {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "content lock total resource size exceeds {} bytes",
+                limits.max_total_resource_bytes
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_persisted_content_lock_limits(
+    content_lock: &locks_core::lock_policy::ContentLock,
+    limits: crate::config::ContentLocksConfig,
+) -> Result<(), ApiError> {
+    if content_lock.resource_count() > limits.max_resources {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "content lock must include at most {} resources",
+                limits.max_resources
+            ),
+        ));
+    }
+
+    let mut total_size = 0_u64;
+    if let Some(primary_resource) = &content_lock.primary_resource {
+        validate_descriptor_size(primary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(primary_resource.size);
+    }
+    for secondary_resource in content_lock.secondary_resources.values() {
+        validate_descriptor_size(secondary_resource.size, &limits)?;
+        total_size = total_size.saturating_add(secondary_resource.size);
     }
     if total_size > limits.max_total_resource_bytes {
         return Err(ApiError::new(

@@ -4,7 +4,7 @@ use locks_core::lock_policy::{GuardedResource, PRIVATE_RESOURCE_CONTENT_PATH_PRE
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::GuardedResourceRecord;
-use crate::application::ports::GuardedResourceRepository;
+use crate::application::ports::{GuardedResourceReadback, GuardedResourceRepository};
 use crate::infrastructure::pubky::storage_client::{
     PubkyBytesResource, PubkyHomeserverStorageClient,
 };
@@ -128,11 +128,28 @@ where
             .await?
             .is_some();
         if existed {
-            self.client
-                .delete_if_present_as_creator(creator, path)
-                .await?;
+            self.client.delete_as_creator(creator, path).await?;
         }
         Ok(existed)
+    }
+
+    async fn read_guarded_resource_generation(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        expected_hash: &GuardedResourceHash,
+    ) -> Result<GuardedResourceReadback, ApplicationError> {
+        ensure_private_resource_path(path)?;
+        let Some(metadata) = self.client.get_metadata_as_creator(creator, path).await? else {
+            return Ok(GuardedResourceReadback::Missing);
+        };
+        Ok(
+            if metadata.content_hash.as_ref() == Some(expected_hash.as_bytes()) {
+                GuardedResourceReadback::Exact
+            } else {
+                GuardedResourceReadback::Replaced
+            },
+        )
     }
 }
 
@@ -176,7 +193,10 @@ fn record_from_resource(
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
     use locks_core::ids::{CreatorPubky, GuardedResourceHash};
@@ -184,12 +204,12 @@ mod tests {
     use super::PubkyPrivResourceRepository;
     use crate::application::errors::ApplicationError;
     use crate::application::models::GuardedResourceRecord;
-    use crate::application::ports::GuardedResourceRepository;
+    use crate::application::ports::{GuardedResourceReadback, GuardedResourceRepository};
     use crate::application::use_cases::register_guarded_resource::{
         RegisterGuardedResourceRequest, RegisterGuardedResourceUseCase,
     };
     use crate::infrastructure::pubky::storage_client::{
-        PubkyBytesResource, PubkyDeleteOutcome, PubkyHomeserverStorageClient, PubkyResourceMetadata,
+        PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
     };
 
     #[tokio::test]
@@ -213,6 +233,32 @@ mod tests {
             ]
         );
         assert_eq!(repository.client().last_bytes(), record.bytes);
+    }
+
+    #[tokio::test]
+    async fn generation_read_uses_metadata_without_downloading_resource_bytes() {
+        let bytes = b"guarded bytes";
+        let expected = GuardedResourceHash::from_bytes(*blake3::hash(bytes).as_bytes());
+        let client = FakeStorageClient::default().with_metadata_read(Some(
+            PubkyResourceMetadata::from_bytes(bytes, Some("text/plain".to_owned())),
+        ));
+        let repository = PubkyPrivResourceRepository::new(client);
+
+        assert_eq!(
+            repository
+                .read_guarded_resource_generation(
+                    &creator(),
+                    "/priv/app.locks/content/example.txt",
+                    &expected,
+                )
+                .await
+                .unwrap(),
+            GuardedResourceReadback::Exact
+        );
+        assert_eq!(
+            repository.client().operations(),
+            vec!["get_metadata pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned()]
+        );
     }
 
     #[tokio::test]
@@ -560,7 +606,7 @@ mod tests {
             repository.client().operations(),
             vec![
                 "get_bytes pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
-                "delete_if_present pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
+                "delete pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy /priv/app.locks/content/example.txt".to_owned(),
             ]
         );
     }
@@ -583,25 +629,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn delete_guarded_resource_succeeds_when_resource_disappears_after_read() {
-        let client = FakeStorageClient::default()
-            .with_bytes_read(Some(PubkyBytesResource {
-                bytes: b"guarded bytes".to_vec(),
-                content_type: Some("text/plain".to_owned()),
-            }))
-            .with_delete_outcome(PubkyDeleteOutcome::NotFound);
-        let repository = PubkyPrivResourceRepository::new(client);
-
-        assert!(
-            repository
-                .delete_guarded_resource(&creator(), "/priv/app.locks/content/example.txt")
-                .await
-                .unwrap()
-        );
-        assert_eq!(repository.client().operations().len(), 2);
-    }
-
     #[derive(Debug, Default)]
     struct FakeStorageClient {
         bytes_read: Mutex<Option<PubkyBytesResource>>,
@@ -609,7 +636,7 @@ mod tests {
         replacement_after_put: Mutex<Option<PubkyBytesResource>>,
         last_bytes: Mutex<Option<Vec<u8>>>,
         operations: Mutex<Vec<String>>,
-        delete_outcome: Mutex<Option<PubkyDeleteOutcome>>,
+        fail_get: AtomicBool,
     }
 
     impl FakeStorageClient {
@@ -625,11 +652,6 @@ mod tests {
 
         fn with_replacement_after_put(self, value: PubkyBytesResource) -> Self {
             *self.replacement_after_put.lock().unwrap() = Some(value);
-            self
-        }
-
-        fn with_delete_outcome(self, outcome: PubkyDeleteOutcome) -> Self {
-            *self.delete_outcome.lock().unwrap() = Some(outcome);
             self
         }
 
@@ -696,6 +718,11 @@ mod tests {
             creator: &CreatorPubky,
             path: &str,
         ) -> Result<Option<PubkyBytesResource>, ApplicationError> {
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(ApplicationError::InvalidGuardedResource {
+                    message: "storage read failed".to_owned(),
+                });
+            }
             self.operations
                 .lock()
                 .unwrap()
@@ -724,23 +751,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("delete {creator} {path}"));
+            *self.bytes_read.lock().unwrap() = None;
             Ok(())
-        }
-
-        async fn delete_if_present_as_creator(
-            &self,
-            creator: &CreatorPubky,
-            path: &str,
-        ) -> Result<PubkyDeleteOutcome, ApplicationError> {
-            self.operations
-                .lock()
-                .unwrap()
-                .push(format!("delete_if_present {creator} {path}"));
-            Ok(self
-                .delete_outcome
-                .lock()
-                .unwrap()
-                .unwrap_or(PubkyDeleteOutcome::Deleted))
         }
     }
 

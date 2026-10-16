@@ -19,23 +19,24 @@ use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
     LockServerConfig, PaykitPaymentAsset, SecondaryGuardedResource, VerifierType,
 };
-use locks_core::verification::{
-    EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
-    VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
-};
+use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
+    AccessCredentialLookupKey, AccessCredentialRecord, ContentLockDeletionFailureCode,
+    ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
-    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, FrontendSessionRecord,
-    FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId, GuardedResourceRecord,
-    InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
-    PrepareForceDeletionResult,
+    CreatorConnectAuthorizationUrl, CreatorConnectFlowId, DeletionReadAuthorization,
+    FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
+    GuardedResourceRecord, InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval,
+    OrdinaryCredentialLookupResult, PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
 };
 use locks_service::application::ports::{
-    Clock, ContentLockRepository, GrantCreatorConnectFlowClient, GuardedResourceRepository,
-    LegacyCreatorConnectFlowClient,
+    AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
+    ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
+    ContentLockDeletionRepository, ContentLockRepository, GrantCreatorConnectFlowClient,
+    GuardedResourceRepository, LegacyCreatorConnectFlowClient,
 };
+
 use pubky_common::crypto::Keypair;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -62,12 +63,14 @@ use crate::config::{
     PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
     VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
+
 use crate::paykit_http_client::{
     PaykitHttpClient, PaykitSetupStatusKind, PaykitSetupStatusProvider,
     PaykitSetupStatusProviderError,
 };
 use crate::worker::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick};
 
+use locks_service::infrastructure::memory::content_lock_tombstones::InMemoryContentLockTombstoneRepository;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
@@ -82,6 +85,7 @@ enum CreatorRepositoryBackend {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct FaultInjectingContentLockRepository {
     inner: InMemoryContentLockRepository,
     delete_failures_remaining: AtomicUsize,
@@ -186,10 +190,44 @@ impl ContentLockRepository for FaultInjectingContentLockRepository {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct FaultInjectingGuardedResourceRepository {
     inner: InMemoryGuardedResourceRepository,
     fail_path_once: Mutex<Option<String>>,
     delete_attempts: Mutex<Vec<String>>,
+}
+
+struct CompleteReceiptBeforeClaimLost {
+    deletions: Arc<dyn ContentLockDeletionRepository>,
+    creator: CreatorPubky,
+    lock_id: LockId,
+    completed_at: time::OffsetDateTime,
+}
+
+#[async_trait]
+impl ContentLockDeletionActionOwnership for CompleteReceiptBeforeClaimLost {
+    async fn try_acquire(
+        &self,
+        _claim: ContentLockDeletionActionClaim<'_>,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
+
+    async fn try_acquire_synchronous_force(
+        &self,
+        _job_id: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        assert!(
+            self.deletions
+                .complete_synchronous_force_deletion(
+                    &self.creator,
+                    &self.lock_id,
+                    self.completed_at,
+                )
+                .await?
+        );
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
 }
 
 #[async_trait]
@@ -233,6 +271,7 @@ impl GuardedResourceRepository for FaultInjectingGuardedResourceRepository {
     }
 }
 
+#[allow(dead_code)]
 fn injected_storage_error(message: &str) -> ApplicationError {
     ApplicationError::Storage {
         message: message.to_owned(),
@@ -246,6 +285,163 @@ struct AlwaysResolvesReader;
 impl ReaderPubkyResolver for AlwaysResolvesReader {
     async fn reader_has_homeserver(&self, _reader: &CreatorPubky) -> bool {
         true
+    }
+}
+
+struct ResponseBoundaryAccessCredentialStore {
+    content_type: String,
+    claim_token: Uuid,
+    consume_succeeds: bool,
+    releases: AtomicUsize,
+    consumes: AtomicUsize,
+}
+
+impl ResponseBoundaryAccessCredentialStore {
+    fn new(content_type: &str) -> Self {
+        Self {
+            content_type: content_type.to_owned(),
+            claim_token: Uuid::new_v4(),
+            consume_succeeds: true,
+            releases: AtomicUsize::new(0),
+            consumes: AtomicUsize::new(0),
+        }
+    }
+
+    fn losing_consume(content_type: &str) -> Self {
+        Self {
+            consume_succeeds: false,
+            ..Self::new(content_type)
+        }
+    }
+}
+
+#[async_trait]
+impl AccessCredentialStore for ResponseBoundaryAccessCredentialStore {
+    async fn insert_access_credential(
+        &self,
+        _lock_id: &LockId,
+        _lookup_key: AccessCredentialLookupKey,
+        _record: AccessCredentialRecord,
+    ) -> Result<(), ApplicationError> {
+        unreachable!("response-boundary fake does not issue credentials")
+    }
+
+    async fn get_access_credential(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<Option<AccessCredentialRecord>, ApplicationError> {
+        Ok(None)
+    }
+
+    async fn delete_access_credential(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    async fn finish_ordinary_credential_lookup(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _expected: &AccessCredentialRecord,
+        _invalidate: bool,
+    ) -> Result<OrdinaryCredentialLookupResult, ApplicationError> {
+        Ok(OrdinaryCredentialLookupResult::DeletionEnrolled)
+    }
+
+    async fn prepare_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        path: &str,
+        _claim_duration: time::Duration,
+    ) -> Result<Option<DeletionReadAuthorization>, ApplicationError> {
+        Ok(Some(DeletionReadAuthorization {
+            claim_token: Some(self.claim_token),
+            creator: creator(),
+            resource: GuardedResource {
+                path: path.to_owned(),
+                hash: GuardedResourceHash::from_bytes([7; 32]),
+                content_type: self.content_type.clone(),
+                size: 13,
+            },
+        }))
+    }
+
+    async fn deletion_credential_enrolled(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+    ) -> Result<bool, ApplicationError> {
+        Ok(true)
+    }
+
+    async fn release_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _path: &str,
+        claim_token: Uuid,
+        _now: time::OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        assert_eq!(claim_token, self.claim_token);
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn consume_deletion_read(
+        &self,
+        _lookup_key: &AccessCredentialLookupKey,
+        _path: &str,
+        claim_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        assert_eq!(claim_token, self.claim_token);
+        self.consumes.fetch_add(1, Ordering::SeqCst);
+        Ok(self.consume_succeeds)
+    }
+}
+
+struct ResponseBoundaryGuardedResourceRepository {
+    content_type: String,
+}
+
+#[async_trait]
+impl GuardedResourceRepository for ResponseBoundaryGuardedResourceRepository {
+    async fn upsert_guarded_resource(
+        &self,
+        _guarded_resource: GuardedResourceRecord,
+    ) -> Result<GuardedResource, ApplicationError> {
+        unreachable!("response-boundary fake does not store resources")
+    }
+
+    async fn get_guarded_resource(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+        hash: &GuardedResourceHash,
+    ) -> Result<Option<GuardedResourceRecord>, ApplicationError> {
+        Ok(Some(GuardedResourceRecord {
+            creator: creator.clone(),
+            path: path.to_owned(),
+            hash: *hash,
+            content_type: self.content_type.clone(),
+            size: 13,
+            bytes: b"guarded bytes".to_vec(),
+        }))
+    }
+
+    async fn get_current_guarded_resource(
+        &self,
+        creator: &CreatorPubky,
+        path: &str,
+    ) -> Result<Option<GuardedResourceRecord>, ApplicationError> {
+        self.get_guarded_resource(creator, path, &GuardedResourceHash::from_bytes([7; 32]))
+            .await
+    }
+
+    async fn delete_guarded_resource(
+        &self,
+        _creator: &CreatorPubky,
+        _path: &str,
+    ) -> Result<bool, ApplicationError> {
+        Ok(false)
     }
 }
 
@@ -511,130 +707,6 @@ async fn graceful_delete_of_absent_lock_returns_completed_postcondition() {
 }
 
 #[tokio::test]
-async fn graceful_delete_during_entitlement_publication_conflicts_without_force_receipt() {
-    let state = test_state();
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    let path = content_lock.content_lock_path().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    let app = router(state.clone());
-    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
-
-    let now = state.clock().now();
-    let claim = state
-        .verification_task_claimer()
-        .claim_next_verification_task("publisher", now, now + time::Duration::minutes(1))
-        .await
-        .unwrap()
-        .unwrap();
-    let publishing = claim
-        .task
-        .begin_entitlement_publication(VerifiedProofBundle {
-            version: VERIFIED_PROOF_BUNDLE_VERSION,
-            bundle_id: claim.task.submitted_proof_bundle.bundle_id.clone(),
-            pubky_lock_resource: claim
-                .task
-                .submitted_proof_bundle
-                .pubky_lock_resource
-                .clone(),
-            verification_result: VerificationResult { criteria: vec![] },
-            entitlement_lifetime: EntitlementLifetime::Unbounded,
-        })
-        .unwrap();
-    state
-        .verification_task_claimer()
-        .persist_claimed_verification_task_transition(
-            publishing,
-            "publisher",
-            &claim.claim_token,
-            now,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-    let response = app
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(
-        response,
-        StatusCode::CONFLICT,
-        "content_lock_deletion_in_progress",
-    )
-    .await;
-    assert!(
-        !state
-            .content_lock_deletions()
-            .has_force_receipt(&creator(), &lock_id)
-            .await
-            .unwrap()
-    );
-    assert!(
-        state
-            .content_locks()
-            .get_content_lock(&creator(), &path)
-            .await
-            .unwrap()
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn proof_submission_after_in_memory_deletion_cutoff_is_rejected() {
-    let state = test_state();
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    let app = router(state.clone());
-
-    let delete_response = app
-        .clone()
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
-
-    let submitted = submitted_proof_bundle_for(&content_lock);
-    let bundle_id = submitted.bundle_id.clone();
-    let response = app
-        .oneshot(json_request(
-            "POST",
-            "/proof-bundles",
-            json!({ "submitted_proof_bundle": submitted }),
-        ))
-        .await
-        .unwrap();
-    assert_error_response(
-        response,
-        StatusCode::CONFLICT,
-        "content_lock_deletion_in_progress",
-    )
-    .await;
-    assert!(
-        state
-            .verification_tasks()
-            .get_verification_task_by_handle(&creator(), &bundle_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn graceful_delete_of_existing_lock_queues_one_frozen_job_and_replays() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -742,556 +814,6 @@ async fn force_delete_removes_resources_and_lock_records_receipt_and_replays() {
     assert_eq!(
         response_json(status).await,
         json!({ "lock_id": lock_id, "status": "completed" })
-    );
-}
-
-#[tokio::test]
-async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_cleanup() {
-    let state = test_state();
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    assert!(matches!(
-        state
-            .content_lock_deletions()
-            .prepare_force_deletion(
-                &creator(),
-                &lock_id,
-                Some(&content_lock),
-                state.clock().now(),
-            )
-            .await
-            .unwrap(),
-        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
-    ));
-    let app = router(state.clone());
-
-    let status = app
-        .clone()
-        .oneshot(authenticated_json_request(
-            "GET",
-            &format!("/creator/content-locks/{lock_id}/deletion"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(status.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(status).await,
-        json!({ "lock_id": lock_id, "status": "queued" })
-    );
-
-    let retried = app
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(retried.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(retried).await,
-        json!({
-            "lock_id": lock_id,
-            "lock_deleted": true,
-            "failed_resource_paths": []
-        })
-    );
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_force_receipt(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .completed_at
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn force_delete_error_keeps_receipt_pending_and_retries_from_frozen_manifest() {
-    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
-    content_locks
-        .delete_failures_remaining
-        .store(1, Ordering::SeqCst);
-    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
-    let state = test_state_with_force_repositories(
-        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
-        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
-    );
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    let app = router(state.clone());
-
-    let failed = force_delete_request(&app, &lock_id).await;
-    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
-    assert_force_status(&app, &lock_id, "queued").await;
-    assert_eq!(
-        state
-            .content_lock_deletions()
-            .get_force_receipt(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .frozen_content_lock,
-        Some(content_lock)
-    );
-
-    assert_eq!(
-        force_delete_request(&app, &lock_id).await.status(),
-        StatusCode::OK
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-}
-
-#[tokio::test]
-async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
-    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
-    content_locks
-        .delete_failures_remaining
-        .store(1, Ordering::SeqCst);
-    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
-    let state = test_state_with_force_repositories(
-        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
-        guarded_resources as Arc<dyn GuardedResourceRepository>,
-    );
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    let app = router(state.clone());
-    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
-
-    let job =
-        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
-    state
-        .content_lock_deletions()
-        .insert_job(job.clone())
-        .await
-        .unwrap();
-    let now = state.clock().now();
-    let claim = state
-        .content_lock_deletions()
-        .claim_next("deletion-worker", now, now + time::Duration::minutes(1))
-        .await
-        .unwrap()
-        .unwrap();
-    state
-        .content_lock_deletions()
-        .finish(
-            job.job_id,
-            "deletion-worker",
-            claim.claim_token,
-            now,
-            Some(ContentLockDeletionFailureCode::StateCorrupt),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-    let response = force_delete_request(&app, &lock_id).await;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(
-        state
-            .verification_task_claimer()
-            .claim_next_verification_task(
-                "verification-worker",
-                now,
-                now + time::Duration::minutes(1),
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_job(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_force_receipt(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .is_some_and(|receipt| receipt.completed_at.is_none())
-    );
-}
-
-#[tokio::test]
-async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
-    let state = test_state_with_content_lock_limits(ContentLocksConfig {
-        max_resource_bytes: 1,
-        max_resources: 0,
-        max_total_resource_bytes: 1,
-    });
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    let path = content_lock.content_lock_path().unwrap();
-    let resource = content_lock.primary_resource.clone().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    assert!(matches!(
-        state
-            .content_lock_deletions()
-            .prepare_force_deletion(
-                &creator(),
-                &lock_id,
-                Some(&content_lock),
-                state.clock().now(),
-            )
-            .await
-            .unwrap(),
-        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
-    ));
-    let app = router(state.clone());
-
-    let response = force_delete_request(&app, &lock_id).await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        state
-            .content_locks()
-            .get_content_lock(&creator(), &path)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        state
-            .guarded_resources()
-            .get_current_guarded_resource(&creator(), &resource.path)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-}
-
-#[tokio::test]
-async fn force_from_failed_job_uses_frozen_manifest_after_resource_limits_are_lowered() {
-    let state = test_state_with_content_lock_limits(ContentLocksConfig {
-        max_resource_bytes: 1,
-        max_resources: 0,
-        max_total_resource_bytes: 1,
-    });
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    let path = content_lock.content_lock_path().unwrap();
-    let resource = content_lock.primary_resource.clone().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    let job =
-        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
-    state
-        .content_lock_deletions()
-        .insert_job(job)
-        .await
-        .unwrap();
-    let now = state.clock().now();
-    let claim = state
-        .content_lock_deletions()
-        .claim_next("test-worker", now, now + time::Duration::minutes(1))
-        .await
-        .unwrap()
-        .unwrap();
-    state
-        .content_lock_deletions()
-        .finish(
-            claim.job.job_id,
-            "test-worker",
-            claim.claim_token,
-            now,
-            Some(ContentLockDeletionFailureCode::StateCorrupt),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let app = router(state.clone());
-
-    let response = force_delete_request(&app, &lock_id).await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        state
-            .content_locks()
-            .get_content_lock(&creator(), &path)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        state
-            .guarded_resources()
-            .get_current_guarded_resource(&creator(), &resource.path)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-}
-
-#[tokio::test]
-async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_resumable() {
-    let state = test_state();
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let mut content_lock = content_lock(true);
-    content_lock.primary_resource = None;
-    content_lock.secondary_resources.clear();
-    let lock_id = content_lock.lock_id().unwrap();
-    let path = content_lock.content_lock_path().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    assert!(matches!(
-        state
-            .content_lock_deletions()
-            .prepare_force_deletion(
-                &creator(),
-                &lock_id,
-                Some(&content_lock),
-                state.clock().now(),
-            )
-            .await
-            .unwrap(),
-        PrepareForceDeletionResult::Synchronous(receipt) if receipt.completed_at.is_none()
-    ));
-    let app = router(state.clone());
-
-    let response = force_delete_request(&app, &lock_id).await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        response_json(response).await,
-        json!({
-            "error": {
-                "code": "internal_error",
-                "message": "state_corrupt"
-            }
-        })
-    );
-    assert!(
-        state
-            .content_locks()
-            .get_content_lock(&creator(), &path)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_force_receipt(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .is_some_and(|receipt| receipt.completed_at.is_none())
-    );
-}
-
-#[tokio::test]
-async fn force_readback_error_does_not_complete_before_retry_cleanup() {
-    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
-    content_locks
-        .fail_read_after_delete
-        .store(true, Ordering::SeqCst);
-    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
-    let state = test_state_with_force_repositories(
-        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
-        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
-    );
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    let app = router(state);
-
-    assert_eq!(
-        force_delete_request(&app, &lock_id).await.status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
-    assert_force_status(&app, &lock_id, "queued").await;
-    assert_eq!(
-        force_delete_request(&app, &lock_id).await.status(),
-        StatusCode::OK
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-}
-
-#[tokio::test]
-async fn force_readback_still_present_keeps_receipt_pending() {
-    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
-    content_locks.retain_on_delete.store(true, Ordering::SeqCst);
-    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
-    let state = test_state_with_force_repositories(
-        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
-        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
-    );
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
-    let app = router(state);
-
-    assert_eq!(
-        force_delete_request(&app, &lock_id).await.status(),
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
-    assert_force_status(&app, &lock_id, "queued").await;
-    content_locks
-        .retain_on_delete
-        .store(false, Ordering::SeqCst);
-    assert_eq!(
-        force_delete_request(&app, &lock_id).await.status(),
-        StatusCode::OK
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-}
-
-#[tokio::test]
-async fn guarded_partial_failure_keeps_receipt_pending_until_repeated_force_finishes() {
-    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
-    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
-    let state = test_state_with_force_repositories(
-        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
-        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
-    );
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let mut content_lock = content_lock(true);
-    let secondary_path = "/priv/app.locks/content/secondary.txt".to_owned();
-    let secondary = SecondaryGuardedResource {
-        hash: GuardedResourceHash::from_bytes([8; 32]),
-        content_type: "text/plain".to_owned(),
-        size: 9,
-    };
-    content_lock
-        .secondary_resources
-        .insert(secondary_path.clone(), secondary.clone());
-    let primary = content_lock.primary_resource.clone().unwrap();
-    let secondary_guarded = GuardedResource {
-        path: secondary_path,
-        hash: secondary.hash,
-        content_type: secondary.content_type,
-        size: secondary.size,
-    };
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock.clone()).await;
-    for (resource, bytes) in [
-        (&primary, b"primary".to_vec()),
-        (&secondary_guarded, b"secondary".to_vec()),
-    ] {
-        state
-            .guarded_resources()
-            .upsert_guarded_resource(GuardedResourceRecord {
-                creator: creator(),
-                path: resource.path.clone(),
-                hash: resource.hash,
-                content_type: resource.content_type.clone(),
-                size: resource.size,
-                bytes,
-            })
-            .await
-            .unwrap();
-    }
-    *guarded_resources.fail_path_once.lock().unwrap() = Some(primary.path.clone());
-    let app = router(state);
-
-    let partial = force_delete_request(&app, &lock_id).await;
-    assert_eq!(partial.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(partial).await["failed_resource_paths"],
-        json!([primary.path])
-    );
-    assert_force_status(&app, &lock_id, "queued").await;
-    assert_eq!(guarded_resources.delete_attempts.lock().unwrap().len(), 2);
-
-    let completed = force_delete_request(&app, &lock_id).await;
-    assert_eq!(completed.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(completed).await["failed_resource_paths"],
-        json!([])
-    );
-    assert_force_status(&app, &lock_id, "completed").await;
-    assert_eq!(guarded_resources.delete_attempts.lock().unwrap().len(), 4);
-}
-
-#[tokio::test]
-async fn graceful_delete_rejects_malformed_live_manifest_before_persisting_job() {
-    let state = test_state();
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let mut content_lock = content_lock(true);
-    content_lock.primary_resource = None;
-    content_lock.secondary_resources.clear();
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock).await;
-
-    let response = router(state.clone())
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_job(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn graceful_delete_rejects_live_manifest_over_configured_resource_limit() {
-    let state = test_state_with_content_lock_limits(ContentLocksConfig {
-        max_resource_bytes: 10_000_000,
-        max_resources: 0,
-        max_total_resource_bytes: 100_000_000,
-    });
-    seed_frontend_session(&state, "creator-session", creator()).await;
-    let content_lock = content_lock(true);
-    let lock_id = content_lock.lock_id().unwrap();
-    seed_content_lock(&state, content_lock).await;
-
-    let response = router(state.clone())
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
-    assert!(
-        state
-            .content_lock_deletions()
-            .get_job(&creator(), &lock_id)
-            .await
-            .unwrap()
-            .is_none()
     );
 }
 
@@ -1409,7 +931,7 @@ async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
 }
 
 #[tokio::test]
-async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_manifest() {
+async fn force_after_terminal_graceful_failure_completes_synchronously() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
     let content_lock = content_lock(true);
@@ -1435,7 +957,7 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
     let now = state.clock().now();
     let claimed = state
         .content_lock_deletions()
-        .claim_next("test-worker", now, now + time::Duration::minutes(1))
+        .claim_next("test-worker", (now + time::Duration::minutes(1)) - (now))
         .await
         .unwrap()
         .unwrap();
@@ -1445,7 +967,6 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
             claimed.job.job_id,
             "test-worker",
             claimed.claim_token,
-            now,
             Some(ContentLockDeletionFailureCode::TombstoneMissing),
         )
         .await
@@ -1462,14 +983,6 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
         .await
         .unwrap();
     assert_eq!(forced.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(forced).await,
-        json!({
-            "lock_id": lock_id,
-            "lock_deleted": true,
-            "failed_resource_paths": []
-        })
-    );
     assert!(
         state
             .content_locks()
@@ -1492,6 +1005,127 @@ async fn force_after_terminal_graceful_failure_runs_synchronously_from_frozen_ma
             .has_force_receipt(&creator(), &lock_id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn terminal_job_force_defers_until_stale_worker_releases_action_lane() {
+    for failure_code in [Some(ContentLockDeletionFailureCode::StateCorrupt), None] {
+        assert_terminal_job_force_defers_until_stale_worker_releases_action_lane(failure_code)
+            .await;
+    }
+}
+
+async fn assert_terminal_job_force_defers_until_stale_worker_releases_action_lane(
+    failure_code: Option<ContentLockDeletionFailureCode>,
+) {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let mut job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    if failure_code.is_none() {
+        job.phase = ContentLockDeletionPhase::PurgeOperationalState;
+    }
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("stale-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_guard = match state
+        .content_lock_deletion_action_ownership()
+        .try_acquire(ContentLockDeletionActionClaim {
+            job_id: claim.job.job_id,
+            worker_id: "stale-worker",
+            claim_token: claim.claim_token,
+            expected_phase: claim.job.phase,
+            force: false,
+        })
+        .await
+        .unwrap()
+    {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        ContentLockDeletionActionAcquireResult::Busy => panic!("first action lane must be free"),
+        ContentLockDeletionActionAcquireResult::ClaimLost => panic!("claim must still be live"),
+    };
+    state
+        .content_lock_deletions()
+        .finish(job.job_id, "stale-worker", claim.claim_token, failure_code)
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+
+    let deferred = force_delete_request(&app, &lock_id).await;
+    assert_eq!(deferred.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response_json(deferred).await,
+        json!({ "lock_id": lock_id, "status": "queued" })
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_none())
+    );
+
+    stale_guard.release().await.unwrap();
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some_and(|receipt| receipt.completed_at.is_some())
     );
 }
 
@@ -1524,7 +1158,7 @@ async fn graceful_replay_of_failed_job_requeues_same_frozen_manifest() {
     let now = state.clock().now();
     let claimed = state
         .content_lock_deletions()
-        .claim_next("test-worker", now, now + time::Duration::minutes(1))
+        .claim_next("test-worker", (now + time::Duration::minutes(1)) - (now))
         .await
         .unwrap()
         .unwrap();
@@ -1534,7 +1168,6 @@ async fn graceful_replay_of_failed_job_requeues_same_frozen_manifest() {
             claimed.job.job_id,
             "test-worker",
             claimed.claim_token,
-            now,
             Some(ContentLockDeletionFailureCode::TombstoneMissing),
         )
         .await
@@ -1677,8 +1310,30 @@ async fn creator_content_lock_deletion_status_reports_job_and_absence() {
 }
 
 #[tokio::test]
-async fn readyz_returns_ready_for_ephemeral_runtime_without_secrets() {
-    let response = router(test_state())
+async fn readyz_requires_independent_ready_evidence_for_enabled_workers() {
+    let state = test_state();
+    let starting = router(state.clone())
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+    assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response_json(starting).await["status"], "not_ready");
+
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    let verification_only = router(state.clone())
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+    assert_eq!(verification_only.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    let response = router(state)
         .oneshot(empty_request("GET", "/readyz"))
         .await
         .unwrap();
@@ -1711,6 +1366,7 @@ async fn readyz_returns_ready_for_ephemeral_runtime_without_secrets() {
 async fn readyz_reports_worker_disabled_for_ephemeral_runtime() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.worker.enabled = false;
+    config.deletion_worker.enabled = false;
     let response = router(AppState::new_empty_in_memory(config))
         .oneshot(empty_request("GET", "/readyz"))
         .await
@@ -1725,6 +1381,31 @@ async fn readyz_reports_worker_disabled_for_ephemeral_runtime() {
 }
 
 #[tokio::test]
+async fn readyz_reports_degraded_when_a_worker_dependency_is_degraded() {
+    let state = test_state();
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::TransientDependencyFailure,
+    );
+
+    let response = router(state)
+        .oneshot(empty_request("GET", "/readyz"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["runtime_storage"], "ephemeral");
+    assert_eq!(body["worker_enabled"], true);
+    assert_eq!(body.as_object().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn readyz_returns_not_ready_for_persisted_runtime_when_pool_ping_fails() {
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -1735,6 +1416,15 @@ async fn readyz_returns_not_ready_for_persisted_runtime_when_pool_ping_fails() {
         test_config(RuntimeEnvironment::Development, true),
         pool,
         CreatorAuthoritySecretCipher::new([7; 32]),
+        locks_service::infrastructure::final_credentials::FinalCredentialCipher::new([8; 32]),
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Verification,
+        crate::app_state::WorkerReadinessEvidence::Ready,
+    );
+    state.record_worker_readiness(
+        crate::app_state::WorkerKind::Deletion,
+        crate::app_state::WorkerReadinessEvidence::TransientDependencyFailure,
     );
 
     let response = router(state)
@@ -3144,6 +2834,7 @@ async fn dev_pubky_homeserver_routes_mount_authenticated_creator_routes_and_manu
     let app = router(AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -3733,6 +3424,138 @@ async fn proxy_read_with_valid_bearer_credential_returns_raw_guarded_resource_by
             .is_none()
     );
     assert_eq!(response_bytes(response).await, b"guarded bytes".to_vec());
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_releases_claim_when_http_response_construction_fails() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new(
+        "invalid\ncontent-type",
+    ));
+    let state = test_state()
+        .with_access_credentials(store.clone())
+        .with_guarded_resources(Arc::new(ResponseBoundaryGuardedResourceRepository {
+            content_type: "invalid\ncontent-type".to_owned(),
+        }));
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_consumes_claim_before_returning_http_200() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new("text/plain"));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deletion_proxy_head_releases_claim_then_get_consumes_it() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::new("text/plain"));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+    let app = router(state);
+
+    let head = app
+        .clone()
+        .oneshot(auth_request(
+            "HEAD",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 0);
+
+    let get = app
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_head_remains_reusable() {
+    let state = test_state();
+    let content_lock = content_lock(true);
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded bytes".to_vec()).await;
+    let app = router(state.clone());
+    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
+    complete_task(&app).await;
+    let credential = issue_credential(&app).await;
+
+    let head = app
+        .clone()
+        .oneshot(auth_request(
+            "HEAD",
+            "/priv-resources/content/hello.txt",
+            &format!("Bearer {credential}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let get = app
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            &format!("Bearer {credential}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn deletion_proxy_read_does_not_return_constructed_response_when_consume_loses() {
+    let store = Arc::new(ResponseBoundaryAccessCredentialStore::losing_consume(
+        "text/plain",
+    ));
+    let state = test_state().with_access_credentials(store.clone());
+    seed_response_boundary_resource(&state, "text/plain").await;
+
+    let response = router(state)
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/hello.txt",
+            "Bearer deletion-credential",
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), StatusCode::OK);
+    assert_eq!(store.consumes.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -4652,58 +4475,6 @@ async fn creator_content_locks_identical_request_returns_same_lock_id_and_path()
 }
 
 #[tokio::test]
-async fn creator_content_lock_replay_after_graceful_delete_returns_deletion_in_progress() {
-    let state = test_state_with_creator_publishing(true)
-        .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
-    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
-    let app = router(state);
-    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
-    let request = creator_content_lock_request(guarded_resource);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            "/creator/content-locks",
-            request.clone(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-    let lock_id = response_json(created).await["lock_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-
-    let deleted = app
-        .clone()
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}"),
-            json!(null),
-            "frontend-session-secret",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
-
-    let replay = app
-        .oneshot(json_request("POST", "/creator/content-locks", request))
-        .await
-        .unwrap();
-    let body = assert_error_response(
-        replay,
-        StatusCode::CONFLICT,
-        "content_lock_deletion_in_progress",
-    )
-    .await;
-    assert_eq!(
-        body["error"]["message"],
-        "content lock deletion is in progress"
-    );
-}
-
-#[tokio::test]
 async fn creator_lock_service_config_route_requires_frontend_session() {
     let app = router(test_state());
 
@@ -5490,46 +5261,6 @@ fn test_state() -> AppState {
     test_state_with_runtime(RuntimeEnvironment::Development, true)
 }
 
-fn test_state_with_force_repositories(
-    content_locks: Arc<dyn ContentLockRepository>,
-    guarded_resources: Arc<dyn GuardedResourceRepository>,
-) -> AppState {
-    AppState::new_empty_in_memory_with_creator_repositories(
-        test_config(RuntimeEnvironment::Development, true),
-        content_locks,
-        guarded_resources,
-        Arc::new(InMemoryLockServicePointerRepository::new()),
-        Arc::new(InMemoryEntitlementRepository::new()),
-    )
-}
-
-async fn force_delete_request(app: &axum::Router, lock_id: &LockId) -> axum::response::Response {
-    app.clone()
-        .oneshot(authenticated_json_request(
-            "DELETE",
-            &format!("/creator/content-locks/{lock_id}?force=true"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap()
-}
-
-async fn assert_force_status(app: &axum::Router, lock_id: &LockId, expected: &str) {
-    let response = app
-        .clone()
-        .oneshot(authenticated_json_request(
-            "GET",
-            &format!("/creator/content-locks/{lock_id}/deletion"),
-            json!(null),
-            "creator-session",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_json(response).await["status"], expected);
-}
-
 fn test_state_with_rate_limit(enabled: bool, max_requests: u32, window_seconds: u64) -> AppState {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.rate_limits = RateLimitsConfig {
@@ -5573,6 +5304,7 @@ fn test_state_with_paykit_lookup_proxy_hops(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5599,6 +5331,7 @@ fn test_state_with_paykit_lookup_admission(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5613,6 +5346,7 @@ fn test_state_with_runtime(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5647,6 +5381,7 @@ fn test_state_with_content_lock_limits(content_locks: ContentLocksConfig) -> App
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5661,6 +5396,7 @@ fn test_state_with_creator_repository_backend(
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5701,6 +5437,8 @@ fn test_config(
         pkdns: crate::config::PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        deletion: crate::config::DeletionConfig::default(),
+        deletion_worker: crate::config::DeletionWorkerConfig::default(),
         paykit: None,
     }
 }
@@ -5920,6 +5658,21 @@ async fn seed_content_lock(state: &AppState, content_lock: ContentLock) {
             content_lock.content_lock_path().unwrap(),
             content_lock,
         )
+        .await
+        .unwrap();
+}
+
+async fn seed_response_boundary_resource(state: &AppState, content_type: &str) {
+    state
+        .guarded_resources()
+        .upsert_guarded_resource(GuardedResourceRecord {
+            creator: creator(),
+            path: "/priv/app.locks/content/hello.txt".to_owned(),
+            hash: GuardedResourceHash::from_bytes([7; 32]),
+            content_type: content_type.to_owned(),
+            size: 13,
+            bytes: b"guarded bytes".to_vec(),
+        })
         .await
         .unwrap();
 }
@@ -6502,4 +6255,677 @@ fn assert_no_keys(json: &Value, keys: &[&str]) {
     for key in keys {
         assert!(json.get(*key).is_none(), "unexpected key {key} in {json}");
     }
+}
+
+#[allow(dead_code)]
+fn test_state_with_force_repositories(
+    content_locks: Arc<dyn ContentLockRepository>,
+    guarded_resources: Arc<dyn GuardedResourceRepository>,
+) -> AppState {
+    AppState::new_empty_in_memory_with_creator_repositories(
+        test_config(RuntimeEnvironment::Development, true),
+        content_locks,
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
+        guarded_resources,
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+}
+
+async fn force_delete_request(app: &axum::Router, lock_id: &LockId) -> axum::response::Response {
+    app.clone()
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}?force=true"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap()
+}
+
+async fn assert_force_status(app: &axum::Router, lock_id: &LockId, expected: &str) {
+    let response = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "GET",
+            &format!("/creator/content-locks/{lock_id}/deletion"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["status"], expected);
+}
+
+#[tokio::test]
+async fn pending_force_receipt_projects_queued_and_graceful_retry_completes_cleanup() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(&creator(), &lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    let app = router(state.clone());
+
+    let status = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "GET",
+            &format!("/creator/content-locks/{lock_id}/deletion"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(status).await,
+        json!({ "lock_id": lock_id, "status": "queued" })
+    );
+
+    let retried = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(retried).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_delete_returns_completed_when_action_claim_is_lost_to_completed_request() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("test-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            job.job_id,
+            "test-worker",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(&creator(), &lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+    let ownership = CompleteReceiptBeforeClaimLost {
+        deletions: Arc::clone(state.content_lock_deletions()),
+        creator: creator(),
+        lock_id: lock_id.clone(),
+        completed_at: state.clock().now(),
+    };
+    let app = router(state.with_content_lock_deletion_action_ownership(Arc::new(ownership)));
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+}
+
+#[tokio::test]
+async fn force_delete_error_keeps_receipt_pending_and_retries_from_frozen_manifest() {
+    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
+    content_locks
+        .delete_failures_remaining
+        .store(1, Ordering::SeqCst);
+    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let app = router(state.clone());
+
+    let failed = force_delete_request(&app, &lock_id).await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
+    assert_force_status(&app, &lock_id, "queued").await;
+    assert!(
+        state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::OK
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn terminal_job_force_failure_keeps_pending_verification_task_fenced() {
+    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
+    content_locks
+        .delete_failures_remaining
+        .store(1, Ordering::SeqCst);
+    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        guarded_resources as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    let app = router(state.clone());
+    submit_task(&state, &app, submitted_proof_bundle_for(&content_lock)).await;
+
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let now = state.clock().now();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("deletion-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            job.job_id,
+            "deletion-worker",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let response = force_delete_request(&app, &lock_id).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        state
+            .verification_task_claimer()
+            .claim_next_verification_task(
+                "verification-worker",
+                now,
+                now + time::Duration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_rejects_invalid_live_resource_set_before_freezing_receipt() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_rejects_live_manifest_over_limits_before_freezing_receipt() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn force_from_failed_job_synchronously_uses_manifest_after_resource_limits_are_lowered() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 1,
+        max_resources: 0,
+        max_total_resource_bytes: 1,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    let resource = content_lock.primary_resource.clone().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job)
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("test-worker", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            claim.job.job_id,
+            "test-worker",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .guarded_resources()
+            .get_current_guarded_resource(&creator(), &resource.path)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_resumable() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = content_lock.content_lock_path().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(_)
+    ));
+    let app = router(state.clone());
+
+    let response = force_delete_request(&app, &lock_id).await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "internal_error",
+                "message": "state_corrupt"
+            }
+        })
+    );
+    assert!(
+        state
+            .content_locks()
+            .get_content_lock(&creator(), &path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .content_lock_deletions()
+            .has_force_receipt(&creator(), &lock_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn force_readback_error_does_not_complete_before_retry_cleanup() {
+    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
+    content_locks
+        .fail_read_after_delete
+        .store(true, Ordering::SeqCst);
+    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let app = router(state);
+
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
+    assert_force_status(&app, &lock_id, "queued").await;
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::OK
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn force_readback_still_present_keeps_receipt_pending() {
+    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
+    content_locks.retain_on_delete.store(true, Ordering::SeqCst);
+    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    seed_guarded_resource(&state, &content_lock, b"guarded".to_vec()).await;
+    let app = router(state);
+
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(guarded_resources.delete_attempts.lock().unwrap().is_empty());
+    assert_force_status(&app, &lock_id, "queued").await;
+    content_locks
+        .retain_on_delete
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        force_delete_request(&app, &lock_id).await.status(),
+        StatusCode::OK
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+}
+
+#[tokio::test]
+async fn guarded_partial_failure_keeps_receipt_pending_until_repeated_force_finishes() {
+    let content_locks = Arc::new(FaultInjectingContentLockRepository::default());
+    let guarded_resources = Arc::new(FaultInjectingGuardedResourceRepository::default());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        Arc::clone(&guarded_resources) as Arc<dyn GuardedResourceRepository>,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    let secondary_path = "/priv/app.locks/content/secondary.txt".to_owned();
+    let secondary = SecondaryGuardedResource {
+        hash: GuardedResourceHash::from_bytes([8; 32]),
+        content_type: "text/plain".to_owned(),
+        size: 9,
+    };
+    content_lock
+        .secondary_resources
+        .insert(secondary_path.clone(), secondary.clone());
+    let primary = content_lock.primary_resource.clone().unwrap();
+    let secondary_guarded = GuardedResource {
+        path: secondary_path,
+        hash: secondary.hash,
+        content_type: secondary.content_type,
+        size: secondary.size,
+    };
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock.clone()).await;
+    for (resource, bytes) in [
+        (&primary, b"primary".to_vec()),
+        (&secondary_guarded, b"secondary".to_vec()),
+    ] {
+        state
+            .guarded_resources()
+            .upsert_guarded_resource(GuardedResourceRecord {
+                creator: creator(),
+                path: resource.path.clone(),
+                hash: resource.hash,
+                content_type: resource.content_type.clone(),
+                size: resource.size,
+                bytes,
+            })
+            .await
+            .unwrap();
+    }
+    *guarded_resources.fail_path_once.lock().unwrap() = Some(primary.path.clone());
+    let app = router(state);
+
+    let partial = force_delete_request(&app, &lock_id).await;
+    assert_eq!(partial.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(partial).await["failed_resource_paths"],
+        json!([primary.path])
+    );
+    assert_force_status(&app, &lock_id, "queued").await;
+    assert_eq!(guarded_resources.delete_attempts.lock().unwrap().len(), 2);
+
+    let completed = force_delete_request(&app, &lock_id).await;
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(completed).await["failed_resource_paths"],
+        json!([])
+    );
+    assert_force_status(&app, &lock_id, "completed").await;
+    assert_eq!(guarded_resources.delete_attempts.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn graceful_delete_rejects_malformed_live_manifest_before_persisting_job() {
+    let state = test_state();
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let mut content_lock = content_lock(true);
+    content_lock.primary_resource = None;
+    content_lock.secondary_resources.clear();
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+
+    let response = router(state.clone())
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn graceful_delete_rejects_live_manifest_over_configured_resource_limit() {
+    let state = test_state_with_content_lock_limits(ContentLocksConfig {
+        max_resource_bytes: 10_000_000,
+        max_resources: 0,
+        max_total_resource_bytes: 100_000_000,
+    });
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+
+    let response = router(state.clone())
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    assert!(
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

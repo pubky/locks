@@ -45,10 +45,12 @@ From a fresh clone:
 docker compose up --build
 ```
 
-The Compose entrypoint generates and persists a random creator-authority encryption
+The Compose entrypoint generates and persists a random runtime master
 key in the private `lock-home` volume. Set
-`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before startup only when you need to supply
-your own 32-byte base64url key.
+`PUBKY_LOCK_RUNTIME_MASTER_KEY` before startup only when you need to supply
+your own 32-byte unpadded-base64url key. A supplied override is atomically
+persisted to that volume, so a later startup without the environment variable
+continues using the same key rather than silently reverting to an older key.
 
 Verified browser-facing defaults for the basic `docker-compose.yml` stack are:
 
@@ -495,7 +497,7 @@ For example:
 
 A submitted proof bundle is sent by the viewer before verification. It is not stored as an entitlement unless verification succeeds.
 
-For `paykit-payment`, the content lock criterion params are exactly `recipient_pubky`, positive base-unit string `amount`, non-empty `asset`, and whole-hour JSON `u64` `payment_in` from 1 through 70,389,527. `recipient_pubky` must equal the content-lock creator. In v1 it must be the lock's only criterion, referenced exactly once by the lock logic. The submitted proof carries no payment details in its proof payload; it uses top-level `reader_public_key` plus the canonical `pubky_lock_resource` so the Lock Server can create the Paykit invoice.
+For `paykit-payment`, the content lock criterion params are exactly `recipient_pubky`, positive base-unit string `amount`, non-empty `asset`, and positive whole-hour JSON `u64` `payment_in`. `recipient_pubky` must equal the content-lock creator. In v1 it must be the lock's only criterion, referenced exactly once by the lock logic. The submitted proof carries no payment details in its proof payload; it uses top-level `reader_public_key` plus the canonical `pubky_lock_resource` so the Lock Server can create the Paykit invoice.
 
 Example:
 

@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::application::{
     errors::ApplicationError,
     models::{
-        ClaimedContentLockDeletionJob, ContentLockDeletionFailureCode, ContentLockDeletionJob,
-        ContentLockDeletionPhase, ForceDeletionReceipt, PrepareForceDeletionResult,
+        AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
+        ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+        ForceDeletionReceipt, PrepareForceDeletionResult,
     },
 };
 
@@ -117,8 +118,7 @@ pub trait ContentLockDeletionRepository: Send + Sync {
     async fn claim_next(
         &self,
         worker_id: &str,
-        now: OffsetDateTime,
-        claim_expires_at: OffsetDateTime,
+        claim_ttl: time::Duration,
     ) -> Result<Option<ClaimedContentLockDeletionJob>, ApplicationError>;
 
     async fn schedule_retry(
@@ -126,8 +126,17 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
-        next_attempt_at: OffsetDateTime,
+        retry_after: time::Duration,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
+
+    /// Releases a healthy-poll claim and schedules its next observation without
+    /// charging the claim-acquisition increment to the transient failure budget.
+    async fn defer(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        defer_for: time::Duration,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
 
     async fn advance_phase(
@@ -135,9 +144,25 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         next_phase: ContentLockDeletionPhase,
-    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
+    ) -> Result<AdvanceContentLockDeletionPhaseResult, ApplicationError>;
+
+    /// Expires every unresolved frozen non-Paykit task under the exact live deletion claim.
+    async fn expire_unresolved_non_paykit_tasks(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let _ = (job_id, worker_id, claim_token);
+        Err(ApplicationError::InvalidContentLockDeletionState {
+            message: "non-Paykit deletion drain is not supported by this repository".to_owned(),
+        })
+    }
+
+    /// Returns whether frozen deletion snapshot includes a Paykit-classified obligation.
+    /// Failed admission remains included because Paykit may already hold its request.
+    async fn has_paykit_snapshots(&self, job_id: Uuid) -> Result<bool, ApplicationError>;
 
     /// Persists terminal completion or a stable secret-free failure under the exact lease.
     async fn finish(
@@ -145,7 +170,6 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         job_id: Uuid,
         worker_id: &str,
         claim_token: Uuid,
-        now: OffsetDateTime,
         failure_code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
 
@@ -162,22 +186,46 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        frozen_content_lock: Option<&locks_core::lock_policy::ContentLock>,
-        forced_at: OffsetDateTime,
     ) -> Result<PrepareForceDeletionResult, ApplicationError>;
+
+    /// Atomically persists the live manifest for synchronous force retries when no job exists.
+    /// Implementations that do not support receipt-owned manifests may retain the legacy behavior.
+    async fn prepare_force_deletion_with_manifest(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        frozen_content_lock: Option<&ContentLock>,
+    ) -> Result<PrepareForceDeletionResult, ApplicationError> {
+        let _ = frozen_content_lock;
+        self.prepare_force_deletion(creator, lock_id).await
+    }
 
     async fn get_force_receipt(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError>;
+    ) -> Result<Option<ForceDeletionReceipt>, ApplicationError> {
+        let _ = (creator, lock_id);
+        Ok(None)
+    }
 
-    /// Marks cleanup complete after public absence and all guarded-resource attempts.
-    async fn complete_force_deletion(
+    /// Marks a synchronous receipt complete after every cleanup postcondition succeeds.
+    async fn complete_synchronous_force_deletion(
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
         completed_at: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        let _ = (creator, lock_id, completed_at);
+        Ok(false)
+    }
+
+    /// Finalizes force deletion only for the exact live worker claim that observed the effects.
+    async fn complete_force_deletion(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
     ) -> Result<bool, ApplicationError>;
 
     async fn has_force_receipt(
@@ -186,7 +234,6 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         lock_id: &LockId,
     ) -> Result<bool, ApplicationError>;
 }
-
 pub(crate) fn publication_reconciliation_matches(
     creator: &CreatorPubky,
     lock_id: &LockId,

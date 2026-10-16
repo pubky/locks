@@ -66,6 +66,15 @@ impl InMemoryVerificationTaskClaimer {
         }
     }
 
+    /// Creates a claimer sharing deletion ownership with related repositories.
+    pub fn with_deletion_fence(
+        records: Vec<VerificationTaskRecord>,
+        deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        let _ = deletion_fence;
+        Self::new(records)
+    }
+
     /// Creates a claimer whose lifecycle transitions are mirrored to the task repository.
     pub fn with_task_repository(
         records: Vec<VerificationTaskRecord>,

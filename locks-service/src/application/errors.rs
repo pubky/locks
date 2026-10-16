@@ -30,6 +30,12 @@ pub enum ApplicationError {
         /// Secret-free invariant failure detail.
         message: String,
     },
+    /// Frozen deletion manifest cannot satisfy canonical resource invariants.
+    #[error("corrupt content lock deletion manifest: {message}")]
+    CorruptContentLockDeletionManifest {
+        /// Secret-free corruption detail.
+        message: String,
+    },
     /// An update-only operation targeted a missing record.
     #[error("missing {record} record")]
     MissingRecord {
@@ -57,6 +63,9 @@ pub enum ApplicationError {
     /// Paykit returned a malformed or unsupported payment-status response.
     #[error("invalid paykit payment status response")]
     PaykitPaymentStatusInvalidResponse,
+    /// A verification provider is transiently unavailable and should be retried later.
+    #[error("verification dependency unavailable")]
+    VerificationDependencyUnavailable,
     /// Submitted payment proof does not match its canonical content lock criterion.
     #[error("invalid paykit payment submission")]
     InvalidPaykitPaymentSubmission,
@@ -98,6 +107,12 @@ pub enum ApplicationError {
     #[error("access credential generation error: {message}")]
     CredentialGeneration {
         /// Human-readable credential generation failure detail.
+        message: String,
+    },
+    /// Final deletion credential envelope could not be encrypted or decrypted.
+    #[error("final credential secret error: {message}")]
+    FinalCredentialSecret {
+        /// Stable secret-free failure detail.
         message: String,
     },
     /// Creator-granted homeserver authority is missing, expired, revoked, or unusable.

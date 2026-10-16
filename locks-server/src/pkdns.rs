@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::future::Future;
 use std::net::IpAddr;
 
 use pkarr::dns::Name;
@@ -22,22 +23,29 @@ pub enum LockServerKeyRepublisherError {
     PacketBuild(String),
     #[error("failed to build PKARR client: {0}")]
     ClientBuild(String),
+    #[error("PKARR republisher interval must be greater than zero")]
+    InvalidInterval,
     #[error("failed to publish lock server PKARR packet: {0}")]
     Publish(String),
 }
 
-/// Background task that publishes and periodically republishes the Lock Server key's PKARR record.
+/// Owned task that publishes and periodically republishes the Lock Server key's PKARR record.
 #[derive(Debug)]
 pub struct LockServerKeyRepublisher {
-    join_handle: tokio::task::JoinHandle<()>,
+    client: pkarr::Client,
+    signed_packet: pkarr::SignedPacket,
+    interval: std::time::Duration,
 }
 
 impl LockServerKeyRepublisher {
-    pub async fn start_if_required(
+    pub fn build_if_required(
         config: &LockServerRuntimeConfig,
     ) -> Result<Option<Self>, LockServerKeyRepublisherError> {
         if !requires_lock_server_pkarr(config) {
             return Ok(None);
+        }
+        if config.pkdns.key_republisher_interval_seconds == 0 {
+            return Err(LockServerKeyRepublisherError::InvalidInterval);
         }
 
         let keypair = load_lock_server_keypair(&config.credentials)?;
@@ -48,30 +56,58 @@ impl LockServerKeyRepublisher {
         let client = builder
             .build()
             .map_err(|error| LockServerKeyRepublisherError::ClientBuild(error.to_string()))?;
-        publish_once(&client, &signed_packet).await?;
-
-        let interval_seconds = config.pkdns.key_republisher_interval_seconds;
-        let join_handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let _ = publish_once(&client, &signed_packet).await;
-            }
-        });
-
-        Ok(Some(Self { join_handle }))
+        Ok(Some(Self {
+            client,
+            signed_packet,
+            interval: std::time::Duration::from_secs(config.pkdns.key_republisher_interval_seconds),
+        }))
     }
 
-    pub fn stop(&self) {
-        self.join_handle.abort();
+    pub async fn publish_initial(&self) -> Result<(), LockServerKeyRepublisherError> {
+        publish_once(&self.client, &self.signed_packet).await
+    }
+
+    pub async fn run_until_shutdown(
+        self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), LockServerKeyRepublisherError> {
+        run_periodic(self.interval, shutdown, || {
+            publish_once(&self.client, &self.signed_packet)
+        })
+        .await;
+        Ok(())
     }
 }
 
-impl Drop for LockServerKeyRepublisher {
-    fn drop(&mut self) {
-        self.stop();
+async fn run_periodic<P, F, E>(
+    period: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut publish: P,
+) where
+    P: FnMut() -> F,
+    F: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = publish().await {
+                    tracing::warn!(
+                        operation = "republish_lock_server_pkarr",
+                        error = %error,
+                        retrying = true,
+                        "periodic PKARR publication failed"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -169,6 +205,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -182,6 +220,33 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn failed_periodic_publication_is_retried_until_shutdown() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        run_periodic(
+            std::time::Duration::from_millis(1),
+            shutdown_rx,
+            move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                let shutdown_tx = shutdown_tx.clone();
+                async move {
+                    if attempt == 0 {
+                        Err("relay unavailable")
+                    } else {
+                        shutdown_tx.send(true).unwrap();
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn lock_server_republisher_uses_pubky_pkarr_relays() {
@@ -312,6 +377,20 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn zero_republisher_interval_is_rejected_before_secret_or_publication_work() {
+        let mut config = test_config();
+        config.creator_authority_acquisition.enabled = true;
+        config.pkdns.key_republisher_interval_seconds = 0;
+
+        let error = LockServerKeyRepublisher::build_if_required(&config).unwrap_err();
+
+        assert!(matches!(
+            error,
+            LockServerKeyRepublisherError::InvalidInterval
+        ));
+    }
+
     #[test]
     fn pkarr_republisher_is_required_for_production_lock_server_identity() {
         let mut config = test_config();
@@ -367,6 +446,8 @@ mod tests {
             pkdns: PkdnsConfig::default(),
             rate_limits: RateLimitsConfig::default(),
             content_locks: ContentLocksConfig::default(),
+            deletion: crate::config::DeletionConfig::default(),
+            deletion_worker: crate::config::DeletionWorkerConfig::default(),
             paykit: None,
         }
     }

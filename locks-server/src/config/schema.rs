@@ -5,7 +5,14 @@ use locks_core::ids::LockServerPubky;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::defaults::DEFAULT_CREATOR_AUTHORITY_KEY_ENV;
+use super::defaults::{
+    DEFAULT_DELETION_RETRY_INITIAL_BACKOFF_SECONDS, DEFAULT_DELETION_RETRY_MAX_ATTEMPTS,
+    DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS, DEFAULT_DELETION_WORKER_CLAIM_TIMEOUT_SECONDS,
+    DEFAULT_DELETION_WORKER_ID, DEFAULT_DELETION_WORKER_POLL_INTERVAL_MS,
+    DEFAULT_DELETION_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+    DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS, DEFAULT_FINAL_READ_WINDOW_SECONDS,
+    DEFAULT_RUNTIME_MASTER_KEY_ENV,
+};
 
 pub const PAYKIT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const PAYKIT_REQUEST_TIMEOUT_SECONDS: u64 = 20;
@@ -25,7 +32,54 @@ pub struct LockServerRuntimeConfig {
     pub pkdns: PkdnsConfig,
     pub rate_limits: RateLimitsConfig,
     pub content_locks: ContentLocksConfig,
+    pub deletion: DeletionConfig,
+    pub deletion_worker: DeletionWorkerConfig,
     pub paykit: Option<PaykitConfig>,
+}
+
+pub const MAX_DELETION_CREDENTIAL_WINDOW_SECONDS: u64 = 3600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionConfig {
+    pub retry_max_attempts: u32,
+    pub retry_initial_backoff_seconds: u64,
+    pub retry_max_backoff_seconds: u64,
+    pub final_credential_issuance_window_seconds: u64,
+    pub final_read_window_seconds: u64,
+}
+
+impl Default for DeletionConfig {
+    fn default() -> Self {
+        Self {
+            retry_max_attempts: DEFAULT_DELETION_RETRY_MAX_ATTEMPTS,
+            retry_initial_backoff_seconds: DEFAULT_DELETION_RETRY_INITIAL_BACKOFF_SECONDS,
+            retry_max_backoff_seconds: DEFAULT_DELETION_RETRY_MAX_BACKOFF_SECONDS,
+            final_credential_issuance_window_seconds:
+                DEFAULT_FINAL_CREDENTIAL_ISSUANCE_WINDOW_SECONDS,
+            final_read_window_seconds: DEFAULT_FINAL_READ_WINDOW_SECONDS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionWorkerConfig {
+    pub enabled: bool,
+    pub poll_interval_ms: u64,
+    pub claim_timeout_seconds: u64,
+    pub shutdown_timeout_seconds: u64,
+    pub worker_id: String,
+}
+
+impl Default for DeletionWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: DEFAULT_DELETION_WORKER_POLL_INTERVAL_MS,
+            claim_timeout_seconds: DEFAULT_DELETION_WORKER_CLAIM_TIMEOUT_SECONDS,
+            shutdown_timeout_seconds: DEFAULT_DELETION_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+            worker_id: DEFAULT_DELETION_WORKER_ID.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,13 +160,13 @@ impl Default for PkdnsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretsConfig {
-    pub creator_authority_key_env: String,
+    pub runtime_master_key_env: String,
 }
 
 impl Default for SecretsConfig {
     fn default() -> Self {
         Self {
-            creator_authority_key_env: DEFAULT_CREATOR_AUTHORITY_KEY_ENV.to_owned(),
+            runtime_master_key_env: DEFAULT_RUNTIME_MASTER_KEY_ENV.to_owned(),
         }
     }
 }
@@ -374,8 +428,20 @@ pub enum ConfigError {
     InvalidContentLocksTotalResourceBytes,
     #[error("invalid logging.level filter: {0}")]
     InvalidLoggingLevel(String),
-    #[error("secrets.creator_authority_key_env must not be empty")]
-    InvalidCreatorAuthorityKeyEnv,
+    #[error("secrets.runtime_master_key_env must not be empty")]
+    InvalidRuntimeMasterKeyEnv,
+    #[error("deletion retry values must be greater than zero")]
+    InvalidDeletionRetry,
+    #[error(
+        "deletion.retry_initial_backoff_seconds must not exceed deletion.retry_max_backoff_seconds"
+    )]
+    InvalidDeletionRetryBackoffOrder,
+    #[error("deletion credential windows must be between 1 and 3600 seconds")]
+    InvalidDeletionCredentialWindow,
+    #[error(
+        "deletion_worker numeric settings must be greater than zero and deletion_worker.worker_id must not be blank"
+    )]
+    InvalidDeletionWorkerConfig,
     #[error(
         "creator_authority_acquisition.allowed_return_origins must contain http(s) origins without path, query, or fragment: {0}"
     )]
@@ -404,6 +470,11 @@ pub enum ConfigError {
     InvalidPubkyPkarrRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
+    #[error("pkdns.key_republisher_interval_seconds must be greater than zero")]
+    InvalidPkarrRepublisherInterval,
+    #[error("pkdns.pkarr_relays must contain valid http(s) URLs: {0}")]
+    InvalidPkarrRelayUrl(String),
+
     #[error(
         "paykit requires credentials.lock_server_secret_key to contain keypair-seed:<base64url-no-pad-32-byte-seed>"
     )]

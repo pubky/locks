@@ -4,9 +4,9 @@ use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_
 use super::raw::RawConfig;
 use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, LockServerCredentialsConfig,
-    LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig, PubkyConfig,
-    RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
+    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
+    LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig,
+    PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
 
@@ -165,6 +165,8 @@ fn initialize_default_config(
         pkdns: PkdnsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         content_locks: ContentLocksConfig::default(),
+        deletion: DeletionConfig::default(),
+        deletion_worker: DeletionWorkerConfig::default(),
         paykit: Some(PaykitConfig {
             server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
@@ -208,7 +210,21 @@ frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep s
 allowed_return_origins = [] # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"]. Empty rejects all /connect return_to values; ["*"] is dev-only and unsafe for staging/prod.
 
 [secrets]
-creator_authority_key_env = "{}" # Environment variable containing a 32-byte base64url key for encrypting creator authority at rest. Rotating requires data migration.
+runtime_master_key_env = "{}" # Environment variable containing the 32-byte base64url runtime master key. Domain-separated keys encrypt creator authority and final credentials. Rotating requires data migration.
+
+[deletion]
+retry_max_attempts = {} # Maximum attempts per deletion phase before stable retry_exhausted failure.
+retry_initial_backoff_seconds = {} # Initial durable retry delay; must be positive and no greater than the maximum.
+retry_max_backoff_seconds = {} # Maximum durable retry delay in seconds.
+final_credential_issuance_window_seconds = {} # Bounded final-credential issuance window; must be 1..=3600.
+final_read_window_seconds = {} # Bounded one-read-per-resource window; must be 1..=3600.
+
+[deletion_worker]
+enabled = {} # true enables the in-process deletion worker; false leaves deletion jobs for another worker process.
+poll_interval_ms = {} # Deletion queue polling interval in milliseconds. Must be > 0.
+claim_timeout_seconds = {} # Seconds before another deletion worker may reclaim a stuck job. Must be > 0.
+shutdown_timeout_seconds = {} # Maximum graceful deletion-worker shutdown wait in seconds. Must be > 0.
+worker_id = "{}" # Stable, non-blank deletion-worker identity. Use a unique value per worker process.
 
 [logging]
 level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or EnvFilter syntax. Higher verbosity may expose operational detail in logs.
@@ -274,7 +290,17 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config
             .creator_authority_acquisition
             .frontend_session_code_ttl_seconds,
-        config.secrets.creator_authority_key_env,
+        config.secrets.runtime_master_key_env,
+        config.deletion.retry_max_attempts,
+        config.deletion.retry_initial_backoff_seconds,
+        config.deletion.retry_max_backoff_seconds,
+        config.deletion.final_credential_issuance_window_seconds,
+        config.deletion.final_read_window_seconds,
+        config.deletion_worker.enabled,
+        config.deletion_worker.poll_interval_ms,
+        config.deletion_worker.claim_timeout_seconds,
+        config.deletion_worker.shutdown_timeout_seconds,
+        config.deletion_worker.worker_id,
         config.logging.level,
         config.pkdns.public_ip,
         config.pkdns.public_pubky_tls_port.unwrap_or(6287),

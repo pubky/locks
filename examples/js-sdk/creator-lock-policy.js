@@ -2,7 +2,6 @@ import { paymentAmountToAtomic } from './payment-amount.js';
 
 const DEV_STATIC = 'dev-static';
 const PAYKIT_PAYMENT = 'paykit-payment';
-const MAX_PAYMENT_IN_HOURS = 70_389_527;
 
 export function buildCreatorLockPolicy({
   lockType = DEV_STATIC,
@@ -10,7 +9,6 @@ export function buildCreatorLockPolicy({
   devStaticSatisfied = true,
   amount,
   asset,
-  paymentIn,
   recipientPubky,
   paykitSetupComplete = false,
 } = {}) {
@@ -34,9 +32,6 @@ export function buildCreatorLockPolicy({
     if (typeof recipientPubky !== 'string' || !recipientPubky) {
       throw new Error('paykit-payment requires the authenticated creator recipient');
     }
-    if (!Number.isInteger(paymentIn) || paymentIn < 1 || paymentIn > MAX_PAYMENT_IN_HOURS) {
-      throw new Error(`paykit-payment payment window must be 1-${MAX_PAYMENT_IN_HOURS} whole hours`);
-    }
     criterion = {
       criterion_id: normalizedCriterionId,
       verifier_type: PAYKIT_PAYMENT,
@@ -44,7 +39,6 @@ export function buildCreatorLockPolicy({
         recipient_pubky: recipientPubky,
         amount: paymentAmountToAtomic(amount, asset),
         asset,
-        payment_in: paymentIn,
       },
     };
   } else {

@@ -97,10 +97,10 @@ For a containerized local stack from the repository root:
 docker compose up --build
 ```
 
-On first startup, the Lock Server entrypoint generates a random creator-authority
-encryption key and persists it in the private `lock-home` volume. Later starts reuse
-that key. To supply your own 32-byte base64url key instead, export
-`PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY` before running Compose.
+On first startup, the Lock Server entrypoint generates a random runtime master key
+and persists it in the private `lock-home` volume. Later starts reuse that key. To
+supply your own 32-byte base64url key instead, export
+`PUBKY_LOCK_RUNTIME_MASTER_KEY` before running Compose.
 
 The compose stack starts:
 
@@ -113,8 +113,8 @@ The compose stack starts:
 The Pubky testnet image is built from the public `pubky/pubky-homeserver` repository at
 the revision pinned in `docker-compose.yml`; no sibling checkout is required.
 
-Compose keeps the Lock Server identity, config, and generated creator-authority
-encryption key in the `lock-home` Docker volume and Postgres data in `postgres-data`.
+Compose keeps the Lock Server identity, config, and generated runtime master key in
+the `lock-home` Docker volume and Postgres data in `postgres-data`.
 To reset everything:
 
 ```bash
@@ -267,6 +267,19 @@ docker compose --file compose.paykit-staging-demo.yaml up -d --build
 ```
 
 This path uses two distinct external Bitkit staging identities, the standard public Pubky network, and no native Paykit helpers or local backend services. Creator and reader remain on ports 8080 and 8088. See [`docs/PAYKIT_STAGING_DEMO.md`](../../docs/PAYKIT_STAGING_DEMO.md) for the exact role split, pasted-reader-Pubky gate, local-client reset, known external setup blocker, and full acceptance milestones.
+
+### Migrating version 1 Compose secrets
+
+Compose secret schema version 1 stored only the retired creator-authority encryption key. It cannot be reinterpreted as the runtime master key because the current server derives domain-specific keys from that root. The bootstrap therefore fails closed rather than starting with a different key and leaving encrypted state unreadable.
+
+If startup reports version 1 secrets, perform this **destructive** reset from the repository root:
+
+```bash
+docker compose -f compose.paykit-local-demo.yaml down --volumes --remove-orphans
+rm -f .local/compose-secrets.json .local/locks-server/compose.env
+```
+
+Then run the normal Compose startup command again. This intentionally deletes the local Lock Server identity, Locks and Paykit databases, encrypted runtime state, and disposable Bitcoin/Fulcrum volumes. Do not use this migration reset when any of that local state must be retained; there is no safe automatic key migration for version 1 state.
 
 ### Direct npm server
 

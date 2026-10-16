@@ -77,7 +77,6 @@ const el = {
   devStaticFields: document.querySelector('#dev-static-fields'),
   paykitPaymentFields: document.querySelector('#paykit-payment-fields'),
   paykitAmount: document.querySelector('#paykit-amount'),
-  paykitPaymentIn: document.querySelector('#paykit-payment-in'),
   paykitAsset: document.querySelector('#paykit-asset'),
   paykitAmountLabel: document.querySelector('#paykit-amount-label'),
   paykitSetupStatus: document.querySelector('#paykit-setup-status'),
@@ -472,7 +471,6 @@ el.lockedContentForm.addEventListener('submit', async (event) => {
       devStaticSatisfied: el.criterionSatisfied.value === 'true',
       amount: el.paykitAmount.value,
       asset: el.paykitAsset.value,
-      paymentIn: el.paykitPaymentIn.valueAsNumber,
       recipientPubky: operation.creatorPubky,
       paykitSetupComplete: state.paykitSetupComplete,
     });
@@ -555,7 +553,6 @@ async function refreshLockTypeFields() {
   el.devStaticFields.hidden = paymentSelected;
   el.paykitPaymentFields.hidden = !paymentSelected;
   el.paykitAmount.required = paymentSelected;
-  el.paykitPaymentIn.required = paymentSelected;
 
   if (!paymentSelected) {
     state.paykitSetupStatusRequestId += 1;

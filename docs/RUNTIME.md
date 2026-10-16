@@ -134,7 +134,7 @@ key_republisher_interval_seconds = 3600
 
 `public_pubky_tls_port` and `public_icann_http_port` advertise externally reachable ports. `icann_domain` is browser/ICANN fallback target. Local testnet operators should set `pubky.pkarr_relays = ["http://127.0.0.1:15411"]`.
 
-PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds.
+PKARR publishing starts when environment is `staging`/`production` or creator-authority acquisition is enabled, and republishes every `key_republisher_interval_seconds` seconds. Initial publication begins only after the HTTP listener binds successfully; it is cancellation-aware and bounded by `deletion_worker.shutdown_timeout_seconds`, the existing lifecycle deadline.
 
 `credentials.lock_server_secret_key` must contain:
 
@@ -222,14 +222,35 @@ Migration `0013_invoice_admission_foundation` adds Lock-Server-private, versione
 
 Migration `0014_invoice_admission_retry_reason` adds the closed `reader_wallet_setup_needed` retry projection for pending invoice admission. It supports viewer-safe task polling while Reader wallet registry setup is retried; it does not grant entitlement or mark invoice admission ready.
 
-Creator-granted session material is encrypted before storage. The server-side encryption key comes from an env var named by config:
+Migration `0023_content_lock_deleted_terminal_reason` extends the closed verification terminal-reason constraint with `content_lock_deleted`. Graceful deletion uses it when unresolved non-Paykit tasks are expired, preserving valid lifecycle timestamps and preventing untyped terminal state.
+
+Sensitive runtime material is encrypted before storage. A root key comes from an env var named by config:
 
 ```toml
 [secrets]
-creator_authority_key_env = "PUBKY_LOCK_CREATOR_AUTH_ENCRYPTION_KEY"
+runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
 ```
 
-The named env var must contain a 32-byte key encoded as base64url without padding:
+The named env var must contain a 32-byte key encoded as base64url without padding. Locks derives separate fixed-domain keys for creator-authority material and replayable final deletion credentials; the root key is never used directly as an AEAD key. Rotating it requires an explicit data migration. In the local Compose flow, an explicitly supplied `PUBKY_LOCK_RUNTIME_MASTER_KEY` is validated and persisted only when `.pubky-lock/runtime-master-key` does not yet exist. Once persisted, an override must match those exact bytes or startup fails closed; later starts without the override reuse the persisted key. Changing the key therefore requires an explicit encrypted-data migration or an intentional reset that discards the dependent ciphertext and its old key together.
+
+Migration `0024_content_lock_access_drains` fails closed when an older database contains a resumable `queued`, `running`, or `failed` deletion job, because earlier rows do not contain enough information to reconstruct cutoff credential classification safely. Failed jobs are resumable by graceful-deletion replay, so they cannot be treated as terminal for this upgrade. Before upgrading, stop new writes and check:
+
+```sql
+SELECT job_id, state, phase
+FROM content_lock_deletion_jobs
+WHERE state IN ('queued', 'running', 'failed');
+```
+
+If rows are returned, resume/retry them on the pre-0021 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
+
+The runtime-master-key cutover intentionally cannot decrypt creator-authority rows written with the retired Compose `creator-authority-encryption-key`. An existing Compose volume containing that file fails startup instead of silently stranding encrypted authority. To upgrade a local stack:
+
+1. Stop the stack and back up any data that must be retained.
+2. Either discard the existing creator-authority rows and reacquire authority after restart, or recreate the local PostgreSQL database/volume.
+3. Remove `.pubky-lock/creator-authority-encryption-key` from the Locks service volume.
+4. Restart. Compose creates `.pubky-lock/runtime-master-key`; keep that file stable with the database.
+
+Removing only the retired key file while retaining its encrypted creator-authority rows is unsupported.
 
 ```bash
 python3 - <<'PY'
@@ -237,6 +258,19 @@ import base64, os
 print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip('='))
 PY
 ```
+
+Deletion retry and final-access bounds are a closed configuration section:
+
+```toml
+[deletion]
+retry_max_attempts = 10
+retry_initial_backoff_seconds = 1
+retry_max_backoff_seconds = 300
+final_credential_issuance_window_seconds = 900
+final_read_window_seconds = 900
+```
+
+All values must be positive, initial backoff cannot exceed maximum backoff, and both final-access windows must be at most 3600 seconds.
 
 ## Development integration shape
 
@@ -293,6 +327,19 @@ For `paykit-payment`, valid request rejection/cancellation and proposal/payment 
 
 Scheduled retries and crash recovery are separate mechanisms. Expected retryable results explicitly release the current claim and set `next_attempt_at`. If a worker crashes while a task is `in_progress`, another worker may reclaim it only after `claim_expires_at`; only the worker that still owns an active claim may schedule its retry.
 
+The deletion worker has an independent closed runtime section:
+
+```toml
+[deletion_worker]
+enabled = true
+poll_interval_ms = 250
+claim_timeout_seconds = 60
+shutdown_timeout_seconds = 30
+worker_id = "deletion-worker"
+```
+
+All three numeric values must be positive and `worker_id` must be nonblank. Queue polling cadence is independent from durable deletion retry backoff. `shutdown_timeout_seconds` bounds coordinated worker and HTTP shutdown; once shutdown begins, the deletion worker must stop acquiring new claims.
+
 ## Health and readiness
 
 `GET /healthz` reports process liveness:
@@ -301,7 +348,7 @@ Scheduled retries and crash recovery are separate mechanisms. Expected retryable
 { "status": "ok" }
 ```
 
-`GET /readyz` reports runtime dependency readiness:
+`GET /readyz` reports runtime dependency and enabled-worker readiness:
 
 ```json
 {
@@ -312,3 +359,5 @@ Scheduled retries and crash recovery are separate mechanisms. Expected retryable
 ```
 
 Health/readiness responses must remain secret-free. They must not include database URLs, secret paths, worker IDs, task counts, public keys, credentials, raw errors, or submitted proof material.
+
+The response status is `not_ready` while an enabled worker is starting, stopping, or unexpectedly stopped. A transient deletion dependency failure reports `degraded` until successful dependency evidence. Ordinary pending deletion work, advisory-lock contention, and a correctly terminalized failed deletion job do not degrade readiness.
