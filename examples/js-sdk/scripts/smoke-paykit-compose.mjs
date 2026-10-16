@@ -575,7 +575,7 @@ for (const [script, description] of [
   assert.ok(script.includes("['compose', '-f', COMPOSE_FILE"), `${description} script must pass the local demo Compose file explicitly`);
 }
 assert.equal(packageJson.scripts['validate:paykit-compose'], 'node scripts/validate-paykit-compose.mjs');
-assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.11.0');
+assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.16.2');
 assert.equal(
   packageJson.scripts['check:paykit-setup-contract'],
   'node scripts/check-paykit-setup-contract.mjs',
