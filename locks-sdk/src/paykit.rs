@@ -17,7 +17,7 @@ pub async fn has_paykit_data(storage: &PublicStorage, user: &PublicKey) -> pubky
 }
 
 fn paykit_directory(user: &PublicKey) -> String {
-    format!("pubky://{}{PAYKIT_PATH_PREFIX}/", user.z32())
+    format!("pubky://{}{PAYKIT_PATH_PREFIX}", user.z32())
 }
 
 fn classify_listing(listing: pubky::Result<Vec<PubkyResource>>) -> pubky::Result<bool> {
@@ -47,10 +47,10 @@ mod tests {
 
     #[test]
     fn paykit_directory_uses_canonical_v0_prefix() {
-        assert_eq!(PAYKIT_PATH_PREFIX, "/pub/paykit/v0");
+        assert_eq!(PAYKIT_PATH_PREFIX, "/pub/paykit/v0/");
         assert_eq!(
             paykit_directory(&user()),
-            format!("pubky://{}{PAYKIT_PATH_PREFIX}/", user().z32())
+            format!("pubky://{}{PAYKIT_PATH_PREFIX}", user().z32())
         );
     }
 

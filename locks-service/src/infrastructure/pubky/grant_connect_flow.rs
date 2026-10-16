@@ -8,8 +8,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::CreatorPubky;
 use pubky::{
     AuthFlowKind, Capability, ClientId, DelegatedGrantAuthFlowState, DelegatedGrantCredentialState,
-    DelegatedSignFn, GrantClaims, GrantCredential, Keypair, POP_JWS_TYP, PopProofClaims,
-    PubkyGrantAuthFlow, PubkyHttpClient, PubkySession, PublicKey, delegated_sign_callback,
+    DelegatedSignFn, GrantClaims, GrantCredential, GrantSigningError, Keypair, POP_JWS_TYP,
+    PopProofClaims, PubkyGrantAuthFlow, PubkyHttpClient, PubkySession, PublicKey,
+    delegated_sign_callback,
 };
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
@@ -71,12 +72,14 @@ impl LockServerGrantPopKeys {
     }
 }
 
-fn sign_pop_signing_input(keypair: &Keypair, signing_input: &str) -> pubky::Result<Vec<u8>> {
+fn sign_pop_signing_input(
+    keypair: &Keypair,
+    signing_input: &str,
+) -> Result<Vec<u8>, GrantSigningError> {
     if !is_pop_signing_input(signing_input) {
-        return Err(pubky::errors::AuthError::Validation(
+        return Err(GrantSigningError::SigningFailed(
             "Lock Server grant key only signs pubky-pop proofs".to_owned(),
-        )
-        .into());
+        ));
     }
     Ok(keypair.sign(signing_input.as_bytes()).to_bytes().to_vec())
 }
@@ -183,6 +186,7 @@ impl GrantCreatorConnectFlowClient for PubkyGrantCreatorConnectFlowClient {
                 authorization_url: authorization_url.expose_url().to_owned(),
                 key_id: pop_key_id.as_str().to_owned(),
                 client_pk: expected_client_pk.clone(),
+                approval_key_secret: None,
             },
             self.client.clone(),
             self.pop_keys.signer(pop_key_id),
@@ -329,7 +333,7 @@ pub async fn restore_grant_session(
         return Err(grant_validation_failure("policy_or_expiry"));
     }
     let credential =
-        GrantCredential::import_delegated_state(state, client, pop_keys.signer(&key_id))
+        GrantCredential::import_delegated_state(state, client, pop_keys.signer(&key_id), None)
             .await
             .map_err(map_grant_restore_sdk_error)?;
     Ok(PubkySession::from_grant_credential(
