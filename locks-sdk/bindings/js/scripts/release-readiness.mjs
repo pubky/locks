@@ -11,6 +11,7 @@ const generatedPackagePath = join(pkgDir, 'package.json');
 
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const cargoToml = readFileSync(cargoTomlPath, 'utf8');
+const expectedDistTag = manifest.version.includes('-') ? 'rc' : 'latest';
 
 const checks = [];
 
@@ -23,7 +24,11 @@ add(manifest.private === true ? 'blocked' : 'ready', 'npm publishing enabled', m
 add(existsSync(licensePath) ? 'ready' : 'blocked', 'repository LICENSE file', existsSync(licensePath) ? 'LICENSE exists' : 'workspace declares MIT but no LICENSE file exists');
 add(cargoToml.includes('license.workspace = true') ? 'ready' : 'blocked', 'Cargo license metadata', 'bindings crate inherits workspace license');
 add(manifest.publishConfig?.access === 'public' ? 'ready' : 'blocked', 'npm public access', `publishConfig.access=${manifest.publishConfig?.access}`);
-add(manifest.publishConfig?.tag === 'rc' ? 'ready' : 'blocked', 'npm RC dist-tag', `publishConfig.tag=${manifest.publishConfig?.tag}`);
+add(
+  manifest.publishConfig?.tag === expectedDistTag ? 'ready' : 'blocked',
+  `npm ${expectedDistTag} dist-tag`,
+  `publishConfig.tag=${manifest.publishConfig?.tag}`,
+);
 add(manifest.exports?.['.']?.import === './pkg/locks_sdk_wasm.js' ? 'ready' : 'blocked', 'package root export', `exports["."].import=${manifest.exports?.['.']?.import}`);
 
 if (existsSync(generatedPackagePath)) {
