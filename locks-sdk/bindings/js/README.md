@@ -5,7 +5,7 @@ Browser JS/WASM SDK for Pubky Locks.
 ## Install
 
 ```bash
-npm install @synonymdev/locks-sdk@rc
+npm install @synonymdev/locks-sdk
 ```
 
 ## Initialize
