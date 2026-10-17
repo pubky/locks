@@ -214,7 +214,7 @@ state locally and bridge only bounded helper input into the relevant container.
 
 The local demo selects immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`, the active Locks
 checkout, and Pubky Homeserver `v0.11.0`. Paykit Server local-demo build uses Paykit Rust
-`v0.1.0-rc71`; Locks workspace retains Paykit Rust `v0.1.0-rc56`. Contract checks derive
+`v0.1.0-rc71`; Locks workspace uses stable Paykit Rust `0.1.0` from crates.io. Contract checks derive
 server release ref from canonical Compose build context. No sibling repository checkout
 is required for source resolution.
 

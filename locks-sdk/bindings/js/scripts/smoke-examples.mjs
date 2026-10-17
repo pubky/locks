@@ -66,7 +66,7 @@ const required = {
   rootReadme: [
     'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
     'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
-    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
+    'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',
     'An absolute local `PAYKIT_SERVER_CONTEXT` override remains available',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
@@ -74,7 +74,7 @@ const required = {
   localOperatorDemo: [
     'Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
     'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
-    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
+    'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
@@ -82,7 +82,7 @@ const required = {
     'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
     'Paykit Server local-demo build uses Paykit Rust',
     '`v0.1.0-rc71`',
-    'Locks workspace retains Paykit Rust `v0.1.0-rc56`',
+    'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',
     'Pubky Homeserver `v0.11.0`',
     'For coordinated Paykit Server work',
     'npm --prefix examples/js-sdk install',
