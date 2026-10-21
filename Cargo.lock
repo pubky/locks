@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "locks-server"
-version = "0.1.0"
+version = "0.1.1-rc1"
 dependencies = [
  "anyhow",
  "async-trait",
