@@ -165,7 +165,7 @@ GET /connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-s
 
 `return_to` must be a full `http`/`https` URL whose origin matches `[creator_authority_acquisition.grant_connect].allowed_return_origins` in grant mode or `[creator_authority_acquisition.legacy_connect].allowed_return_origins` in legacy mode. Grant mode requires at least one grant-specific origin and does not fall back to legacy or top-level origins. Outside production, an explicit wildcard may admit the concrete `return_to` origin. The Lock Server validates this before starting Pubky auth.
 
-Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and a touch-device deeplink button on the Lock Server origin. In grant mode its URL host is `signin_grant`; no cookie-auth URL is generated.
+Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and, for touch devices, deeplink buttons on the Lock Server origin: "Continue with Pubky Ring" in both modes, plus "Continue with Bitkit" in grant mode, because Bitkit accepts only grant auth. In grant mode the URL host is `signin_grant`; no cookie-auth URL is generated. On Android each button opens an `intent://` URL for its app's package; on iOS the Bitkit button uses `bitkit://pubky-auth/signin` with the same query.
 
 The HTML form posts back to:
 

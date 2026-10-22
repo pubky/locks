@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use super::router;
 use crate::api::auth::parse_frontend_session_token;
-use crate::api::creator_authority::{escape_html, validate_return_to_url};
+use crate::api::creator_authority::{android_intent_url, escape_html, validate_return_to_url};
 use crate::api::dtos::{
     AuthenticatedCreateContentLockHttpRequest, AuthenticatedSetLockServicePointerHttpRequest,
     IssueAccessCredentialHttpRequest, SubmitProofBundleHttpRequest,
@@ -4800,12 +4800,8 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
 }
 
 #[tokio::test]
-async fn connect_shell_points_the_ios_ring_link_at_the_top_frame_only_when_embedded() {
-    let ios_rule = r#"if (/iPhone|iPad|iPod/i.test(userAgent) || (/Macintosh/i.test(userAgent) && navigator.maxTouchPoints > 1)) {
-        if (authorizeButton) {
-          authorizeButton.target = "_top";
-        }"#;
-    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
+async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
+    for delivery in ["&delivery=postmessage", ""] {
         let state =
             test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
                 .with_legacy_creator_connect_flow_client(Arc::new(
@@ -4823,20 +4819,23 @@ async fn connect_shell_points_the_ios_ring_link_at_the_top_frame_only_when_embed
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = String::from_utf8(response_bytes(response).await).unwrap();
-        // Android and desktop keep the untargeted link; only the iOS branch of the script retargets it.
-        assert!(body.contains(
-            "<a class=\"authorize-btn\" href=\"pubkyauth://signin?secret=fake-secret-flow-url\">"
-        ));
-        assert_eq!(body.contains(ios_rule), embedded, "delivery={delivery:?}");
+        // Bitkit accepts only grant auth, and only a grant link gets an Android intent.
+        assert!(
+            body.contains(
+                "<a class=\"authorize-btn\" href=\"pubkyauth://signin?secret=fake-secret-flow-url\">"
+            ),
+            "delivery={delivery:?}"
+        );
+        assert!(
+            !body.contains("Continue with Bitkit"),
+            "delivery={delivery:?}"
+        );
+        assert!(!body.contains("intent://"), "delivery={delivery:?}");
     }
 }
 
 #[tokio::test]
-async fn embedded_grant_connect_shell_adds_a_hidden_bitkit_link_for_ios() {
-    let ios_reveal = r#"if (bitkitButton) {
-          bitkitButton.target = "_top";
-          bitkitButton.hidden = false;
-        }"#;
+async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_variants() {
     for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
         let mut config = test_config(RuntimeEnvironment::Development, true);
         config.creator_authority_acquisition.enabled = true;
@@ -4862,41 +4861,31 @@ async fn embedded_grant_connect_shell_adds_a_hidden_bitkit_link_for_ios() {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = String::from_utf8(response_bytes(response).await).unwrap();
-        // The Ring link is unchanged; the Bitkit link carries the same query and starts hidden.
-        assert!(body.contains(
-            "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\">"
-        ));
-        assert_eq!(
+        // Both buttons keep the plain link for desktop and Firefox for Android; the script swaps in
+        // the Android intent naming each app, and Bitkit's own scheme on iOS.
+        assert!(
             body.contains(
-                "<a class=\"authorize-btn bitkit-btn\" href=\"bitkit://pubky-auth/signin?secret=fake-grant\" hidden>"
+                "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\" data-android-href=\"intent://signin_grant?secret=fake-grant#Intent;scheme=pubkyauth;package=to.pubky.ring;end\">"
             ),
-            embedded,
             "delivery={delivery:?}"
         );
-        assert_eq!(body.contains(ios_reveal), embedded, "delivery={delivery:?}");
+        assert!(
+            body.contains(
+                "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\" data-android-href=\"intent://signin_grant?secret=fake-grant#Intent;scheme=pubkyauth;package=to.bitkit;end\" data-ios-href=\"bitkit://pubky-auth/signin?secret=fake-grant\">"
+            ),
+            "delivery={delivery:?}"
+        );
+        assert!(
+            body.contains("button.target = \"_top\";"),
+            "delivery={delivery:?}"
+        );
+        // The embedding app draws the description itself.
+        assert_eq!(
+            body.contains("Use the same pubky you signed in with."),
+            !embedded,
+            "delivery={delivery:?}"
+        );
     }
-}
-
-#[tokio::test]
-async fn embedded_legacy_connect_shell_offers_no_bitkit_link() {
-    let state =
-        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-            .with_legacy_creator_connect_flow_client(Arc::new(
-                CountingLegacyConnectFlowClient::default(),
-            ));
-
-    let response = router(state)
-        .oneshot(empty_request(
-            "GET",
-            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s&delivery=postmessage",
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = String::from_utf8(response_bytes(response).await).unwrap();
-    assert!(body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
-    assert!(!body.contains("bitkit://pubky-auth"));
 }
 
 #[tokio::test]
@@ -4965,6 +4954,22 @@ async fn grant_connect_postmessage_completion_returns_only_state_and_code() {
 #[test]
 fn connect_shell_escape_html_escapes_interpolated_text() {
     assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#x27;");
+}
+
+#[test]
+fn connect_shell_android_intent_wraps_only_a_canonical_grant_link() {
+    assert_eq!(
+        android_intent_url("pubkyauth://signin_grant?a=1&b=2", "to.bitkit").as_deref(),
+        Some("intent://signin_grant?a=1&b=2#Intent;scheme=pubkyauth;package=to.bitkit;end")
+    );
+    for url in [
+        "pubkyauth://signin?a=1",
+        "pubkyauth://signin_grant?",
+        "pubkyauth://signin_grant?a=1#Intent;package=evil;end",
+        "pubkyauth://signin_grant?a=1 b",
+    ] {
+        assert_eq!(android_intent_url(url, "to.bitkit"), None, "url={url:?}");
+    }
 }
 
 #[tokio::test]
