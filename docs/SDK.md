@@ -188,7 +188,7 @@ const locksFromCreator = await Locks.forCreator("pubky...");
 
 ## Connect flow
 
-The browser auth surface is the Lock-Server-hosted connect shell. In grant mode it renders exactly one `signin_grant` QR, Pubky Ring and Bitkit deeplink buttons for that same URL on touch devices, and no cookie fallback. Creator UI receives only a short-lived `code` and caller-managed `state` on the configured callback URL; PoP keys, delegated restore state, and authorization URLs remain server-owned.
+The browser auth surface is the Lock-Server-hosted connect shell. In grant mode it renders exactly one `signin_grant` QR, Pubky Ring and Bitkit deeplink buttons for that same URL on touch devices, and no cookie fallback. Android Bitkit links select `to.bitkit` in the production runtime environment and `to.bitkit.dev` in staging or development; Ring remains `to.pubky.ring`. Creator UI receives only a short-lived `code` and caller-managed `state` on the configured callback URL; PoP keys, delegated restore state, and authorization URLs remain server-owned.
 
 ```ts
 import { Locks, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions } from "locks-sdk-wasm";

@@ -4836,20 +4836,26 @@ async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
 
 #[tokio::test]
 async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_variants() {
-    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
-        let mut config = test_config(RuntimeEnvironment::Development, true);
-        config.creator_authority_acquisition.enabled = true;
-        config.creator_authority_acquisition.method =
-            CreatorAuthorityAcquisitionMethod::GrantConnect;
-        config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
-            client_id: "locks.example".to_owned(),
-            allowed_return_origins: vec!["https://pubky.app".to_owned()],
-        });
-        let state = AppState::new_empty_in_memory(config)
-            .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
-            .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    for (environment, bitkit_package) in [
+        (RuntimeEnvironment::Development, "to.bitkit.dev"),
+        (RuntimeEnvironment::Staging, "to.bitkit.dev"),
+        (RuntimeEnvironment::Production, "to.bitkit"),
+    ] {
+        for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
+            let mut config = test_config(environment, true);
+            config.creator_authority_acquisition.enabled = true;
+            config.creator_authority_acquisition.method =
+                CreatorAuthorityAcquisitionMethod::GrantConnect;
+            config.creator_authority_acquisition.grant_connect =
+                Some(GrantConnectAcquisitionConfig {
+                    client_id: "locks.example".to_owned(),
+                    allowed_return_origins: vec!["https://pubky.app".to_owned()],
+                });
+            let state = AppState::new_empty_in_memory(config)
+                .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+                .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
 
-        let response = router(state)
+            let response = router(state)
             .oneshot(empty_request(
                 "GET",
                 &format!(
@@ -4859,32 +4865,34 @@ async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_varia
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(response_bytes(response).await).unwrap();
-        // Both buttons keep the plain link for desktop and Firefox for Android; the script swaps in
-        // the Android intent naming each app, and Bitkit's own scheme on iOS.
-        assert!(
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(response_bytes(response).await).unwrap();
+            // Both buttons keep the plain link for desktop and Firefox for Android; the script swaps in
+            // the Android intent naming each app, and Bitkit's own scheme on iOS.
+            assert!(
             body.contains(
                 "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\" data-android-href=\"intent://signin_grant?secret=fake-grant#Intent;scheme=pubkyauth;package=to.pubky.ring;end\">"
             ),
             "delivery={delivery:?}"
         );
-        assert!(
-            body.contains(
-                "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\" data-android-href=\"intent://signin_grant?secret=fake-grant#Intent;scheme=pubkyauth;package=to.bitkit;end\" data-ios-href=\"bitkit://pubky-auth/signin?secret=fake-grant\">"
-            ),
-            "delivery={delivery:?}"
-        );
-        assert!(
-            body.contains("button.target = \"_top\";"),
-            "delivery={delivery:?}"
-        );
-        // The embedding app draws the description itself.
-        assert_eq!(
-            body.contains("Use the same pubky you signed in with."),
-            !embedded,
-            "delivery={delivery:?}"
-        );
+            let expected_bitkit_link = format!(
+                "<a class=\"authorize-btn\" href=\"pubkyauth://signin_grant?secret=fake-grant\" data-android-href=\"intent://signin_grant?secret=fake-grant#Intent;scheme=pubkyauth;package={bitkit_package};end\" data-ios-href=\"bitkit://pubky-auth/signin?secret=fake-grant\">"
+            );
+            assert!(
+                body.contains(&expected_bitkit_link),
+                "environment={environment:?}, delivery={delivery:?}"
+            );
+            assert!(
+                body.contains("button.target = \"_top\";"),
+                "delivery={delivery:?}"
+            );
+            // The embedding app draws the description itself.
+            assert_eq!(
+                body.contains("Use the same pubky you signed in with."),
+                !embedded,
+                "environment={environment:?}, delivery={delivery:?}"
+            );
+        }
     }
 }
 
