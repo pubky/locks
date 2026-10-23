@@ -4801,7 +4801,7 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
 
 #[tokio::test]
 async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
-    for delivery in ["&delivery=postmessage", ""] {
+    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
         let state =
             test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
                 .with_legacy_creator_connect_flow_client(Arc::new(
@@ -4826,11 +4826,18 @@ async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
             ),
             "delivery={delivery:?}"
         );
+        // No Bitkit button, copy or logo.
+        assert!(!body.contains("Bitkit"), "delivery={delivery:?}");
         assert!(
-            !body.contains("Continue with Bitkit"),
+            !body.contains("<span class=\"bitkit-logo\">"),
             "delivery={delivery:?}"
         );
         assert!(!body.contains("intent://"), "delivery={delivery:?}");
+        assert_eq!(
+            body.contains("<strong>Pubky Ring</strong> to authorize"),
+            !embedded,
+            "delivery={delivery:?}"
+        );
     }
 }
 
@@ -4888,10 +4895,17 @@ async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_varia
             );
             // The embedding app draws the description itself.
             assert_eq!(
-                body.contains("Use the same pubky you signed in with."),
+                body.contains("<strong>Pubky Ring</strong> or <strong>Bitkit</strong>"),
                 !embedded,
                 "environment={environment:?}, delivery={delivery:?}"
             );
+            // The embed CSS hides the logos, so only the standalone page is checked.
+            if !embedded {
+                assert!(
+                    body.contains("<span class=\"bitkit-logo\">"),
+                    "environment={environment:?}, delivery={delivery:?}"
+                );
+            }
         }
     }
 }
