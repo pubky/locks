@@ -6,6 +6,7 @@ use tokio::sync::watch;
 
 use crate::app_state::AppState;
 use crate::paykit_http_client::{PaykitClientError, PaykitInvoiceCreator, PaykitInvoiceRequest};
+use crate::worker::application_error_class;
 use crate::worker::timing::{TimingOutcome, TimingStage, TimingWorker, record_timing};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,9 +336,10 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                         _ = tokio::time::sleep(self.poll_interval) => {}
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     tracing::error!(
                         worker = TimingWorker::InvoiceAdmission.as_str(),
+                        error_class = application_error_class(&error),
                         "invoice admission worker tick failed"
                     );
                     tokio::select! {
@@ -416,6 +418,7 @@ fn invoice_retry_reason(error: &PaykitClientError) -> Option<InvoiceAdmissionRet
 fn log_invoice_error(error: &PaykitClientError) {
     match error {
         PaykitClientError::InvoiceNonSuccess {
+            request_id,
             elapsed_ms,
             status,
             error_code,
@@ -423,6 +426,7 @@ fn log_invoice_error(error: &PaykitClientError) {
             ..
         } => tracing::warn!(
             operation = "invoice_creation",
+            %request_id,
             status = status.as_u16(),
             error_code,
             retry_after_seconds,
@@ -430,12 +434,14 @@ fn log_invoice_error(error: &PaykitClientError) {
             "Paykit request returned non-success status"
         ),
         PaykitClientError::InvoiceTransport {
+            request_id,
             elapsed_ms,
             timeout,
             connect,
             ..
         } => tracing::warn!(
             operation = "invoice_creation",
+            %request_id,
             elapsed_ms,
             timeout,
             connect,

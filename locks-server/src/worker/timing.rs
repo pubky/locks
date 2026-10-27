@@ -104,10 +104,17 @@ mod tests {
 
     #[test]
     fn timing_event_is_visible_at_default_info_without_identifier_fields() {
+        record_timing(
+            TimingWorker::Verification,
+            TimingStage::PaykitStatus,
+            TimingOutcome::Completed,
+            Instant::now(),
+        );
         let events = RecordedEvents::default();
         let filter = EnvFilter::new(LoggingConfig::default().level);
         let subscriber = Registry::default().with(filter).with(events.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         record_timing(
             TimingWorker::Verification,

@@ -203,6 +203,7 @@ impl<'a> VerificationWorker<'a> {
             ) => {
                 if matches!(error, ApplicationError::PaykitPaymentStatusConflict) {
                     tracing::error!(
+                        %task_id,
                         worker = TimingWorker::Verification.as_str(),
                         reason = "paykit_status_conflict",
                         "paykit payment status conflict; scheduling retry"
@@ -293,7 +294,13 @@ impl<'a> VerificationWorker<'a> {
                 );
                 Ok(WorkerTick::Idle)
             }
-            Err(_) => {
+            Err(error) => {
+                tracing::error!(
+                    %task_id,
+                    worker = TimingWorker::Verification.as_str(),
+                    error_class = application_error_class(&error),
+                    "verification task failed"
+                );
                 record_timing(
                     TimingWorker::Verification,
                     processing_stage,
@@ -395,6 +402,83 @@ fn retry_delay(
     time::Duration::seconds(NON_PAYKIT_PENDING_VERIFICATION_RETRY_DELAY_SECONDS)
 }
 
+fn application_error_class(error: &ApplicationError) -> &'static str {
+    match error {
+        ApplicationError::DuplicateRecord { .. } => "duplicate_record",
+        ApplicationError::ContentLockPathConflict { .. } => "content_lock_path_conflict",
+        ApplicationError::ContentLockDeletionInProgress => "content_lock_deletion_in_progress",
+        ApplicationError::ContentLockPublicationInProgress => {
+            "content_lock_publication_in_progress"
+        }
+        ApplicationError::InvalidContentLockDeletionState { .. } => {
+            "invalid_content_lock_deletion_state"
+        }
+        ApplicationError::CorruptContentLockDeletionManifest { .. } => {
+            "corrupt_content_lock_deletion_manifest"
+        }
+        ApplicationError::MissingRecord { .. } => "missing_record",
+        ApplicationError::Storage { .. } => "storage",
+        ApplicationError::Verifier { .. } => "verifier",
+        ApplicationError::VerificationPending => "verification_pending",
+        ApplicationError::PaykitPaymentStatusConflict => "paykit_payment_status_conflict",
+        ApplicationError::PaykitPaymentStatusInvalidResponse => {
+            "paykit_payment_status_invalid_response"
+        }
+        ApplicationError::VerificationDependencyUnavailable => {
+            "verification_dependency_unavailable"
+        }
+        ApplicationError::InvalidPaykitPaymentSubmission => "invalid_paykit_payment_submission",
+        ApplicationError::InvalidVerificationTaskTransition { .. } => {
+            "invalid_verification_task_transition"
+        }
+        ApplicationError::InvalidVerificationTaskState { .. } => "invalid_verification_task_state",
+        ApplicationError::InvalidVerificationTaskFailureMessage => {
+            "invalid_verification_task_failure_message"
+        }
+        ApplicationError::VerificationTaskConflict => "verification_task_conflict",
+        ApplicationError::VerificationTaskClaimLost => "verification_task_claim_lost",
+        ApplicationError::RateLimited => "rate_limited",
+        ApplicationError::UnsupportedCredentialTtl { .. } => "unsupported_credential_ttl",
+        ApplicationError::CredentialGeneration { .. } => "credential_generation",
+        ApplicationError::FinalCredentialSecret { .. } => "final_credential_secret",
+        ApplicationError::CreatorAuthorityUnavailable => "creator_authority_unavailable",
+        ApplicationError::CreatorAuthoritySecret { .. } => "creator_authority_secret",
+        ApplicationError::InvalidCreatorAuthorityAuthKind { .. } => {
+            "invalid_creator_authority_auth_kind"
+        }
+        ApplicationError::CreatorConnectFlowUnavailable => "creator_connect_flow_unavailable",
+        ApplicationError::CreatorConnectFlowExpired => "creator_connect_flow_expired",
+        ApplicationError::FrontendSessionCodeUnavailable => "frontend_session_code_unavailable",
+        ApplicationError::FrontendSessionCodeExpired => "frontend_session_code_expired",
+        ApplicationError::FrontendSessionCodeAlreadyConsumed => {
+            "frontend_session_code_already_consumed"
+        }
+        ApplicationError::FrontendSessionUnavailable => "frontend_session_unavailable",
+        ApplicationError::FrontendSessionExpired => "frontend_session_expired",
+        ApplicationError::FrontendSessionStateMismatch => "frontend_session_state_mismatch",
+        ApplicationError::EmptyContentLockCriteria => "empty_content_lock_criteria",
+        ApplicationError::DuplicateContentLockCriterion { .. } => {
+            "duplicate_content_lock_criterion"
+        }
+        ApplicationError::DuplicateVerificationResultCriterion { .. } => {
+            "duplicate_verification_result_criterion"
+        }
+        ApplicationError::UnknownVerificationResultCriterion { .. } => {
+            "unknown_verification_result_criterion"
+        }
+        ApplicationError::EntitlementNotFound => "entitlement_not_found",
+        ApplicationError::ContentLockUnavailable => "content_lock_unavailable",
+        ApplicationError::ContentLockHashMismatch { .. } => "content_lock_hash_mismatch",
+        ApplicationError::EntitlementNotSatisfied => "entitlement_not_satisfied",
+        ApplicationError::ContentLockCanonicalization { .. } => "content_lock_canonicalization",
+        ApplicationError::UnsupportedVerifierType { .. } => "unsupported_verifier_type",
+        ApplicationError::GuardedResourceUnavailable => "guarded_resource_unavailable",
+        ApplicationError::InvalidGuardedResource { .. } => "invalid_guarded_resource",
+        ApplicationError::InvalidAccessCredential => "invalid_access_credential",
+        ApplicationError::ExpiredAccessCredential => "expired_access_credential",
+    }
+}
+
 #[cfg(test)]
 mod invoice_tests;
 
@@ -438,10 +522,40 @@ mod tests {
         SecretsConfig, WorkerConfig,
     };
     use crate::worker::timing::{TimingOutcome, TimingStage, TimingWorker};
-    use crate::worker::{VerificationWorker, WorkerTick, retry_delay};
+    use crate::worker::{VerificationWorker, WorkerTick, application_error_class, retry_delay};
 
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+
+    #[test]
+    fn application_error_class_is_closed_and_does_not_expose_error_details() {
+        let secret = "postgres://operator:secret@example.test/locks";
+
+        assert_eq!(
+            application_error_class(&ApplicationError::Storage {
+                message: secret.to_owned(),
+            }),
+            "storage"
+        );
+        assert_eq!(
+            application_error_class(&ApplicationError::Verifier {
+                message: secret.to_owned(),
+            }),
+            "verifier"
+        );
+        assert_eq!(
+            application_error_class(&ApplicationError::InvalidVerificationTaskState {
+                message: secret.to_owned(),
+            }),
+            "invalid_verification_task_state"
+        );
+        assert!(
+            !application_error_class(&ApplicationError::Storage {
+                message: secret.to_owned(),
+            })
+            .contains(secret)
+        );
+    }
 
     #[tokio::test]
     async fn worker_completes_pending_task() {

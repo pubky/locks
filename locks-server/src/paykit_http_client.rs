@@ -410,6 +410,7 @@ impl PaykitHttpClient {
         }
         tracing::info!(
             operation = "invoice_creation",
+            %request_id,
             status = StatusCode::OK.as_u16(),
             elapsed_ms = elapsed_millis(started),
             "Paykit request completed"
