@@ -49,7 +49,7 @@ impl LocksClient {
     /// response that says it is not ready. Reusing a configured [`PubkyHttpClient`] also reuses
     /// its relay configuration and transport cache.
     pub async fn is_ready(&self, http: &PubkyHttpClient) -> Result<bool> {
-        let url = self.transport_url("/readyz")?;
+        let url = self.readiness_transport_url()?;
         let request = http
             .request_async(Method::GET, url)
             .await
@@ -69,11 +69,19 @@ impl LocksClient {
         Fut: std::future::Future<Output = std::result::Result<StatusCode, E>>,
         E: std::fmt::Display,
     {
-        let status = send(self.transport_url("/readyz")?)
+        let status = send(self.readiness_transport_url()?)
             .await
             .map_err(lock_server_readiness_request_failed)?;
 
         Ok(status.is_success())
+    }
+
+    fn readiness_transport_url(&self) -> Result<Url> {
+        Url::parse(&format!(
+            "https://{}/readyz",
+            raw_pubky_z32(&self.lock_server)
+        ))
+        .map_err(|_| LocksSdkError::InvalidTransportUrl)
     }
 
     pub fn restore_session(&self, secret: impl Into<String>) -> LocksSession {

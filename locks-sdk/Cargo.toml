@@ -23,4 +23,7 @@ paykit-lib.workspace = true
 pubky-noise.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+locks-server = { path = "../locks-server" }
+pkarr.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-rustls = "0.26"

@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
 use locks_sdk::{
@@ -9,6 +10,85 @@ use locks_sdk::{
     ViewerLocks, content_lock_resource_url, creator_lock_service_pointer_url,
     lock_server_for_content_lock,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn readiness_resolves_the_lock_server_packet_at_the_bare_key_apex() {
+    let keypair = pubky_common::crypto::Keypair::from_secret(&[9_u8; 32]);
+    let (readiness_port, readiness_task) = spawn_readiness_server(&keypair).await;
+    let packet = locks_server::pkdns::create_signed_packet(
+        &locks_server::config::PkdnsConfig {
+            public_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            public_pubky_tls_port: Some(readiness_port),
+            public_icann_http_port: None,
+            icann_domain: None,
+            key_republisher_interval_seconds: 3600,
+        },
+        &keypair,
+    )
+    .unwrap();
+    let relay_url = spawn_packet_relay(packet).await;
+    let lock_server =
+        LockServerPubky::from_str(&format!("pubky{}", keypair.public_key().to_z32())).unwrap();
+    let client = LocksClient::for_server(lock_server);
+    let mut builder = pubky::PubkyHttpClient::builder();
+    builder.request_timeout(std::time::Duration::from_secs(2));
+    builder.pkarr(|pkarr| {
+        pkarr
+            .no_default_network()
+            .relays(&[relay_url.as_str()])
+            .expect("local relay URL")
+    });
+    let http = builder.build().unwrap();
+
+    assert!(client.is_ready(&http).await.unwrap());
+    readiness_task.await.unwrap();
+}
+
+async fn spawn_packet_relay(packet: pkarr::SignedPacket) -> String {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 2048];
+        let read = stream.read(&mut request).await.unwrap();
+        assert!(request[..read].starts_with(b"GET /"));
+        let payload = packet.to_relay_payload();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+    });
+    format!("http://{address}")
+}
+
+async fn spawn_readiness_server(
+    keypair: &pubky_common::crypto::Keypair,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut tls_config = keypair.to_rpk_rustls_server_config();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let mut request = [0_u8; 2048];
+        let read = stream.read(&mut request).await.unwrap();
+        assert!(request[..read].starts_with(b"GET /readyz HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    (port, task)
+}
 
 #[tokio::test]
 async fn readiness_missing_pkarr_record_uses_public_request_failure_contract() {
