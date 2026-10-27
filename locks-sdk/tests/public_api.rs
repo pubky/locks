@@ -3,12 +3,36 @@ use std::str::FromStr;
 use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
 use locks_sdk::{
     AccessCredentialResponse, CreatorLockServicePointer, DeleteContentLockMode,
-    DeleteContentLockRequest, DeleteGuardedResourceRequest, LocksClient, LocksSession,
-    ReadLockedResourceRequest, RegisterGuardedResourceRequest, SdkRequestBody,
+    DeleteContentLockRequest, DeleteGuardedResourceRequest, LocksClient, LocksSdkError,
+    LocksSession, ReadLockedResourceRequest, RegisterGuardedResourceRequest, SdkRequestBody,
     VerificationTaskHandleRequest, VerificationTaskLifecycleResponse, VerificationTaskStatus,
     ViewerLocks, content_lock_resource_url, creator_lock_service_pointer_url,
     lock_server_for_content_lock,
 };
+
+#[tokio::test]
+async fn readiness_missing_pkarr_record_uses_public_request_failure_contract() {
+    let lock_server =
+        LockServerPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+            .unwrap();
+    let client = LocksClient::for_server(lock_server);
+    let mut builder = pubky::PubkyHttpClient::builder();
+    builder.request_timeout(std::time::Duration::from_millis(250));
+    builder.pkarr(|pkarr| {
+        pkarr
+            .no_default_network()
+            .relays(&["http://127.0.0.1:9"])
+            .expect("local relay URL")
+    });
+    let http = builder.build().unwrap();
+
+    let error = client.is_ready(&http).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LocksSdkError::LockServerReadinessRequestFailed(_)
+    ));
+}
 
 #[test]
 fn crate_root_exports_foundation_sdk_types() {

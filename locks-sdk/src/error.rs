@@ -20,8 +20,6 @@ pub enum LocksSdkError {
     MissingBrowserEndpointDomain,
     #[error("browser testnet endpoint is missing required HTTP_PORT parameter")]
     MissingHttpPortParam,
-    #[error("Lock Server endpoint resolution failed: {0}")]
-    LockServerResolutionFailed(String),
     #[error("Lock Server readiness request failed: {0}")]
     LockServerReadinessRequestFailed(String),
     #[error("invalid Lock Server response: {0}")]

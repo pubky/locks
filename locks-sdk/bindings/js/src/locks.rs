@@ -51,7 +51,7 @@ impl LocksOptions {
 }
 
 impl LocksOptions {
-    fn try_add_pkarr_relay(&mut self, relay_url: String) -> Result<(), String> {
+    pub(crate) fn try_add_pkarr_relay(&mut self, relay_url: String) -> Result<(), String> {
         let relay =
             Url::parse(&relay_url).map_err(|err| format!("invalid PKARR relay URL: {err}"))?;
         match relay.scheme() {
