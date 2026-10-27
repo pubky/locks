@@ -25,7 +25,7 @@ npm --prefix locks-sdk/bindings/js run live:smoke:check
 npm --prefix locks-sdk/bindings/js test
 ```
 
-`build` runs `wasm-pack build --target web --out-dir pkg`. `smoke:pkg` rebuilds generated output and verifies that `pkg/package.json` and `pkg/locks_sdk_wasm.d.ts` expose documented browser SDK API. `smoke:demo` verifies static demo alignment. `smoke:examples` verifies copyable root examples. `release:audit` checks public package metadata; see [`SDK_RELEASE.md`](SDK_RELEASE.md). `test` runs native binding tests, wasm compile check, package smoke, demo smoke, and examples smoke. Generated `pkg/` remains ignored and is rebuilt automatically by npm's `prepack` lifecycle.
+`build` runs `wasm-pack build --target web --out-dir pkg`. `smoke:pkg` rebuilds generated output and verifies that `pkg/package.json` and `pkg/locks_sdk_wasm.d.ts` expose documented browser SDK API. `smoke:demo` verifies static demo alignment. `smoke:examples` verifies copyable root examples. `release:audit` checks public package metadata; see [`SDK_RELEASE.md`](SDK_RELEASE.md). `test` runs native binding tests, wasm compile check, headless-Chrome WASM behavior tests, package smoke, demo smoke, and examples smoke. Generated `pkg/` remains ignored and is rebuilt automatically by npm's `prepack` lifecycle.
 
 The public package is `@synonymdev/locks-sdk`. It wraps generated `pkg/locks_sdk_wasm.js`, declarations, and WASM as package-root exports. The internal wasm-pack manifest remains build output rather than npm publication metadata.
 
@@ -137,6 +137,32 @@ options.addPkarrRelay("http://127.0.0.1:15411");
 
 const locks = Locks.forServerWithOptions("pubky...", options);
 ```
+
+Rust callers supply a reusable `PubkyHttpClient`, preserving its PKARR relay configuration and transport cache:
+
+```rust
+use locks_sdk::LocksClient;
+use pubky::PubkyHttpClient;
+
+let http = PubkyHttpClient::new()?;
+let locks = LocksClient::for_server(lock_server);
+if !locks.is_ready(&http).await? {
+    return Err("Lock Server is not ready".into());
+}
+```
+
+Browser callers can check the selected Lock Server before starting a connect flow:
+
+```ts
+if (!(await locks.isReady())) {
+  // The resolved Lock Server answered /readyz with a non-2xx status.
+  throw new Error("Lock Server is not ready");
+}
+```
+
+Rust `LocksClient::is_ready` and browser `Locks.isReady()` resolve the Lock Server Pubky through their supplied/configured PKARR path, then call `GET /readyz`. They return `true` for every HTTP 2xx response (`Response.ok` in browsers) and `false` for every non-2xx response. Current Lock Server behavior returns `200` with `status: "degraded"`, so degraded is `true`; only `status: "not_ready"` returns `503` and therefore `false`.
+
+Resolution and transport failures remain errors instead of returning `false`. Native `PubkyHttpClient` falls back to PubkyTLS when PKARR yields no endpoint, so its public boundary cannot distinguish missing PKARR from later transport failure; Rust callers match both as `LocksSdkError::LockServerReadinessRequestFailed`. Browser resolution is explicit, so browser callers can distinguish `error.name === "LockServerResolutionFailed"` from `error.name === "LockServerFetchFailed"`. Browser PKARR caches are shared only among equivalent relay sets; default and custom relay configurations remain isolated. The SDK does not expose or persist the resolved origin. Each call resolves the Pubky held by that client instance: endpoint updates under the same key follow the Pubky client's normal cache/refresh policy, while a changed Lock Server key requires constructing a new `LocksClient`/`Locks` from updated creator discovery.
 
 Local `pubky-homeserver/pubky-testnet` defaults are:
 

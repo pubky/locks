@@ -11,9 +11,11 @@ use futures_lite::{StreamExt, pin};
 #[cfg(target_arch = "wasm32")]
 use std::collections::BTreeMap;
 #[cfg(any(test, target_arch = "wasm32"))]
+use std::collections::VecDeque;
+#[cfg(any(test, target_arch = "wasm32"))]
 use std::num::NonZeroUsize;
 #[cfg(any(test, target_arch = "wasm32"))]
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(any(test, target_arch = "wasm32"))]
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -64,23 +66,44 @@ pub(crate) struct BrowserPkarrResolver {
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-fn browser_pkarr_cache() -> Arc<dyn pkarr8::Cache> {
-    static CACHE: OnceLock<Arc<dyn pkarr8::Cache>> = OnceLock::new();
+fn browser_pkarr_cache(options: &LocksOptions) -> Arc<dyn pkarr8::Cache> {
+    const MAX_RELAY_CACHE_CONTEXTS: usize = 8;
+    type RelayCacheRegistry = VecDeque<(Vec<String>, Arc<dyn pkarr8::Cache>)>;
 
-    CACHE
-        .get_or_init(|| {
-            Arc::new(pkarr8::InMemoryCache::new(
-                NonZeroUsize::new(pkarr8::DEFAULT_CACHE_SIZE)
-                    .expect("pkarr default cache size is non-zero"),
-            ))
-        })
-        .clone()
+    static CACHES: OnceLock<Mutex<RelayCacheRegistry>> = OnceLock::new();
+
+    let mut relay_key = options.pkarr_relay_urls().to_vec();
+    relay_key.sort_unstable();
+    relay_key.dedup();
+
+    let mut caches = CACHES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .expect("browser PKARR cache registry mutex");
+    if let Some(index) = caches.iter().position(|(key, _)| key == &relay_key) {
+        let entry = caches
+            .remove(index)
+            .expect("existing browser PKARR cache registry entry");
+        let cache = Arc::clone(&entry.1);
+        caches.push_back(entry);
+        return cache;
+    }
+
+    let cache: Arc<dyn pkarr8::Cache> = Arc::new(pkarr8::InMemoryCache::new(
+        NonZeroUsize::new(pkarr8::DEFAULT_CACHE_SIZE)
+            .expect("pkarr default cache size is non-zero"),
+    ));
+    if caches.len() == MAX_RELAY_CACHE_CONTEXTS {
+        caches.pop_front();
+    }
+    caches.push_back((relay_key, Arc::clone(&cache)));
+    cache
 }
 
 #[cfg(target_arch = "wasm32")]
 fn build_browser_pkarr_client(options: &LocksOptions) -> locks_sdk::Result<pkarr8::Client> {
     let mut builder = pkarr8::Client::builder();
-    builder.cache(browser_pkarr_cache());
+    builder.cache(browser_pkarr_cache(options));
     if !options.pkarr_relay_urls().is_empty() {
         builder
             .relays(options.pkarr_relay_urls())
@@ -429,11 +452,74 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    fn browser_pkarr_clients_share_singleton_cache() {
-        let first = browser_pkarr_cache();
-        let second = browser_pkarr_cache();
+    fn browser_pkarr_clients_share_cache_for_equivalent_relay_sets() {
+        let mut first_options = LocksOptions::new();
+        first_options
+            .try_add_pkarr_relay("https://relay-b.example".to_owned())
+            .unwrap();
+        first_options
+            .try_add_pkarr_relay("https://relay-a.example".to_owned())
+            .unwrap();
+        let mut second_options = LocksOptions::new();
+        second_options
+            .try_add_pkarr_relay("https://relay-a.example/".to_owned())
+            .unwrap();
+        second_options
+            .try_add_pkarr_relay("https://relay-b.example/".to_owned())
+            .unwrap();
+
+        let first = browser_pkarr_cache(&first_options);
+        let second = browser_pkarr_cache(&second_options);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn browser_pkarr_clients_isolate_default_and_custom_relay_caches() {
+        let default_cache = browser_pkarr_cache(&LocksOptions::new());
+        let mut custom_options = LocksOptions::new();
+        custom_options
+            .try_add_pkarr_relay("https://relay.example".to_owned())
+            .unwrap();
+        let custom_cache = browser_pkarr_cache(&custom_options);
+        let lock_server = pkarr8::Keypair::random();
+        let cache_key: pkarr8::CacheKey = lock_server.public_key().into();
+        let public_packet = pkarr8::SignedPacket::builder()
+            .https(
+                "_pubky".try_into().expect("_pubky name"),
+                pkarr8::dns::rdata::SVCB::new(
+                    0,
+                    "public-locks.example.".try_into().expect("public endpoint"),
+                ),
+                3600,
+            )
+            .sign(&lock_server)
+            .expect("signed public packet");
+        let custom_packet = pkarr8::SignedPacket::builder()
+            .https(
+                "_pubky".try_into().expect("_pubky name"),
+                pkarr8::dns::rdata::SVCB::new(
+                    0,
+                    "custom-locks.example.".try_into().expect("custom endpoint"),
+                ),
+                3600,
+            )
+            .sign(&lock_server)
+            .expect("signed custom packet");
+
+        assert!(!Arc::ptr_eq(&default_cache, &custom_cache));
+        default_cache.put(&cache_key, &public_packet);
+        assert!(custom_cache.get(&cache_key).is_none());
+
+        custom_cache.put(&cache_key, &custom_packet);
+        assert_eq!(
+            default_cache.get(&cache_key).unwrap().as_bytes(),
+            public_packet.as_bytes()
+        );
+        assert_eq!(
+            custom_cache.get(&cache_key).unwrap().as_bytes(),
+            custom_packet.as_bytes()
+        );
     }
 
     #[test]

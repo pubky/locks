@@ -10,9 +10,13 @@ use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-#[cfg(target_arch = "wasm32")]
-use crate::js_error::paykit_data_lookup_failed;
 use crate::js_error::{JsResult, invalid_input};
+#[cfg(test)]
+use crate::js_error::{ReadinessErrorKind, readiness_error_name};
+#[cfg(target_arch = "wasm32")]
+use crate::js_error::{
+    lock_server_fetch_failed, lock_server_resolution_failed, paykit_data_lookup_failed,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::json::serializable_to_plain_js_value;
 #[cfg(target_arch = "wasm32")]
@@ -47,7 +51,7 @@ impl LocksOptions {
 }
 
 impl LocksOptions {
-    fn try_add_pkarr_relay(&mut self, relay_url: String) -> Result<(), String> {
+    pub(crate) fn try_add_pkarr_relay(&mut self, relay_url: String) -> Result<(), String> {
         let relay =
             Url::parse(&relay_url).map_err(|err| format!("invalid PKARR relay URL: {err}"))?;
         match relay.scheme() {
@@ -154,6 +158,23 @@ struct JsPreparedRequest {
     url: Url,
     pubky_host: Option<String>,
     body: Value,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq)]
+struct JsReadinessRequest {
+    method: &'static str,
+    path: &'static str,
+    url: Url,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq)]
+struct JsPreparedReadinessRequest {
+    method: &'static str,
+    path: &'static str,
+    url: Url,
+    pubky_host: Option<String>,
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -329,6 +350,21 @@ impl Locks {
         Viewer::new(self.inner.clone(), self.options.clone())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = isReady)]
+    pub async fn is_ready(&self) -> JsResult<bool> {
+        let request = self
+            .build_readiness_request()
+            .map_err(|_| lock_server_resolution_failed())?;
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|_| lock_server_resolution_failed())?;
+        let request = self
+            .prepare_readiness_request_with_pkarr_resolver(&request, &resolver, None)
+            .await
+            .map_err(|_| lock_server_resolution_failed())?;
+        fetch_readiness(&request).await
+    }
+
     #[wasm_bindgen(js_name = createConnectUrl)]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_connect_url(&self, options: &ConnectUrlOptions) -> JsResult<String> {
@@ -443,6 +479,67 @@ impl Locks {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    fn build_readiness_request(&self) -> locks_sdk::Result<JsReadinessRequest> {
+        Ok(JsReadinessRequest {
+            method: "GET",
+            path: "/readyz",
+            url: self.inner.transport_url("/readyz")?,
+        })
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn prepare_readiness_request_for_endpoint(
+        &self,
+        request: &JsReadinessRequest,
+        endpoint: &locks_sdk::transport::BrowserEndpoint,
+        testnet_host: Option<&str>,
+    ) -> locks_sdk::Result<JsPreparedReadinessRequest> {
+        let browser_request = locks_sdk::transport::rewrite_browser_request(
+            request.url.as_str(),
+            endpoint,
+            testnet_host,
+        )?;
+        Ok(JsPreparedReadinessRequest {
+            method: request.method,
+            path: request.path,
+            url: browser_request.url,
+            pubky_host: browser_request.pubky_host,
+        })
+    }
+
+    #[cfg(test)]
+    fn prepare_readiness_request_with_resolver(
+        &self,
+        request: &JsReadinessRequest,
+        resolver: &dyn crate::session::BrowserEndpointResolver,
+        testnet_host: Option<&str>,
+    ) -> locks_sdk::Result<JsPreparedReadinessRequest> {
+        let qname = request
+            .url
+            .host_str()
+            .and_then(|host| host.strip_prefix("_pubky."))
+            .ok_or(locks_sdk::LocksSdkError::InvalidTransportUrl)?;
+        let endpoint = resolver.resolve_browser_endpoint(qname)?;
+        self.prepare_readiness_request_for_endpoint(request, &endpoint, testnet_host)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn prepare_readiness_request_with_pkarr_resolver(
+        &self,
+        request: &JsReadinessRequest,
+        resolver: &BrowserPkarrResolver,
+        testnet_host: Option<&str>,
+    ) -> locks_sdk::Result<JsPreparedReadinessRequest> {
+        let qname = request
+            .url
+            .host_str()
+            .and_then(|host| host.strip_prefix("_pubky."))
+            .ok_or(locks_sdk::LocksSdkError::InvalidTransportUrl)?;
+        let endpoint = resolver.resolve_browser_endpoint(qname).await?;
+        self.prepare_readiness_request_for_endpoint(request, &endpoint, testnet_host)
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     fn build_connect_url_for_endpoint(
         &self,
         return_to: &str,
@@ -511,6 +608,31 @@ impl Locks {
         let endpoint = resolver.resolve_browser_endpoint(qname).await?;
         self.prepare_exchange_request_for_endpoint(request, &endpoint, testnet_host)
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_readiness(request_plan: &JsPreparedReadinessRequest) -> JsResult<bool> {
+    let request_init = web_sys::RequestInit::new();
+    request_init.set_method(request_plan.method);
+    request_init.set_mode(web_sys::RequestMode::Cors);
+
+    let request = web_sys::Request::new_with_str_and_init(request_plan.url.as_str(), &request_init)
+        .map_err(|_| lock_server_fetch_failed())?;
+    if let Some(pubky_host) = &request_plan.pubky_host {
+        request
+            .headers()
+            .set("pubky-host", pubky_host)
+            .map_err(|_| lock_server_fetch_failed())?;
+    }
+
+    let window = web_sys::window().ok_or_else(lock_server_fetch_failed)?;
+    let response_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|_| lock_server_fetch_failed())?;
+    let response: web_sys::Response = response_value
+        .dyn_into()
+        .map_err(|_| lock_server_fetch_failed())?;
+    Ok(response.ok())
 }
 
 fn parse_connect_callback_url(callback_url: &str) -> Result<ConnectCallback, String> {
@@ -1102,6 +1224,125 @@ mod tests {
             url.query(),
             Some("return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state")
         );
+    }
+
+    #[test]
+    fn readiness_request_uses_readyz_and_preserves_lock_server_identity() {
+        let locks =
+            Locks::for_server("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo").unwrap();
+        let request = locks.build_readiness_request().unwrap();
+        let endpoint = locks_sdk::transport::BrowserEndpoint {
+            domain: Some("locks.example".to_owned()),
+            port: Some(8443),
+            params: std::collections::BTreeMap::new(),
+        };
+
+        let prepared = locks
+            .prepare_readiness_request_for_endpoint(&request, &endpoint, None)
+            .unwrap();
+
+        assert_eq!(prepared.method, "GET");
+        assert_eq!(prepared.path, "/readyz");
+        assert_eq!(prepared.url.as_str(), "https://locks.example:8443/readyz");
+        assert_eq!(
+            prepared.pubky_host.as_deref(),
+            Some("7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+        );
+    }
+
+    #[test]
+    fn readiness_resolution_failure_remains_distinct_from_fetch_failure() {
+        struct MissingEndpoint;
+
+        impl crate::session::BrowserEndpointResolver for MissingEndpoint {
+            fn resolve_browser_endpoint(
+                &self,
+                _qname: &str,
+            ) -> locks_sdk::Result<locks_sdk::transport::BrowserEndpoint> {
+                Err(locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint)
+            }
+        }
+
+        let locks =
+            Locks::for_server("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo").unwrap();
+        let request = locks.build_readiness_request().unwrap();
+        let error = locks
+            .prepare_readiness_request_with_resolver(&request, &MissingEndpoint, None)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            locks_sdk::LocksSdkError::MissingBrowserDomainEndpoint
+        ));
+        assert_ne!(
+            readiness_error_name(ReadinessErrorKind::Resolution),
+            readiness_error_name(ReadinessErrorKind::Fetch)
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn readiness_fetch_uses_response_ok_and_classifies_network_failure() {
+        let locks =
+            Locks::for_server("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo").unwrap();
+        let request = locks.build_readiness_request().unwrap();
+        let endpoint = locks_sdk::transport::BrowserEndpoint {
+            domain: Some("locks.example".to_owned()),
+            port: None,
+            params: std::collections::BTreeMap::new(),
+        };
+        let prepared = locks
+            .prepare_readiness_request_for_endpoint(&request, &endpoint, None)
+            .unwrap();
+        let window = web_sys::window().unwrap();
+        let original_fetch =
+            js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("fetch")).unwrap();
+
+        let fetch_200 = js_sys::Function::new_no_args(
+            "return Promise.resolve(new Response('', { status: 200 }));",
+        );
+        js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("fetch"),
+            fetch_200.as_ref(),
+        )
+        .unwrap();
+        assert!(fetch_readiness(&prepared).await.unwrap());
+
+        let fetch_503 = js_sys::Function::new_no_args(
+            "return Promise.resolve(new Response('', { status: 503 }));",
+        );
+        js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("fetch"),
+            fetch_503.as_ref(),
+        )
+        .unwrap();
+        assert!(!fetch_readiness(&prepared).await.unwrap());
+
+        let fetch_failure =
+            js_sys::Function::new_no_args("return Promise.reject(new TypeError('offline'));");
+        js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("fetch"),
+            fetch_failure.as_ref(),
+        )
+        .unwrap();
+        let error = fetch_readiness(&prepared).await.unwrap_err();
+        assert_eq!(
+            js_sys::Reflect::get(&error, &JsValue::from_str("name"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("LockServerFetchFailed")
+        );
+
+        js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("fetch"),
+            &original_fetch,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -1,4 +1,7 @@
 use locks_core::ids::LockServerPubky;
+#[cfg(test)]
+use pubky::StatusCode;
+use pubky::{Method, PubkyHttpClient};
 use url::Url;
 
 use crate::discovery::CreatorLockServicePointer;
@@ -36,9 +39,58 @@ impl LocksClient {
         .map_err(|_| LocksSdkError::InvalidTransportUrl)
     }
 
+    /// Resolve the selected Lock Server through the supplied Pubky HTTP client and query
+    /// its `/readyz` endpoint.
+    ///
+    /// Returns `true` for every HTTP 2xx response and `false` for every non-2xx response.
+    /// Request preparation, PKARR lookup, and HTTP transport failures use the same request-error
+    /// class because the current [`PubkyHttpClient`] falls back to PubkyTLS when PKARR has no
+    /// endpoint and exposes that failure only when sending. They remain distinct from a server
+    /// response that says it is not ready. Reusing a configured [`PubkyHttpClient`] also reuses
+    /// its relay configuration and transport cache.
+    pub async fn is_ready(&self, http: &PubkyHttpClient) -> Result<bool> {
+        let url = self.readiness_transport_url()?;
+        let request = http
+            .request_async(Method::GET, url)
+            .await
+            .map_err(lock_server_readiness_request_failed)?;
+        let response = request
+            .send()
+            .await
+            .map_err(lock_server_readiness_request_failed)?;
+
+        Ok(response.status().is_success())
+    }
+
+    #[cfg(test)]
+    async fn is_ready_with<F, Fut, E>(&self, send: F) -> Result<bool>
+    where
+        F: FnOnce(Url) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<StatusCode, E>>,
+        E: std::fmt::Display,
+    {
+        let status = send(self.readiness_transport_url()?)
+            .await
+            .map_err(lock_server_readiness_request_failed)?;
+
+        Ok(status.is_success())
+    }
+
+    fn readiness_transport_url(&self) -> Result<Url> {
+        Url::parse(&format!(
+            "https://{}/readyz",
+            raw_pubky_z32(&self.lock_server)
+        ))
+        .map_err(|_| LocksSdkError::InvalidTransportUrl)
+    }
+
     pub fn restore_session(&self, secret: impl Into<String>) -> LocksSession {
         LocksSession::new(secret)
     }
+}
+
+fn lock_server_readiness_request_failed(error: impl std::fmt::Display) -> LocksSdkError {
+    LocksSdkError::LockServerReadinessRequestFailed(error.to_string())
 }
 
 fn raw_pubky_z32(lock_server: &LockServerPubky) -> String {
@@ -99,6 +151,52 @@ mod tests {
         assert_eq!(
             url.query(),
             Some("return_to=https%3A%2F%2Fpubky.app%2Fcallback&state=opaque")
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_uses_readyz_and_accepts_every_success_status() {
+        let client = LocksClient::for_server(lock_server());
+
+        for status in [pubky::StatusCode::OK, pubky::StatusCode::NO_CONTENT] {
+            let ready = client
+                .is_ready_with(|url| async move {
+                    assert_eq!(url.path(), "/readyz");
+                    Ok::<_, &'static str>(status)
+                })
+                .await
+                .unwrap();
+
+            assert!(ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_false_for_server_non_success() {
+        let client = LocksClient::for_server(lock_server());
+
+        let ready = client
+            .is_ready_with(|_| async {
+                Ok::<_, &'static str>(pubky::StatusCode::SERVICE_UNAVAILABLE)
+            })
+            .await
+            .unwrap();
+
+        assert!(!ready);
+    }
+
+    #[tokio::test]
+    async fn readiness_transport_failure_remains_distinct_from_not_ready() {
+        let client = LocksClient::for_server(lock_server());
+
+        let error = client
+            .is_ready_with(|_| async { Err::<pubky::StatusCode, _>("offline") })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LocksSdkError::LockServerReadinessRequestFailed("offline".to_owned())
         );
     }
 

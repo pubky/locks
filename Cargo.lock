@@ -1852,8 +1852,10 @@ name = "locks-sdk"
 version = "0.1.0"
 dependencies = [
  "locks-core",
+ "locks-server",
  "paykit-lib",
  "percent-encoding",
+ "pkarr",
  "pubky",
  "pubky-common",
  "pubky-noise",
@@ -1861,6 +1863,8 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+ "tokio",
+ "tokio-rustls",
  "url",
 ]
 
