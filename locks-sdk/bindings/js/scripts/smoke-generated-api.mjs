@@ -49,6 +49,7 @@ const requiredSnippets = [
   'addPkarrRelay(relay_url: string): LocksOptions;',
   'readonly pkarrRelays: string[];',
   'static fromCreatorLockServicePointer(pointer: any): Locks;',
+  'isReady(): Promise<boolean>;',
   'createConnectUrl(options: ConnectUrlOptions): Promise<string>;',
   'static parseConnectCallback(callback_url: string): ConnectCallback;',
   'exchangeFrontendSessionCode(options: ExchangeFrontendSessionCodeOptions): Promise<Session>;',
@@ -117,6 +118,9 @@ if (typeof sdk.Locks.hasPaykitData !== 'function') {
 if (typeof sdk.Locks.hasPaykitDataWithOptions !== 'function') {
   throw new Error('generated Locks missing hasPaykitDataWithOptions');
 }
+if (typeof sdk.Locks.prototype.isReady !== 'function') {
+  throw new Error('generated Locks missing isReady');
+}
 await assert.rejects(
   () => sdk.Locks.hasPaykitData('not-a-pubky'),
   /invalid user pubky/,
@@ -127,6 +131,20 @@ await assert.rejects(
 );
 const unavailableOptions = new sdk.LocksOptions();
 unavailableOptions.addPkarrRelay('http://127.0.0.1:1');
+const unavailableLocks = sdk.Locks.forServerWithOptions(
+  'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo',
+  unavailableOptions,
+);
+await Promise.race([
+  assert.rejects(
+    () => unavailableLocks.isReady(),
+    (error) => error?.name === 'LockServerResolutionFailed'
+      && error?.message === 'Lock Server endpoint resolution failed',
+  ),
+  new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Lock Server readiness resolution smoke timed out')), 10_000);
+  }),
+]);
 await Promise.race([
   assert.rejects(
     () => sdk.Locks.hasPaykitDataWithOptions(

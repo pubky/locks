@@ -21,3 +21,6 @@ url.workspace = true
 [build-dependencies]
 paykit-lib.workspace = true
 pubky-noise.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
