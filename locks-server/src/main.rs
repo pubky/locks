@@ -186,15 +186,46 @@ fn with_sensitive_pubky_logs_disabled(filter: EnvFilter) -> EnvFilter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use locks_server::config::LoggingConfig;
+
     use super::{SENSITIVE_PUBKY_LOG_DIRECTIVES, with_sensitive_pubky_logs_disabled};
-    use tracing_subscriber::EnvFilter;
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::{EnvFilter, Layer, Registry};
 
     #[test]
-    fn pubky_auth_identifier_logs_stay_disabled_with_trace_base_filter() {
-        let filter = with_sensitive_pubky_logs_disabled(EnvFilter::new("trace")).to_string();
+    fn default_filter_emits_info_but_disables_sensitive_pubky_targets() {
+        let filter =
+            with_sensitive_pubky_logs_disabled(EnvFilter::new(LoggingConfig::default().level));
+        let directives = filter.to_string();
 
         for directive in SENSITIVE_PUBKY_LOG_DIRECTIVES {
-            assert!(filter.contains(directive));
+            assert!(directives.contains(directive));
+        }
+
+        let targets = RecordedTargets::default();
+        let subscriber = Registry::default().with(filter).with(targets.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!(target: "locks_server::timing_filter_test", "visible control event");
+        tracing::info!(target: "pkarr", creator = "identifier-must-not-appear", "suppressed event");
+
+        assert_eq!(
+            targets.0.lock().unwrap().as_slice(),
+            ["locks_server::timing_filter_test"]
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordedTargets(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S> Layer<S> for RecordedTargets
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            self.0.lock().unwrap().push(event.metadata().target());
         }
     }
 }
