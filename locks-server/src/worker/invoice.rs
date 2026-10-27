@@ -6,6 +6,8 @@ use tokio::sync::watch;
 
 use crate::app_state::AppState;
 use crate::paykit_http_client::{PaykitClientError, PaykitInvoiceCreator, PaykitInvoiceRequest};
+use crate::worker::application_error_class;
+use crate::worker::timing::{TimingOutcome, TimingStage, TimingWorker, record_timing};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvoiceWorkerTick {
@@ -81,13 +83,31 @@ impl<'a> InvoiceAdmissionWorker<'a> {
     }
 
     pub async fn run_once(&self) -> Result<InvoiceWorkerTick, ApplicationError> {
-        let Some(claim) = self
+        let task_started = std::time::Instant::now();
+        let claim_started = std::time::Instant::now();
+        let claim = match self
             .admissions
             .claim_next_invoice_admission(&self.worker_id, self.clock.now(), self.claim_ttl)
-            .await?
-        else {
-            return Ok(InvoiceWorkerTick::Idle);
+            .await
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return Ok(InvoiceWorkerTick::Idle),
+            Err(error) => {
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::Claim,
+                    TimingOutcome::Error,
+                    claim_started,
+                );
+                return Err(error);
+            }
         };
+        record_timing(
+            TimingWorker::InvoiceAdmission,
+            TimingStage::Claim,
+            TimingOutcome::Claimed,
+            claim_started,
+        );
         let task_id = claim.admission.task.task_id;
         if claim.deadline_expired {
             return self
@@ -95,6 +115,7 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                     &task_id,
                     &claim.claim_token,
                     "invoice admission deadline exceeded",
+                    task_started,
                 )
                 .await;
         }
@@ -105,13 +126,21 @@ impl<'a> InvoiceAdmissionWorker<'a> {
             reader: intent.reader.to_string(),
             payment_in: intent.payment_in,
         };
+        let paykit_started = std::time::Instant::now();
         match self
             .paykit
             .create_invoice(task_id.as_uuid(), &request)
             .await
         {
             Ok(window) => {
-                let updated = self
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::PaykitInvoice,
+                    TimingOutcome::Completed,
+                    paykit_started,
+                );
+                let persistence_started = std::time::Instant::now();
+                let updated = match self
                     .admissions
                     .mark_invoice_admission_ready(
                         &task_id,
@@ -121,20 +150,58 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                         window.invoice_created_at,
                         window.payment_deadline,
                     )
-                    .await?;
-                Ok(if updated.is_some() {
-                    InvoiceWorkerTick::Ready(task_id)
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        record_timing(
+                            TimingWorker::InvoiceAdmission,
+                            TimingStage::AdmissionPersistence,
+                            TimingOutcome::Error,
+                            persistence_started,
+                        );
+                        record_timing(
+                            TimingWorker::InvoiceAdmission,
+                            TimingStage::Task,
+                            TimingOutcome::Error,
+                            task_started,
+                        );
+                        return Err(error);
+                    }
+                };
+                let (tick, outcome) = if updated.is_some() {
+                    (InvoiceWorkerTick::Ready(task_id), TimingOutcome::Completed)
                 } else {
-                    InvoiceWorkerTick::Idle
-                })
+                    (InvoiceWorkerTick::Idle, TimingOutcome::ClaimLost)
+                };
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::AdmissionPersistence,
+                    outcome,
+                    persistence_started,
+                );
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::Task,
+                    outcome,
+                    task_started,
+                );
+                Ok(tick)
             }
             Err(error) => {
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::PaykitInvoice,
+                    TimingOutcome::Failed,
+                    paykit_started,
+                );
                 log_invoice_error(&error);
                 match invoice_error_action(&error) {
                     InvoiceErrorAction::Retry(retry_after) => {
                         let retry_after = retry_after
                             .unwrap_or_else(|| self.jitter.delay(claim.admission.attempt_count));
-                        let updated = self
+                        let retry_started = std::time::Instant::now();
+                        let updated = match self
                             .admissions
                             .schedule_invoice_admission_retry(
                                 &task_id,
@@ -144,15 +211,50 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                                 retry_after,
                                 invoice_retry_reason(&error),
                             )
-                            .await?;
-                        Ok(if updated.is_some() {
-                            InvoiceWorkerTick::RetryScheduled(task_id)
+                            .await
+                        {
+                            Ok(updated) => updated,
+                            Err(error) => {
+                                record_timing(
+                                    TimingWorker::InvoiceAdmission,
+                                    TimingStage::RetrySchedule,
+                                    TimingOutcome::Error,
+                                    retry_started,
+                                );
+                                record_timing(
+                                    TimingWorker::InvoiceAdmission,
+                                    TimingStage::Task,
+                                    TimingOutcome::Error,
+                                    task_started,
+                                );
+                                return Err(error);
+                            }
+                        };
+                        let (tick, outcome) = if updated.is_some() {
+                            (
+                                InvoiceWorkerTick::RetryScheduled(task_id),
+                                TimingOutcome::RetryScheduled,
+                            )
                         } else {
-                            InvoiceWorkerTick::Idle
-                        })
+                            (InvoiceWorkerTick::Idle, TimingOutcome::ClaimLost)
+                        };
+                        record_timing(
+                            TimingWorker::InvoiceAdmission,
+                            TimingStage::RetrySchedule,
+                            outcome,
+                            retry_started,
+                        );
+                        record_timing(
+                            TimingWorker::InvoiceAdmission,
+                            TimingStage::Task,
+                            outcome,
+                            task_started,
+                        );
+                        Ok(tick)
                     }
                     InvoiceErrorAction::Fail(message) => {
-                        self.fail(&task_id, &claim.claim_token, message).await
+                        self.fail(&task_id, &claim.claim_token, message, task_started)
+                            .await
                     }
                 }
             }
@@ -164,8 +266,10 @@ impl<'a> InvoiceAdmissionWorker<'a> {
         task_id: &TaskId,
         claim_token: &uuid::Uuid,
         message: &str,
+        task_started: std::time::Instant,
     ) -> Result<InvoiceWorkerTick, ApplicationError> {
-        let updated = self
+        let persistence_started = std::time::Instant::now();
+        let updated = match self
             .admissions
             .mark_invoice_admission_failed(
                 task_id,
@@ -174,12 +278,43 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                 self.clock.now(),
                 message,
             )
-            .await?;
-        Ok(if updated.is_some() {
-            InvoiceWorkerTick::Failed(*task_id)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::AdmissionPersistence,
+                    TimingOutcome::Error,
+                    persistence_started,
+                );
+                record_timing(
+                    TimingWorker::InvoiceAdmission,
+                    TimingStage::Task,
+                    TimingOutcome::Error,
+                    task_started,
+                );
+                return Err(error);
+            }
+        };
+        let (tick, outcome) = if updated.is_some() {
+            (InvoiceWorkerTick::Failed(*task_id), TimingOutcome::Failed)
         } else {
-            InvoiceWorkerTick::Idle
-        })
+            (InvoiceWorkerTick::Idle, TimingOutcome::ClaimLost)
+        };
+        record_timing(
+            TimingWorker::InvoiceAdmission,
+            TimingStage::AdmissionPersistence,
+            outcome,
+            persistence_started,
+        );
+        record_timing(
+            TimingWorker::InvoiceAdmission,
+            TimingStage::Task,
+            outcome,
+            task_started,
+        );
+        Ok(tick)
     }
 
     pub async fn run_until_shutdown(
@@ -202,7 +337,11 @@ impl<'a> InvoiceAdmissionWorker<'a> {
                     }
                 }
                 Err(error) => {
-                    tracing::error!(%error, worker_id = %self.worker_id, "invoice admission worker tick failed");
+                    tracing::error!(
+                        worker = TimingWorker::InvoiceAdmission.as_str(),
+                        error_class = application_error_class(&error),
+                        "invoice admission worker tick failed"
+                    );
                     tokio::select! {
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
@@ -284,8 +423,9 @@ fn log_invoice_error(error: &PaykitClientError) {
             status,
             error_code,
             retry_after_seconds,
+            ..
         } => tracing::warn!(
-            operation = "invoice creation",
+            operation = "invoice_creation",
             %request_id,
             status = status.as_u16(),
             error_code,
@@ -298,8 +438,9 @@ fn log_invoice_error(error: &PaykitClientError) {
             elapsed_ms,
             timeout,
             connect,
+            ..
         } => tracing::warn!(
-            operation = "invoice creation",
+            operation = "invoice_creation",
             %request_id,
             elapsed_ms,
             timeout,

@@ -409,7 +409,7 @@ impl PaykitHttpClient {
             return Err(PaykitClientError::InvalidInvoiceTimestamps);
         }
         tracing::info!(
-            operation = "invoice creation",
+            operation = "invoice_creation",
             %request_id,
             status = StatusCode::OK.as_u16(),
             elapsed_ms = elapsed_millis(started),
