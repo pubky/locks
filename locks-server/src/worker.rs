@@ -9,11 +9,12 @@ use locks_service::application::use_cases::complete_verification_task::{
 };
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 use tokio::sync::watch;
-use tracing::{debug, error, info};
 
 use crate::app_state::{AppState, WorkerKind, WorkerReadiness, WorkerReadinessEvidence};
+use crate::worker::timing::{TimingOutcome, TimingStage, TimingWorker, record_timing};
 
 mod invoice;
+mod timing;
 pub use invoice::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, OsFullJitter};
 
 const NON_PAYKIT_PENDING_VERIFICATION_RETRY_DELAY_SECONDS: i64 = 30;
@@ -107,22 +108,49 @@ impl<'a> VerificationWorker<'a> {
     }
 
     pub async fn run_once(&self) -> Result<WorkerTick, ApplicationError> {
+        let task_started = std::time::Instant::now();
         let now = self.clock.now();
         let claim_expires_at = now + claim_timeout(self.claim_timeout_seconds);
-        let Some(claim) = self
+        let claim_started = std::time::Instant::now();
+        let claim = match self
             .claimer
             .claim_next_verification_task(&self.worker_id, now, claim_expires_at)
-            .await?
-        else {
-            return Ok(WorkerTick::Idle);
+            .await
+        {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return Ok(WorkerTick::Idle),
+            Err(error) => {
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::Claim,
+                    TimingOutcome::Error,
+                    claim_started,
+                );
+                return Err(error);
+            }
         };
+        record_timing(
+            TimingWorker::Verification,
+            TimingStage::Claim,
+            TimingOutcome::Claimed,
+            claim_started,
+        );
 
         let task_id = claim.task.task_id;
         let claim_token = claim.claim_token;
         let is_paykit_payment = claim.task.submitted_proof_bundle.proofs.len() == 1
             && claim.task.submitted_proof_bundle.proofs[0].verifier_type
                 == locks_core::lock_policy::VerifierType::PaykitPayment;
-        debug!(%task_id, worker_id = %self.worker_id, "claimed verification task");
+        let processing_stage = if claim.task.status
+            == locks_service::application::models::VerificationTaskStatus::PublishingEntitlement
+        {
+            TimingStage::EntitlementPublication
+        } else if is_paykit_payment {
+            TimingStage::PaykitStatus
+        } else {
+            TimingStage::Verification
+        };
+        let processing_started = std::time::Instant::now();
         let mut verifiers = StaticCriterionVerifierRegistry::new();
         if self.allow_dev_static_verifier {
             verifiers = verifiers.with_dev_static(self.dev_static_verifier);
@@ -149,7 +177,24 @@ impl<'a> VerificationWorker<'a> {
             .await
         {
             Ok(completed) => {
-                info!(%task_id, status = ?completed.status, "completed verification task");
+                let outcome = match completed.status {
+                    locks_service::application::models::VerificationTaskStatus::Expired => {
+                        TimingOutcome::Expired
+                    }
+                    _ => TimingOutcome::Completed,
+                };
+                record_timing(
+                    TimingWorker::Verification,
+                    processing_stage,
+                    outcome,
+                    processing_started,
+                );
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::Task,
+                    outcome,
+                    task_started,
+                );
                 Ok(WorkerTick::Completed(task_id))
             }
             Err(
@@ -157,19 +202,26 @@ impl<'a> VerificationWorker<'a> {
                 | ApplicationError::PaykitPaymentStatusConflict),
             ) => {
                 if matches!(error, ApplicationError::PaykitPaymentStatusConflict) {
-                    error!(
-                        %task_id,
-                        worker_id = %self.worker_id,
+                    tracing::error!(
+                        worker = TimingWorker::Verification.as_str(),
+                        reason = "paykit_status_conflict",
                         "paykit payment status conflict; scheduling retry"
                     );
                 }
+                record_timing(
+                    TimingWorker::Verification,
+                    processing_stage,
+                    TimingOutcome::RetryRequired,
+                    processing_started,
+                );
                 let retry_scheduled_at = self.clock.now();
                 let next_attempt_at = retry_scheduled_at
                     + retry_delay(
                         is_paykit_payment,
                         self.paykit_payment_retry_interval_seconds,
                     );
-                let Some(_) = self
+                let retry_started = std::time::Instant::now();
+                let updated = match self
                     .claimer
                     .schedule_verification_task_retry(
                         &task_id,
@@ -178,33 +230,82 @@ impl<'a> VerificationWorker<'a> {
                         retry_scheduled_at,
                         next_attempt_at,
                     )
-                    .await?
-                else {
-                    info!(
-                        %task_id,
-                        worker_id = %self.worker_id,
-                        "verification task claim no longer owned; retry not scheduled"
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        record_timing(
+                            TimingWorker::Verification,
+                            TimingStage::RetrySchedule,
+                            TimingOutcome::Error,
+                            retry_started,
+                        );
+                        record_timing(
+                            TimingWorker::Verification,
+                            TimingStage::Task,
+                            TimingOutcome::Error,
+                            task_started,
+                        );
+                        return Err(error);
+                    }
+                };
+                if updated.is_none() {
+                    record_timing(
+                        TimingWorker::Verification,
+                        TimingStage::RetrySchedule,
+                        TimingOutcome::ClaimLost,
+                        retry_started,
+                    );
+                    record_timing(
+                        TimingWorker::Verification,
+                        TimingStage::Task,
+                        TimingOutcome::ClaimLost,
+                        task_started,
                     );
                     return Ok(WorkerTick::Idle);
-                };
-                debug!(
-                    %task_id,
-                    worker_id = %self.worker_id,
-                    %next_attempt_at,
-                    "scheduled verification task retry"
+                }
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::RetrySchedule,
+                    TimingOutcome::RetryScheduled,
+                    retry_started,
+                );
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::Task,
+                    TimingOutcome::RetryScheduled,
+                    task_started,
                 );
                 Ok(WorkerTick::RetryScheduled(task_id))
             }
             Err(ApplicationError::VerificationTaskClaimLost) => {
-                info!(
-                    %task_id,
-                    worker_id = %self.worker_id,
-                    "verification task claim no longer owned; terminal state not persisted"
+                record_timing(
+                    TimingWorker::Verification,
+                    processing_stage,
+                    TimingOutcome::ClaimLost,
+                    processing_started,
+                );
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::Task,
+                    TimingOutcome::ClaimLost,
+                    task_started,
                 );
                 Ok(WorkerTick::Idle)
             }
-            Err(error) => {
-                error!(%task_id, error = %error, "verification task failed");
+            Err(_) => {
+                record_timing(
+                    TimingWorker::Verification,
+                    processing_stage,
+                    TimingOutcome::Failed,
+                    processing_started,
+                );
+                record_timing(
+                    TimingWorker::Verification,
+                    TimingStage::Task,
+                    TimingOutcome::Failed,
+                    task_started,
+                );
                 Ok(WorkerTick::Failed(task_id))
             }
         }
@@ -336,6 +437,7 @@ mod tests {
         LoggingConfig, PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment,
         SecretsConfig, WorkerConfig,
     };
+    use crate::worker::timing::{TimingOutcome, TimingStage, TimingWorker};
     use crate::worker::{VerificationWorker, WorkerTick, retry_delay};
 
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
@@ -609,6 +711,34 @@ mod tests {
     fn pending_verification_retry_is_independent_of_queue_polling() {
         assert_eq!(retry_delay(false, 3), time::Duration::seconds(30));
         assert_eq!(retry_delay(true, 3), time::Duration::seconds(3));
+    }
+
+    #[test]
+    fn worker_timing_labels_are_stable_and_low_cardinality() {
+        assert_eq!(TimingWorker::Verification.as_str(), "verification");
+        assert_eq!(TimingWorker::InvoiceAdmission.as_str(), "invoice_admission");
+        assert_eq!(TimingStage::Claim.as_str(), "claim");
+        assert_eq!(TimingStage::Verification.as_str(), "verification");
+        assert_eq!(TimingStage::PaykitStatus.as_str(), "paykit_status");
+        assert_eq!(
+            TimingStage::EntitlementPublication.as_str(),
+            "entitlement_publication"
+        );
+        assert_eq!(TimingStage::PaykitInvoice.as_str(), "paykit_invoice");
+        assert_eq!(
+            TimingStage::AdmissionPersistence.as_str(),
+            "admission_persistence"
+        );
+        assert_eq!(TimingStage::RetrySchedule.as_str(), "retry_schedule");
+        assert_eq!(TimingStage::Task.as_str(), "task");
+        assert_eq!(TimingOutcome::Claimed.as_str(), "claimed");
+        assert_eq!(TimingOutcome::Completed.as_str(), "completed");
+        assert_eq!(TimingOutcome::Expired.as_str(), "expired");
+        assert_eq!(TimingOutcome::RetryRequired.as_str(), "retry_required");
+        assert_eq!(TimingOutcome::RetryScheduled.as_str(), "retry_scheduled");
+        assert_eq!(TimingOutcome::Failed.as_str(), "failed");
+        assert_eq!(TimingOutcome::ClaimLost.as_str(), "claim_lost");
+        assert_eq!(TimingOutcome::Error.as_str(), "error");
     }
 
     #[tokio::test]
