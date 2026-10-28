@@ -25,10 +25,12 @@ import {
   DEFAULT_PAYKIT_SERVER_CONTEXT,
   PAYKIT_SERVER_REF,
 } from './lib/paykit-server-source.mjs';
+import { assertCargoLockPackageVersions } from './lib/release-version-contract.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const locksReleaseVersion = '0.1.0';
+const locksServerReleaseVersion = '0.1.1-rc1';
 assert.equal(PAYKIT_SERVER_REF, '4cc8e7b836dba28446a8d821f593ee40bb4acbeb');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
@@ -89,20 +91,14 @@ assert.match(composeSource, /^# Local development and demonstration only;/);
 assert.match(composeSource, /^name: pubky-locks-paykit-demo$/m);
 assert.match(cargoManifestSource, new RegExp(`^version = "${locksReleaseVersion}"$`, 'm'));
 assert.equal(jsPackage.version, locksReleaseVersion);
-for (const packageName of [
-  'locks-core',
-  'locks-e2e',
-  'locks-sdk',
-  'locks-sdk-wasm',
-  'locks-server',
-  'locks-service',
-]) {
-  assert.match(
-    cargoLockSource,
-    new RegExp(`name = "${packageName}"\\nversion = "${locksReleaseVersion}"`),
-    `${packageName} Cargo.lock version must match the release candidate`,
-  );
-}
+assertCargoLockPackageVersions(cargoLockSource, new Map([
+  ['locks-core', locksReleaseVersion],
+  ['locks-e2e', locksReleaseVersion],
+  ['locks-sdk', locksReleaseVersion],
+  ['locks-sdk-wasm', locksReleaseVersion],
+  ['locks-server', locksServerReleaseVersion],
+  ['locks-service', locksReleaseVersion],
+]));
 assert.match(creatorAppSource, /hasExactKeys\(event\.data, \['type', 'state', 'code'\]\)/);
 assert.match(creatorAppSource, /body: JSON\.stringify\(\{ level \}\)/);
 assert.match(creatorAppSource, /\[result\.authorizationUrl, result\.command\]\.filter\(Boolean\)/);
@@ -590,7 +586,7 @@ assert.ok(
 );
 assert.equal(
   packageJson.scripts['smoke:paykit-compose'],
-  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:pubky && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
+  'npm run validate:paykit-compose && npm run check:paykit-setup-contract && npm run test:release-version-contract && npm run test:pubky && npm run test:paykit-reader-worker && node scripts/smoke-paykit-compose.mjs',
 );
 
 console.log('Paykit Compose smoke check passed');
