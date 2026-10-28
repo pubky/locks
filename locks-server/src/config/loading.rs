@@ -128,12 +128,33 @@ fn initialize_default_config(
     secret_path: PathBuf,
     identity_provider: &impl LockServerIdentityProvider,
 ) -> Result<LockServerRuntimeConfig, ConfigError> {
+    initialize_default_config_with_database_url(
+        config_path,
+        service_home,
+        secret_path,
+        identity_provider,
+        || {
+            std::env::var("PUBKY_LOCK_DATABASE_URL").map_err(|_| {
+                ConfigError::MissingDatabaseUrlEnv("PUBKY_LOCK_DATABASE_URL".to_owned())
+            })
+        },
+    )
+}
+
+fn initialize_default_config_with_database_url(
+    config_path: PathBuf,
+    service_home: PathBuf,
+    secret_path: PathBuf,
+    identity_provider: &impl LockServerIdentityProvider,
+    database_url: impl FnOnce() -> Result<String, ConfigError>,
+) -> Result<LockServerRuntimeConfig, ConfigError> {
     std::fs::create_dir_all(&service_home).map_err(|source| ConfigError::CreateServiceHome {
         path: service_home.clone(),
         source,
     })?;
 
     let public_key = identity_provider.generate_secret(&secret_path)?;
+    let database_url = database_url()?;
     let config = LockServerRuntimeConfig {
         bind_addr: "127.0.0.1:3000".parse().expect("static bind addr is valid"),
         credentials: LockServerCredentialsConfig {
@@ -142,9 +163,7 @@ fn initialize_default_config(
             max_ttl_seconds: 900,
         },
         database: DatabaseConfig {
-            url: std::env::var("PUBKY_LOCK_DATABASE_URL").map_err(|_| {
-                ConfigError::MissingDatabaseUrlEnv("PUBKY_LOCK_DATABASE_URL".to_owned())
-            })?,
+            url: database_url,
             max_connections: 10,
             run_migrations_on_startup: true,
         },
@@ -355,19 +374,24 @@ mod tests {
     use crate::config::{FilesystemLockServerIdentityProvider, GrantConnectAcquisitionConfig};
     use tempfile::tempdir;
 
+    const TEST_DATABASE_URL: &str = "postgres://localhost/locks_test";
+
+    fn initialize_test_default_config(home: &Path) -> LockServerRuntimeConfig {
+        let service_home = home.join(DEFAULT_SERVICE_HOME);
+        initialize_default_config_with_database_url(
+            service_home.join(DEFAULT_CONFIG_FILE),
+            service_home.clone(),
+            service_home.join(DEFAULT_SECRET_FILE),
+            &FilesystemLockServerIdentityProvider,
+            || Ok(TEST_DATABASE_URL.to_owned()),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn generated_default_config_comments_every_setting_and_remains_parseable() {
         let home = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(
-                "PUBKY_LOCK_DATABASE_URL",
-                "postgres://locks:locks@localhost/locks_test",
-            );
-        }
-
-        let generated =
-            load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
-                .unwrap();
+        let generated = initialize_test_default_config(home.path());
         let config_path = home.path().join(".pubky-lock/config.toml");
         let config_text = std::fs::read_to_string(&config_path).unwrap();
 
@@ -375,6 +399,14 @@ mod tests {
             assert!(line.contains(" # "), "missing inline comment: {line}");
         }
 
+        std::fs::write(
+            &config_path,
+            config_text.replace(
+                "url_env = \"PUBKY_LOCK_DATABASE_URL\"",
+                &format!("url = \"{TEST_DATABASE_URL}\""),
+            ),
+        )
+        .unwrap();
         let parsed = load_existing_config_from_path(&config_path).unwrap();
 
         assert_eq!(parsed, generated);
@@ -394,15 +426,7 @@ mod tests {
     #[test]
     fn paykit_config_requires_signing_seed_secret_on_startup() {
         let home = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(
-                "PUBKY_LOCK_DATABASE_URL",
-                "postgres://locks:locks@localhost/locks_test",
-            );
-        }
-        let generated =
-            load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
-                .unwrap();
+        let generated = initialize_test_default_config(home.path());
         let secret_path = home.path().join(".pubky-lock/secret.sess");
         std::fs::write(
             &secret_path,
@@ -413,6 +437,16 @@ mod tests {
         )
         .unwrap();
 
+        let config_path = home.path().join(".pubky-lock/config.toml");
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            config_text.replace(
+                "url_env = \"PUBKY_LOCK_DATABASE_URL\"",
+                &format!("url = \"{TEST_DATABASE_URL}\""),
+            ),
+        )
+        .unwrap();
         let error =
             load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
                 .unwrap_err();
@@ -423,15 +457,7 @@ mod tests {
     #[test]
     fn grant_connect_requires_signing_seed_secret_on_startup() {
         let home = tempdir().unwrap();
-        unsafe {
-            std::env::set_var(
-                "PUBKY_LOCK_DATABASE_URL",
-                "postgres://locks:***@localhost/locks_test",
-            );
-        }
-        let mut generated =
-            load_or_initialize_config(None, home.path(), &FilesystemLockServerIdentityProvider)
-                .unwrap();
+        let mut generated = initialize_test_default_config(home.path());
         generated.paykit = None;
         generated.creator_authority_acquisition.method =
             CreatorAuthorityAcquisitionMethod::GrantConnect;

@@ -92,6 +92,7 @@ async fn run_periodic<P, F, E>(
     interval.tick().await;
     loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
@@ -223,29 +224,32 @@ mod tests {
 
     #[tokio::test]
     async fn failed_periodic_publication_is_retried_until_shutdown() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&attempts);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        for _ in 0..20 {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&attempts);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        run_periodic(
-            std::time::Duration::from_millis(1),
-            shutdown_rx,
-            move || {
-                let attempt = observed.fetch_add(1, Ordering::SeqCst);
-                let shutdown_tx = shutdown_tx.clone();
-                async move {
-                    if attempt == 0 {
-                        Err("relay unavailable")
-                    } else {
-                        shutdown_tx.send(true).unwrap();
-                        Ok(())
+            run_periodic(
+                std::time::Duration::from_millis(1),
+                shutdown_rx,
+                move || {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    let shutdown_tx = shutdown_tx.clone();
+                    async move {
+                        if attempt == 0 {
+                            Err("relay unavailable")
+                        } else {
+                            shutdown_tx.send(true).unwrap();
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            Ok(())
+                        }
                     }
-                }
-            },
-        )
-        .await;
+                },
+            )
+            .await;
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
