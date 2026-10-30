@@ -174,6 +174,12 @@ impl InMemoryAccessCredentialStore {
         )
     }
 
+    pub fn with_deletion_fence(
+        verification_task_deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self {
+        Self::build(None, Some(verification_task_deletion_fence))
+    }
+
     fn build(
         verification_tasks: Option<Arc<dyn VerificationTaskRepository>>,
         verification_task_deletion_fence: Option<Arc<InMemoryVerificationTaskDeletionFence>>,
@@ -423,9 +429,34 @@ impl InMemoryAccessCredentialStore {
                 .collect::<Vec<_>>()
         };
 
-        if let Some(tasks) = &self.verification_tasks {
-            let mut updates = Vec::with_capacity(task_ids.len());
-            for task_id in &task_ids {
+        let graph_task_ids = if let Some(fence) = &self.verification_task_deletion_fence {
+            let graph_records = fence.graph_records.read().await;
+            task_ids
+                .iter()
+                .filter(|task_id| {
+                    graph_records
+                        .iter()
+                        .any(|stored| stored.task.task_id == **task_id)
+                })
+                .copied()
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let legacy_task_ids = task_ids
+            .iter()
+            .filter(|task_id| !graph_task_ids.contains(task_id))
+            .copied()
+            .collect::<Vec<_>>();
+
+        if !legacy_task_ids.is_empty() {
+            let Some(tasks) = &self.verification_tasks else {
+                return Err(invalid_deletion_state(
+                    "frozen non-Paykit verification task is missing",
+                ));
+            };
+            let mut updates = Vec::with_capacity(legacy_task_ids.len());
+            for task_id in &legacy_task_ids {
                 let Some(task) = tasks.get_verification_task(task_id).await? else {
                     return Err(invalid_deletion_state(
                         "frozen non-Paykit verification task is missing",
@@ -439,6 +470,43 @@ impl InMemoryAccessCredentialStore {
                 }
             }
             tasks.update_verification_tasks_atomically(updates).await?;
+        }
+
+        if !graph_task_ids.is_empty() {
+            let fence = self
+                .verification_task_deletion_fence
+                .as_ref()
+                .expect("graph task IDs require deletion fence");
+            let mut fence_records = fence.records.write().await;
+            let mut current_statuses = fence.current_statuses.write().await;
+            let mut graph_records = fence.graph_records.write().await;
+            if graph_task_ids.iter().any(|task_id| {
+                !graph_records
+                    .iter()
+                    .any(|stored| stored.task.task_id == *task_id)
+            }) {
+                return Err(invalid_deletion_state(
+                    "frozen graph verification task is missing",
+                ));
+            }
+            for stored in graph_records
+                .iter_mut()
+                .filter(|stored| graph_task_ids.contains(&stored.task.task_id))
+            {
+                if matches!(
+                    stored.task.status,
+                    VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
+                ) {
+                    stored.task.status = VerificationTaskStatus::Expired;
+                    stored.claimed_by = None;
+                    stored.claim_token = None;
+                    stored.claim_expires_at = None;
+                    current_statuses.insert(stored.task.task_id, VerificationTaskStatus::Expired);
+                    if let Some(record) = fence_records.get_mut(&stored.task.task_id) {
+                        record.status = VerificationTaskStatus::Expired;
+                    }
+                }
+            }
         }
 
         let mut state = self.state.write().await;

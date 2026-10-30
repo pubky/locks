@@ -3,6 +3,7 @@ mod content_lock_deletion;
 mod content_lock_ownership;
 mod creator_authority;
 mod frontend_session;
+mod graph0conf;
 mod guarded_resource;
 mod verification;
 
@@ -11,6 +12,7 @@ pub use content_lock_deletion::*;
 pub use content_lock_ownership::*;
 pub use creator_authority::*;
 pub use frontend_session::*;
+pub use graph0conf::*;
 pub use guarded_resource::*;
 pub use verification::*;
 

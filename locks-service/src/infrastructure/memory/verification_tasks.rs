@@ -99,6 +99,18 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
         let mut fence_records = self.deletion_fence.records.write().await;
         let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
+        if fence_records.contains_key(&task.task_id) && !records.contains_key(&task.task_id) {
+            return Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            });
+        }
+        if fence_records.iter().any(|(task_id, record)| {
+            record.creator == task.creator
+                && record.bundle_id == task.submitted_proof_bundle.bundle_id
+                && !records.contains_key(task_id)
+        }) {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
                 && existing.submitted_proof_bundle.bundle_id
@@ -212,6 +224,9 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
         let task = self.records.read().await.get(task_id).cloned();
+        if task.is_none() {
+            return Ok(());
+        }
         let _admission_guard = if let Some(task) = task.as_ref() {
             Some(
                 self.deletion_fence
@@ -274,6 +289,18 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
         let mut admissions = self.invoice_admissions.write().await;
+        if fence_records.contains_key(&task.task_id) && !records.contains_key(&task.task_id) {
+            return Err(ApplicationError::DuplicateRecord {
+                record: "verification_task",
+            });
+        }
+        if fence_records.iter().any(|(task_id, record)| {
+            record.creator == task.creator
+                && record.bundle_id == task.submitted_proof_bundle.bundle_id
+                && !records.contains_key(task_id)
+        }) {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if let Some(existing) = records.values().find(|existing| {
             existing.creator == task.creator
                 && existing.submitted_proof_bundle.bundle_id

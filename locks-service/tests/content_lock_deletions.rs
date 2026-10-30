@@ -5,8 +5,8 @@ use locks_core::{
         BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
     },
     lock_policy::{
-        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
-        LockServerConfig, VerifierType,
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
+        GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, VerifierType,
     },
     verification::{
         CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
@@ -20,16 +20,16 @@ use locks_service::{
             AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
             AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
             ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-            FinalAccessWindows, INVOICE_ADMISSION_INTENT_VERSION,
-            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
-            PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
-            VerificationTerminalReason,
+            FinalAccessWindows, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
+            INVOICE_ADMISSION_INTENT_VERSION, InitializeFinalAccessWindowsResult,
+            InvoiceAdmissionIntentV1, PrepareForceDeletionResult, VerificationTaskRecord,
+            VerificationTaskStatus, VerificationTerminalReason,
         },
         ports::{
             AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
             ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-            ContentLockDeletionRepository, InvoiceAdmissionRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            ContentLockDeletionRepository, GraphTaskClaimer, GraphTaskRepository,
+            InvoiceAdmissionRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -37,6 +37,7 @@ use locks_service::{
         access_credentials::InMemoryAccessCredentialStore,
         content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
         content_lock_deletions::InMemoryContentLockDeletionRepository,
+        graph_tasks::InMemoryGraphTaskRepository,
         verification_task_claims::InMemoryVerificationTaskClaimer,
         verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
         verification_tasks::InMemoryVerificationTaskRepository,
@@ -1733,6 +1734,75 @@ async fn in_memory_non_paykit_expiry_rejects_claim_at_expiry_equality() {
 }
 
 #[tokio::test]
+async fn in_memory_deletion_expires_claimed_graph_task_and_fences_stale_snapshot_write() {
+    assert_memory_graph_deletion(false).await;
+    assert_memory_graph_deletion(true).await;
+}
+
+async fn assert_memory_graph_deletion(include_legacy_repository: bool) {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let graph = InMemoryGraphTaskRepository::with_deletion_fence(Arc::clone(&fence));
+    let access = if include_legacy_repository {
+        let legacy = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        Arc::new(
+            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+                legacy,
+                Arc::clone(&fence),
+            ),
+        )
+    } else {
+        Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        ))
+    };
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access, fence,
+        );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = graph_task_for_job(&job);
+    graph.insert_graph_task(task).await.unwrap();
+    let graph_claim = graph
+        .claim_next_graph_task("graph-worker", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let deletion_claim = advance_to_start_payment_drain(&deletions, job.job_id).await;
+
+    assert!(
+        deletions
+            .expire_unresolved_non_paykit_tasks(job.job_id, "worker", deletion_claim.claim_token,)
+            .await
+            .unwrap()
+    );
+    let stored = graph
+        .get_graph_task_by_handle(&job.creator, &graph_claim.task.snapshot.as_v1().bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, VerificationTaskStatus::Expired);
+    assert_eq!(
+        graph
+            .persist_claimed_graph_snapshot(
+                &graph_claim.task.task_id,
+                "graph-worker",
+                &graph_claim.claim_token,
+                NOW,
+                0,
+                graph_claim.task.snapshot,
+            )
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn no_paykit_task_expiry_serializes_with_force_claim_revocation() {
     let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
         FixedClock(NOW),
@@ -2376,6 +2446,39 @@ fn complete_verification_task(in_progress: VerificationTaskRecord) -> Verificati
         .unwrap()
         .complete_entitlement_publication(NOW)
         .unwrap()
+}
+
+fn graph_task_for_job(job: &ContentLockDeletionJob) -> GraphTaskRecord {
+    let lock_hash = job.frozen_content_lock.lock_hash().unwrap();
+    let pubky_lock_resource = PubkyLockResource::from_str(&format!(
+        "{}/pub/app.locks/{}.json",
+        job.creator, job.lock_id
+    ))
+    .unwrap();
+    GraphTaskRecord {
+        task_id: TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d19").unwrap(),
+        snapshot: GraphTaskSnapshot::V1(
+            GraphTaskSnapshotV1::new(
+                job.creator.clone(),
+                BundleId::new_random(),
+                pubky_lock_resource,
+                *lock_hash.as_bytes(),
+                job.creator.clone(),
+                NOW,
+                60,
+                GraphPolicyV2 {
+                    predicates: vec![GraphPredicateV2::Follows {
+                        follower: GraphParticipantV2::Reader,
+                        followed: GraphParticipantV2::Creator,
+                    }],
+                    operator: None,
+                },
+            )
+            .unwrap(),
+        ),
+        evaluator_revision: 0,
+        status: VerificationTaskStatus::Pending,
+    }
 }
 
 fn content_lock() -> ContentLock {

@@ -14,6 +14,7 @@ pub mod creator_authority;
 pub mod creator_connect_flows;
 pub mod errors;
 pub mod frontend_sessions;
+pub mod graph_tasks;
 pub mod migrations;
 pub mod payment_drains;
 mod proof_admission;
@@ -30,6 +31,7 @@ pub use creator_authority::{CreatorAuthoritySecretCipher, PostgresCreatorAuthori
 pub use creator_connect_flows::PostgresCreatorConnectFlowStore;
 pub use errors::PostgresError;
 pub use frontend_sessions::{PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore};
+pub use graph_tasks::PostgresGraphTaskRepository;
 pub use migrations::run_migrations;
 pub use payment_drains::PostgresPaymentDrainRepository;
 pub use verification_task_claims::PostgresVerificationTaskClaimer;

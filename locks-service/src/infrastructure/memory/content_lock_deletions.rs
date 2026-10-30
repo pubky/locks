@@ -81,9 +81,12 @@ pub struct InMemoryContentLockDeletionRepository {
 
 impl Default for InMemoryContentLockDeletionRepository {
     fn default() -> Self {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
         Self::with_dependencies(
-            Arc::new(InMemoryAccessCredentialStore::new()),
-            Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+            Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+                Arc::clone(&fence),
+            )),
+            fence,
             OwnershipRecords::default(),
         )
     }
@@ -98,7 +101,9 @@ impl InMemoryContentLockDeletionRepository {
         verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     ) -> Self {
         Self::with_access_credentials_and_verification_task_fence(
-            Arc::new(InMemoryAccessCredentialStore::new()),
+            Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+                Arc::clone(&verification_task_fence),
+            )),
             verification_task_fence,
         )
     }

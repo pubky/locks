@@ -9,7 +9,10 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use uuid::Uuid;
 
-use crate::application::{models::VerificationTaskStatus, ports::Clock};
+use crate::application::{
+    models::{GraphTaskRecord, VerificationTaskStatus},
+    ports::Clock,
+};
 
 type LockKey = (CreatorPubky, LockId);
 
@@ -34,9 +37,18 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
     pub(crate) deletion_job_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InMemoryStoredGraphTask {
+    pub(crate) task: GraphTaskRecord,
+    pub(crate) claimed_by: Option<String>,
+    pub(crate) claim_token: Option<Uuid>,
+    pub(crate) claim_expires_at: Option<OffsetDateTime>,
+}
+
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
+    pub(crate) graph_records: RwLock<Vec<InMemoryStoredGraphTask>>,
     pub(crate) current_statuses: RwLock<HashMap<TaskId, VerificationTaskStatus>>,
     pub(crate) deletion_cutoffs: RwLock<HashSet<LockKey>>,
     lock_admissions: Mutex<HashMap<LockKey, Arc<Mutex<()>>>>,
@@ -48,6 +60,7 @@ impl fmt::Debug for InMemoryVerificationTaskDeletionFence {
         formatter
             .debug_struct("InMemoryVerificationTaskDeletionFence")
             .field("records", &self.records)
+            .field("graph_records", &self.graph_records)
             .field("current_statuses", &self.current_statuses)
             .field("deletion_cutoffs", &self.deletion_cutoffs)
             .field("lock_admissions", &self.lock_admissions)
@@ -70,6 +83,7 @@ impl InMemoryVerificationTaskDeletionFence {
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
+            graph_records: RwLock::new(Vec::new()),
             current_statuses: RwLock::new(HashMap::new()),
             deletion_cutoffs: RwLock::new(HashSet::new()),
             lock_admissions: Mutex::new(HashMap::new()),
