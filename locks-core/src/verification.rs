@@ -1,14 +1,23 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
-use crate::lock_policy::VerifierType;
+use crate::lock_policy::{
+    CONTENT_LOCK_V2_VERSION, CONTENT_LOCK_VERSION, ContentLockPayload, ContentLockV2, VerifierType,
+};
 
 /// Supported v0 submitted proof bundle payload version.
 pub const SUBMITTED_PROOF_BUNDLE_VERSION: u16 = 1;
 
+/// Supported GRAPH-0CONF submitted proof bundle payload version.
+pub const SUBMITTED_PROOF_BUNDLE_V2_VERSION: u16 = 2;
+
 /// Supported v0 verified proof bundle payload version.
 pub const VERIFIED_PROOF_BUNDLE_VERSION: u16 = 1;
+
+/// Supported GRAPH-0CONF verified proof bundle payload version.
+pub const VERIFIED_PROOF_BUNDLE_V2_VERSION: u16 = 2;
 
 /// Viewer-submitted proof material for a content lock.
 ///
@@ -29,6 +38,163 @@ pub struct SubmittedProofBundle {
     pub reader_public_key: Option<CreatorPubky>,
     /// Viewer-submitted proofs keyed to content lock criteria.
     pub proofs: Vec<Proof>,
+}
+
+/// Closed version-dispatched submitted proof bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SubmittedProofBundlePayload {
+    V1(SubmittedProofBundle),
+    V2(SubmittedProofBundleV2),
+}
+
+impl<'de> Deserialize<'de> for SubmittedProofBundlePayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            V1(SubmittedProofBundle),
+            V2(SubmittedProofBundleV2),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::V1(bundle) if bundle.version == SUBMITTED_PROOF_BUNDLE_VERSION => {
+                Ok(Self::V1(bundle))
+            }
+            Wire::V2(bundle) if bundle.version == SUBMITTED_PROOF_BUNDLE_V2_VERSION => {
+                Ok(Self::V2(bundle))
+            }
+            Wire::V1(bundle) => Err(serde::de::Error::custom(format!(
+                "unsupported submitted proof bundle version: {}",
+                bundle.version
+            ))),
+            Wire::V2(bundle) => Err(serde::de::Error::custom(format!(
+                "unsupported submitted proof bundle version: {}",
+                bundle.version
+            ))),
+        }
+    }
+}
+
+/// Closed GRAPH-0CONF submitted bundle. Verification evidence remains server-owned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SubmittedProofBundleV2 {
+    pub version: u16,
+    pub bundle_id: BundleId,
+    pub pubky_lock_resource: PubkyLockResource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader_pubky: Option<CreatorPubky>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct SubmittedProofBundleV2Wire {
+    version: u16,
+    bundle_id: BundleId,
+    pubky_lock_resource: PubkyLockResource,
+    #[serde(default)]
+    reader_pubky: Option<CreatorPubky>,
+}
+
+impl<'de> Deserialize<'de> for SubmittedProofBundleV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = SubmittedProofBundleV2Wire::deserialize(deserializer)?;
+        if value.version != SUBMITTED_PROOF_BUNDLE_V2_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported submitted proof bundle v2 version: {}",
+                value.version
+            )));
+        }
+        Ok(Self {
+            version: value.version,
+            bundle_id: value.bundle_id,
+            pubky_lock_resource: value.pubky_lock_resource,
+            reader_pubky: value.reader_pubky,
+        })
+    }
+}
+
+/// Validates exact v1/v1 or v2/v2 dispatch and v2 reader identity placement.
+pub fn validate_content_lock_submission(
+    content_lock: &ContentLockPayload,
+    submitted: &SubmittedProofBundlePayload,
+) -> Result<(), VersionPairValidationError> {
+    match (content_lock, submitted) {
+        (ContentLockPayload::V1(lock), SubmittedProofBundlePayload::V1(bundle)) => {
+            if lock.version != CONTENT_LOCK_VERSION
+                || bundle.version != SUBMITTED_PROOF_BUNDLE_VERSION
+            {
+                return Err(VersionPairValidationError::UnsupportedVersion);
+            }
+            validate_lock_resource(
+                &lock.creator,
+                lock.lock_id()
+                    .map_err(|_| VersionPairValidationError::InvalidContentLock)?,
+                &bundle.pubky_lock_resource,
+            )
+        }
+        (ContentLockPayload::V2(lock), SubmittedProofBundlePayload::V2(bundle)) => {
+            lock.validate()
+                .map_err(|_| VersionPairValidationError::InvalidContentLock)?;
+            if lock.version != CONTENT_LOCK_V2_VERSION
+                || bundle.version != SUBMITTED_PROOF_BUNDLE_V2_VERSION
+            {
+                return Err(VersionPairValidationError::UnsupportedVersion);
+            }
+            validate_lock_resource(
+                &lock.creator,
+                lock.lock_id()
+                    .map_err(|_| VersionPairValidationError::InvalidContentLock)?,
+                &bundle.pubky_lock_resource,
+            )?;
+            match (lock.has_graph(), bundle.reader_pubky.is_some()) {
+                (false, true) | (true, false) => Ok(()),
+                (false, false) => Err(VersionPairValidationError::PaymentReaderRequired),
+                (true, true) => Err(VersionPairValidationError::GraphReaderForbidden),
+            }
+        }
+        _ => Err(VersionPairValidationError::CrossVersion),
+    }
+}
+
+fn validate_lock_resource(
+    creator: &CreatorPubky,
+    lock_id: crate::ids::LockId,
+    resource: &PubkyLockResource,
+) -> Result<(), VersionPairValidationError> {
+    if resource.creator() != creator {
+        return Err(VersionPairValidationError::ResourceCreatorMismatch);
+    }
+    if resource.lock_id() != &lock_id {
+        return Err(VersionPairValidationError::ResourceLockIdMismatch);
+    }
+    Ok(())
+}
+
+/// Rejected content-lock/submission version or role pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VersionPairValidationError {
+    #[error("content lock and submitted proof bundle versions must match exactly")]
+    CrossVersion,
+    #[error("unsupported wire version")]
+    UnsupportedVersion,
+    #[error("invalid v2 content lock")]
+    InvalidContentLock,
+    #[error("payment-only v2 requires reader_pubky")]
+    PaymentReaderRequired,
+    #[error("graph-containing v2 must omit reader_pubky")]
+    GraphReaderForbidden,
+    #[error("submitted pubky_lock_resource creator must match content lock creator")]
+    ResourceCreatorMismatch,
+    #[error("submitted pubky_lock_resource Lock ID must match content lock identity")]
+    ResourceLockIdMismatch,
 }
 
 /// One viewer-submitted proof for one criterion.
@@ -57,6 +223,179 @@ pub struct VerifiedProofBundle {
     pub verification_result: VerificationResult,
     /// Rule describing how long the entitlement remains usable.
     pub entitlement_lifetime: EntitlementLifetime,
+}
+
+/// Closed version-dispatched verified entitlement publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum VerifiedProofBundlePayload {
+    V1(VerifiedProofBundle),
+    V2(VerifiedProofBundleV2),
+}
+
+impl<'de> Deserialize<'de> for VerifiedProofBundlePayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            V1(VerifiedProofBundle),
+            V2(VerifiedProofBundleV2),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::V1(bundle) if bundle.version == VERIFIED_PROOF_BUNDLE_VERSION => {
+                Ok(Self::V1(bundle))
+            }
+            Wire::V2(bundle) if bundle.version == VERIFIED_PROOF_BUNDLE_V2_VERSION => {
+                Ok(Self::V2(bundle))
+            }
+            Wire::V1(bundle) => Err(serde::de::Error::custom(format!(
+                "unsupported verified proof bundle version: {}",
+                bundle.version
+            ))),
+            Wire::V2(bundle) => Err(serde::de::Error::custom(format!(
+                "unsupported verified proof bundle version: {}",
+                bundle.version
+            ))),
+        }
+    }
+}
+
+/// Closed policy paths that may satisfy a v2 content lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SatisfiedByV2 {
+    Payment,
+    Graph,
+    ZeroConfGraph,
+}
+
+/// Minimal GRAPH-0CONF v2 entitlement publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct VerifiedProofBundleV2 {
+    pub version: u16,
+    pub creator: CreatorPubky,
+    pub reader: CreatorPubky,
+    pub bundle_id: BundleId,
+    pub pubky_lock_resource: PubkyLockResource,
+    #[serde(with = "time::serde::rfc3339")]
+    pub verified_at: time::OffsetDateTime,
+    pub satisfied_by: Vec<SatisfiedByV2>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct VerifiedProofBundleV2Wire {
+    version: u16,
+    creator: CreatorPubky,
+    reader: CreatorPubky,
+    bundle_id: BundleId,
+    pubky_lock_resource: PubkyLockResource,
+    #[serde(with = "time::serde::rfc3339")]
+    verified_at: time::OffsetDateTime,
+    satisfied_by: Vec<SatisfiedByV2>,
+}
+
+impl<'de> Deserialize<'de> for VerifiedProofBundleV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = VerifiedProofBundleV2Wire::deserialize(deserializer)?;
+        let verified = Self {
+            version: value.version,
+            creator: value.creator,
+            reader: value.reader,
+            bundle_id: value.bundle_id,
+            pubky_lock_resource: value.pubky_lock_resource,
+            verified_at: value.verified_at,
+            satisfied_by: value.satisfied_by,
+        };
+        verified.validate().map_err(serde::de::Error::custom)?;
+        Ok(verified)
+    }
+}
+
+impl VerifiedProofBundleV2 {
+    /// Validates publication identity and canonical non-empty satisfaction paths.
+    pub fn validate(&self) -> Result<(), VerifiedProofBundleV2ValidationError> {
+        if self.version != VERIFIED_PROOF_BUNDLE_V2_VERSION {
+            return Err(VerifiedProofBundleV2ValidationError::UnsupportedVersion(
+                self.version,
+            ));
+        }
+        if self.pubky_lock_resource.creator() != &self.creator {
+            return Err(VerifiedProofBundleV2ValidationError::CreatorMismatch);
+        }
+        let canonical = matches!(
+            self.satisfied_by.as_slice(),
+            [SatisfiedByV2::Payment]
+                | [SatisfiedByV2::Graph]
+                | [SatisfiedByV2::ZeroConfGraph]
+                | [SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph]
+        );
+        if !canonical {
+            return Err(VerifiedProofBundleV2ValidationError::InvalidSatisfiedBy);
+        }
+        Ok(())
+    }
+}
+
+/// Validates a v2 publication against its exact content lock and policy mode.
+pub fn validate_verified_content_lock_publication(
+    content_lock: &ContentLockV2,
+    verified: &VerifiedProofBundleV2,
+) -> Result<(), VerifiedProofBundleV2ValidationError> {
+    content_lock
+        .validate()
+        .map_err(|_| VerifiedProofBundleV2ValidationError::InvalidContentLock)?;
+    verified.validate()?;
+    if verified.creator != content_lock.creator
+        || verified.pubky_lock_resource.creator() != &content_lock.creator
+    {
+        return Err(VerifiedProofBundleV2ValidationError::CreatorMismatch);
+    }
+    let lock_id = content_lock
+        .lock_id()
+        .map_err(|_| VerifiedProofBundleV2ValidationError::InvalidContentLock)?;
+    if verified.pubky_lock_resource.lock_id() != &lock_id {
+        return Err(VerifiedProofBundleV2ValidationError::LockIdMismatch);
+    }
+
+    let valid_paths = match (content_lock.payment.is_some(), content_lock.graph.is_some()) {
+        (true, false) => matches!(verified.satisfied_by.as_slice(), [SatisfiedByV2::Payment]),
+        (false, true) => matches!(verified.satisfied_by.as_slice(), [SatisfiedByV2::Graph]),
+        (true, true) => matches!(
+            verified.satisfied_by.as_slice(),
+            [SatisfiedByV2::Payment]
+                | [SatisfiedByV2::ZeroConfGraph]
+                | [SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph]
+        ),
+        (false, false) => false,
+    };
+    if !valid_paths {
+        return Err(VerifiedProofBundleV2ValidationError::InvalidSatisfiedBy);
+    }
+    Ok(())
+}
+
+/// Invalid GRAPH-0CONF v2 entitlement publication.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum VerifiedProofBundleV2ValidationError {
+    #[error("unsupported verified proof bundle v2 version: {0}")]
+    UnsupportedVersion(u16),
+    #[error("verified bundle creator must match pubky_lock_resource creator")]
+    CreatorMismatch,
+    #[error("verified bundle pubky_lock_resource Lock ID must match content lock identity")]
+    LockIdMismatch,
+    #[error("invalid v2 content lock")]
+    InvalidContentLock,
+    #[error("satisfied_by must be a canonical non-empty approved path array")]
+    InvalidSatisfiedBy,
 }
 
 /// Minimal criterion-level verification evidence.

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -32,6 +32,9 @@ impl PaykitPaymentAsset {
 
 /// Supported v0 content lock payload version.
 pub const CONTENT_LOCK_VERSION: u16 = 1;
+
+/// Supported GRAPH-0CONF content lock payload version.
+pub const CONTENT_LOCK_V2_VERSION: u16 = 2;
 
 /// Canonical public Locks application namespace on a creator homeserver.
 pub const PUBLIC_LOCKS_APP_PATH_PREFIX: &str = "/pub/app.locks/";
@@ -231,6 +234,387 @@ impl ContentLock {
     pub fn content_lock_path(&self) -> serde_json::Result<ContentLockPath> {
         Ok(ContentLockPath::from_lock_id(self.lock_id()?))
     }
+}
+
+/// Closed version-dispatched content-lock wire payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ContentLockPayload {
+    /// Released v1 content-lock payload.
+    V1(ContentLock),
+    /// GRAPH-0CONF v2 content-lock payload.
+    V2(ContentLockV2),
+}
+
+impl<'de> Deserialize<'de> for ContentLockPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            V1(ContentLock),
+            V2(ContentLockV2),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::V1(lock) if lock.version == CONTENT_LOCK_VERSION => Ok(Self::V1(lock)),
+            Wire::V2(lock) if lock.version == CONTENT_LOCK_V2_VERSION => Ok(Self::V2(lock)),
+            Wire::V1(lock) => Err(serde::de::Error::custom(format!(
+                "unsupported content lock version: {}",
+                lock.version
+            ))),
+            Wire::V2(lock) => Err(serde::de::Error::custom(format!(
+                "unsupported content lock version: {}",
+                lock.version
+            ))),
+        }
+    }
+}
+
+impl ContentLockPayload {
+    /// Returns the creator that owns this content lock.
+    pub fn creator(&self) -> &CreatorPubky {
+        match self {
+            Self::V1(lock) => &lock.creator,
+            Self::V2(lock) => &lock.creator,
+        }
+    }
+
+    /// Derives the canonical lock identifier for either supported version.
+    pub fn lock_id(&self) -> serde_json::Result<LockId> {
+        match self {
+            Self::V1(lock) => lock.lock_id(),
+            Self::V2(lock) => lock.lock_id(),
+        }
+    }
+}
+
+/// GRAPH-0CONF v2 content-lock payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ContentLockV2 {
+    pub version: u16,
+    pub creator: CreatorPubky,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_resource: Option<GuardedResource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secondary_resources: BTreeMap<String, SecondaryGuardedResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentPolicyV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphPolicyV2>,
+    pub verification_window_seconds: u64,
+    pub access_policy: AccessPolicy,
+    pub lock_server: LockServerConfig,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ContentLockV2Wire {
+    version: u16,
+    creator: CreatorPubky,
+    #[serde(default)]
+    primary_resource: Option<GuardedResource>,
+    #[serde(default)]
+    secondary_resources: BTreeMap<String, SecondaryGuardedResource>,
+    #[serde(default)]
+    payment: Option<PaymentPolicyV2>,
+    #[serde(default)]
+    graph: Option<GraphPolicyV2>,
+    verification_window_seconds: u64,
+    access_policy: AccessPolicy,
+    lock_server: LockServerConfig,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl From<ContentLockV2Wire> for ContentLockV2 {
+    fn from(value: ContentLockV2Wire) -> Self {
+        Self {
+            version: value.version,
+            creator: value.creator,
+            primary_resource: value.primary_resource,
+            secondary_resources: value.secondary_resources,
+            payment: value.payment,
+            graph: value.graph,
+            verification_window_seconds: value.verification_window_seconds,
+            access_policy: value.access_policy,
+            lock_server: value.lock_server,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentLockV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let lock = Self::from(ContentLockV2Wire::deserialize(deserializer)?);
+        lock.validate().map_err(serde::de::Error::custom)?;
+        Ok(lock)
+    }
+}
+
+impl ContentLockV2 {
+    /// Validates all closed v2 wire and policy invariants.
+    pub fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
+        if self.version != CONTENT_LOCK_V2_VERSION {
+            return Err(ContentLockV2ValidationError::UnsupportedVersion(
+                self.version,
+            ));
+        }
+        if self.payment.is_none() && self.graph.is_none() {
+            return Err(ContentLockV2ValidationError::MissingPolicy);
+        }
+        if !(60..=604_800).contains(&self.verification_window_seconds) {
+            return Err(ContentLockV2ValidationError::InvalidVerificationWindow);
+        }
+        self.validate_resource_set()
+            .map_err(ContentLockV2ValidationError::InvalidResourceSet)?;
+        if let Some(payment) = &self.payment {
+            payment.validate(&self.creator)?;
+        }
+        if let Some(graph) = &self.graph {
+            graph.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether this lock contains a graph policy.
+    pub fn has_graph(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// Validates guarded-resource invariants shared with v1.
+    pub fn validate_resource_set(&self) -> Result<(), ContentLockValidationError> {
+        validate_v2_resource_set(&self.primary_resource, &self.secondary_resources)
+    }
+
+    /// Serializes this validated lock to RFC 8785/JCS-compatible bytes.
+    pub fn canonical_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        self.validate().map_err(validation_as_json_error)?;
+        serde_json_canonicalizer::to_vec(self)
+    }
+
+    /// Serializes this validated lock to an RFC 8785/JCS-compatible string.
+    pub fn canonical_json_string(&self) -> serde_json::Result<String> {
+        self.validate().map_err(validation_as_json_error)?;
+        serde_json_canonicalizer::to_string(self)
+    }
+
+    /// Computes the BLAKE3 hash of this lock's canonical bytes.
+    pub fn lock_hash(&self) -> serde_json::Result<LockHash> {
+        let hash = blake3::hash(&self.canonical_json_bytes()?);
+        Ok(LockHash::from_bytes(*hash.as_bytes()))
+    }
+
+    /// Derives this lock's canonical identifier.
+    pub fn lock_id(&self) -> serde_json::Result<LockId> {
+        Ok(LockId::from_hash(self.lock_hash()?))
+    }
+}
+
+fn validation_as_json_error(error: ContentLockV2ValidationError) -> serde_json::Error {
+    serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn validate_v2_resource_set(
+    primary_resource: &Option<GuardedResource>,
+    secondary_resources: &BTreeMap<String, SecondaryGuardedResource>,
+) -> Result<(), ContentLockValidationError> {
+    if primary_resource.is_none() && secondary_resources.is_empty() {
+        return Err(ContentLockValidationError::EmptyResourceSet);
+    }
+    if let Some(primary) = primary_resource {
+        GuardedResource::new(
+            primary.path.clone(),
+            primary.hash,
+            primary.content_type.clone(),
+            primary.size,
+        )
+        .map_err(ContentLockValidationError::InvalidPrimaryResource)?;
+        if secondary_resources.contains_key(&primary.path) {
+            return Err(ContentLockValidationError::DuplicatePrimarySecondaryPath {
+                path: primary.path.clone(),
+            });
+        }
+    }
+    let mut total = primary_resource
+        .as_ref()
+        .map_or(0, |resource| resource.size);
+    for (path, secondary) in secondary_resources {
+        GuardedResource::new(
+            path.clone(),
+            secondary.hash,
+            secondary.content_type.clone(),
+            secondary.size,
+        )
+        .map_err(
+            |reason| ContentLockValidationError::InvalidSecondaryResource {
+                path: path.clone(),
+                reason,
+            },
+        )?;
+        total = total
+            .checked_add(secondary.size)
+            .ok_or(ContentLockValidationError::TotalResourceSizeOverflow)?;
+    }
+    Ok(())
+}
+
+/// Closed v2 payment policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PaymentPolicyV2 {
+    pub recipient_pubky: CreatorPubky,
+    pub amount: String,
+    pub asset: String,
+    pub minimum_confirmations: u8,
+}
+
+impl PaymentPolicyV2 {
+    fn validate(&self, creator: &CreatorPubky) -> Result<(), ContentLockV2ValidationError> {
+        if &self.recipient_pubky != creator {
+            return Err(ContentLockV2ValidationError::PaymentRecipientMustMatchCreator);
+        }
+        if self.amount.is_empty()
+            || !self.amount.bytes().all(|byte| byte.is_ascii_digit())
+            || !self.amount.bytes().any(|byte| byte != b'0')
+        {
+            return Err(ContentLockV2ValidationError::InvalidPaymentAmount);
+        }
+        if self.asset.is_empty() || self.asset.chars().any(char::is_control) {
+            return Err(ContentLockV2ValidationError::InvalidPaymentAsset);
+        }
+        if self.minimum_confirmations > 6 {
+            return Err(ContentLockV2ValidationError::InvalidMinimumConfirmations);
+        }
+        Ok(())
+    }
+}
+
+/// Flat graph operator required only for two through eight predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphOperatorV2 {
+    And,
+    Or,
+}
+
+/// Participant role used by graph predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphParticipantV2 {
+    Creator,
+    Reader,
+}
+
+/// Closed Nexus graph predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
+pub enum GraphPredicateV2 {
+    Follows {
+        follower: GraphParticipantV2,
+        followed: GraphParticipantV2,
+    },
+    Tagged {
+        tagger: GraphParticipantV2,
+        tagged: GraphParticipantV2,
+        label: String,
+    },
+}
+
+impl GraphPredicateV2 {
+    fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
+        match self {
+            Self::Follows { follower, followed } if follower == followed => {
+                Err(ContentLockV2ValidationError::GraphRolesMustDiffer)
+            }
+            Self::Tagged { tagger, tagged, .. } if tagger == tagged => {
+                Err(ContentLockV2ValidationError::GraphRolesMustDiffer)
+            }
+            Self::Tagged { label, .. } if !valid_graph_label(label) => {
+                Err(ContentLockV2ValidationError::InvalidGraphLabel)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn valid_graph_label(label: &str) -> bool {
+    let scalar_count = label.chars().count();
+    (1..=20).contains(&scalar_count)
+        && label.trim() == label
+        && label.to_lowercase() == label
+        && !label
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, ',' | ':'))
+}
+
+/// Closed flat graph policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct GraphPolicyV2 {
+    pub predicates: Vec<GraphPredicateV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<GraphOperatorV2>,
+}
+
+impl GraphPolicyV2 {
+    fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
+        if !(1..=8).contains(&self.predicates.len()) {
+            return Err(ContentLockV2ValidationError::InvalidGraphCardinality);
+        }
+        if (self.predicates.len() == 1) != self.operator.is_none() {
+            return Err(ContentLockV2ValidationError::InvalidGraphOperatorPresence);
+        }
+        let unique: std::collections::HashSet<_> = self.predicates.iter().collect();
+        if unique.len() != self.predicates.len() {
+            return Err(ContentLockV2ValidationError::DuplicateGraphPredicate);
+        }
+        for predicate in &self.predicates {
+            predicate.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Validation failure for a GRAPH-0CONF v2 content lock.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ContentLockV2ValidationError {
+    #[error("unsupported content lock v2 version: {0}")]
+    UnsupportedVersion(u16),
+    #[error("content lock v2 requires payment, graph, or both")]
+    MissingPolicy,
+    #[error("verification_window_seconds must be in 60..=604800")]
+    InvalidVerificationWindow,
+    #[error("invalid guarded resource set: {0}")]
+    InvalidResourceSet(ContentLockValidationError),
+    #[error("payment recipient_pubky must match content lock creator")]
+    PaymentRecipientMustMatchCreator,
+    #[error("payment amount must be a positive decimal integer string")]
+    InvalidPaymentAmount,
+    #[error("payment asset must be non-empty and contain no control characters")]
+    InvalidPaymentAsset,
+    #[error("minimum_confirmations must be in 0..=6")]
+    InvalidMinimumConfirmations,
+    #[error("graph must contain 1..=8 predicates")]
+    InvalidGraphCardinality,
+    #[error("graph operator must be omitted for one predicate and present for 2..=8")]
+    InvalidGraphOperatorPresence,
+    #[error("graph predicates must be unique")]
+    DuplicateGraphPredicate,
+    #[error("graph predicate participant roles must differ")]
+    GraphRolesMustDiffer,
+    #[error(
+        "graph label must be canonical lowercase, 1..=20 scalars, without whitespace/comma/colon"
+    )]
+    InvalidGraphLabel,
 }
 
 /// Guarded resource metadata referenced by a content lock.
