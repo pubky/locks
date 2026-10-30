@@ -16,6 +16,7 @@ pub mod get_verification_task;
 pub mod issue_access_credential;
 pub mod materialize_final_credentials;
 pub mod no_paykit_deletion_drain;
+pub mod poll_folded_auth;
 pub mod proxy_read_guarded_resource;
 pub mod register_guarded_resource;
 pub mod require_creator_authority_for_pubky_io;

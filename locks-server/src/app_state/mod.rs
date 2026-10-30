@@ -20,9 +20,9 @@ use locks_service::{
             AccessCredentialStore, Clock, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
             ContentLockTombstoneRepository, CreatorAuthorityManager, CreatorAuthorityStore,
-            CreatorConnectFlowStore, EntitlementRepository, FrontendSessionCodeStore,
-            FrontendSessionStore, GrantCreatorConnectFlowClient, GuardedResourceRepository,
-            InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
+            CreatorConnectFlowStore, EntitlementRepository, FoldedAuthRepository,
+            FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
+            GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
             LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
             VerificationTaskClaimer, VerificationTaskRepository,
         },
@@ -30,6 +30,7 @@ use locks_service::{
     },
     infrastructure::{
         final_credentials::FinalCredentialCipher,
+        folded_auth::FoldedAuthSecretCipher,
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
             content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
@@ -44,9 +45,10 @@ use locks_service::{
             CreatorAuthoritySecretCipher, PostgresAccessCredentialStore,
             PostgresContentLockDeletionActionOwnership, PostgresContentLockDeletionRepository,
             PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
-            PostgresCreatorConnectFlowStore, PostgresFrontendSessionCodeStore,
-            PostgresFrontendSessionStore, PostgresPaymentDrainRepository,
-            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
+            PostgresCreatorConnectFlowStore, PostgresFoldedAuthRepository,
+            PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
+            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
+            PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
@@ -290,6 +292,7 @@ pub struct AppState {
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
+    folded_auth: Option<Arc<dyn FoldedAuthRepository>>,
 }
 
 /// Purpose-separated runtime ciphers derived from the configured master key.
@@ -647,6 +650,26 @@ impl AppState {
         )
     }
 
+    pub fn new_with_postgres_runtime_and_folded_auth(
+        config: LockServerRuntimeConfig,
+        pool: PgPool,
+        creator_authority_cipher: CreatorAuthoritySecretCipher,
+        final_credential_cipher: FinalCredentialCipher,
+        folded_auth_cipher: FoldedAuthSecretCipher,
+    ) -> Self {
+        let repository: Arc<dyn FoldedAuthRepository> = Arc::new(
+            PostgresFoldedAuthRepository::new(pool.clone(), folded_auth_cipher),
+        );
+        let mut state = Self::new_with_postgres_runtime(
+            config,
+            pool,
+            creator_authority_cipher,
+            final_credential_cipher,
+        );
+        state.folded_auth = Some(repository);
+        state
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_postgres_runtime_and_creator_repositories(
         config: LockServerRuntimeConfig,
@@ -811,6 +834,7 @@ impl AppState {
             paykit_http_client,
             paykit_setup_status_provider,
             payment_drain_client,
+            folded_auth: None,
         }
     }
 
@@ -879,6 +903,10 @@ impl AppState {
 
     pub fn payment_drain_client(&self) -> Option<&Arc<dyn PaymentDrainClient>> {
         self.payment_drain_client.as_ref()
+    }
+
+    pub fn folded_auth(&self) -> Option<&Arc<dyn FoldedAuthRepository>> {
+        self.folded_auth.as_ref()
     }
 
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {

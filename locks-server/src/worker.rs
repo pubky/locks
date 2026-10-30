@@ -441,6 +441,8 @@ fn application_error_class(error: &ApplicationError) -> &'static str {
         ApplicationError::UnsupportedCredentialTtl { .. } => "unsupported_credential_ttl",
         ApplicationError::CredentialGeneration { .. } => "credential_generation",
         ApplicationError::FinalCredentialSecret { .. } => "final_credential_secret",
+        ApplicationError::FoldedAuthSecret { .. } => "folded_auth_secret",
+        ApplicationError::InvalidFoldedAuthState { .. } => "invalid_folded_auth_state",
         ApplicationError::CreatorAuthorityUnavailable => "creator_authority_unavailable",
         ApplicationError::CreatorAuthoritySecret { .. } => "creator_authority_secret",
         ApplicationError::InvalidCreatorAuthorityAuthKind { .. } => {

@@ -266,6 +266,8 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::Storage { .. }
             | ApplicationError::VerificationDependencyUnavailable
             | ApplicationError::FinalCredentialSecret { .. }
+            | ApplicationError::FoldedAuthSecret { .. }
+            | ApplicationError::InvalidFoldedAuthState { .. }
             | ApplicationError::InvalidContentLockDeletionState { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }

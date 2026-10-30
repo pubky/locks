@@ -5,6 +5,7 @@ use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initial
 use locks_server::deletion_worker::{
     DeletionWorker, DeletionWorkerConfig, RandomFullJitter, RuntimeClaimedDeletionExecutor,
 };
+use locks_server::folded_auth_cleanup::{FOLDED_AUTH_CLEANUP_INTERVAL, FoldedAuthCleanupWorker};
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{
     InitialStartupOutcome, RuntimeTasks, ShutdownFuture, bind_listener_then_run_initial,
@@ -85,6 +86,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .run_until_shutdown(shutdown)
                     .await
                     .map_err(anyhow::Error::from)
+            })
+        }));
+    }
+
+    if let Some(repository) = state.folded_auth().cloned() {
+        let cleanup_clock = state.clock().clone();
+        tasks = tasks.with_folded_auth_cleanup(Box::new(move |shutdown| {
+            Box::pin(async move {
+                FoldedAuthCleanupWorker::new(
+                    repository,
+                    cleanup_clock,
+                    FOLDED_AUTH_CLEANUP_INTERVAL,
+                )
+                .run_until_shutdown(shutdown)
+                .await
+                .map_err(anyhow::Error::from)
             })
         }));
     }

@@ -1931,6 +1931,7 @@ name = "locks-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "blake3",
  "chacha20poly1305 0.10.1",

@@ -61,6 +61,21 @@ impl GraphTaskRepository for PostgresGraphTaskRepository {
         )
         .await?;
 
+        let pending_folded_auth: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM folded_auth_attempts
+                WHERE creator = $1 AND bundle_id = $2 AND status = 'pending'
+             )",
+        )
+        .bind(snapshot.creator.to_string())
+        .bind(snapshot.bundle_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if pending_folded_auth {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
+
         let existing = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
              WHERE creator = $1 AND bundle_id = $2

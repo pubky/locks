@@ -115,6 +115,18 @@ pub enum ApplicationError {
         /// Stable secret-free failure detail.
         message: String,
     },
+    /// Pending folded-auth flow material could not be encrypted or restored.
+    #[error("folded auth secret error: {message}")]
+    FoldedAuthSecret {
+        /// Stable secret-free failure detail.
+        message: String,
+    },
+    /// Persisted folded-auth state violates its closed lifecycle contract.
+    #[error("invalid folded auth state: {message}")]
+    InvalidFoldedAuthState {
+        /// Stable secret-free invariant detail.
+        message: String,
+    },
     /// Creator-granted homeserver authority is missing, expired, revoked, or unusable.
     #[error("creator authority unavailable")]
     CreatorAuthorityUnavailable,

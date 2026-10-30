@@ -1,6 +1,7 @@
 pub mod content_lock_tombstones;
 pub mod content_locks;
 pub mod entitlements;
+pub mod folded_auth_flow;
 pub mod grant_connect_flow;
 mod grant_session_cache;
 pub mod legacy_connect_flow;

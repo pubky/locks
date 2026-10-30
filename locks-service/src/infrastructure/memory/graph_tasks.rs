@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId, TaskId};
+use time::OffsetDateTime;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -17,6 +20,7 @@ use super::verification_task_deletion_fence::{
 #[derive(Debug)]
 pub struct InMemoryGraphTaskRepository {
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    folded_auth_reservations: tokio::sync::RwLock<HashSet<(CreatorPubky, BundleId)>>,
 }
 
 impl Default for InMemoryGraphTaskRepository {
@@ -31,28 +35,93 @@ impl InMemoryGraphTaskRepository {
     }
 
     pub fn with_deletion_fence(deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>) -> Self {
-        Self { deletion_fence }
+        Self {
+            deletion_fence,
+            folded_auth_reservations: tokio::sync::RwLock::new(HashSet::new()),
+        }
     }
 
     /// Graph-only records never own invoice-admission/payment intent state.
     pub async fn has_payment_intent(&self, _task_id: &TaskId) -> bool {
         false
     }
-}
 
-#[async_trait]
-impl GraphTaskRepository for InMemoryGraphTaskRepository {
-    async fn insert_graph_task(
+    pub(crate) async fn acquire_admission(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+    ) -> OwnedMutexGuard<()> {
+        self.deletion_fence
+            .acquire_lock_admission(creator, lock_id)
+            .await
+    }
+
+    pub(crate) fn authoritative_time(&self) -> OffsetDateTime {
+        self.deletion_fence.authoritative_cutoff()
+    }
+
+    pub(crate) async fn has_graph_task_by_handle_under_admission(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> bool {
+        self.deletion_fence
+            .graph_records
+            .read()
+            .await
+            .iter()
+            .any(|stored| {
+                let snapshot = stored.task.snapshot.as_v1();
+                &snapshot.creator == creator && &snapshot.bundle_id == bundle_id
+            })
+    }
+
+    pub(crate) async fn reserve_folded_auth_under_admission(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) {
+        self.folded_auth_reservations
+            .write()
+            .await
+            .insert((creator.clone(), bundle_id.clone()));
+    }
+
+    pub(crate) async fn insert_graph_task_before_publish<F>(
         &self,
         task: GraphTaskRecord,
-    ) -> Result<GraphTaskRecord, ApplicationError> {
-        validate_new_task(&task)?;
+        before_publish: F,
+    ) -> Result<GraphTaskRecord, ApplicationError>
+    where
+        F: FnOnce(&GraphTaskRecord) -> Result<(), ApplicationError> + Send,
+    {
         let identity = task.snapshot.as_v1();
         let lock_id = identity.pubky_lock_resource.lock_id().clone();
         let _guard = self
             .deletion_fence
             .acquire_lock_admission(&identity.creator, &lock_id)
             .await;
+        self.insert_graph_task_before_publish_under_admission(task, before_publish, false)
+            .await
+    }
+
+    pub(crate) async fn insert_graph_task_before_publish_under_admission<F>(
+        &self,
+        task: GraphTaskRecord,
+        before_publish: F,
+        folded_auth_source: bool,
+    ) -> Result<GraphTaskRecord, ApplicationError>
+    where
+        F: FnOnce(&GraphTaskRecord) -> Result<(), ApplicationError> + Send,
+    {
+        validate_new_task(&task)?;
+        let identity = task.snapshot.as_v1();
+        let lock_id = identity.pubky_lock_resource.lock_id().clone();
+        let reservation_key = (identity.creator.clone(), identity.bundle_id.clone());
+        let mut reservations = self.folded_auth_reservations.write().await;
+        if reservations.contains(&reservation_key) != folded_auth_source {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if self
             .deletion_fence
             .deletion_cutoffs
@@ -103,6 +172,7 @@ impl GraphTaskRepository for InMemoryGraphTaskRepository {
             });
         }
 
+        before_publish(&task)?;
         fence_records.insert(
             task.task_id,
             InMemoryVerificationTaskFenceRecord {
@@ -123,7 +193,21 @@ impl GraphTaskRepository for InMemoryGraphTaskRepository {
             claim_token: None,
             claim_expires_at: None,
         });
+        if folded_auth_source {
+            reservations.remove(&reservation_key);
+        }
         Ok(task)
+    }
+}
+
+#[async_trait]
+impl GraphTaskRepository for InMemoryGraphTaskRepository {
+    async fn insert_graph_task(
+        &self,
+        task: GraphTaskRecord,
+    ) -> Result<GraphTaskRecord, ApplicationError> {
+        self.insert_graph_task_before_publish(task, |_| Ok(()))
+            .await
     }
 
     async fn get_graph_task_by_handle(
