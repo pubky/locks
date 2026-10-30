@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,7 +19,6 @@ use super::verification_task_deletion_fence::{
 #[derive(Debug)]
 pub struct InMemoryGraphTaskRepository {
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
-    folded_auth_reservations: tokio::sync::RwLock<HashSet<(CreatorPubky, BundleId)>>,
 }
 
 impl Default for InMemoryGraphTaskRepository {
@@ -35,10 +33,7 @@ impl InMemoryGraphTaskRepository {
     }
 
     pub fn with_deletion_fence(deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>) -> Self {
-        Self {
-            deletion_fence,
-            folded_auth_reservations: tokio::sync::RwLock::new(HashSet::new()),
-        }
+        Self { deletion_fence }
     }
 
     /// Graph-only records never own invoice-admission/payment intent state.
@@ -58,6 +53,16 @@ impl InMemoryGraphTaskRepository {
 
     pub(crate) fn authoritative_time(&self) -> OffsetDateTime {
         self.deletion_fence.authoritative_cutoff()
+    }
+
+    pub(crate) async fn acquire_handle_admission(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> OwnedMutexGuard<()> {
+        self.deletion_fence
+            .acquire_handle_admission(creator, bundle_id)
+            .await
     }
 
     pub(crate) async fn has_graph_task_by_handle_under_admission(
@@ -81,10 +86,23 @@ impl InMemoryGraphTaskRepository {
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) {
-        self.folded_auth_reservations
+        self.deletion_fence
+            .folded_auth_reservations
             .write()
             .await
             .insert((creator.clone(), bundle_id.clone()));
+    }
+
+    pub(crate) async fn release_folded_auth_reservation(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) {
+        self.deletion_fence
+            .folded_auth_reservations
+            .write()
+            .await
+            .remove(&(creator.clone(), bundle_id.clone()));
     }
 
     pub(crate) async fn insert_graph_task_before_publish<F>(
@@ -118,7 +136,7 @@ impl InMemoryGraphTaskRepository {
         let identity = task.snapshot.as_v1();
         let lock_id = identity.pubky_lock_resource.lock_id().clone();
         let reservation_key = (identity.creator.clone(), identity.bundle_id.clone());
-        let mut reservations = self.folded_auth_reservations.write().await;
+        let mut reservations = self.deletion_fence.folded_auth_reservations.write().await;
         if reservations.contains(&reservation_key) != folded_auth_source {
             return Err(ApplicationError::VerificationTaskConflict);
         }

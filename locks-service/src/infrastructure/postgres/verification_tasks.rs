@@ -15,7 +15,7 @@ use crate::application::models::{
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
 
-use super::proof_admission::lock_proof_admission;
+use super::proof_admission::{lock_proof_admission, lock_proof_handle_admission};
 
 /// Postgres-backed repository for Lock Server private verification task state.
 #[derive(Debug, Clone)]
@@ -94,6 +94,26 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let lock_id = task.submitted_proof_bundle.pubky_lock_resource.lock_id();
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+        lock_proof_handle_admission(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?;
+        let folded_auth_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM folded_auth_attempts
+                WHERE creator = $1 AND bundle_id = $2 AND status = 'pending'
+             )",
+        )
+        .bind(task.creator.to_string())
+        .bind(task.submitted_proof_bundle.bundle_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if folded_auth_pending {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if graph_task_exists_by_handle(
             &mut transaction,
             &task.creator,

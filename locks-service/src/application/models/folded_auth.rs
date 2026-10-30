@@ -118,6 +118,8 @@ pub struct FoldedAuthAttempt {
     pub graph: GraphPolicyV2,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+    /// Durable fact that approval polling may have consumed one-shot authority.
+    pub poll_dispatched: bool,
     pub terminal_at: Option<OffsetDateTime>,
     pub purge_after: Option<OffsetDateTime>,
     pub task_id: Option<TaskId>,

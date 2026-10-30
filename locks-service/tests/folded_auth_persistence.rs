@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use locks_core::ids::{
-    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, PubkyLockResource,
+    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
     AccessPolicy, ContentLockV2, GraphParticipantV2, GraphPolicyV2, GraphPredicateV2,
@@ -14,7 +14,8 @@ use locks_core::lock_policy::{
 use locks_core::verification::SubmittedProofBundleV2;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    FoldedAuthFlowSecret, FoldedAuthStateHash, FoldedAuthStatus, StartFoldedAuthAttempt,
+    FoldedAuthFlowSecret, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
+    GraphTaskSnapshot, GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
 };
 use locks_service::application::ports::{
     Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller,
@@ -257,6 +258,10 @@ async fn accepted_grant_atomically_starts_graph_deadline_at_durable_acceptance()
             .unwrap(),
         Some(task.clone())
     );
+    assert_eq!(
+        use_case.execute(&started.attempt.state_hash).await.unwrap(),
+        PollFoldedAuthOutcome::Accepted(task.clone())
+    );
     clock.set(accepted_at + Duration::hours(24));
     assert_eq!(
         repository.purge_terminal_before(accepted_at).await.unwrap(),
@@ -287,6 +292,102 @@ impl FoldedAuthApprovalPoller for ApprovedPoller {
             reader: self.0.clone(),
         }))
     }
+}
+
+struct MustNotPoll;
+
+#[async_trait]
+impl FoldedAuthApprovalPoller for MustNotPoll {
+    async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+        panic!("durable dispatched marker must close recovery before polling")
+    }
+}
+
+#[tokio::test]
+async fn successful_exchange_then_accept_failure_restarts_after_reconstruction() {
+    let (graph, clock) = graph_at(datetime!(2026-10-30 12:00:00 UTC));
+    let cipher = folded_auth_cipher();
+    let repository = Arc::new(InMemoryFoldedAuthRepository::new(
+        graph.clone(),
+        cipher.clone(),
+    ));
+    let now = datetime!(2026-10-30 12:00:00 UTC);
+    let started = repository
+        .start_or_rotate(start_request_with(
+            &graph_lock(),
+            FoldedAuthStateHash::derive(b"accept-storage-failure"),
+            b"consumed-one-shot-flow",
+            now,
+        ))
+        .await
+        .unwrap();
+    let duplicate_task_id = TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap();
+    let other_task = GraphTaskRecord {
+        task_id: duplicate_task_id,
+        snapshot: GraphTaskSnapshot::V1(
+            GraphTaskSnapshotV1::new(
+                creator(),
+                BundleId::from_str("100G40R40M30E209185GR38E1W").unwrap(),
+                started.attempt.pubky_lock_resource.clone(),
+                started.attempt.lock_hash,
+                reader(),
+                now,
+                started.attempt.verification_window_seconds,
+                started.attempt.graph.clone(),
+            )
+            .unwrap(),
+        ),
+        evaluator_revision: 0,
+        status: VerificationTaskStatus::Pending,
+    };
+    graph.insert_graph_task(other_task).await.unwrap();
+
+    repository
+        .mark_poll_dispatched(&started.attempt.state_hash, started.attempt.generation, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        repository
+            .accept_and_insert_graph_task(
+                &started.attempt.state_hash,
+                started.attempt.generation,
+                duplicate_task_id,
+                reader(),
+                now,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .get_by_state_hash(&started.attempt.state_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .poll_dispatched
+    );
+
+    let reconstructed = Arc::new(repository.reconstruct(cipher));
+    let use_case = PollFoldedAuthAttempt::new(
+        reconstructed.clone(),
+        Arc::new(MustNotPoll),
+        Arc::new(FixedClock(now + Duration::SECOND)),
+    );
+    clock.set(now + Duration::SECOND);
+    assert!(matches!(
+        use_case.execute(&started.attempt.state_hash).await.unwrap(),
+        PollFoldedAuthOutcome::RestartRequired(_)
+    ));
+    assert_eq!(
+        reconstructed
+            .get_by_state_hash(&started.attempt.state_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        FoldedAuthStatus::RestartRequired
+    );
 }
 
 #[tokio::test]
@@ -434,7 +535,10 @@ async fn pre_poll_failure_remains_pending_and_retryable() {
         Arc::new(FixedClock(now + Duration::SECOND)),
     );
 
-    assert!(use_case.execute(&started.attempt.state_hash).await.is_err());
+    assert!(matches!(
+        use_case.execute(&started.attempt.state_hash).await,
+        Err(ApplicationError::VerificationDependencyUnavailable)
+    ));
     assert_eq!(
         repository
             .get_by_state_hash(&started.attempt.state_hash)
@@ -451,9 +555,7 @@ struct NotAttemptedPoller;
 #[async_trait]
 impl FoldedAuthApprovalPoller for NotAttemptedPoller {
     async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
-        FoldedAuthPollCall::NotAttempted(ApplicationError::InvalidFoldedAuthState {
-            message: "invalid persisted flow".to_owned(),
-        })
+        FoldedAuthPollCall::NotAttempted(ApplicationError::VerificationDependencyUnavailable)
     }
 }
 

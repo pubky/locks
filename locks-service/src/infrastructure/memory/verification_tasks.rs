@@ -87,6 +87,22 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&task.creator, &lock_id)
             .await;
+        let _handle_admission_guard = self
+            .deletion_fence
+            .acquire_handle_admission(&task.creator, &task.submitted_proof_bundle.bundle_id)
+            .await;
+        if self
+            .deletion_fence
+            .folded_auth_reservations
+            .read()
+            .await
+            .contains(&(
+                task.creator.clone(),
+                task.submitted_proof_bundle.bundle_id.clone(),
+            ))
+        {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if self
             .deletion_fence
             .deletion_cutoffs
@@ -595,6 +611,28 @@ mod tests {
     const OTHER_TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d11";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+
+    #[tokio::test]
+    async fn ordinary_v1_admission_rejects_pending_folded_handle_even_for_different_lock() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let repo = InMemoryVerificationTaskRepository::with_deletion_fence(Arc::clone(&fence));
+        let mut ordinary = task(VerificationTaskStatus::Pending);
+        ordinary.submitted_proof_bundle.pubky_lock_resource =
+            PubkyLockResource::from_str(&format!(
+                "{}/pub/app.locks/100G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+                ordinary.creator
+            ))
+            .unwrap();
+        fence.folded_auth_reservations.write().await.insert((
+            ordinary.creator.clone(),
+            ordinary.submitted_proof_bundle.bundle_id.clone(),
+        ));
+
+        assert_eq!(
+            repo.insert_verification_task(ordinary).await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+    }
 
     #[tokio::test]
     async fn insert_update_read_and_delete_use_explicit_semantics() {

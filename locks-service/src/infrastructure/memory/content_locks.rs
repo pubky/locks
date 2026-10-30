@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::{ContentLock, ContentLockPayload};
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::ContentLockRepository;
@@ -27,6 +27,22 @@ impl InMemoryContentLockRepository {
 
 #[async_trait]
 impl ContentLockRepository for InMemoryContentLockRepository {
+    async fn upsert_content_lock_payload(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLockPayload,
+    ) -> Result<(), ApplicationError> {
+        let bytes =
+            serde_json::to_vec(&content_lock).map_err(|error| ApplicationError::Storage {
+                message: format!("failed to serialize in-memory content lock: {error}"),
+            })?;
+        self.public_store
+            .put(creator, content_lock_path, bytes)
+            .await;
+        Ok(())
+    }
+
     async fn upsert_content_lock(
         &self,
         creator: CreatorPubky,
@@ -50,6 +66,22 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError> {
+        self.public_store
+            .get(creator, content_lock_path)
+            .await
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| ApplicationError::Storage {
+                    message: format!("failed to deserialize in-memory content lock: {error}"),
+                })
+            })
+            .transpose()
+    }
+
+    async fn get_content_lock_payload(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<Option<ContentLockPayload>, ApplicationError> {
         self.public_store
             .get(creator, content_lock_path)
             .await

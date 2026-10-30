@@ -14,10 +14,10 @@ use crate::application::models::{
     FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, RestoredFoldedAuthAttempt,
     StartFoldedAuthAttempt,
 };
-use crate::application::ports::FoldedAuthRepository;
+use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository};
 use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
 
-use super::proof_admission::lock_proof_admission;
+use super::proof_admission::{lock_proof_admission, lock_proof_handle_admission};
 use super::verification_tasks::reject_deletion_cutoff;
 
 #[derive(Debug, Clone)]
@@ -47,6 +47,7 @@ struct FoldedAuthRow {
     encrypted_flow_secret: Option<String>,
     created_at: OffsetDateTime,
     expires_at: OffsetDateTime,
+    poll_dispatched_at: Option<OffsetDateTime>,
     terminal_at: Option<OffsetDateTime>,
     purge_after: Option<OffsetDateTime>,
     task_id: Option<String>,
@@ -54,28 +55,60 @@ struct FoldedAuthRow {
 
 const COLUMNS: &str = "creator, bundle_id, generation, state_hash, status,
     submitted_proof_bundle, pubky_lock_resource, lock_hash, verification_window_seconds,
-    graph_policy, encrypted_flow_secret, created_at, expires_at, terminal_at, purge_after,
-    task_id::text AS task_id";
+    graph_policy, encrypted_flow_secret, created_at, expires_at, poll_dispatched_at,
+    terminal_at, purge_after, task_id::text AS task_id";
 
 #[async_trait]
 impl FoldedAuthRepository for PostgresFoldedAuthRepository {
+    async fn get_latest_by_handle(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        sqlx::query_as::<_, FoldedAuthRow>(&format!(
+            "SELECT {COLUMNS} FROM folded_auth_attempts
+             WHERE creator = $1 AND bundle_id = $2
+             ORDER BY generation DESC LIMIT 1"
+        ))
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(row_to_stored)
+        .transpose()
+        .map(|stored| stored.map(|stored| stored.0))
+    }
+
+    async fn accepted_graph_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let Some(attempt) = self.get_by_state_hash(state_hash).await? else {
+            return Ok(None);
+        };
+        if attempt.status != FoldedAuthStatus::Accepted {
+            return Ok(None);
+        }
+        super::graph_tasks::PostgresGraphTaskRepository::new(self.pool.clone())
+            .get_graph_task_by_handle(&attempt.creator, &attempt.bundle_id)
+            .await
+    }
+
     async fn start_or_rotate(
         &self,
         request: StartFoldedAuthAttempt,
     ) -> Result<FoldedAuthStartResult, ApplicationError> {
         request.validate().map_err(invalid_state)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let attempt_key = format!(
-            "{}:{}:{}",
+        lock_proof_admission(
+            &mut transaction,
             request.creator(),
-            request.creator().to_string().len(),
-            request.bundle_id()
-        );
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(attempt_key)
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
+            request.pubky_lock_resource.lock_id(),
+        )
+        .await?;
+        lock_proof_handle_admission(&mut transaction, request.creator(), request.bundle_id())
+            .await?;
         let latest = sqlx::query_as::<_, FoldedAuthRow>(&format!(
             "SELECT {COLUMNS} FROM folded_auth_attempts
              WHERE creator = $1 AND bundle_id = $2
@@ -88,12 +121,6 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         .map_err(storage_error)?
         .map(row_to_stored)
         .transpose()?;
-        lock_proof_admission(
-            &mut transaction,
-            request.creator(),
-            request.pubky_lock_resource.lock_id(),
-        )
-        .await?;
         let existing_task: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM verification_tasks WHERE creator = $1 AND bundle_id = $2
@@ -159,7 +186,7 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             let updated = sqlx::query(
                 "UPDATE folded_auth_attempts
                  SET status = $2, encrypted_flow_secret = NULL,
-                     terminal_at = $3, purge_after = $4
+                     poll_dispatched_at = NULL, terminal_at = $3, purge_after = $4
                  WHERE state_hash = $1 AND status = 'pending'",
             )
             .bind(latest.state_hash.as_bytes().as_slice())
@@ -226,7 +253,7 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         else {
             return Ok(None);
         };
-        if attempt.status != FoldedAuthStatus::Pending {
+        if attempt.status != FoldedAuthStatus::Pending || attempt.poll_dispatched {
             return Ok(None);
         }
         let encrypted = encrypted
@@ -236,6 +263,24 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             attempt,
             flow_secret,
         }))
+    }
+
+    async fn mark_poll_dispatched(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        _now: OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        set_poll_dispatched(&self.pool, state_hash, expected_generation, true).await
+    }
+
+    async fn confirm_not_attempted(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        _now: OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        set_poll_dispatched(&self.pool, state_hash, expected_generation, false).await
     }
 
     async fn confirm_pending_generation(
@@ -328,7 +373,8 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         let updated = sqlx::query(
             "UPDATE folded_auth_attempts
              SET status = 'accepted', encrypted_flow_secret = NULL,
-                 terminal_at = $3, purge_after = $4, task_id = $5::uuid
+                 poll_dispatched_at = NULL, terminal_at = $3,
+                 purge_after = $4, task_id = $5::uuid
              WHERE state_hash = $1 AND generation = $2 AND status = 'pending'",
         )
         .bind(state_hash.as_bytes().as_slice())
@@ -357,8 +403,19 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         sqlx::query(
             "UPDATE folded_auth_attempts
              SET status = 'expired', encrypted_flow_secret = NULL,
-                 terminal_at = $1, purge_after = $2
+                 poll_dispatched_at = NULL, terminal_at = $1, purge_after = $2
              WHERE status = 'pending' AND expires_at <= $1",
+        )
+        .bind(database_now)
+        .bind(purge_after)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE folded_auth_attempts
+             SET status = 'restart_required', encrypted_flow_secret = NULL,
+                 poll_dispatched_at = NULL, terminal_at = $1, purge_after = $2
+             WHERE status = 'pending' AND poll_dispatched_at IS NOT NULL",
         )
         .bind(database_now)
         .bind(purge_after)
@@ -377,6 +434,43 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         transaction.commit().await.map_err(storage_error)?;
         Ok(deleted)
     }
+}
+
+async fn set_poll_dispatched(
+    pool: &PgPool,
+    state_hash: &FoldedAuthStateHash,
+    expected_generation: u64,
+    dispatched: bool,
+) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+    let generation = match i64::try_from(expected_generation) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let predicate = if dispatched {
+        "poll_dispatched_at IS NULL"
+    } else {
+        "poll_dispatched_at IS NOT NULL"
+    };
+    let assignment = if dispatched {
+        "clock_timestamp()"
+    } else {
+        "NULL"
+    };
+    let row = sqlx::query_as::<_, FoldedAuthRow>(&format!(
+        "UPDATE folded_auth_attempts
+         SET poll_dispatched_at = {assignment}
+         WHERE state_hash = $1 AND generation = $2 AND status = 'pending'
+           AND {predicate}
+         RETURNING {COLUMNS}"
+    ))
+    .bind(state_hash.as_bytes().as_slice())
+    .bind(generation)
+    .fetch_optional(pool)
+    .await
+    .map_err(storage_error)?;
+    row.map(row_to_stored)
+        .transpose()
+        .map(|stored| stored.map(|stored| stored.0))
 }
 
 async fn transition_after_poll(
@@ -423,8 +517,20 @@ async fn transition_after_poll(
         )
         .await?;
         attempt.status = status;
+        attempt.poll_dispatched = false;
         attempt.terminal_at = Some(database_now);
         attempt.purge_after = Some(checked_purge_after(database_now)?);
+    } else {
+        sqlx::query(
+            "UPDATE folded_auth_attempts SET poll_dispatched_at = NULL
+             WHERE state_hash = $1 AND generation = $2 AND status = 'pending'",
+        )
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(generation)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        attempt.poll_dispatched = false;
     }
     transaction.commit().await.map_err(storage_error)?;
     Ok(Some(attempt))
@@ -441,7 +547,7 @@ async fn terminalize_pending_tx(
     let updated = sqlx::query(
         "UPDATE folded_auth_attempts
          SET status = $3, encrypted_flow_secret = NULL,
-             terminal_at = $4, purge_after = $5
+             poll_dispatched_at = NULL, terminal_at = $4, purge_after = $5
          WHERE state_hash = $1 AND generation = $2 AND status = 'pending'",
     )
     .bind(state_hash.as_bytes().as_slice())
@@ -565,6 +671,7 @@ fn row_to_stored(
         graph,
         created_at: row.created_at,
         expires_at: row.expires_at,
+        poll_dispatched: row.poll_dispatched_at.is_some(),
         terminal_at: row.terminal_at,
         purge_after: row.purge_after,
         task_id,
@@ -594,6 +701,7 @@ fn validate_stored(attempt: &FoldedAuthAttempt, has_secret: bool) -> Result<(), 
     if pending != has_secret
         || pending != attempt.terminal_at.is_none()
         || pending != attempt.purge_after.is_none()
+        || (!pending && attempt.poll_dispatched)
         || (attempt.status == FoldedAuthStatus::Accepted) != attempt.task_id.is_some()
     {
         return Err(invalid_state("folded auth durable lifecycle is invalid"));
@@ -636,20 +744,24 @@ mod tests {
     };
     use locks_core::lock_policy::{
         AccessPolicy, ContentLockV2, GraphParticipantV2, GraphPolicyV2, GraphPredicateV2,
-        GuardedResource, LockServerConfig,
+        GuardedResource, LockServerConfig, VerifierType,
     };
-    use locks_core::verification::SubmittedProofBundleV2;
+    use locks_core::verification::{
+        Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
+    };
+    use serde_json::json;
     use time::macros::datetime;
     use tokio::sync::Notify;
 
     use super::PostgresFoldedAuthRepository;
     use crate::application::models::{
         FoldedAuthFlowSecret, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
-        GraphTaskSnapshot, GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
+        GraphTaskSnapshot, GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskRecord,
+        VerificationTaskStatus,
     };
     use crate::application::ports::{
         Clock, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthPollCall,
-        FoldedAuthRepository, GraphTaskRepository,
+        FoldedAuthRepository, GraphTaskRepository, VerificationTaskRepository,
     };
     use crate::application::use_cases::poll_folded_auth::{
         PollFoldedAuthAttempt, PollFoldedAuthOutcome,
@@ -657,6 +769,7 @@ mod tests {
     use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
     use crate::infrastructure::postgres::graph_tasks::PostgresGraphTaskRepository;
     use crate::infrastructure::postgres::testing::TestDatabase;
+    use crate::infrastructure::postgres::verification_tasks::PostgresVerificationTaskRepository;
     use crate::infrastructure::runtime_master_key::RuntimeMasterKey;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -849,6 +962,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_storage_failure_leaves_dispatch_marker_and_startup_recovery_requires_restart() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        let lock = graph_lock();
+        let started = repository
+            .start_or_rotate(start_request(
+                &lock,
+                FoldedAuthStateHash::derive(b"postgres-accept-storage-failure"),
+                b"consumed-postgres-flow",
+                time::OffsetDateTime::now_utc(),
+            ))
+            .await
+            .unwrap();
+        repository
+            .mark_poll_dispatched(
+                &started.attempt.state_hash,
+                started.attempt.generation,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "CREATE FUNCTION fail_folded_graph_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'injected graph persistence failure'; END $$",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_folded_graph_insert
+             BEFORE INSERT ON verification_tasks
+             FOR EACH ROW EXECUTE FUNCTION fail_folded_graph_insert()",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repository
+                .accept_and_insert_graph_task(
+                    &started.attempt.state_hash,
+                    started.attempt.generation,
+                    TaskId::from_str(TASK_ID).unwrap(),
+                    reader(),
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await,
+            Err(crate::application::errors::ApplicationError::Storage { .. })
+        ));
+        assert!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .poll_dispatched
+        );
+
+        let reconstructed = PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        reconstructed
+            .purge_terminal_before(time::OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert_eq!(
+            reconstructed
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::RestartRequired
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn rotation_fences_stale_results_and_late_acceptance_expires_atomically() {
         let database = TestDatabase::create().await;
         let repository = PostgresFoldedAuthRepository::new(
@@ -995,6 +1191,63 @@ mod tests {
             FoldedAuthStatus::Pending
         );
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn pending_folded_auth_and_ordinary_v1_admission_are_exclusive_in_both_commit_orders() {
+        for folded_first in [true, false] {
+            let database = TestDatabase::create().await;
+            let folded_repository = PostgresFoldedAuthRepository::new(
+                database.pool().clone(),
+                cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            );
+            let verification_repository =
+                PostgresVerificationTaskRepository::new(database.pool().clone());
+            let lock = graph_lock();
+            let request = start_request(
+                &lock,
+                FoldedAuthStateHash::derive(if folded_first {
+                    b"v1-folded-first"
+                } else {
+                    b"v1-ordinary-first"
+                }),
+                b"v1-exclusive-flow",
+                time::OffsetDateTime::now_utc(),
+            );
+            let task = ordinary_v1_task();
+
+            if folded_first {
+                folded_repository.start_or_rotate(request).await.unwrap();
+                assert!(matches!(
+                    verification_repository.insert_verification_task(task).await,
+                    Err(crate::application::errors::ApplicationError::VerificationTaskConflict)
+                ));
+            } else {
+                verification_repository
+                    .insert_verification_task(task)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    folded_repository.start_or_rotate(request).await,
+                    Err(crate::application::errors::ApplicationError::VerificationTaskConflict)
+                ));
+            }
+            let folded_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folded_auth_attempts")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+            let ordinary_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM verification_tasks WHERE evaluator_snapshot IS NULL",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                (folded_count, ordinary_count),
+                if folded_first { (1, 0) } else { (0, 1) }
+            );
+            database.cleanup().await;
+        }
     }
 
     #[tokio::test]
@@ -1149,6 +1402,34 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         now.replace_nanosecond((now.nanosecond() / 1_000) * 1_000)
             .unwrap()
+    }
+
+    fn ordinary_v1_task() -> VerificationTaskRecord {
+        VerificationTaskRecord {
+            task_id: TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap(),
+            creator: creator(),
+            submitted_proof_bundle: SubmittedProofBundle {
+                version: SUBMITTED_PROOF_BUNDLE_VERSION,
+                bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+                pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                    "{CREATOR}/pub/app.locks/100G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+                ))
+                .unwrap(),
+                reader_public_key: None,
+                proofs: vec![Proof {
+                    criterion_id: "criterion-1".to_owned(),
+                    verifier_type: VerifierType::DevStatic,
+                    payload: json!({}),
+                }],
+            },
+            status: VerificationTaskStatus::Pending,
+            submitted_at: canonical_now(),
+            started_at: None,
+            completed_at: None,
+            failure_message: None,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+        }
     }
 
     fn ordinary_graph_task(lock: &ContentLockV2) -> GraphTaskRecord {

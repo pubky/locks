@@ -21,7 +21,7 @@ pub enum PollFoldedAuthOutcome {
     Stale,
 }
 
-pub struct PollFoldedAuthAttempt<R, P> {
+pub struct PollFoldedAuthAttempt<R: ?Sized, P: ?Sized> {
     repository: Arc<R>,
     poller: Arc<P>,
     clock: Arc<dyn Clock>,
@@ -29,8 +29,8 @@ pub struct PollFoldedAuthAttempt<R, P> {
 
 impl<R, P> PollFoldedAuthAttempt<R, P>
 where
-    R: FoldedAuthRepository,
-    P: FoldedAuthApprovalPoller,
+    R: FoldedAuthRepository + ?Sized,
+    P: FoldedAuthApprovalPoller + ?Sized,
 {
     pub fn new(repository: Arc<R>, poller: Arc<P>, clock: Arc<dyn Clock>) -> Self {
         Self {
@@ -53,10 +53,34 @@ where
             FoldedAuthStatus::RestartRequired => {
                 return Ok(PollFoldedAuthOutcome::RestartRequired(attempt));
             }
-            FoldedAuthStatus::Accepted => return Ok(PollFoldedAuthOutcome::Stale),
+            FoldedAuthStatus::Accepted => {
+                return Ok(
+                    match self.repository.accepted_graph_task(state_hash).await? {
+                        Some(task) => PollFoldedAuthOutcome::Accepted(task),
+                        None => PollFoldedAuthOutcome::Stale,
+                    },
+                );
+            }
             FoldedAuthStatus::Pending => {}
         }
         let generation = attempt.generation;
+        if attempt.poll_dispatched {
+            return Ok(
+                match self
+                    .repository
+                    .require_restart(state_hash, generation, before_poll)
+                    .await?
+                {
+                    Some(attempt) if attempt.status == FoldedAuthStatus::Expired => {
+                        PollFoldedAuthOutcome::Expired(attempt)
+                    }
+                    Some(attempt) if attempt.status == FoldedAuthStatus::RestartRequired => {
+                        PollFoldedAuthOutcome::RestartRequired(attempt)
+                    }
+                    _ => PollFoldedAuthOutcome::Stale,
+                },
+            );
+        }
         if attempt.expires_at <= before_poll {
             return Ok(
                 match self
@@ -77,12 +101,30 @@ where
         if restored.attempt.generation != generation {
             return Ok(PollFoldedAuthOutcome::Stale);
         }
+        if self
+            .repository
+            .mark_poll_dispatched(state_hash, generation, before_poll)
+            .await?
+            .is_none()
+        {
+            return Ok(PollFoldedAuthOutcome::Stale);
+        }
 
         // No repository transaction or row lock is held across this awaited SDK/relay call.
         let polled = self.poller.poll_approval(&restored.flow_secret).await;
         let result_time = self.clock.now();
         match polled {
-            FoldedAuthPollCall::NotAttempted(error) => Err(error),
+            FoldedAuthPollCall::NotAttempted(error) => {
+                if self
+                    .repository
+                    .confirm_not_attempted(state_hash, generation, result_time)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(PollFoldedAuthOutcome::Stale);
+                }
+                Err(error)
+            }
             FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Pending)) => Ok(
                 match self
                     .repository

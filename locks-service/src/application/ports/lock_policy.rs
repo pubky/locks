@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::{ContentLock, ContentLockPayload};
 use locks_core::lock_service_pointer::LockServicePointer;
 
 use crate::application::errors::ApplicationError;
@@ -25,6 +25,23 @@ impl ContentLockWriteError {
 /// Repository for public content lock payloads.
 #[async_trait]
 pub trait ContentLockRepository: Send + Sync {
+    async fn upsert_content_lock_payload(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLockPayload,
+    ) -> Result<(), ApplicationError> {
+        match content_lock {
+            ContentLockPayload::V1(lock) => {
+                self.upsert_content_lock(creator, content_lock_path, lock)
+                    .await
+            }
+            ContentLockPayload::V2(_) => Err(ApplicationError::Storage {
+                message: "v2 content lock writes are unsupported by this repository".to_owned(),
+            }),
+        }
+    }
+
     /// Creates or replaces a content lock for a creator and canonical content lock path.
     async fn upsert_content_lock(
         &self,
@@ -54,6 +71,17 @@ pub trait ContentLockRepository: Send + Sync {
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError>;
+
+    async fn get_content_lock_payload(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<Option<ContentLockPayload>, ApplicationError> {
+        Ok(self
+            .get_content_lock(creator, content_lock_path)
+            .await?
+            .map(ContentLockPayload::V1))
+    }
 
     /// Deletes the public content lock at the canonical creator-owned path.
     /// Returns true when a record existed and false when already absent.

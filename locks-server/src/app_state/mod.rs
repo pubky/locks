@@ -20,9 +20,10 @@ use locks_service::{
             AccessCredentialStore, Clock, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
             ContentLockTombstoneRepository, CreatorAuthorityManager, CreatorAuthorityStore,
-            CreatorConnectFlowStore, EntitlementRepository, FoldedAuthRepository,
-            FrontendSessionCodeStore, FrontendSessionStore, GrantCreatorConnectFlowClient,
-            GuardedResourceRepository, InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
+            CreatorConnectFlowStore, EntitlementRepository, FoldedAuthApprovalPoller,
+            FoldedAuthFlowStarter, FoldedAuthRepository, FrontendSessionCodeStore,
+            FrontendSessionStore, GrantCreatorConnectFlowClient, GuardedResourceRepository,
+            InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
             LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
             VerificationTaskClaimer, VerificationTaskRepository,
         },
@@ -54,10 +55,11 @@ use locks_service::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
             GrantSessionCache, LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys,
             PubkyBytesResource, PubkyContentLockRepository, PubkyContentLockTombstoneRepository,
-            PubkyEntitlementRepository, PubkyGrantCreatorConnectFlowClient,
-            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionImporter,
-            PubkyLegacyCookieSessionRevalidator, PubkyLegacyCreatorConnectFlowClient,
-            PubkyLockServicePointerRepository, PubkyPrivResourceRepository, PubkyResourceMetadata,
+            PubkyEntitlementRepository, PubkyFoldedAuthApprovalPoller, PubkyFoldedAuthFlowStarter,
+            PubkyGrantCreatorConnectFlowClient, PubkyHomeserverStorageClient,
+            PubkyLegacyCookieSessionImporter, PubkyLegacyCookieSessionRevalidator,
+            PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
+            PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
         verifiers::dev_static::DevStaticVerifier,
         verifiers::paykit_payment::PaykitPaymentVerifier,
@@ -293,6 +295,8 @@ pub struct AppState {
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
     folded_auth: Option<Arc<dyn FoldedAuthRepository>>,
+    folded_auth_poller: Option<Arc<dyn FoldedAuthApprovalPoller>>,
+    folded_auth_flow_starter: Option<Arc<dyn FoldedAuthFlowStarter>>,
 }
 
 /// Purpose-separated runtime ciphers derived from the configured master key.
@@ -667,6 +671,29 @@ impl AppState {
             final_credential_cipher,
         );
         state.folded_auth = Some(repository);
+        if let Some(grant) = state
+            .config
+            .creator_authority_acquisition
+            .grant_connect
+            .as_ref()
+        {
+            let keypair = load_lock_server_signing_keypair(&state.config.credentials)
+                .expect("folded auth requires keypair-seed Lock Server secret");
+            let keys = LockServerGrantPopKeys::from_lock_server_seed(keypair.secret());
+            let client_id =
+                pubky::ClientId::new(&grant.client_id).expect("validated grant-connect client_id");
+            let client = build_pubky_http_client(&state.config.pubky);
+            state.folded_auth_poller = Some(Arc::new(PubkyFoldedAuthApprovalPoller::new(
+                client.clone(),
+                keys.clone(),
+            )));
+            state.folded_auth_flow_starter = Some(Arc::new(PubkyFoldedAuthFlowStarter::new(
+                client,
+                pubky_auth_relay_for_network(state.config.pubky.network),
+                client_id,
+                keys,
+            )));
+        }
         state
     }
 
@@ -835,6 +862,8 @@ impl AppState {
             paykit_setup_status_provider,
             payment_drain_client,
             folded_auth: None,
+            folded_auth_poller: None,
+            folded_auth_flow_starter: None,
         }
     }
 
@@ -907,6 +936,27 @@ impl AppState {
 
     pub fn folded_auth(&self) -> Option<&Arc<dyn FoldedAuthRepository>> {
         self.folded_auth.as_ref()
+    }
+
+    pub fn folded_auth_poller(&self) -> Option<&Arc<dyn FoldedAuthApprovalPoller>> {
+        self.folded_auth_poller.as_ref()
+    }
+
+    pub fn folded_auth_flow_starter(&self) -> Option<&Arc<dyn FoldedAuthFlowStarter>> {
+        self.folded_auth_flow_starter.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_folded_auth_runtime(
+        mut self,
+        repository: Arc<dyn FoldedAuthRepository>,
+        poller: Arc<dyn FoldedAuthApprovalPoller>,
+        starter: Arc<dyn FoldedAuthFlowStarter>,
+    ) -> Self {
+        self.folded_auth = Some(repository);
+        self.folded_auth_poller = Some(poller);
+        self.folded_auth_flow_starter = Some(starter);
+        self
     }
 
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {

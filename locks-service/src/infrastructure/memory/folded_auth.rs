@@ -10,7 +10,7 @@ use crate::application::models::{
     FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, RestoredFoldedAuthAttempt,
     StartFoldedAuthAttempt,
 };
-use crate::application::ports::FoldedAuthRepository;
+use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository};
 use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
 
 use super::graph_tasks::InMemoryGraphTaskRepository;
@@ -53,6 +53,39 @@ impl InMemoryFoldedAuthRepository {
 
 #[async_trait]
 impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
+    async fn get_latest_by_handle(
+        &self,
+        creator: &locks_core::ids::CreatorPubky,
+        bundle_id: &locks_core::ids::BundleId,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .records
+            .iter()
+            .filter(|stored| {
+                &stored.attempt.creator == creator && &stored.attempt.bundle_id == bundle_id
+            })
+            .max_by_key(|stored| stored.attempt.generation)
+            .map(|stored| stored.attempt.clone()))
+    }
+
+    async fn accepted_graph_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let Some(attempt) = self.get_by_state_hash(state_hash).await? else {
+            return Ok(None);
+        };
+        if attempt.status != FoldedAuthStatus::Accepted {
+            return Ok(None);
+        }
+        self.graph
+            .get_graph_task_by_handle(&attempt.creator, &attempt.bundle_id)
+            .await
+    }
+
     async fn start_or_rotate(
         &self,
         request: StartFoldedAuthAttempt,
@@ -61,6 +94,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         let _admission = self
             .graph
             .acquire_admission(request.creator(), request.pubky_lock_resource.lock_id())
+            .await;
+        let _handle_admission = self
+            .graph
+            .acquire_handle_admission(request.creator(), request.bundle_id())
             .await;
         let mut state = self.state.write().await;
         if self
@@ -142,6 +179,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             graph: request.graph,
             created_at: database_now,
             expires_at,
+            poll_dispatched: false,
             terminal_at: None,
             purge_after: None,
             task_id: None,
@@ -188,7 +226,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         let Some(stored) = stored else {
             return Ok(None);
         };
-        if stored.attempt.status != FoldedAuthStatus::Pending {
+        if stored.attempt.status != FoldedAuthStatus::Pending || stored.attempt.poll_dispatched {
             return Ok(None);
         }
         let encrypted = stored
@@ -200,6 +238,40 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             attempt: stored.attempt,
             flow_secret,
         }))
+    }
+
+    async fn mark_poll_dispatched(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let mut state = self.state.write().await;
+        let Some(stored) = exact_pending_mut(&mut state, state_hash, expected_generation) else {
+            return Ok(None);
+        };
+        if stored.attempt.poll_dispatched {
+            return Ok(None);
+        }
+        stored.attempt.poll_dispatched = true;
+        Ok(Some(stored.attempt.clone()))
+    }
+
+    async fn confirm_not_attempted(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let mut state = self.state.write().await;
+        let Some(stored) = exact_pending_mut(&mut state, state_hash, expected_generation) else {
+            return Ok(None);
+        };
+        if !stored.attempt.poll_dispatched {
+            return Ok(None);
+        }
+        stored.attempt.poll_dispatched = false;
+        Ok(Some(stored.attempt.clone()))
     }
 
     async fn confirm_pending_generation(
@@ -216,6 +288,11 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         if stored.attempt.expires_at <= now {
             let purge_after = checked_purge_after(now)?;
             terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+            self.graph
+                .release_folded_auth_reservation(&stored.attempt.creator, &stored.attempt.bundle_id)
+                .await;
+        } else {
+            stored.attempt.poll_dispatched = false;
         }
         Ok(Some(stored.attempt.clone()))
     }
@@ -238,6 +315,9 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             FoldedAuthStatus::RestartRequired
         };
         terminalize(stored, status, now, purge_after);
+        self.graph
+            .release_folded_auth_reservation(&stored.attempt.creator, &stored.attempt.bundle_id)
+            .await;
         Ok(Some(stored.attempt.clone()))
     }
 
@@ -257,6 +337,9 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         }
         let purge_after = checked_purge_after(now)?;
         terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+        self.graph
+            .release_folded_auth_reservation(&stored.attempt.creator, &stored.attempt.bundle_id)
+            .await;
         Ok(Some(stored.attempt.clone()))
     }
 
@@ -291,6 +374,9 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         if stored.attempt.expires_at <= now {
             let purge_after = checked_purge_after(now)?;
             terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+            self.graph
+                .release_folded_auth_reservation(&stored.attempt.creator, &stored.attempt.bundle_id)
+                .await;
             return Ok(None);
         }
         let task = stored
@@ -321,10 +407,24 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         let now = self.graph.authoritative_time();
         let purge_after = checked_purge_after(now)?;
         for stored in &mut state.records {
-            if stored.attempt.status == FoldedAuthStatus::Pending
-                && stored.attempt.expires_at <= now
-            {
-                terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+            if stored.attempt.status == FoldedAuthStatus::Pending {
+                if stored.attempt.expires_at <= now {
+                    terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+                    self.graph
+                        .release_folded_auth_reservation(
+                            &stored.attempt.creator,
+                            &stored.attempt.bundle_id,
+                        )
+                        .await;
+                } else if stored.attempt.poll_dispatched {
+                    terminalize(stored, FoldedAuthStatus::RestartRequired, now, purge_after);
+                    self.graph
+                        .release_folded_auth_reservation(
+                            &stored.attempt.creator,
+                            &stored.attempt.bundle_id,
+                        )
+                        .await;
+                }
             }
         }
         let before = state.records.len();
@@ -359,6 +459,7 @@ fn terminalize(
     purge_after: time::OffsetDateTime,
 ) {
     stored.attempt.status = status;
+    stored.attempt.poll_dispatched = false;
     stored.attempt.terminal_at = Some(now);
     stored.attempt.purge_after = Some(purge_after);
     stored.encrypted_flow_secret = None;
@@ -468,6 +569,35 @@ mod tests {
             .unwrap()
             .is_some();
         assert_ne!(has_attempt, has_task);
+    }
+
+    #[tokio::test]
+    async fn terminal_folded_attempt_releases_handle_reservation_for_ordinary_admission() {
+        let graph = Arc::new(InMemoryGraphTaskRepository::new());
+        let repository = InMemoryFoldedAuthRepository::new(Arc::clone(&graph), cipher());
+        let creator = creator();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let resource =
+            PubkyLockResource::new(creator.clone(), ContentLockPath::from_lock_id(lock_id()));
+        let started = repository
+            .start_or_rotate(start_request(bundle_id.clone(), resource.clone()))
+            .await
+            .unwrap();
+
+        repository
+            .require_restart(
+                &started.attempt.state_hash,
+                started.attempt.generation,
+                datetime!(2026-10-30 12:01:00 UTC),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        graph
+            .insert_graph_task(graph_task(creator, bundle_id, resource))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

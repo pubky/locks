@@ -5,7 +5,7 @@ pub use locks_core::creator_publishing::{
 use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, LockId, LockServerPubky};
 use locks_core::lock_policy::{ContentLock, GuardedResource};
 use locks_core::lock_service_pointer::LockServicePointer;
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::verification::SubmittedProofBundlePayload;
 use locks_service::application::models::{
     AccessCredential, FrontendSessionCode, VerificationTaskStatus, VerificationTerminalReason,
 };
@@ -15,6 +15,8 @@ use locks_service::application::use_cases::exchange_frontend_session_code::{
 use locks_service::application::use_cases::get_creator_authority_status::CreatorAuthorityStatusView;
 use locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView;
 use locks_service::application::use_cases::issue_access_credential::IssuedAccessCredential;
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -81,7 +83,60 @@ pub struct SetLockServicePointerHttpResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitProofBundleHttpRequest {
-    pub submitted_proof_bundle: SubmittedProofBundle,
+    pub submitted_proof_bundle: SubmittedProofBundlePayload,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct FoldedAuthPendingHttpResponse {
+    pub status: &'static str,
+    pub auth_url: String,
+    pub state: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+}
+
+impl fmt::Debug for FoldedAuthPendingHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FoldedAuthPendingHttpResponse")
+            .field("status", &self.status)
+            .field("auth_url", &"<redacted>")
+            .field("state", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FoldedAuthStatusHttpRequest {
+    pub state: String,
+}
+
+impl fmt::Debug for FoldedAuthStatusHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FoldedAuthStatusHttpRequest")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FoldedAuthStatusHttpResponse {
+    Pending {
+        #[serde(with = "time::serde::rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    Accepted {
+        task: VerificationTaskLifecycleHttpResponse,
+    },
+    RestartRequired,
+    Expired {
+        #[serde(with = "time::serde::rfc3339")]
+        expired_at: OffsetDateTime,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -257,7 +312,9 @@ mod tests {
 
     use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
     use locks_core::lock_policy::VerifierType;
-    use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+    use locks_core::verification::{
+        Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundlePayload,
+    };
     use locks_service::application::models::{
         AccessCredential, CreatorAuthorityAuthKind, VerificationTaskStatus,
     };
@@ -269,7 +326,8 @@ mod tests {
 
     use super::{
         CreatorAuthorityStatusHttpResponse, ExchangeFrontendSessionCodeHttpRequest,
-        ExchangeFrontendSessionCodeHttpResponse, IssueAccessCredentialHttpRequest,
+        ExchangeFrontendSessionCodeHttpResponse, FoldedAuthPendingHttpResponse,
+        FoldedAuthStatusHttpRequest, IssueAccessCredentialHttpRequest,
         IssueAccessCredentialHttpResponse, SubmitProofBundleHttpRequest,
         VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
     };
@@ -279,9 +337,35 @@ mod tests {
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
     #[test]
+    fn folded_auth_pending_debug_redacts_auth_url_and_state() {
+        let response = FoldedAuthPendingHttpResponse {
+            status: "auth_pending",
+            auth_url: "pubkyauth://secret-bearing-url".to_owned(),
+            state: "secret-bearing-state".to_owned(),
+            expires_at: datetime!(2026-10-30 12:10:00 UTC),
+        };
+
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("secret-bearing-url"));
+        assert!(!debug.contains("secret-bearing-state"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn folded_auth_status_request_debug_redacts_state() {
+        let request = FoldedAuthStatusHttpRequest {
+            state: "secret-bearing-state".to_owned(),
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("secret-bearing-state"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn submit_proof_request_uses_explicit_envelope() {
         let request = SubmitProofBundleHttpRequest {
-            submitted_proof_bundle: submitted_proof_bundle(),
+            submitted_proof_bundle: SubmittedProofBundlePayload::V1(submitted_proof_bundle()),
         };
 
         let json = serde_json::to_value(request).unwrap();

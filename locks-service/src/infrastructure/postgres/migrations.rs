@@ -529,7 +529,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=28).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=29).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -570,7 +570,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=28).collect::<Vec<_>>()
+            (1..=29).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],

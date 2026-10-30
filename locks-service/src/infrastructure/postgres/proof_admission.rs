@@ -1,9 +1,10 @@
-use locks_core::ids::{CreatorPubky, LockId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId};
 use sqlx::{Postgres, Transaction};
 
 use crate::application::errors::ApplicationError;
 
 const PROOF_ADMISSION_LOCK_NAMESPACE: &str = "locks:proof-admission:v1";
+const PROOF_HANDLE_ADMISSION_LOCK_NAMESPACE: &str = "locks:proof-handle-admission:v1";
 
 pub(super) async fn lock_proof_admission(
     transaction: &mut Transaction<'_, Postgres>,
@@ -12,6 +13,22 @@ pub(super) async fn lock_proof_admission(
 ) -> Result<(), ApplicationError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(proof_admission_lock_key(creator, lock_id))
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+pub(super) async fn lock_proof_handle_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+    creator: &CreatorPubky,
+    bundle_id: &BundleId,
+) -> Result<(), ApplicationError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "{PROOF_HANDLE_ADMISSION_LOCK_NAMESPACE}:{creator}:{}",
+            bundle_id.as_str()
+        ))
         .execute(&mut **transaction)
         .await
         .map_err(storage_error)?;

@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pubky::{
     AuthFlowKind, Capabilities, ClientId, DelegatedGrantAuthFlowState, GrantClaims,
-    PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
+    PubkyGrantAuthFlow, PubkyHttpClient, PubkySession, PublicKey,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -16,7 +16,7 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{FoldedAuthFlowSecret, GrantPopKeyId};
 use crate::application::ports::{
     FoldedAuthApprovalPoll, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller,
-    FoldedAuthPollCall,
+    FoldedAuthFlowStarter, FoldedAuthPollCall,
 };
 use crate::infrastructure::pubky::grant_connect_flow::LockServerGrantPopKeys;
 use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
@@ -32,6 +32,45 @@ pub struct PubkyFoldedAuthApprovalPoller {
 
 const MAX_CACHED_FLOWS: usize = 1_024;
 const CACHED_FLOW_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+#[derive(Clone)]
+pub struct PubkyFoldedAuthFlowStarter {
+    client: PubkyHttpClient,
+    relay: Option<Url>,
+    client_id: ClientId,
+    pop_keys: LockServerGrantPopKeys,
+}
+
+impl PubkyFoldedAuthFlowStarter {
+    pub fn new(
+        client: PubkyHttpClient,
+        relay: Option<Url>,
+        client_id: ClientId,
+        pop_keys: LockServerGrantPopKeys,
+    ) -> Self {
+        Self {
+            client,
+            relay,
+            client_id,
+            pop_keys,
+        }
+    }
+}
+
+impl FoldedAuthFlowStarter for PubkyFoldedAuthFlowStarter {
+    fn start(
+        &self,
+        key_id: &GrantPopKeyId,
+    ) -> Result<(String, FoldedAuthFlowSecret), ApplicationError> {
+        start_folded_auth_flow(
+            self.client.clone(),
+            self.relay.clone(),
+            self.client_id.clone(),
+            &self.pop_keys,
+            key_id,
+        )
+    }
+}
 
 struct CachedFlow {
     flow: Arc<Mutex<PubkyGrantAuthFlow>>,
@@ -55,6 +94,7 @@ struct StoredDelegatedFlowState {
     authorization_url: String,
     key_id: String,
     client_pk: String,
+    client_id: String,
     approval_key_secret: Option<String>,
 }
 
@@ -65,14 +105,17 @@ pub fn start_folded_auth_flow(
     pop_keys: &LockServerGrantPopKeys,
     key_id: &GrantPopKeyId,
 ) -> Result<(String, FoldedAuthFlowSecret), ApplicationError> {
-    let mut builder =
-        PubkyGrantAuthFlow::builder(&Capabilities::default(), AuthFlowKind::signin(), client_id)
-            .client(client)
-            .delegated_client_signer(
-                key_id.as_str().to_owned(),
-                pop_keys.public_key(key_id),
-                pop_keys.signer(key_id),
-            );
+    let mut builder = PubkyGrantAuthFlow::builder(
+        &Capabilities::default(),
+        AuthFlowKind::signin(),
+        client_id.clone(),
+    )
+    .client(client)
+    .delegated_client_signer(
+        key_id.as_str().to_owned(),
+        pop_keys.public_key(key_id),
+        pop_keys.signer(key_id),
+    );
     if let Some(relay) = relay {
         builder = builder.relay(relay);
     }
@@ -81,17 +124,19 @@ pub fn start_folded_auth_flow(
     let state = flow
         .save_delegated()
         .ok_or_else(|| flow_error("missing delegated restore state"))?;
-    Ok((authorization_url, encode_flow_state(&state)?))
+    Ok((authorization_url, encode_flow_state(&state, &client_id)?))
 }
 
 pub fn encode_flow_state(
     state: &DelegatedGrantAuthFlowState,
+    client_id: &ClientId,
 ) -> Result<FoldedAuthFlowSecret, ApplicationError> {
     let encoded = serde_json::to_vec(&StoredDelegatedFlowState {
         version: FLOW_STATE_VERSION,
         authorization_url: state.authorization_url.clone(),
         key_id: state.key_id.clone(),
         client_pk: state.client_pk.z32(),
+        client_id: client_id.to_string(),
         approval_key_secret: state
             .approval_key_secret
             .map(|secret| URL_SAFE_NO_PAD.encode(secret)),
@@ -103,11 +148,18 @@ pub fn encode_flow_state(
 pub fn decode_flow_state(
     secret: &FoldedAuthFlowSecret,
 ) -> Result<DelegatedGrantAuthFlowState, ApplicationError> {
+    decode_flow_state_with_client_id(secret).map(|(state, _)| state)
+}
+
+fn decode_flow_state_with_client_id(
+    secret: &FoldedAuthFlowSecret,
+) -> Result<(DelegatedGrantAuthFlowState, ClientId), ApplicationError> {
     let stored: StoredDelegatedFlowState = serde_json::from_slice(secret.expose_bytes())
         .map_err(|_| flow_error("invalid stored state"))?;
     if stored.version != FLOW_STATE_VERSION
         || stored.authorization_url.is_empty()
         || stored.key_id.is_empty()
+        || stored.client_id.is_empty()
     {
         return Err(flow_error("invalid stored state"));
     }
@@ -123,18 +175,23 @@ pub fn decode_flow_state(
                 .map_err(|_| flow_error("invalid stored state"))
         })
         .transpose()?;
-    Ok(DelegatedGrantAuthFlowState {
-        authorization_url: stored.authorization_url,
-        key_id: stored.key_id,
-        client_pk,
-        approval_key_secret,
-    })
+    let client_id =
+        ClientId::new(&stored.client_id).map_err(|_| flow_error("invalid stored state"))?;
+    Ok((
+        DelegatedGrantAuthFlowState {
+            authorization_url: stored.authorization_url,
+            key_id: stored.key_id,
+            client_pk,
+            approval_key_secret,
+        },
+        client_id,
+    ))
 }
 
 #[async_trait]
 impl FoldedAuthApprovalPoller for PubkyFoldedAuthApprovalPoller {
     async fn poll_approval(&self, flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
-        let state = match decode_flow_state(flow_secret) {
+        let (state, expected_client_id) = match decode_flow_state_with_client_id(flow_secret) {
             Ok(state) => state,
             Err(error) => return FoldedAuthPollCall::NotAttempted(error),
         };
@@ -142,6 +199,8 @@ impl FoldedAuthApprovalPoller for PubkyFoldedAuthApprovalPoller {
         if state.client_pk != self.pop_keys.public_key(&key_id) {
             return FoldedAuthPollCall::NotAttempted(flow_error("invalid delegated key binding"));
         }
+        let expected_client_pk = state.client_pk.clone();
+        let expected_key_id = state.key_id.clone();
         let flow_key = *blake3::hash(flow_secret.expose_bytes()).as_bytes();
         let flow = {
             let mut flows = self.flows.lock().await;
@@ -194,14 +253,55 @@ impl FoldedAuthApprovalPoller for PubkyFoldedAuthApprovalPoller {
         let Some(state) = credential.export_delegated_restore_state().await else {
             return FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError));
         };
+        let session_pubky =
+            PubkySession::from_grant_credential(self.client.clone(), credential).public_key();
         let Ok(claims) = GrantClaims::decode(&state.grant_jws) else {
             return FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError));
         };
-        let Ok(reader) = creator_from_pubky_public_key_z32(&claims.iss.z32()) else {
-            return FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError));
+        let reader = match validate_approved_grant(
+            &claims,
+            &state,
+            &session_pubky,
+            &expected_client_id,
+            &expected_client_pk,
+            &expected_key_id,
+            time::OffsetDateTime::now_utc(),
+        ) {
+            Ok(reader) => reader,
+            Err(error) => return FoldedAuthPollCall::Attempted(Err(error)),
         };
         FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Approved { reader }))
     }
+}
+
+fn validate_approved_grant(
+    claims: &GrantClaims,
+    state: &pubky::DelegatedGrantCredentialState,
+    session_pubky: &PublicKey,
+    expected_client_id: &ClientId,
+    expected_client_pk: &PublicKey,
+    expected_key_id: &str,
+    now: time::OffsetDateTime,
+) -> Result<locks_core::ids::CreatorPubky, FoldedAuthApprovalPollError> {
+    if !claims.caps.is_empty()
+        || &claims.iss != session_pubky
+        || &claims.client_id != expected_client_id
+        || &claims.cnf != expected_client_pk
+        || &state.client_pk != expected_client_pk
+        || state.key_id != expected_key_id
+    {
+        return Err(FoldedAuthApprovalPollError);
+    }
+    let Some(expires_at) = i64::try_from(claims.exp)
+        .ok()
+        .and_then(|value| time::OffsetDateTime::from_unix_timestamp(value).ok())
+    else {
+        return Err(FoldedAuthApprovalPollError);
+    };
+    if expires_at <= now {
+        return Err(FoldedAuthApprovalPollError);
+    }
+    creator_from_pubky_public_key_z32(&claims.iss.z32()).map_err(|_| FoldedAuthApprovalPollError)
 }
 
 fn flow_error(class: &'static str) -> ApplicationError {
@@ -220,12 +320,16 @@ mod tests {
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::get;
-    use pubky::{ClientId, DelegatedGrantAuthFlowState, Keypair, Pubky, PubkyHttpClient};
+    use pubky::{
+        Capability, ClientId, DelegatedGrantAuthFlowState, DelegatedGrantCredentialState,
+        GrantClaims, GrantId, Keypair, Pubky, PubkyHttpClient,
+    };
     use tokio::sync::{Mutex, Notify};
     use url::Url;
 
     use super::{
-        PubkyFoldedAuthApprovalPoller, decode_flow_state, encode_flow_state, start_folded_auth_flow,
+        PubkyFoldedAuthApprovalPoller, decode_flow_state, encode_flow_state,
+        start_folded_auth_flow, validate_approved_grant,
     };
     use crate::application::models::{FoldedAuthFlowSecret, GrantPopKeyId};
     use crate::application::ports::{FoldedAuthApprovalPoller, FoldedAuthPollCall};
@@ -242,11 +346,133 @@ mod tests {
             approval_key_secret: Some([4; 32]),
         };
 
-        let decoded = decode_flow_state(&encode_flow_state(&state).unwrap()).unwrap();
+        let decoded = decode_flow_state(
+            &encode_flow_state(&state, &ClientId::new("locks.test").unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(decoded.authorization_url, state.authorization_url);
         assert_eq!(decoded.key_id, state.key_id);
         assert_eq!(decoded.client_pk, state.client_pk);
         assert_eq!(decoded.approval_key_secret, state.approval_key_secret);
+    }
+
+    #[test]
+    fn approved_grant_requires_empty_caps_and_exact_session_client_pop_and_expiry_binding() {
+        let issuer = Keypair::random().public_key();
+        let client = Keypair::random().public_key();
+        let homeserver = Keypair::random().public_key();
+        let expected_client_id = ClientId::new("locks.test").unwrap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let state = DelegatedGrantCredentialState {
+            grant_jws: "<redacted-test-jws>".to_owned(),
+            homeserver_pk: homeserver,
+            key_id: "folded-pop-key".to_owned(),
+            client_pk: client.clone(),
+        };
+        let claims = GrantClaims {
+            iss: issuer.clone(),
+            client_id: expected_client_id.clone(),
+            caps: vec![],
+            cnf: client,
+            jti: GrantId::generate(),
+            iat: 1_700_000_000,
+            exp: 1_700_000_100,
+        };
+
+        assert!(
+            validate_approved_grant(
+                &claims,
+                &state,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            )
+            .is_ok()
+        );
+
+        let mut non_empty_caps = claims.clone();
+        non_empty_caps.caps.push(Capability::root());
+        let mut wrong_client = claims.clone();
+        wrong_client.client_id = ClientId::new("other.test").unwrap();
+        let mut wrong_pop = claims.clone();
+        wrong_pop.cnf = Keypair::random().public_key();
+        let wrong_session = Keypair::random().public_key();
+        let mut wrong_state_key = state.clone();
+        wrong_state_key.client_pk = Keypair::random().public_key();
+        let mut wrong_state_key_id = state.clone();
+        wrong_state_key_id.key_id = "attacker-key".to_owned();
+        let mut expired = claims.clone();
+        expired.exp = u64::try_from(now.unix_timestamp()).unwrap();
+
+        for rejected in [
+            validate_approved_grant(
+                &non_empty_caps,
+                &state,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &wrong_client,
+                &state,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &wrong_pop,
+                &state,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &claims,
+                &state,
+                &wrong_session,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &claims,
+                &wrong_state_key,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &claims,
+                &wrong_state_key_id,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+            validate_approved_grant(
+                &expired,
+                &state,
+                &issuer,
+                &expected_client_id,
+                &state.client_pk,
+                &state.key_id,
+                now,
+            ),
+        ] {
+            assert!(rejected.is_err());
+        }
     }
 
     #[test]
