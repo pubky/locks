@@ -78,6 +78,16 @@ impl GraphVerificationWorker {
     }
 
     pub async fn run_once(&self) -> Result<GraphWorkerTick, ApplicationError> {
+        self.run_once_with_shutdown(None).await
+    }
+
+    async fn run_once_with_shutdown(
+        &self,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<GraphWorkerTick, ApplicationError> {
+        if shutdown.is_some_and(|shutdown| *shutdown.borrow()) {
+            return Ok(GraphWorkerTick::Idle);
+        }
         let claim_now = self.clock.now();
         let Some(claim) = self
             .claimer
@@ -89,9 +99,15 @@ impl GraphVerificationWorker {
         let task_id = claim.task.task_id;
         let expected_revision = claim.task.evaluator_revision;
         let claim_token = claim.claim_token;
+        if shutdown.is_some_and(|shutdown| *shutdown.borrow()) {
+            self.claimer
+                .release_claimed_graph_task(&task_id, &self.worker_id, &claim_token)
+                .await?;
+            return Ok(GraphWorkerTick::ClaimLost);
+        }
         if claim.task.status == VerificationTaskStatus::PublishingEntitlement {
             return self
-                .publish_claimed_entitlement(claim.task, claim_token, expected_revision)
+                .publish_claimed_entitlement(claim.task, claim_token, expected_revision, shutdown)
                 .await;
         }
         if claim.task.snapshot.as_v1().root != GraphRootState::Pending {
@@ -102,6 +118,7 @@ impl GraphVerificationWorker {
                     expected_revision,
                     claim.task.snapshot,
                     self.clock.now(),
+                    shutdown,
                 )
                 .await;
         }
@@ -119,6 +136,7 @@ impl GraphVerificationWorker {
                     expected_revision,
                     snapshot,
                     dispatch_now,
+                    shutdown,
                 )
                 .await;
         }
@@ -199,16 +217,31 @@ impl GraphVerificationWorker {
             expected_revision,
             snapshot,
             reduced_at,
+            shutdown,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn run_wave(&self) -> Result<[GraphWorkerTick; CONCURRENT_TASK_WAVES], ApplicationError> {
         let (first, second, third, fourth) = tokio::try_join!(
             self.run_once(),
             self.run_once(),
             self.run_once(),
             self.run_once()
+        )?;
+        Ok([first, second, third, fourth])
+    }
+
+    async fn run_shutdown_wave(
+        &self,
+        shutdown: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<[GraphWorkerTick; CONCURRENT_TASK_WAVES], ApplicationError> {
+        let (first, second, third, fourth) = tokio::try_join!(
+            self.run_once_with_shutdown(Some(shutdown)),
+            self.run_once_with_shutdown(Some(shutdown)),
+            self.run_once_with_shutdown(Some(shutdown)),
+            self.run_once_with_shutdown(Some(shutdown))
         )?;
         Ok([first, second, third, fourth])
     }
@@ -222,7 +255,7 @@ impl GraphVerificationWorker {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            let ticks = self.run_wave().await?;
+            let ticks = self.run_shutdown_wave(&shutdown).await?;
             if ticks.iter().all(|tick| {
                 matches!(
                     tick,
@@ -248,6 +281,7 @@ impl GraphVerificationWorker {
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
         now: time::OffsetDateTime,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<GraphWorkerTick, ApplicationError> {
         if snapshot.as_v1().root != GraphRootState::Pending {
             let persisted = self
@@ -266,7 +300,12 @@ impl GraphVerificationWorker {
             };
             if persisted.status == VerificationTaskStatus::PublishingEntitlement {
                 return self
-                    .publish_claimed_entitlement(persisted, claim_token, expected_revision + 1)
+                    .publish_claimed_entitlement(
+                        persisted,
+                        claim_token,
+                        expected_revision + 1,
+                        shutdown,
+                    )
                     .await;
             }
             return Ok(GraphWorkerTick::Terminal(task_id));
@@ -281,6 +320,7 @@ impl GraphVerificationWorker {
         task: locks_service::application::models::GraphTaskRecord,
         claim_token: uuid::Uuid,
         expected_revision: u64,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<GraphWorkerTick, ApplicationError> {
         let task_id = task.task_id;
         let payload = task
@@ -293,60 +333,79 @@ impl GraphVerificationWorker {
                 .ok_or_else(|| ApplicationError::Storage {
                     message: "publishing graph task is missing external-effect fence".to_owned(),
                 })?;
-        let existing = match self
-            .entitlements
-            .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
-            .await
-        {
-            Ok(existing) => existing,
-            Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
-        };
-        match existing {
-            Some(existing) if existing == payload => {}
-            Some(_) => {
-                return Err(ApplicationError::Storage {
-                    message: "published v2 entitlement conflicts with durable graph payload"
-                        .to_owned(),
-                });
-            }
-            None => {
-                if self
-                    .entitlements
-                    .insert_verified_proof_bundle_v2(payload.clone())
-                    .await
-                    .is_err()
-                {
-                    return Ok(GraphWorkerTick::PublicationDeferred(task_id));
-                }
-                let readback = match self
-                    .entitlements
-                    .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
-                    .await
-                {
-                    Ok(readback) => readback,
-                    Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
-                };
-                if readback.as_ref() != Some(&payload) {
-                    return Ok(GraphWorkerTick::PublicationDeferred(task_id));
-                }
-            }
-        }
-        let completed = self
+        let Some(mut action) = self
             .claimer
-            .complete_claimed_graph_publication(
+            .acquire_graph_publication_action(
                 &task_id,
                 &self.worker_id,
                 &claim_token,
-                self.clock.now(),
                 expected_revision,
                 publication_token,
             )
-            .await?;
-        Ok(if completed.is_some() {
-            GraphWorkerTick::Terminal(task_id)
-        } else {
-            GraphWorkerTick::ClaimLost
-        })
+            .await?
+        else {
+            return Ok(GraphWorkerTick::ClaimLost);
+        };
+        if shutdown.is_some_and(|shutdown| *shutdown.borrow()) {
+            action.release().await?;
+            self.claimer
+                .release_claimed_graph_task(&task_id, &self.worker_id, &claim_token)
+                .await?;
+            return Ok(GraphWorkerTick::ClaimLost);
+        }
+        let outcome = async {
+            let existing = match self
+                .entitlements
+                .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
+                .await
+            {
+                Ok(existing) => existing,
+                Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
+            };
+            match existing {
+                Some(existing) if existing == payload => {}
+                Some(_) => {
+                    return Err(ApplicationError::Storage {
+                        message: "published v2 entitlement conflicts with durable graph payload"
+                            .to_owned(),
+                    });
+                }
+                None => {
+                    if self
+                        .entitlements
+                        .insert_verified_proof_bundle_v2(payload.clone())
+                        .await
+                        .is_err()
+                    {
+                        return Ok(GraphWorkerTick::PublicationDeferred(task_id));
+                    }
+                    let readback = match self
+                        .entitlements
+                        .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
+                        .await
+                    {
+                        Ok(readback) => readback,
+                        Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
+                    };
+                    if readback.as_ref() != Some(&payload) {
+                        return Ok(GraphWorkerTick::PublicationDeferred(task_id));
+                    }
+                }
+            }
+            let completed = action.complete().await?;
+            Ok(if completed.is_some() {
+                GraphWorkerTick::Terminal(task_id)
+            } else {
+                GraphWorkerTick::ClaimLost
+            })
+        }
+        .await;
+        let released = action.release().await;
+        match (outcome, released) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(tick), Ok(())) => Ok(tick),
+        }
     }
 
     async fn schedule_retry(
@@ -532,6 +591,7 @@ mod tests {
     use locks_service::application::ports::{EntitlementRepository, GraphTaskRepository};
     use locks_service::infrastructure::memory::{
         entitlements::InMemoryEntitlementRepository, graph_tasks::InMemoryGraphTaskRepository,
+        verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
     };
     use pubky_common::crypto::Keypair;
     use time::macros::datetime;
@@ -579,6 +639,11 @@ mod tests {
         }
     }
 
+    fn repository_with_clock(clock: Arc<MutableClock>) -> Arc<InMemoryGraphTaskRepository> {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(clock));
+        Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(fence))
+    }
+
     struct FakeNexus {
         responses: Mutex<VecDeque<TimedNexusObservation>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -602,6 +667,7 @@ mod tests {
         inner: Arc<InMemoryEntitlementRepository>,
         fail_after_first_write: std::sync::atomic::AtomicBool,
         insert_calls: std::sync::atomic::AtomicUsize,
+        get_calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -656,6 +722,8 @@ mod tests {
             creator: &CreatorPubky,
             bundle_id: &BundleId,
         ) -> Result<Option<VerifiedProofBundleV2>, ApplicationError> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner
                 .get_verified_proof_bundle_v2(creator, bundle_id)
                 .await
@@ -715,6 +783,135 @@ mod tests {
         }
     }
 
+    struct BlockingClaimer {
+        inner: Arc<InMemoryGraphTaskRepository>,
+        claim_calls: std::sync::atomic::AtomicUsize,
+        gate: Arc<Semaphore>,
+        action_gate: Option<Arc<Semaphore>>,
+        action_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GraphTaskClaimer for BlockingClaimer {
+        async fn claim_next_graph_task(
+            &self,
+            worker_id: &str,
+            now: time::OffsetDateTime,
+            claim_expires_at: time::OffsetDateTime,
+        ) -> Result<Option<locks_service::application::models::ClaimedGraphTask>, ApplicationError>
+        {
+            self.claim_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.acquire().await.unwrap().forget();
+            self.inner
+                .claim_next_graph_task(worker_id, now, claim_expires_at)
+                .await
+        }
+
+        async fn persist_claimed_graph_snapshot(
+            &self,
+            task_id: &TaskId,
+            worker_id: &str,
+            claim_token: &uuid::Uuid,
+            now: time::OffsetDateTime,
+            expected_revision: u64,
+            snapshot: GraphTaskSnapshot,
+        ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+            self.inner
+                .persist_claimed_graph_snapshot(
+                    task_id,
+                    worker_id,
+                    claim_token,
+                    now,
+                    expected_revision,
+                    snapshot,
+                )
+                .await
+        }
+
+        async fn schedule_graph_task_retry(
+            &self,
+            task_id: &TaskId,
+            worker_id: &str,
+            claim_token: &uuid::Uuid,
+            now: time::OffsetDateTime,
+            expected_revision: u64,
+            snapshot: GraphTaskSnapshot,
+            next_attempt_at: time::OffsetDateTime,
+        ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+            self.inner
+                .schedule_graph_task_retry(
+                    task_id,
+                    worker_id,
+                    claim_token,
+                    now,
+                    expected_revision,
+                    snapshot,
+                    next_attempt_at,
+                )
+                .await
+        }
+
+        async fn release_claimed_graph_task(
+            &self,
+            task_id: &TaskId,
+            worker_id: &str,
+            claim_token: &uuid::Uuid,
+        ) -> Result<bool, ApplicationError> {
+            self.inner
+                .release_claimed_graph_task(task_id, worker_id, claim_token)
+                .await
+        }
+
+        async fn acquire_graph_publication_action(
+            &self,
+            task_id: &TaskId,
+            worker_id: &str,
+            claim_token: &uuid::Uuid,
+            expected_revision: u64,
+            publication_token: uuid::Uuid,
+        ) -> Result<
+            Option<Box<dyn locks_service::application::ports::GraphPublicationActionGuard>>,
+            ApplicationError,
+        > {
+            self.action_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.action_gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            self.inner
+                .acquire_graph_publication_action(
+                    task_id,
+                    worker_id,
+                    claim_token,
+                    expected_revision,
+                    publication_token,
+                )
+                .await
+        }
+
+        async fn complete_claimed_graph_publication(
+            &self,
+            task_id: &TaskId,
+            worker_id: &str,
+            claim_token: &uuid::Uuid,
+            now: time::OffsetDateTime,
+            expected_revision: u64,
+            publication_token: uuid::Uuid,
+        ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+            self.inner
+                .complete_claimed_graph_publication(
+                    task_id,
+                    worker_id,
+                    claim_token,
+                    now,
+                    expected_revision,
+                    publication_token,
+                )
+                .await
+        }
+    }
+
     #[test]
     fn retry_backoff_and_jitter_contract_is_bounded() {
         for base in OPERATIONAL_BACKOFF_SECONDS {
@@ -758,10 +955,10 @@ mod tests {
 
     #[tokio::test]
     async fn false_repolls_then_true_is_sticky_and_persisted() {
-        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
         let entitlements = Arc::new(InMemoryEntitlementRepository::new());
         repository.insert_graph_task(task()).await.unwrap();
-        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let verifier = Arc::new(FakeNexus {
             responses: Mutex::new(VecDeque::from([
                 TimedNexusObservation {
@@ -830,15 +1027,16 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_publication_is_reconciled_after_lease_reclaim_without_republishing() {
-        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
         repository.insert_graph_task(task()).await.unwrap();
         let published = Arc::new(InMemoryEntitlementRepository::new());
         let entitlements = Arc::new(AmbiguousOnceEntitlements {
             inner: published.clone(),
             fail_after_first_write: std::sync::atomic::AtomicBool::new(true),
             insert_calls: std::sync::atomic::AtomicUsize::new(0),
+            get_calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let verifier = Arc::new(FakeNexus {
             responses: Mutex::new(VecDeque::from([TimedNexusObservation {
                 observation: NexusObservation::Valid {
@@ -906,9 +1104,9 @@ mod tests {
 
     #[tokio::test]
     async fn completion_timestamp_at_deadline_is_timely_even_if_join_happens_later() {
-        let repository = Arc::new(InMemoryGraphTaskRepository::new());
-        repository.insert_graph_task(task()).await.unwrap();
         let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
+        repository.insert_graph_task(task()).await.unwrap();
         let worker = GraphVerificationWorker::new(
             repository.clone(),
             Arc::new(InMemoryEntitlementRepository::new()),
@@ -943,9 +1141,9 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_reached_dispatches_no_nexus_io() {
-        let repository = Arc::new(InMemoryGraphTaskRepository::new());
-        repository.insert_graph_task(task()).await.unwrap();
         let clock = Arc::new(MutableClock(Mutex::new(NOW + time::Duration::seconds(60))));
+        let repository = repository_with_clock(clock.clone());
+        repository.insert_graph_task(task()).await.unwrap();
         let verifier = Arc::new(FakeNexus {
             responses: Mutex::new(VecDeque::new()),
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -969,7 +1167,8 @@ mod tests {
 
     #[tokio::test]
     async fn four_task_waves_dispatch_eight_each_and_reach_thirty_two_concurrent_calls() {
-        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
         for index in 0..4 {
             repository
                 .insert_graph_task(eight_predicate_task(index))
@@ -984,7 +1183,7 @@ mod tests {
             repository,
             Arc::new(InMemoryEntitlementRepository::new()),
             verifier.clone(),
-            Arc::new(MutableClock(Mutex::new(NOW))),
+            clock,
             Arc::new(FixedJitter),
             "graph-worker".to_owned(),
             time::Duration::seconds(30),
@@ -1003,6 +1202,167 @@ mod tests {
         assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 32);
         verifier.gate.add_permits(32);
         assert_eq!(running.await.unwrap().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_claim_starts_no_nexus_or_publication_io() {
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let claimer = Arc::new(BlockingClaimer {
+            inner: repository.clone(),
+            claim_calls: std::sync::atomic::AtomicUsize::new(0),
+            gate: gate.clone(),
+            action_gate: None,
+            action_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let verifier = Arc::new(FakeNexus {
+            responses: Mutex::new(VecDeque::from([TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: true,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: NOW,
+            }])),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = Arc::new(GraphVerificationWorker::new(
+            claimer.clone(),
+            Arc::new(InMemoryEntitlementRepository::new()),
+            verifier.clone(),
+            clock,
+            Arc::new(FixedJitter),
+            "graph-worker".to_owned(),
+            time::Duration::seconds(30),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let running = {
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                worker
+                    .run_until_shutdown(shutdown_rx, Duration::from_millis(1))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while claimer
+                .claim_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 4
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        gate.add_permits(4);
+        running.await.unwrap().unwrap();
+
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_publication_action_acquisition_starts_no_publication_io() {
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let repository = repository_with_clock(clock.clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let published = Arc::new(InMemoryEntitlementRepository::new());
+        let entitlements = Arc::new(AmbiguousOnceEntitlements {
+            inner: published,
+            fail_after_first_write: std::sync::atomic::AtomicBool::new(true),
+            insert_calls: std::sync::atomic::AtomicUsize::new(0),
+            get_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let first_verifier = Arc::new(FakeNexus {
+            responses: Mutex::new(VecDeque::from([TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: true,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: NOW,
+            }])),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let first_worker = GraphVerificationWorker::new(
+            repository.clone(),
+            entitlements.clone(),
+            first_verifier,
+            clock.clone(),
+            Arc::new(FixedJitter),
+            "first-worker".to_owned(),
+            time::Duration::seconds(30),
+        );
+        assert!(matches!(
+            first_worker.run_once().await.unwrap(),
+            GraphWorkerTick::PublicationDeferred(_)
+        ));
+
+        let reads_before = entitlements
+            .get_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let writes_before = entitlements
+            .insert_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        clock.set(NOW + time::Duration::seconds(30));
+        let action_gate = Arc::new(Semaphore::new(0));
+        let claimer = Arc::new(BlockingClaimer {
+            inner: repository,
+            claim_calls: std::sync::atomic::AtomicUsize::new(0),
+            gate: Arc::new(Semaphore::new(4)),
+            action_gate: Some(action_gate.clone()),
+            action_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let verifier = Arc::new(FakeNexus {
+            responses: Mutex::new(VecDeque::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = GraphVerificationWorker::new(
+            claimer.clone(),
+            entitlements.clone(),
+            verifier.clone(),
+            clock,
+            Arc::new(FixedJitter),
+            "second-worker".to_owned(),
+            time::Duration::seconds(30),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let running = tokio::spawn(async move {
+            worker
+                .run_until_shutdown(shutdown_rx, Duration::from_millis(1))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while claimer
+                .action_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(true).unwrap();
+        action_gate.add_permits(1);
+        running.await.unwrap().unwrap();
+
+        assert_eq!(
+            entitlements
+                .get_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            reads_before
+        );
+        assert_eq!(
+            entitlements
+                .insert_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            writes_before
+        );
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

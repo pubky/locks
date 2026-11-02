@@ -12,16 +12,49 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedGraphTask, GraphRootState, GraphTaskRecord, GraphTaskSnapshot, VerificationTaskStatus,
 };
-use crate::application::ports::{GraphTaskClaimer, GraphTaskRepository};
+use crate::application::ports::{
+    GraphPublicationActionGuard, GraphTaskClaimer, GraphTaskRepository,
+};
 
 use super::verification_task_deletion_fence::{
     InMemoryStoredGraphTask, InMemoryVerificationTaskDeletionFence,
     InMemoryVerificationTaskFenceRecord,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InMemoryGraphTaskRepository {
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+}
+
+struct InMemoryGraphPublicationActionGuard {
+    guard: Option<OwnedMutexGuard<()>>,
+    repository: InMemoryGraphTaskRepository,
+    task_id: TaskId,
+    worker_id: String,
+    claim_token: uuid::Uuid,
+    expected_revision: u64,
+    publication_token: uuid::Uuid,
+}
+
+#[async_trait]
+impl GraphPublicationActionGuard for InMemoryGraphPublicationActionGuard {
+    async fn complete(&mut self) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        self.repository
+            .complete_claimed_graph_publication(
+                &self.task_id,
+                &self.worker_id,
+                &self.claim_token,
+                self.repository.authoritative_time(),
+                self.expected_revision,
+                self.publication_token,
+            )
+            .await
+    }
+
+    async fn release(mut self: Box<Self>) -> Result<(), ApplicationError> {
+        self.guard.take();
+        Ok(())
+    }
 }
 
 impl Default for InMemoryGraphTaskRepository {
@@ -256,16 +289,19 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
     async fn claim_next_graph_task(
         &self,
         worker_id: &str,
-        now: time::OffsetDateTime,
-        claim_expires_at: time::OffsetDateTime,
+        caller_now: time::OffsetDateTime,
+        requested_claim_expires_at: time::OffsetDateTime,
     ) -> Result<Option<ClaimedGraphTask>, ApplicationError> {
-        if claim_expires_at <= now {
+        let claim_ttl = requested_claim_expires_at - caller_now;
+        if !claim_ttl.is_positive() {
             return Err(ApplicationError::InvalidVerificationTaskState {
                 message: "graph task claim expiry must follow claim time".to_owned(),
             });
         }
         let fence = self.deletion_fence.records.read().await;
         let mut records = self.deletion_fence.graph_records.write().await;
+        let now = self.authoritative_time();
+        let claim_expires_at = now + claim_ttl;
         let Some(stored) = records.iter_mut().find(|stored| {
             ((matches!(
                 stored.task.status,
@@ -302,13 +338,14 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
+        _caller_now: time::OffsetDateTime,
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
         let mut fence = self.deletion_fence.records.write().await;
         let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.deletion_fence.graph_records.write().await;
+        let now = self.authoritative_time();
         let Some(stored) = records.iter_mut().find(|stored| {
             stored.task.task_id == *task_id
                 && stored.task.status == VerificationTaskStatus::InProgress
@@ -401,13 +438,16 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
+        caller_now: time::OffsetDateTime,
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
-        next_attempt_at: time::OffsetDateTime,
+        requested_next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let retry_delay = requested_next_attempt_at - caller_now;
         let fence = self.deletion_fence.records.read().await;
         let mut records = self.deletion_fence.graph_records.write().await;
+        let now = self.authoritative_time();
+        let next_attempt_at = now + retry_delay;
         let Some(stored) = records.iter_mut().find(|stored| {
             stored.task.task_id == *task_id
                 && stored.task.status == VerificationTaskStatus::InProgress
@@ -459,18 +499,114 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         Ok(Some(stored.task.clone()))
     }
 
+    async fn release_claimed_graph_task(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
+        let mut records = self.deletion_fence.graph_records.write().await;
+        let Some(stored) = records.iter_mut().find(|stored| {
+            stored.task.task_id == *task_id
+                && stored.claimed_by.as_deref() == Some(worker_id)
+                && stored.claim_token.as_ref() == Some(claim_token)
+        }) else {
+            return Ok(false);
+        };
+        if stored.task.status == VerificationTaskStatus::InProgress
+            && stored.task.snapshot.as_v1().root == GraphRootState::Pending
+        {
+            stored.task.status = VerificationTaskStatus::Pending;
+            current_statuses.insert(*task_id, VerificationTaskStatus::Pending);
+        }
+        stored.claimed_by = None;
+        stored.claim_token = None;
+        stored.claim_expires_at = None;
+        Ok(true)
+    }
+
+    async fn acquire_graph_publication_action(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<Box<dyn GraphPublicationActionGuard>>, ApplicationError> {
+        let identity = {
+            let records = self.deletion_fence.graph_records.read().await;
+            let Some(stored) = records
+                .iter()
+                .find(|stored| stored.task.task_id == *task_id)
+            else {
+                return Ok(None);
+            };
+            let snapshot = stored.task.snapshot.as_v1();
+            (
+                snapshot.creator.clone(),
+                snapshot.pubky_lock_resource.lock_id().clone(),
+            )
+        };
+        let guard = self
+            .deletion_fence
+            .acquire_lock_admission(&identity.0, &identity.1)
+            .await;
+        if self
+            .deletion_fence
+            .deletion_cutoffs
+            .read()
+            .await
+            .contains(&identity)
+        {
+            return Ok(None);
+        }
+        let now = self.authoritative_time();
+        let fence = self.deletion_fence.records.read().await;
+        let records = self.deletion_fence.graph_records.read().await;
+        let live = records.iter().any(|stored| {
+            stored.task.task_id == *task_id
+                && stored.task.status == VerificationTaskStatus::PublishingEntitlement
+                && stored.task.evaluator_revision == expected_revision
+                && stored.task.entitlement_publication_token == Some(publication_token)
+                && stored.claimed_by.as_deref() == Some(worker_id)
+                && stored.claim_token.as_ref() == Some(claim_token)
+                && stored
+                    .claim_expires_at
+                    .is_some_and(|claim_expires_at| claim_expires_at > now)
+                && fence.get(task_id).is_some_and(|record| {
+                    record.deletion_job_id.is_none()
+                        && record.entitlement_publication_claim_token == Some(publication_token)
+                })
+        });
+        if !live {
+            drop(guard);
+            return Ok(None);
+        }
+        Ok(Some(Box::new(InMemoryGraphPublicationActionGuard {
+            guard: Some(guard),
+            repository: self.clone(),
+            task_id: *task_id,
+            worker_id: worker_id.to_owned(),
+            claim_token: *claim_token,
+            expected_revision,
+            publication_token,
+        })))
+    }
+
     async fn complete_claimed_graph_publication(
         &self,
         task_id: &TaskId,
         worker_id: &str,
         claim_token: &uuid::Uuid,
-        now: time::OffsetDateTime,
+        _caller_now: time::OffsetDateTime,
         expected_revision: u64,
         publication_token: uuid::Uuid,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
         let mut fence = self.deletion_fence.records.write().await;
         let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.deletion_fence.graph_records.write().await;
+        let now = self.authoritative_time();
         let Some(stored) = records.iter_mut().find(|stored| {
             stored.task.task_id == *task_id
                 && stored.task.status == VerificationTaskStatus::PublishingEntitlement
@@ -553,5 +689,114 @@ fn ensure_same_binding(
 fn invalid_snapshot(message: String) -> ApplicationError {
     ApplicationError::Storage {
         message: format!("invalid graph task snapshot: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod post_lock_time_tests {
+    use std::{
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
+
+    use locks_core::ids::{BundleId, CreatorPubky, LockHash, LockId, PubkyLockResource, TaskId};
+    use locks_core::lock_policy::{GraphParticipantV2, GraphPolicyV2, GraphPredicateV2};
+    use time::macros::datetime;
+
+    use super::*;
+    use crate::application::ports::Clock;
+
+    const NOW: OffsetDateTime = datetime!(2026-10-01 12:00:00 UTC);
+
+    #[derive(Debug)]
+    struct MutableClock(Mutex<OffsetDateTime>);
+
+    impl MutableClock {
+        fn set(&self, now: OffsetDateTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> OffsetDateTime {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    fn task() -> GraphTaskRecord {
+        const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
+        let creator = CreatorPubky::from_str(CREATOR).unwrap();
+        let lock_id = LockId::from_hash(LockHash::from_bytes([0; 32]));
+        GraphTaskRecord {
+            task_id: TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap(),
+            snapshot: GraphTaskSnapshot::V1(
+                crate::application::models::GraphTaskSnapshotV1::new(
+                    creator,
+                    BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                    PubkyLockResource::from_str(&format!("{CREATOR}/pub/app.locks/{lock_id}.json"))
+                        .unwrap(),
+                    [0; 32],
+                    CreatorPubky::from_str(READER).unwrap(),
+                    NOW,
+                    300,
+                    GraphPolicyV2 {
+                        predicates: vec![GraphPredicateV2::Follows {
+                            follower: GraphParticipantV2::Reader,
+                            followed: GraphParticipantV2::Creator,
+                        }],
+                        operator: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_ttl_starts_after_decisive_lock_is_acquired() {
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            fence.clone(),
+        ));
+        repository.insert_graph_task(task()).await.unwrap();
+
+        let records_guard = fence.graph_records.write().await;
+        let blocked = {
+            let repository = repository.clone();
+            tokio::spawn(async move {
+                repository
+                    .claim_next_graph_task("worker-a", NOW, NOW + time::Duration::seconds(30))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        tokio::task::yield_now().await;
+        clock.set(NOW + time::Duration::minutes(1));
+        drop(records_guard);
+        let first = blocked.await.unwrap();
+
+        assert!(
+            repository
+                .claim_next_graph_task(
+                    "worker-b",
+                    NOW + time::Duration::minutes(1),
+                    NOW + time::Duration::minutes(2),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "post-lock claim must retain its full TTL instead of being born expired"
+        );
+        assert_eq!(first.task.status, VerificationTaskStatus::InProgress);
     }
 }

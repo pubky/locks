@@ -5,21 +5,84 @@ use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use locks_core::verification::{
     SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{Connection, FromRow, PgConnection, PgPool};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedGraphTask, GraphRootState, GraphTaskRecord, GraphTaskSnapshot, VerificationTaskStatus,
     VerificationTerminalReason,
 };
-use crate::application::ports::{GraphTaskClaimer, GraphTaskRepository};
+use crate::application::ports::{
+    GraphPublicationActionGuard, GraphTaskClaimer, GraphTaskRepository,
+};
 
-use super::proof_admission::lock_proof_admission;
+use super::proof_admission::{lock_proof_admission, proof_admission_lock_key};
 use super::verification_tasks::{reject_deletion_cutoff, status_from_database};
 
 #[derive(Debug, Clone)]
 pub struct PostgresGraphTaskRepository {
     pool: PgPool,
+}
+
+struct PostgresGraphPublicationActionGuard {
+    connection: Option<PgConnection>,
+    task_id: String,
+    worker_id: String,
+    claim_token: uuid::Uuid,
+    expected_revision: i64,
+    publication_token: uuid::Uuid,
+}
+
+#[async_trait]
+impl GraphPublicationActionGuard for PostgresGraphPublicationActionGuard {
+    async fn complete(&mut self) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "graph publication action ownership was already released".to_owned(),
+            })?;
+        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
+            "UPDATE verification_tasks
+             SET status = 'completed', completed_at = clock_timestamp(),
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 next_attempt_at = NULL,
+                 entitlement_publication_claim_token = NULL,
+                 updated_at = clock_timestamp()
+             WHERE task_id = $1::uuid
+               AND status = 'publishing_entitlement'
+               AND claimed_by = $2 AND claim_token = $3
+               AND claim_expires_at > clock_timestamp()
+               AND evaluator_revision = $4
+               AND entitlement_to_publish IS NOT NULL
+               AND entitlement_publication_claim_token = $5
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
+                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
+               )
+             RETURNING {GRAPH_TASK_COLUMNS}"
+        ))
+        .bind(&self.task_id)
+        .bind(&self.worker_id)
+        .bind(self.claim_token)
+        .bind(self.expected_revision)
+        .bind(self.publication_token)
+        .fetch_optional(connection)
+        .await
+        .map_err(storage_error)?;
+        row.map(row_to_task).transpose()
+    }
+
+    async fn release(mut self: Box<Self>) -> Result<(), ApplicationError> {
+        let connection = self
+            .connection
+            .take()
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "graph publication action ownership was already released".to_owned(),
+            })?;
+        connection.close().await.map_err(storage_error)
+    }
 }
 
 impl PostgresGraphTaskRepository {
@@ -253,8 +316,8 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  END,
                  claimed_by = $1, claim_token = $2,
                  claim_expires_at = clock_timestamp() + ($3 - $4),
-                 started_at = COALESCE(started_at, $4), next_attempt_at = NULL,
-                 attempt_count = attempt_count + 1, updated_at = $4
+                 started_at = COALESCE(started_at, clock_timestamp()), next_attempt_at = NULL,
+                 attempt_count = attempt_count + 1, updated_at = clock_timestamp()
              FROM candidate
              WHERE task.task_id = candidate.task_id
              RETURNING task.task_id::text AS task_id, task.creator, task.bundle_id,
@@ -460,6 +523,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         snapshot: GraphTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let retry_delay = next_attempt_at - now;
         let expected_revision = match i64::try_from(expected_revision) {
             Ok(revision) => revision,
             Err(_) => return Ok(None),
@@ -501,7 +565,8 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        if next_attempt_at <= now || next_attempt_at > snapshot.as_v1().deadline_at {
+        let next_attempt_at = database_now + retry_delay;
+        if !retry_delay.is_positive() || next_attempt_at > snapshot.as_v1().deadline_at {
             return Err(ApplicationError::InvalidVerificationTaskState {
                 message: "graph retry must be after now and no later than deadline".to_owned(),
             });
@@ -529,7 +594,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  status = 'pending', started_at = NULL,
                  claimed_by = NULL, claim_token = NULL,
                  claim_expires_at = NULL,
-                 next_attempt_at = clock_timestamp() + ($6 - $4), updated_at = $4
+                 next_attempt_at = $6, updated_at = $4
              WHERE task_id = $1::uuid
                AND status = 'in_progress'
                AND claimed_by = $2 AND claim_token = $3
@@ -554,6 +619,107 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
         row.map(row_to_task).transpose()
+    }
+
+    async fn release_claimed_graph_task(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+    ) -> Result<bool, ApplicationError> {
+        let result = sqlx::query(
+            "UPDATE verification_tasks
+             SET status = CASE
+                   WHEN status = 'in_progress'
+                    AND evaluator_snapshot->'root'->>'status' = 'pending'
+                   THEN 'pending'
+                   ELSE status
+                 END,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 updated_at = clock_timestamp()
+             WHERE task_id = $1::uuid
+               AND claimed_by = $2 AND claim_token = $3",
+        )
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn acquire_graph_publication_action(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<Box<dyn GraphPublicationActionGuard>>, ApplicationError> {
+        let expected_revision = match i64::try_from(expected_revision) {
+            Ok(revision) => revision,
+            Err(_) => return Ok(None),
+        };
+        let identity = sqlx::query_as::<_, GraphTaskRow>(&format!(
+            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks WHERE task_id = $1::uuid"
+        ))
+        .bind(task_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(row_to_task)
+        .transpose()?;
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        let snapshot = identity.snapshot.as_v1();
+        let lock_key =
+            proof_admission_lock_key(&snapshot.creator, snapshot.pubky_lock_resource.lock_id());
+        let mut pooled = self.pool.acquire().await.map_err(storage_error)?;
+        pooled.close_on_drop();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(lock_key)
+            .execute(&mut *pooled)
+            .await
+            .map_err(storage_error)?;
+        let mut connection = pooled.detach();
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM verification_tasks
+                WHERE task_id = $1::uuid
+                  AND status = 'publishing_entitlement'
+                  AND claimed_by = $2 AND claim_token = $3
+                  AND claim_expires_at > clock_timestamp()
+                  AND evaluator_revision = $4
+                  AND entitlement_publication_claim_token = $5
+                  AND deletion_job_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
+                    WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
+                  )
+             )",
+        )
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .bind(expected_revision)
+        .bind(publication_token)
+        .fetch_one(&mut connection)
+        .await
+        .map_err(storage_error)?;
+        if !live {
+            connection.close().await.map_err(storage_error)?;
+            return Ok(None);
+        }
+        Ok(Some(Box::new(PostgresGraphPublicationActionGuard {
+            connection: Some(connection),
+            task_id: task_id.to_string(),
+            worker_id: worker_id.to_owned(),
+            claim_token: *claim_token,
+            expected_revision,
+            publication_token,
+        })))
     }
 
     async fn complete_claimed_graph_publication(
@@ -940,7 +1106,7 @@ mod tests {
             )
             .unwrap();
         reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(4)).unwrap();
-        repository
+        let publishing = repository
             .persist_claimed_graph_snapshot(
                 &claim.task.task_id,
                 "graph-worker",
@@ -952,6 +1118,51 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let publication_token = publishing.entitlement_publication_token.unwrap();
+        let action = repository
+            .acquire_graph_publication_action(
+                &publishing.task_id,
+                "graph-worker",
+                &claim.claim_token,
+                publishing.evaluator_revision,
+                publication_token,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let blocked_admission = {
+            let pool = database.pool().clone();
+            let creator = publishing.snapshot.as_v1().creator.clone();
+            let lock_id = publishing
+                .snapshot
+                .as_v1()
+                .pubky_lock_resource
+                .lock_id()
+                .clone();
+            tokio::spawn(async move {
+                let mut transaction = pool.begin().await.unwrap();
+                super::super::proof_admission::lock_proof_admission(
+                    &mut transaction,
+                    &creator,
+                    &lock_id,
+                )
+                .await
+                .unwrap();
+                transaction.rollback().await.unwrap();
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), async {
+                while !blocked_admission.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "deletion/admission transaction must wait for publication action ownership"
+        );
+        action.release().await.unwrap();
+        blocked_admission.await.unwrap();
         assert_eq!(
             repository
                 .claim_next_graph_task(
@@ -970,9 +1181,13 @@ mod tests {
     async fn graph_retry_snapshot_schedule_and_claim_release_are_atomic_and_fenced() {
         let database = TestDatabase::create().await;
         let repository = PostgresGraphTaskRepository::new(database.pool().clone());
-        repository.insert_graph_task(task()).await.unwrap();
+        let raw_now = time::OffsetDateTime::now_utc();
+        let now = raw_now
+            .replace_nanosecond((raw_now.nanosecond() / 1_000) * 1_000)
+            .unwrap();
+        repository.insert_graph_task(task_at(now)).await.unwrap();
         let claim = repository
-            .claim_next_graph_task("graph-worker", NOW, NOW + time::Duration::minutes(5))
+            .claim_next_graph_task("graph-worker", now, now + time::Duration::minutes(5))
             .await
             .unwrap()
             .unwrap();
@@ -982,11 +1197,11 @@ mod tests {
             .record_nexus_observation(
                 0,
                 GraphObservationOutcome::False,
-                NOW + time::Duration::seconds(1),
+                now,
                 "https://nexus.example".to_owned(),
                 Some(200),
                 None,
-                Some(NOW + time::Duration::seconds(5)),
+                Some(now + time::Duration::seconds(5)),
                 0,
             )
             .unwrap();
@@ -995,10 +1210,10 @@ mod tests {
                 &claim.task.task_id,
                 "graph-worker",
                 &claim.claim_token,
-                NOW + time::Duration::seconds(1),
+                now + time::Duration::seconds(1),
                 0,
                 next.clone(),
-                NOW + time::Duration::seconds(5),
+                now + time::Duration::seconds(5),
             )
             .await
             .unwrap()
@@ -1012,10 +1227,10 @@ mod tests {
                     &claim.task.task_id,
                     "graph-worker",
                     &claim.claim_token,
-                    NOW + time::Duration::seconds(2),
+                    now + time::Duration::seconds(2),
                     0,
                     scheduled.snapshot.clone(),
-                    NOW + time::Duration::seconds(6),
+                    now + time::Duration::seconds(6),
                 )
                 .await
                 .unwrap(),
@@ -1544,6 +1759,10 @@ mod tests {
     }
 
     fn task() -> GraphTaskRecord {
+        task_at(NOW)
+    }
+
+    fn task_at(now: time::OffsetDateTime) -> GraphTaskRecord {
         GraphTaskRecord {
             task_id: TaskId::from_str(TASK_ID).unwrap(),
             snapshot: GraphTaskSnapshot::V1(
@@ -1553,7 +1772,7 @@ mod tests {
                     resource(),
                     [0; 32],
                     CreatorPubky::from_str(READER).unwrap(),
-                    NOW,
+                    now,
                     60,
                     GraphPolicyV2 {
                         predicates: vec![GraphPredicateV2::Follows {

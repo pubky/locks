@@ -4,6 +4,12 @@ use locks_core::ids::{BundleId, CreatorPubky, TaskId};
 use crate::application::errors::ApplicationError;
 use crate::application::models::{ClaimedGraphTask, GraphTaskRecord, GraphTaskSnapshot};
 
+#[async_trait]
+pub trait GraphPublicationActionGuard: Send {
+    async fn complete(&mut self) -> Result<Option<GraphTaskRecord>, ApplicationError>;
+    async fn release(self: Box<Self>) -> Result<(), ApplicationError>;
+}
+
 /// Graph-only task persistence on the canonical verification-task lease lane.
 #[async_trait]
 pub trait GraphTaskRepository: Send + Sync {
@@ -54,6 +60,26 @@ pub trait GraphTaskClaimer: Send + Sync {
         snapshot: GraphTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
+
+    /// Releases an exact live claim without advancing evaluator state.
+    /// Used when shutdown becomes sticky after claim acquisition.
+    async fn release_claimed_graph_task(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+    ) -> Result<bool, ApplicationError>;
+
+    /// Serializes entitlement external I/O with content-lock deletion admission,
+    /// then validates exact live claim ownership using storage-authoritative time.
+    async fn acquire_graph_publication_action(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<Box<dyn GraphPublicationActionGuard>>, ApplicationError>;
 
     /// Mark exact persisted graph entitlement published after equivalent readback.
     ///

@@ -1,13 +1,16 @@
 mod support;
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use locks_service::application::graph0conf_reducer::reduce_graph_snapshot;
 use locks_service::application::models::{
     GraphDeadlineResult, GraphObservationOutcome, GraphPredicateObservation, GraphRootState,
 };
 use locks_service::application::ports::{
-    GraphTaskClaimer, GraphTaskRepository, VerificationTaskRepository,
+    Clock, GraphTaskClaimer, GraphTaskRepository, VerificationTaskRepository,
 };
 use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
 use locks_service::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
@@ -17,9 +20,35 @@ use time::macros::datetime;
 const NOW: time::OffsetDateTime = datetime!(2026-10-01 12:00:00 UTC);
 const LEASE_END: time::OffsetDateTime = datetime!(2026-10-01 12:05:00 UTC);
 
+#[derive(Debug)]
+struct MutableClock(Mutex<time::OffsetDateTime>);
+
+impl MutableClock {
+    fn set(&self, now: time::OffsetDateTime) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl Clock for MutableClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+fn repository() -> (InMemoryGraphTaskRepository, Arc<MutableClock>) {
+    let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+        clock.clone(),
+    ));
+    (
+        InMemoryGraphTaskRepository::with_deletion_fence(fence),
+        clock,
+    )
+}
+
 #[tokio::test]
 async fn graph_evidence_must_enter_through_a_timely_latest_observation_transition() {
-    let repository = InMemoryGraphTaskRepository::new();
+    let (repository, _clock) = repository();
     let mut fabricated_insert = support::graph_task();
     let locks_service::application::models::GraphTaskSnapshot::V1(snapshot) =
         &mut fabricated_insert.snapshot;
@@ -107,7 +136,7 @@ async fn graph_evidence_must_enter_through_a_timely_latest_observation_transitio
 
 #[tokio::test]
 async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
-    let repository = InMemoryGraphTaskRepository::new();
+    let (repository, clock) = repository();
     let inserted = repository
         .insert_graph_task(support::graph_task())
         .await
@@ -130,6 +159,7 @@ async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
         )
         .unwrap();
 
+    clock.set(NOW + time::Duration::seconds(2));
     let persisted = repository
         .persist_claimed_graph_snapshot(
             &first.task.task_id,
@@ -168,6 +198,7 @@ async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
     let mut early_expiry = persisted.snapshot.clone();
     let locks_service::application::models::GraphTaskSnapshot::V1(snapshot) = &mut early_expiry;
     snapshot.root = GraphRootState::Expired(GraphDeadlineResult::False);
+    clock.set(NOW + time::Duration::seconds(4));
     assert!(
         repository
             .persist_claimed_graph_snapshot(
@@ -198,6 +229,7 @@ async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
     );
 
     let reclaimed_at = LEASE_END;
+    clock.set(reclaimed_at);
     let second = repository
         .claim_next_graph_task(
             "worker-a",
@@ -242,7 +274,7 @@ async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
 
 #[tokio::test]
 async fn replay_is_exact_and_snapshot_binding_cannot_change() {
-    let repository = InMemoryGraphTaskRepository::new();
+    let (repository, _clock) = repository();
     let task = support::graph_task();
     assert_eq!(
         repository.insert_graph_task(task.clone()).await.unwrap(),
@@ -298,7 +330,7 @@ async fn replay_is_exact_and_snapshot_binding_cannot_change() {
 
 #[tokio::test]
 async fn satisfied_graph_persists_canonical_publication_and_reclaims_after_restart() {
-    let repository = InMemoryGraphTaskRepository::new();
+    let (repository, clock) = repository();
     repository
         .insert_graph_task(support::graph_task())
         .await
@@ -318,6 +350,7 @@ async fn satisfied_graph_persists_canonical_publication_and_reclaims_after_resta
         )
         .unwrap();
     reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(1)).unwrap();
+    clock.set(NOW + time::Duration::seconds(2));
     let persisted = repository
         .persist_claimed_graph_snapshot(
             &claim.task.task_id,
@@ -348,6 +381,7 @@ async fn satisfied_graph_persists_canonical_publication_and_reclaims_after_resta
         .entitlement_publication_token
         .expect("publication marker is durable");
 
+    clock.set(LEASE_END);
     let reclaimed = repository
         .claim_next_graph_task(
             "worker-b",
@@ -382,6 +416,7 @@ async fn satisfied_graph_persists_canonical_publication_and_reclaims_after_resta
             .unwrap()
             .is_none()
     );
+    clock.set(LEASE_END + time::Duration::seconds(1));
     let completed = repository
         .complete_claimed_graph_publication(
             &reclaimed.task.task_id,

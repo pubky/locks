@@ -35,7 +35,7 @@ pub(super) async fn lock_proof_handle_admission(
     Ok(())
 }
 
-fn proof_admission_lock_key(creator: &CreatorPubky, lock_id: &LockId) -> String {
+pub(super) fn proof_admission_lock_key(creator: &CreatorPubky, lock_id: &LockId) -> String {
     format!(
         "{PROOF_ADMISSION_LOCK_NAMESPACE}:{creator}:{}",
         lock_id.as_str()

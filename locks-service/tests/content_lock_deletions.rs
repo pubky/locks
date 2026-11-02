@@ -16,14 +16,16 @@ use locks_core::{
 };
 use locks_service::{
     application::{
+        graph0conf_reducer::reduce_graph_snapshot,
         models::{
             AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
             AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
             ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-            FinalAccessWindows, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
-            INVOICE_ADMISSION_INTENT_VERSION, InitializeFinalAccessWindowsResult,
-            InvoiceAdmissionIntentV1, PrepareForceDeletionResult, VerificationTaskRecord,
-            VerificationTaskStatus, VerificationTerminalReason,
+            FinalAccessWindows, GraphObservationOutcome, GraphTaskRecord, GraphTaskSnapshot,
+            GraphTaskSnapshotV1, INVOICE_ADMISSION_INTENT_VERSION,
+            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
+            PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
+            VerificationTerminalReason,
         },
         ports::{
             AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
@@ -1815,6 +1817,96 @@ async fn assert_memory_graph_deletion(include_legacy_repository: bool) {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn graph_publication_action_blocks_deletion_cutoff_until_completion() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let access = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let deletions = Arc::new(
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access, fence,
+        ),
+    );
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    graph
+        .insert_graph_task(graph_task_for_job(&job))
+        .await
+        .unwrap();
+    let claim = graph
+        .claim_next_graph_task("publisher-a", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut satisfied = claim.task.snapshot.clone();
+    let GraphTaskSnapshot::V1(snapshot) = &mut satisfied;
+    snapshot
+        .record_observation(0, GraphObservationOutcome::True, NOW)
+        .unwrap();
+    reduce_graph_snapshot(snapshot, NOW).unwrap();
+    let publishing = graph
+        .persist_claimed_graph_snapshot(
+            &claim.task.task_id,
+            "publisher-a",
+            &claim.claim_token,
+            NOW,
+            0,
+            satisfied,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let publication_token = publishing.entitlement_publication_token.unwrap();
+    let action = graph
+        .acquire_graph_publication_action(
+            &publishing.task_id,
+            "publisher-a",
+            &claim.claim_token,
+            publishing.evaluator_revision,
+            publication_token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let blocked_deletion = {
+        let deletions = deletions.clone();
+        let job = job.clone();
+        tokio::spawn(async move { deletions.insert_job(job).await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), async {
+            while !blocked_deletion.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err(),
+        "deletion cutoff must wait while publication external action is owned"
+    );
+    assert!(
+        graph
+            .complete_claimed_graph_publication(
+                &publishing.task_id,
+                "publisher-a",
+                &claim.claim_token,
+                NOW,
+                publishing.evaluator_revision,
+                publication_token,
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    action.release().await.unwrap();
+    blocked_deletion.await.unwrap().unwrap();
 }
 
 #[tokio::test]
