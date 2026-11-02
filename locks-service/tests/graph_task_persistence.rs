@@ -26,6 +26,8 @@ async fn graph_evidence_must_enter_through_a_timely_latest_observation_transitio
     snapshot.predicates[0].first_true_observation = Some(GraphPredicateObservation {
         outcome: GraphObservationOutcome::True,
         observed_at: NOW,
+        origin: None,
+        http_status: None,
     });
     assert!(
         repository
@@ -49,6 +51,8 @@ async fn graph_evidence_must_enter_through_a_timely_latest_observation_transitio
     snapshot.predicates[0].first_true_observation = Some(GraphPredicateObservation {
         outcome: GraphObservationOutcome::True,
         observed_at: NOW + time::Duration::seconds(1),
+        origin: None,
+        http_status: None,
     });
     snapshot.root = GraphRootState::Satisfied;
     assert!(

@@ -112,6 +112,7 @@ impl TestServerApp {
             deletion: crate::config::DeletionConfig::default(),
             deletion_worker: crate::config::DeletionWorkerConfig::default(),
             paykit: None,
+            nexus: None,
         }
     }
 

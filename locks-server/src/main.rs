@@ -1,4 +1,4 @@
-use std::{env, error::Error, time::Duration};
+use std::{env, error::Error, sync::Arc, time::Duration};
 
 use locks_server::api::routes::router;
 use locks_server::config::{FilesystemLockServerIdentityProvider, load_or_initialize_config};
@@ -6,6 +6,8 @@ use locks_server::deletion_worker::{
     DeletionWorker, DeletionWorkerConfig, RandomFullJitter, RuntimeClaimedDeletionExecutor,
 };
 use locks_server::folded_auth_cleanup::{FOLDED_AUTH_CLEANUP_INTERVAL, FoldedAuthCleanupWorker};
+use locks_server::graph_worker::{GraphVerificationWorker, OsGraphRetryJitter};
+use locks_server::nexus_http_client::NexusHttpClient;
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{
     InitialStartupOutcome, RuntimeTasks, ShutdownFuture, bind_listener_then_run_initial,
@@ -111,27 +113,104 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tasks = tasks.with_verification_worker(Box::new(move |context| {
             Box::pin(async move {
                 let verification = VerificationWorker::from_state(&worker_state);
-                if let Some(paykit) = worker_state.paykit_http_client().cloned() {
-                    let jitter = OsFullJitter;
-                    let invoice =
-                        InvoiceAdmissionWorker::from_state(&worker_state, paykit.as_ref(), &jitter);
-                    tokio::try_join!(
-                        verification.run_until_shutdown_with_readiness(
-                            context.shutdown(),
-                            worker_state.worker_readiness(),
-                        ),
-                        invoice.run_until_shutdown(context.shutdown()),
-                    )
-                    .map(|_| ())
-                    .map_err(anyhow::Error::from)
-                } else {
-                    verification
+                let paykit = worker_state.paykit_http_client().cloned();
+                let graph_verifier = worker_state
+                    .config()
+                    .nexus
+                    .as_ref()
+                    .map(|config| {
+                        NexusHttpClient::new(
+                            config.server_url.as_str(),
+                            config.allow_insecure_loopback,
+                        )
+                        .map(Arc::new)
+                    })
+                    .transpose()?;
+
+                match (paykit, graph_verifier) {
+                    (Some(paykit), Some(graph_verifier)) => {
+                        let invoice_jitter = OsFullJitter;
+                        let invoice = InvoiceAdmissionWorker::from_state(
+                            &worker_state,
+                            paykit.as_ref(),
+                            &invoice_jitter,
+                        );
+                        let graph = GraphVerificationWorker::new(
+                            worker_state.graph_task_claimer().clone(),
+                            graph_verifier,
+                            worker_state.clock().clone(),
+                            Arc::new(OsGraphRetryJitter),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
+                        tokio::try_join!(
+                            verification.run_until_shutdown_with_readiness(
+                                context.shutdown(),
+                                worker_state.worker_readiness(),
+                            ),
+                            invoice.run_until_shutdown(context.shutdown()),
+                            graph.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms,
+                                ),
+                            ),
+                        )
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                    }
+                    (Some(paykit), None) => {
+                        let jitter = OsFullJitter;
+                        let invoice = InvoiceAdmissionWorker::from_state(
+                            &worker_state,
+                            paykit.as_ref(),
+                            &jitter,
+                        );
+                        tokio::try_join!(
+                            verification.run_until_shutdown_with_readiness(
+                                context.shutdown(),
+                                worker_state.worker_readiness(),
+                            ),
+                            invoice.run_until_shutdown(context.shutdown()),
+                        )
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                    }
+                    (None, Some(graph_verifier)) => {
+                        let graph = GraphVerificationWorker::new(
+                            worker_state.graph_task_claimer().clone(),
+                            graph_verifier,
+                            worker_state.clock().clone(),
+                            Arc::new(OsGraphRetryJitter),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
+                        tokio::try_join!(
+                            verification.run_until_shutdown_with_readiness(
+                                context.shutdown(),
+                                worker_state.worker_readiness(),
+                            ),
+                            graph.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms,
+                                ),
+                            ),
+                        )
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                    }
+                    (None, None) => verification
                         .run_until_shutdown_with_readiness(
                             context.shutdown(),
                             worker_state.worker_readiness(),
                         )
                         .await
-                        .map_err(anyhow::Error::from)
+                        .map_err(anyhow::Error::from),
                 }
             })
         }));

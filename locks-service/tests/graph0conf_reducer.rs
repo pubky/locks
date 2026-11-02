@@ -178,6 +178,8 @@ fn model_rejects_fabricated_sticky_true_and_future_reduction_atomically() {
     no_latest.predicates[0].first_true_observation = Some(GraphPredicateObservation {
         outcome: GraphObservationOutcome::True,
         observed_at: ACCEPTED_AT,
+        origin: None,
+        http_status: None,
     });
     assert!(no_latest.validate().is_err());
 
@@ -185,10 +187,14 @@ fn model_rejects_fabricated_sticky_true_and_future_reduction_atomically() {
     unrelated.predicates[0].first_true_observation = Some(GraphPredicateObservation {
         outcome: GraphObservationOutcome::True,
         observed_at: ACCEPTED_AT + time::Duration::seconds(1),
+        origin: None,
+        http_status: None,
     });
     unrelated.predicates[0].latest_observation = Some(GraphPredicateObservation {
         outcome: GraphObservationOutcome::False,
         observed_at: ACCEPTED_AT + time::Duration::seconds(2),
+        origin: None,
+        http_status: None,
     });
     assert!(unrelated.validate().is_ok());
     assert!(unrelated.validate_progress_from(&current).is_err());
@@ -346,5 +352,7 @@ fn observation(outcome: GraphObservationOutcome) -> GraphPredicateObservation {
     GraphPredicateObservation {
         outcome,
         observed_at: DEADLINE_AT,
+        origin: None,
+        http_status: None,
     }
 }

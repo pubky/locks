@@ -345,6 +345,112 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         transaction.commit().await.map_err(storage_error)?;
         row.map(row_to_task).transpose()
     }
+
+    async fn schedule_graph_task_retry(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        expected_revision: u64,
+        snapshot: GraphTaskSnapshot,
+        next_attempt_at: time::OffsetDateTime,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        if next_attempt_at <= now || next_attempt_at > snapshot.as_v1().deadline_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "graph retry must be after now and no later than deadline".to_owned(),
+            });
+        }
+        let expected_revision = match i64::try_from(expected_revision) {
+            Ok(revision) => revision,
+            Err(_) => return Ok(None),
+        };
+        expected_revision
+            .checked_add(1)
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "graph evaluator revision overflow".to_owned(),
+            })?;
+
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let current = sqlx::query_as::<_, GraphTaskRow>(&format!(
+            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
+             WHERE task_id = $1::uuid
+               AND status = 'in_progress'
+               AND claimed_by = $2 AND claim_token = $3
+               AND claim_expires_at > clock_timestamp()
+               AND evaluator_revision = $4
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
+                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
+               )
+             FOR UPDATE"
+        ))
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .bind(expected_revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(current) = current else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
+        let current = row_to_task(current)?;
+        let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        snapshot.as_v1().validate().map_err(invalid_snapshot)?;
+        snapshot
+            .as_v1()
+            .validate_observations_not_after(database_now)
+            .map_err(invalid_snapshot)?;
+        ensure_same_binding(&current.snapshot, &snapshot)?;
+        snapshot
+            .as_v1()
+            .validate_progress_from(current.snapshot.as_v1())
+            .map_err(invalid_snapshot)?;
+        if snapshot.as_v1().root != GraphRootState::Pending {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "graph retry requires pending snapshot".to_owned(),
+            });
+        }
+        let snapshot_json = snapshot.to_json().map_err(snapshot_encode_error)?;
+        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
+            "UPDATE verification_tasks
+             SET evaluator_snapshot = $5,
+                 evaluator_revision = evaluator_revision + 1,
+                 status = 'pending', started_at = NULL,
+                 claimed_by = NULL, claim_token = NULL,
+                 claim_expires_at = NULL,
+                 next_attempt_at = clock_timestamp() + ($6 - $4), updated_at = $4
+             WHERE task_id = $1::uuid
+               AND status = 'in_progress'
+               AND claimed_by = $2 AND claim_token = $3
+               AND claim_expires_at > clock_timestamp()
+               AND evaluator_revision = $7
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
+                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
+               )
+             RETURNING {GRAPH_TASK_COLUMNS}"
+        ))
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .bind(database_now)
+        .bind(snapshot_json)
+        .bind(next_attempt_at)
+        .bind(expected_revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        row.map(row_to_task).transpose()
+    }
 }
 
 fn row_to_task(row: GraphTaskRow) -> Result<GraphTaskRecord, ApplicationError> {
@@ -613,6 +719,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_retry_snapshot_schedule_and_claim_release_are_atomic_and_fenced() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let claim = repository
+            .claim_next_graph_task("graph-worker", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut next = claim.task.snapshot.clone();
+        let GraphTaskSnapshot::V1(snapshot) = &mut next;
+        snapshot
+            .record_nexus_observation(
+                0,
+                GraphObservationOutcome::False,
+                NOW + time::Duration::seconds(1),
+                "https://nexus.example".to_owned(),
+                Some(200),
+                Some(NOW + time::Duration::seconds(5)),
+                0,
+            )
+            .unwrap();
+        let scheduled = repository
+            .schedule_graph_task_retry(
+                &claim.task.task_id,
+                "graph-worker",
+                &claim.claim_token,
+                NOW + time::Duration::seconds(1),
+                0,
+                next.clone(),
+                NOW + time::Duration::seconds(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduled.evaluator_revision, 1);
+        assert_eq!(scheduled.snapshot, next);
+        assert_eq!(scheduled.status, VerificationTaskStatus::Pending);
+        assert_eq!(
+            repository
+                .schedule_graph_task_retry(
+                    &claim.task.task_id,
+                    "graph-worker",
+                    &claim.claim_token,
+                    NOW + time::Duration::seconds(2),
+                    0,
+                    scheduled.snapshot.clone(),
+                    NOW + time::Duration::seconds(6),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        let persisted_due: Option<time::OffsetDateTime> = sqlx::query_scalar(
+            "SELECT next_attempt_at FROM verification_tasks WHERE task_id = $1::uuid",
+        )
+        .bind(claim.task.task_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(persisted_due.is_some());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn corrupt_snapshot_fails_closed_on_read() {
         let database = TestDatabase::create().await;
         let repository = PostgresGraphTaskRepository::new(database.pool().clone());
@@ -651,6 +822,8 @@ mod tests {
             Some(crate::application::models::GraphPredicateObservation {
                 outcome: GraphObservationOutcome::True,
                 observed_at: NOW,
+                origin: None,
+                http_status: None,
             });
         assert_eq!(
             repository

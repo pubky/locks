@@ -41,4 +41,17 @@ pub trait GraphTaskClaimer: Send + Sync {
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
+
+    /// Atomically persists one wave, schedules next due work, and releases the claim.
+    #[allow(clippy::too_many_arguments)]
+    async fn schedule_graph_task_retry(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        expected_revision: u64,
+        snapshot: GraphTaskSnapshot,
+        next_attempt_at: time::OffsetDateTime,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
 }

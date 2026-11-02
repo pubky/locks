@@ -3,6 +3,8 @@ pub mod app_state;
 pub mod config;
 pub mod deletion_worker;
 pub mod folded_auth_cleanup;
+pub mod graph_worker;
+pub mod nexus_http_client;
 pub mod paykit_http_client;
 pub mod pkdns;
 pub mod rate_limit;

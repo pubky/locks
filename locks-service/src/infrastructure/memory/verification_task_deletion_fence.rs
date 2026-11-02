@@ -46,6 +46,7 @@ pub(crate) struct InMemoryStoredGraphTask {
     pub(crate) claimed_by: Option<String>,
     pub(crate) claim_token: Option<Uuid>,
     pub(crate) claim_expires_at: Option<OffsetDateTime>,
+    pub(crate) next_attempt_at: Option<OffsetDateTime>,
 }
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.

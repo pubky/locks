@@ -190,6 +190,7 @@ fn initialize_default_config_with_database_url(
             server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
         }),
+        nexus: None,
     };
     let config_text = format!(
         r#"# Lock Server runtime configuration. Generated on first run; edit intentionally per environment.

@@ -210,6 +210,7 @@ impl InMemoryGraphTaskRepository {
             claimed_by: None,
             claim_token: None,
             claim_expires_at: None,
+            next_attempt_at: None,
         });
         if folded_auth_source {
             reservations.remove(&reservation_key);
@@ -267,6 +268,7 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
                 stored.task.status,
                 VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
             ) && stored.task.snapshot.as_v1().root == GraphRootState::Pending
+                && stored.next_attempt_at.is_none_or(|due| due <= now)
                 && stored
                     .claim_expires_at
                     .is_none_or(|claim_expires_at| claim_expires_at <= now)
@@ -281,6 +283,7 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         let claim_token = uuid::Uuid::new_v4();
         stored.claim_token = Some(claim_token);
         stored.claim_expires_at = Some(claim_expires_at);
+        stored.next_attempt_at = None;
         Ok(Some(ClaimedGraphTask {
             task: stored.task.clone(),
             claim_token,
@@ -344,6 +347,51 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
             stored.claim_token = None;
             stored.claim_expires_at = None;
         }
+        Ok(Some(stored.task.clone()))
+    }
+
+    async fn schedule_graph_task_retry(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        expected_revision: u64,
+        snapshot: GraphTaskSnapshot,
+        next_attempt_at: time::OffsetDateTime,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        if next_attempt_at <= now || next_attempt_at > snapshot.as_v1().deadline_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "graph retry must be after now and no later than deadline".to_owned(),
+            });
+        }
+        let persisted = self
+            .persist_claimed_graph_snapshot(
+                task_id,
+                worker_id,
+                claim_token,
+                now,
+                expected_revision,
+                snapshot,
+            )
+            .await?;
+        let Some(_) = persisted else {
+            return Ok(None);
+        };
+        let mut records = self.deletion_fence.graph_records.write().await;
+        let Some(stored) = records.iter_mut().find(|stored| {
+            stored.task.task_id == *task_id
+                && stored.task.evaluator_revision == expected_revision + 1
+                && stored.claimed_by.as_deref() == Some(worker_id)
+                && stored.claim_token.as_ref() == Some(claim_token)
+        }) else {
+            return Ok(None);
+        };
+        stored.task.status = VerificationTaskStatus::Pending;
+        stored.claimed_by = None;
+        stored.claim_token = None;
+        stored.claim_expires_at = None;
+        stored.next_attempt_at = Some(next_attempt_at);
         Ok(Some(stored.task.clone()))
     }
 }

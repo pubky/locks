@@ -10,6 +10,7 @@ enum PredicateTruth {
     False,
     Unavailable,
     Unknown,
+    Invalid,
 }
 
 pub fn reduce_graph_snapshot(
@@ -29,6 +30,8 @@ pub fn reduce_graph_snapshot(
         .map(|state| {
             if state.first_true_observation.is_some() {
                 PredicateTruth::True
+            } else if state.terminal_invalid {
+                PredicateTruth::Invalid
             } else {
                 match state
                     .latest_observation
@@ -60,7 +63,9 @@ pub fn reduce_graph_snapshot(
     let truth = match snapshot.operator {
         None => values[0],
         Some(GraphOperatorV2::And) => {
-            if values.contains(&PredicateTruth::False) {
+            if values.contains(&PredicateTruth::Invalid) {
+                PredicateTruth::Invalid
+            } else if values.contains(&PredicateTruth::False) {
                 PredicateTruth::False
             } else if values.contains(&PredicateTruth::Unavailable) {
                 PredicateTruth::Unavailable
@@ -73,6 +78,8 @@ pub fn reduce_graph_snapshot(
         Some(GraphOperatorV2::Or) => {
             if values.contains(&PredicateTruth::True) {
                 PredicateTruth::True
+            } else if values.iter().all(|value| *value == PredicateTruth::Invalid) {
+                PredicateTruth::Invalid
             } else if values.contains(&PredicateTruth::Unavailable) && deadline_reached {
                 PredicateTruth::Unavailable
             } else if values.contains(&PredicateTruth::Unknown) {
@@ -91,6 +98,7 @@ pub fn reduce_graph_snapshot(
         PredicateTruth::Unavailable if deadline_reached => {
             GraphRootState::Expired(GraphDeadlineResult::DependencyUnavailable)
         }
+        PredicateTruth::Invalid => GraphRootState::FailedInvalidResponse,
         PredicateTruth::False | PredicateTruth::Unavailable | PredicateTruth::Unknown => {
             GraphRootState::Pending
         }

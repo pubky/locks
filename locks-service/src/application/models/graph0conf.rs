@@ -147,6 +147,8 @@ impl GraphTaskSnapshotV1 {
         let observation = GraphPredicateObservation {
             outcome,
             observed_at,
+            origin: None,
+            http_status: None,
         };
         predicate.latest_observation = Some(observation.clone());
         if outcome == GraphObservationOutcome::True && predicate.first_true_observation.is_none() {
@@ -155,6 +157,56 @@ impl GraphTaskSnapshotV1 {
         next.validate()?;
         *self = next;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_nexus_observation(
+        &mut self,
+        predicate_index: usize,
+        outcome: GraphObservationOutcome,
+        observed_at: OffsetDateTime,
+        origin: String,
+        http_status: Option<u16>,
+        next_due_at: Option<OffsetDateTime>,
+        operational_failure_count: u32,
+    ) -> Result<(), String> {
+        self.record_observation(predicate_index, outcome, observed_at)?;
+        let predicate = self
+            .predicates
+            .get_mut(predicate_index)
+            .ok_or_else(|| "graph predicate index is out of bounds".to_owned())?;
+        let latest = predicate
+            .latest_observation
+            .as_mut()
+            .ok_or_else(|| "graph predicate observation was not recorded".to_owned())?;
+        latest.origin = Some(origin);
+        latest.http_status = http_status;
+        if outcome == GraphObservationOutcome::True {
+            predicate.first_true_observation = Some(latest.clone());
+        }
+        predicate.next_due_at = next_due_at;
+        predicate.operational_failure_count = operational_failure_count;
+        self.validate()
+    }
+
+    pub fn terminalize_invalid_nexus_response(
+        &mut self,
+        predicate_index: usize,
+        observed_at: OffsetDateTime,
+        origin: String,
+        http_status: Option<u16>,
+    ) -> Result<(), String> {
+        self.record_nexus_observation(
+            predicate_index,
+            GraphObservationOutcome::DependencyUnavailable,
+            observed_at,
+            origin,
+            http_status,
+            None,
+            0,
+        )?;
+        self.predicates[predicate_index].terminal_invalid = true;
+        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -300,6 +352,8 @@ impl GraphTaskSnapshotV1 {
             .map(|state| {
                 if state.first_true_observation.is_some() {
                     TerminalPredicateTruth::True
+                } else if state.terminal_invalid {
+                    TerminalPredicateTruth::Invalid
                 } else {
                     match state
                         .latest_observation
@@ -320,7 +374,9 @@ impl GraphTaskSnapshotV1 {
         let truth = match self.operator {
             None => values[0],
             Some(GraphOperatorV2::And) => {
-                if values.contains(&TerminalPredicateTruth::False) {
+                if values.contains(&TerminalPredicateTruth::Invalid) {
+                    TerminalPredicateTruth::Invalid
+                } else if values.contains(&TerminalPredicateTruth::False) {
                     TerminalPredicateTruth::False
                 } else if values.contains(&TerminalPredicateTruth::Unavailable) {
                     TerminalPredicateTruth::Unavailable
@@ -331,6 +387,11 @@ impl GraphTaskSnapshotV1 {
             Some(GraphOperatorV2::Or) => {
                 if values.contains(&TerminalPredicateTruth::True) {
                     TerminalPredicateTruth::True
+                } else if values
+                    .iter()
+                    .all(|value| *value == TerminalPredicateTruth::Invalid)
+                {
+                    TerminalPredicateTruth::Invalid
                 } else if values.contains(&TerminalPredicateTruth::Unavailable) {
                     TerminalPredicateTruth::Unavailable
                 } else {
@@ -344,6 +405,7 @@ impl GraphTaskSnapshotV1 {
             TerminalPredicateTruth::Unavailable => {
                 GraphRootState::Expired(GraphDeadlineResult::DependencyUnavailable)
             }
+            TerminalPredicateTruth::Invalid => GraphRootState::FailedInvalidResponse,
         }
     }
 }
@@ -353,6 +415,7 @@ enum TerminalPredicateTruth {
     True,
     False,
     Unavailable,
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +424,12 @@ pub struct GraphPredicateState {
     pub predicate: GraphPredicateV2,
     pub latest_observation: Option<GraphPredicateObservation>,
     pub first_true_observation: Option<GraphPredicateObservation>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub next_due_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub operational_failure_count: u32,
+    #[serde(default)]
+    pub terminal_invalid: bool,
 }
 
 impl GraphPredicateState {
@@ -369,6 +438,9 @@ impl GraphPredicateState {
             predicate,
             latest_observation: None,
             first_true_observation: None,
+            next_due_at: None,
+            operational_failure_count: 0,
+            terminal_invalid: false,
         }
     }
 
@@ -414,6 +486,12 @@ impl GraphPredicateState {
                 );
             }
         }
+        if self
+            .next_due_at
+            .is_some_and(|next_due_at| next_due_at > deadline_at)
+        {
+            return Err("graph predicate next due time exceeds task deadline".to_owned());
+        }
         Ok(())
     }
 }
@@ -424,6 +502,10 @@ pub struct GraphPredicateObservation {
     pub outcome: GraphObservationOutcome,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,6 +522,7 @@ pub enum GraphRootState {
     Pending,
     Satisfied,
     Expired(GraphDeadlineResult),
+    FailedInvalidResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
