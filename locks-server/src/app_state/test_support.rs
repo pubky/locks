@@ -15,9 +15,11 @@ use crate::app_state::pubky_clients::{
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
 use crate::config::{
     ContentLocksConfig, DatabaseConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
-    LoggingConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    LoggingConfig, NexusConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig,
+    RuntimeConfig, RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig,
+    WorkerConfig,
 };
+
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::ContentLockDeletionPhase;
@@ -38,6 +40,73 @@ fn in_memory_state_uses_in_memory_private_runtime_adapters() {
         state.private_runtime_storage_kind(),
         RuntimeStorageKind::InMemory
     );
+}
+
+#[test]
+fn app_state_owns_live_validated_nexus_endpoint_source() {
+    let mut config = test_config();
+    config.nexus = Some(NexusConfig {
+        server_url: "https://first.nexus.example".to_owned(),
+        allow_insecure_loopback: false,
+    });
+    let state = AppState::new_empty_in_memory(config);
+    let source = state
+        .nexus_endpoint_source()
+        .expect("configured Nexus has a live endpoint source");
+
+    assert_eq!(
+        source.current().normalized_origin(),
+        "https://first.nexus.example"
+    );
+    source.update("https://second.nexus.example").unwrap();
+    assert_eq!(
+        source.current().normalized_origin(),
+        "https://second.nexus.example"
+    );
+
+    let mut production_config = test_config();
+    production_config.runtime.environment = RuntimeEnvironment::Production;
+    production_config.nexus = Some(NexusConfig {
+        server_url: "https://nexus.example".to_owned(),
+        allow_insecure_loopback: false,
+    });
+    let production_state = AppState::new_empty_in_memory(production_config);
+    assert!(
+        production_state
+            .nexus_endpoint_source()
+            .unwrap()
+            .update("http://127.0.0.1:8080")
+            .is_err()
+    );
+}
+
+#[test]
+fn development_live_nexus_updates_require_explicit_insecure_loopback_opt_in() {
+    let mut disabled_config = test_config();
+    disabled_config.nexus = Some(NexusConfig {
+        server_url: "https://nexus.example".to_owned(),
+        allow_insecure_loopback: false,
+    });
+    let disabled_state = AppState::new_empty_in_memory(disabled_config);
+    assert!(
+        disabled_state
+            .nexus_endpoint_source()
+            .unwrap()
+            .update("http://127.0.0.1:8080")
+            .is_err()
+    );
+
+    let mut enabled_config = test_config();
+    enabled_config.nexus = Some(NexusConfig {
+        server_url: "http://127.0.0.1:8080".to_owned(),
+        allow_insecure_loopback: true,
+    });
+    let enabled_state = AppState::new_empty_in_memory(enabled_config);
+    enabled_state
+        .nexus_endpoint_source()
+        .unwrap()
+        .update("http://localhost:8081")
+        .unwrap();
 }
 
 #[tokio::test]

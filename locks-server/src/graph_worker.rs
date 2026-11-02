@@ -8,13 +8,13 @@ use locks_service::application::models::{
     GraphObservationOutcome, GraphRootState, GraphTaskSnapshot,
 };
 use locks_service::application::ports::{Clock, GraphTaskClaimer};
-use tokio::sync::Semaphore;
 
-use crate::nexus_http_client::{NexusGraphVerifier, NexusObservation};
+use crate::nexus_http_client::{NexusGraphVerifier, NexusObservation, TimedNexusObservation};
 
 const FALSE_REPOLL_SECONDS: u64 = 5;
 const OPERATIONAL_BACKOFF_SECONDS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 const PER_TASK_CONCURRENCY: usize = 8;
+const CONCURRENT_TASK_WAVES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphWorkerTick {
@@ -51,7 +51,6 @@ pub struct GraphVerificationWorker {
     jitter: Arc<dyn GraphRetryJitter>,
     worker_id: String,
     claim_timeout: time::Duration,
-    per_task_permits: Arc<Semaphore>,
 }
 
 impl GraphVerificationWorker {
@@ -70,7 +69,6 @@ impl GraphVerificationWorker {
             jitter,
             worker_id,
             claim_timeout,
-            per_task_permits: Arc::new(Semaphore::new(PER_TASK_CONCURRENCY)),
         }
     }
 
@@ -136,24 +134,13 @@ impl GraphVerificationWorker {
         let reader = snapshot.as_v1().reader.clone();
         let mut set = tokio::task::JoinSet::new();
         for (index, predicate) in due {
-            // Recheck after backpressure. Waiting for a permit must never turn into late I/O.
-            let permit = self
-                .per_task_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ApplicationError::Storage {
-                    message: "graph per-task semaphore closed".to_owned(),
-                })?;
             if self.clock.now() >= deadline {
-                drop(permit);
                 break;
             }
             let verifier = Arc::clone(&self.verifier);
             let creator = creator.clone();
             let reader = reader.clone();
             set.spawn(async move {
-                let _permit = permit;
                 let observation = verifier
                     .verify_predicate(&predicate, &creator, &reader, deadline)
                     .await;
@@ -162,10 +149,13 @@ impl GraphVerificationWorker {
         }
 
         while let Some(result) = set.join_next().await {
-            let (index, observation) = result.map_err(|error| ApplicationError::Storage {
+            let (index, timed) = result.map_err(|error| ApplicationError::Storage {
                 message: format!("graph verifier task failed: {error}"),
             })?;
-            let observed_at = self.clock.now();
+            let TimedNexusObservation {
+                observation,
+                observed_at,
+            } = timed;
             if observed_at > deadline {
                 continue;
             }
@@ -192,6 +182,16 @@ impl GraphVerificationWorker {
         .await
     }
 
+    async fn run_wave(&self) -> Result<[GraphWorkerTick; CONCURRENT_TASK_WAVES], ApplicationError> {
+        let (first, second, third, fourth) = tokio::try_join!(
+            self.run_once(),
+            self.run_once(),
+            self.run_once(),
+            self.run_once()
+        )?;
+        Ok([first, second, third, fourth])
+    }
+
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -201,8 +201,8 @@ impl GraphVerificationWorker {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            let tick = self.run_once().await?;
-            if tick == GraphWorkerTick::Idle {
+            let ticks = self.run_wave().await?;
+            if ticks.iter().all(|tick| *tick == GraphWorkerTick::Idle) {
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -326,15 +326,13 @@ fn apply_observation(
             let failures = snapshot.predicates[index]
                 .operational_failure_count
                 .saturating_add(1);
-            let honored_retry_after = retry_after_seconds.filter(|seconds| {
-                time::Duration::seconds(*seconds as i64) <= deadline - observed_at
-            });
-            let base = honored_retry_after.unwrap_or_else(|| {
+            let retry_after = retry_after_seconds.map(|seconds| seconds.min(60));
+            let base = retry_after.unwrap_or_else(|| {
                 OPERATIONAL_BACKOFF_SECONDS[usize::try_from(failures.saturating_sub(1))
                     .unwrap_or(usize::MAX)
                     .min(OPERATIONAL_BACKOFF_SECONDS.len() - 1)]
             });
-            let delay = if honored_retry_after.is_some() {
+            let delay = if retry_after.is_some() {
                 Duration::from_secs(base.min(60))
             } else {
                 jitter.jitter(Duration::from_secs(base))
@@ -397,19 +395,30 @@ fn invalid_snapshot(message: String) -> ApplicationError {
 mod tests {
     use std::collections::VecDeque;
     use std::str::FromStr;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use locks_core::ids::{BundleId, CreatorPubky, LockHash, LockId, PubkyLockResource, TaskId};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use locks_core::ids::{
+        BundleId, CreatorPubky, LockHash, LockId, LockServerPubky, PubkyLockResource, TaskId,
+    };
     use locks_core::lock_policy::{GraphParticipantV2, GraphPolicyV2, GraphPredicateV2};
     use locks_service::application::models::{
         GraphTaskRecord, GraphTaskSnapshotV1, VerificationTaskStatus,
     };
     use locks_service::application::ports::GraphTaskRepository;
     use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
+    use pubky_common::crypto::Keypair;
     use time::macros::datetime;
+    use tokio::sync::Semaphore;
 
     use super::*;
+    use crate::config::{NexusConfig, PaykitConfig, RuntimeEnvironment};
+    use crate::testing::TestServerApp;
+    use crate::worker::{
+        InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick, VerificationWorker,
+        WorkerTick,
+    };
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
@@ -421,6 +430,12 @@ mod tests {
     impl GraphRetryJitter for FixedJitter {
         fn jitter(&self, base: Duration) -> Duration {
             base
+        }
+    }
+
+    impl InvoiceRetryJitter for FixedJitter {
+        fn delay(&self, _attempt_count: u32) -> time::Duration {
+            time::Duration::seconds(1)
         }
     }
 
@@ -440,7 +455,7 @@ mod tests {
     }
 
     struct FakeNexus {
-        responses: Mutex<VecDeque<NexusObservation>>,
+        responses: Mutex<VecDeque<TimedNexusObservation>>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -452,9 +467,62 @@ mod tests {
             _creator: &CreatorPubky,
             _reader: &CreatorPubky,
             _not_after: time::OffsetDateTime,
-        ) -> NexusObservation {
+        ) -> TimedNexusObservation {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.responses.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    struct CompletingNexus {
+        clock: Arc<MutableClock>,
+    }
+
+    #[async_trait]
+    impl NexusGraphVerifier for CompletingNexus {
+        async fn verify_predicate(
+            &self,
+            _predicate: &GraphPredicateV2,
+            _creator: &CreatorPubky,
+            _reader: &CreatorPubky,
+            not_after: time::OffsetDateTime,
+        ) -> TimedNexusObservation {
+            let completed = TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: true,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: not_after,
+            };
+            self.clock.set(not_after + time::Duration::milliseconds(1));
+            completed
+        }
+    }
+
+    struct BlockingNexus {
+        calls: std::sync::atomic::AtomicUsize,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl NexusGraphVerifier for BlockingNexus {
+        async fn verify_predicate(
+            &self,
+            _predicate: &GraphPredicateV2,
+            _creator: &CreatorPubky,
+            _reader: &CreatorPubky,
+            _not_after: time::OffsetDateTime,
+        ) -> TimedNexusObservation {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.acquire().await.unwrap().forget();
+            TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: false,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: NOW,
+            }
         }
     }
 
@@ -474,6 +542,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_after_is_clamped_to_remaining_window_without_backoff_fallback() {
+        let mut snapshot = task().snapshot.as_v1().clone();
+        let deadline = snapshot.deadline_at;
+        let observed_at = deadline - time::Duration::seconds(10);
+        apply_observation(
+            &mut snapshot,
+            0,
+            NexusObservation::Operational {
+                kind: crate::nexus_http_client::NexusOperationalError::RateLimited,
+                origin: "https://nexus.example".to_owned(),
+                status: Some(429),
+                retry_after_seconds: Some(60),
+            },
+            observed_at,
+            deadline,
+            &FixedJitter,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.predicates[0].next_due_at,
+            Some(snapshot.deadline_at)
+        );
+    }
+
     #[tokio::test]
     async fn false_repolls_then_true_is_sticky_and_persisted() {
         let repository = Arc::new(InMemoryGraphTaskRepository::new());
@@ -481,15 +574,21 @@ mod tests {
         let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let verifier = Arc::new(FakeNexus {
             responses: Mutex::new(VecDeque::from([
-                NexusObservation::Valid {
-                    value: false,
-                    origin: "https://nexus.example".to_owned(),
-                    status: 200,
+                TimedNexusObservation {
+                    observation: NexusObservation::Valid {
+                        value: false,
+                        origin: "https://nexus.example".to_owned(),
+                        status: 200,
+                    },
+                    observed_at: NOW,
                 },
-                NexusObservation::Valid {
-                    value: true,
-                    origin: "https://nexus.example".to_owned(),
-                    status: 200,
+                TimedNexusObservation {
+                    observation: NexusObservation::Valid {
+                        value: true,
+                        origin: "https://nexus.example".to_owned(),
+                        status: 200,
+                    },
+                    observed_at: NOW + time::Duration::seconds(5),
                 },
             ])),
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -529,6 +628,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_timestamp_at_deadline_is_timely_even_if_join_happens_later() {
+        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        repository.insert_graph_task(task()).await.unwrap();
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let worker = GraphVerificationWorker::new(
+            repository.clone(),
+            Arc::new(CompletingNexus {
+                clock: clock.clone(),
+            }),
+            clock,
+            Arc::new(FixedJitter),
+            "graph-worker".to_owned(),
+            time::Duration::seconds(120),
+        );
+
+        assert!(matches!(
+            worker.run_once().await.unwrap(),
+            GraphWorkerTick::Terminal(_)
+        ));
+        let stored = repository
+            .get_graph_task_by_handle(&creator(), &bundle_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.snapshot.as_v1().root, GraphRootState::Satisfied);
+        assert_eq!(
+            stored.snapshot.as_v1().predicates[0]
+                .first_true_observation
+                .as_ref()
+                .unwrap()
+                .observed_at,
+            stored.snapshot.as_v1().deadline_at
+        );
+    }
+
+    #[tokio::test]
     async fn deadline_reached_dispatches_no_nexus_io() {
         let repository = Arc::new(InMemoryGraphTaskRepository::new());
         repository.insert_graph_task(task()).await.unwrap();
@@ -553,6 +688,111 @@ mod tests {
         assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn four_task_waves_dispatch_eight_each_and_reach_thirty_two_concurrent_calls() {
+        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        for index in 0..4 {
+            repository
+                .insert_graph_task(eight_predicate_task(index))
+                .await
+                .unwrap();
+        }
+        let verifier = Arc::new(BlockingNexus {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            gate: Arc::new(Semaphore::new(0)),
+        });
+        let worker = Arc::new(GraphVerificationWorker::new(
+            repository,
+            verifier.clone(),
+            Arc::new(MutableClock(Mutex::new(NOW))),
+            Arc::new(FixedJitter),
+            "graph-worker".to_owned(),
+            time::Duration::seconds(30),
+        ));
+        let running = {
+            let worker = worker.clone();
+            tokio::spawn(async move { worker.run_wave().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while verifier.calls.load(std::sync::atomic::Ordering::SeqCst) < 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all four task waves should dispatch concurrently");
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 32);
+        verifier.gate.add_permits(32);
+        assert_eq!(running.await.unwrap().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn graph_only_task_in_production_worker_composition_makes_zero_paykit_calls() {
+        let paykit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secret_dir = tempfile::tempdir().unwrap();
+        let secret_path = secret_dir.path().join("lock-server.sess");
+        std::fs::write(
+            &secret_path,
+            format!("keypair-seed:{}", URL_SAFE_NO_PAD.encode([9_u8; 32])),
+        )
+        .unwrap();
+        let mut config = TestServerApp::default_in_memory_config();
+        config.runtime.environment = RuntimeEnvironment::Production;
+        config.credentials.lock_server_secret_key = secret_path;
+        config.credentials.lock_server_public_key =
+            LockServerPubky::from_str(&Keypair::from_secret(&[9_u8; 32]).public_key().to_string())
+                .unwrap();
+        config.paykit = Some(PaykitConfig {
+            server_url: format!("http://{}", paykit_listener.local_addr().unwrap()),
+            minimum_confirmations: 0,
+        });
+        config.nexus = Some(NexusConfig {
+            server_url: "https://nexus.example".to_owned(),
+            allow_insecure_loopback: false,
+        });
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let state =
+            crate::app_state::AppState::new_empty_in_memory(config).with_clock(clock.clone());
+        state.graph_tasks().insert_graph_task(task()).await.unwrap();
+        let nexus = Arc::new(FakeNexus {
+            responses: Mutex::new(VecDeque::from([TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: true,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: NOW,
+            }])),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let graph = GraphVerificationWorker::new(
+            state.graph_task_claimer().clone(),
+            nexus,
+            clock,
+            Arc::new(FixedJitter),
+            "graph-worker".to_owned(),
+            time::Duration::seconds(30),
+        );
+        let paykit = state.paykit_http_client().unwrap();
+        let invoice = InvoiceAdmissionWorker::from_state(&state, paykit.as_ref(), &FixedJitter);
+        let verification = VerificationWorker::from_state(&state);
+
+        let (verification_tick, invoice_tick, graph_tick) = tokio::join!(
+            verification.run_once(),
+            invoice.run_once(),
+            graph.run_once()
+        );
+
+        assert_eq!(verification_tick.unwrap(), WorkerTick::Idle);
+        assert_eq!(invoice_tick.unwrap(), InvoiceWorkerTick::Idle);
+        assert!(matches!(graph_tick.unwrap(), GraphWorkerTick::Terminal(_)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), paykit_listener.accept())
+                .await
+                .is_err(),
+            "graph-only execution must not open any Paykit connection"
+        );
+    }
+
     fn task() -> GraphTaskRecord {
         let lock_id = LockId::from_hash(LockHash::from_bytes([0; 32]));
         GraphTaskRecord {
@@ -573,6 +813,40 @@ mod tests {
                             followed: GraphParticipantV2::Creator,
                         }],
                         operator: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+        }
+    }
+
+    fn eight_predicate_task(index: u8) -> GraphTaskRecord {
+        let lock_hash = [index; 32];
+        let lock_id = LockId::from_hash(LockHash::from_bytes(lock_hash));
+        GraphTaskRecord {
+            task_id: TaskId::from_str(&format!("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d{index:02}"))
+                .unwrap(),
+            snapshot: GraphTaskSnapshot::V1(
+                GraphTaskSnapshotV1::new(
+                    creator(),
+                    BundleId::new_random(),
+                    PubkyLockResource::from_str(&format!("{CREATOR}/pub/app.locks/{lock_id}.json"))
+                        .unwrap(),
+                    lock_hash,
+                    CreatorPubky::from_str(READER).unwrap(),
+                    NOW,
+                    60,
+                    GraphPolicyV2 {
+                        predicates: (0..8)
+                            .map(|predicate| GraphPredicateV2::Tagged {
+                                tagger: GraphParticipantV2::Reader,
+                                tagged: GraphParticipantV2::Creator,
+                                label: format!("trusted-{index}-{predicate}"),
+                            })
+                            .collect(),
+                        operator: Some(locks_core::lock_policy::GraphOperatorV2::And),
                     },
                 )
                 .unwrap(),

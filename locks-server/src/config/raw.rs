@@ -67,7 +67,10 @@ struct RawNexusConfig {
 }
 
 impl RawNexusConfig {
-    fn into_nexus_config(self) -> Result<NexusConfig, ConfigError> {
+    fn into_nexus_config(
+        self,
+        environment: RuntimeEnvironment,
+    ) -> Result<NexusConfig, ConfigError> {
         let parsed =
             Url::parse(&self.server_url).map_err(|_| ConfigError::InvalidNexusServerUrl)?;
         let exact = parsed.host_str().is_some()
@@ -77,7 +80,8 @@ impl RawNexusConfig {
             && parsed.fragment().is_none()
             && (parsed.path().is_empty() || parsed.path() == "/");
         let secure = parsed.scheme() == "https";
-        let loopback = self.allow_insecure_loopback
+        let loopback = environment.is_development()
+            && self.allow_insecure_loopback
             && parsed.scheme() == "http"
             && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
         if !exact || (!secure && !loopback) {
@@ -1000,7 +1004,7 @@ impl RawConfig {
             .transpose()?;
         let nexus = self
             .nexus
-            .map(RawNexusConfig::into_nexus_config)
+            .map(|nexus| nexus.into_nexus_config(runtime.environment))
             .transpose()?;
         if self.worker.poll_interval_ms == 0 {
             return Err(ConfigError::InvalidWorkerPollInterval);

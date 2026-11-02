@@ -1794,7 +1794,22 @@ async fn assert_memory_graph_deletion(include_legacy_repository: bool) {
                 &graph_claim.claim_token,
                 NOW,
                 0,
+                graph_claim.task.snapshot.clone(),
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        graph
+            .schedule_graph_task_retry(
+                &graph_claim.task.task_id,
+                "graph-worker",
+                &graph_claim.claim_token,
+                NOW,
+                0,
                 graph_claim.task.snapshot,
+                NOW + time::Duration::seconds(1),
             )
             .await
             .unwrap(),

@@ -189,6 +189,39 @@ fn parses_staging_environment_as_production_shaped_runtime_label() {
 }
 
 #[test]
+fn insecure_loopback_nexus_is_development_only() {
+    for environment in ["staging", "production"] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config(&secret_path, &public_key, environment).replace(
+            "[content_locks]",
+            "[nexus]\nserver_url = \"http://127.0.0.1:8080\"\nallow_insecure_loopback = true\n\n[content_locks]",
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        assert!(matches!(
+            load_existing_config_from_path(&config_path),
+            Err(ConfigError::InvalidNexusServerUrl)
+        ));
+    }
+
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[nexus]\nserver_url = \"http://127.0.0.1:8080\"\nallow_insecure_loopback = true\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+    assert_eq!(config.nexus.unwrap().server_url, "http://127.0.0.1:8080");
+}
+
+#[test]
 fn parses_optional_paykit_runtime_config() {
     let temp_dir = tempdir().unwrap();
     let secret_path = temp_dir.path().join("secret.sess");

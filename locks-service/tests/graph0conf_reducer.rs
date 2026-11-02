@@ -233,6 +233,28 @@ fn snapshot_validation_rejects_fabricated_terminal_roots() {
 }
 
 #[test]
+fn terminal_invalid_is_sticky_and_requires_matching_unavailable_nexus_evidence() {
+    let observed_at = ACCEPTED_AT + time::Duration::seconds(1);
+    let mut current = snapshot(None, 1);
+    current
+        .terminalize_invalid_nexus_response(
+            0,
+            observed_at,
+            "https://nexus.example".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+
+    let mut cleared = current.clone();
+    cleared.predicates[0].terminal_invalid = false;
+    assert!(cleared.validate_progress_from(&current).is_err());
+
+    let mut fabricated = snapshot(None, 1);
+    fabricated.predicates[0].terminal_invalid = true;
+    assert!(fabricated.validate().is_err());
+}
+
+#[test]
 fn deadline_creation_is_checked_and_expiry_without_observation_is_false() {
     let mut snapshot = GraphTaskSnapshotV1::new(
         creator(),

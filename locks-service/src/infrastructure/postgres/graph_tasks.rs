@@ -356,11 +356,6 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         snapshot: GraphTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
-        if next_attempt_at <= now || next_attempt_at > snapshot.as_v1().deadline_at {
-            return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "graph retry must be after now and no later than deadline".to_owned(),
-            });
-        }
         let expected_revision = match i64::try_from(expected_revision) {
             Ok(revision) => revision,
             Err(_) => return Ok(None),
@@ -402,6 +397,11 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
+        if next_attempt_at <= now || next_attempt_at > snapshot.as_v1().deadline_at {
+            return Err(ApplicationError::InvalidVerificationTaskState {
+                message: "graph retry must be after now and no later than deadline".to_owned(),
+            });
+        }
         snapshot.as_v1().validate().map_err(invalid_snapshot)?;
         snapshot
             .as_v1()
@@ -834,6 +834,21 @@ mod tests {
                     NOW,
                     0,
                     invalid.clone(),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repository
+                .schedule_graph_task_retry(
+                    &claim.task.task_id,
+                    "worker",
+                    &uuid::Uuid::new_v4(),
+                    NOW,
+                    0,
+                    invalid.clone(),
+                    NOW,
                 )
                 .await
                 .unwrap(),

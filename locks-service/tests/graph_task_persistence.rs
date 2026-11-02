@@ -36,6 +36,17 @@ async fn graph_evidence_must_enter_through_a_timely_latest_observation_transitio
             .is_err()
     );
 
+    let mut terminal_invalid_insert = support::graph_task();
+    let locks_service::application::models::GraphTaskSnapshot::V1(snapshot) =
+        &mut terminal_invalid_insert.snapshot;
+    snapshot.predicates[0].terminal_invalid = true;
+    assert!(
+        repository
+            .insert_graph_task(terminal_invalid_insert)
+            .await
+            .is_err()
+    );
+
     repository
         .insert_graph_task(support::graph_task())
         .await
@@ -210,6 +221,22 @@ async fn whole_snapshot_write_is_claim_token_lease_and_revision_fenced() {
             .await
             .unwrap(),
         None
+    );
+    assert_eq!(
+        repository
+            .schedule_graph_task_retry(
+                &first.task.task_id,
+                "worker-a",
+                &first.claim_token,
+                reclaimed_at,
+                1,
+                next,
+                reclaimed_at,
+            )
+            .await
+            .unwrap(),
+        None,
+        "stale ownership must be fenced before candidate retry validation"
     );
 }
 

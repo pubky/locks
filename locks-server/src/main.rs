@@ -115,13 +115,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let verification = VerificationWorker::from_state(&worker_state);
                 let paykit = worker_state.paykit_http_client().cloned();
                 let graph_verifier = worker_state
-                    .config()
-                    .nexus
-                    .as_ref()
-                    .map(|config| {
-                        NexusHttpClient::new(
-                            config.server_url.as_str(),
-                            config.allow_insecure_loopback,
+                    .nexus_endpoint_source()
+                    .cloned()
+                    .map(|endpoint_source| {
+                        NexusHttpClient::with_endpoint_resolver(
+                            Arc::new(move || endpoint_source.current()),
+                            worker_state.clock().clone(),
                         )
                         .map(Arc::new)
                     })

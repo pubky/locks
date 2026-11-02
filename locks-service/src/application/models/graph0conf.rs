@@ -170,8 +170,9 @@ impl GraphTaskSnapshotV1 {
         next_due_at: Option<OffsetDateTime>,
         operational_failure_count: u32,
     ) -> Result<(), String> {
-        self.record_observation(predicate_index, outcome, observed_at)?;
-        let predicate = self
+        let mut next = self.clone();
+        next.record_observation(predicate_index, outcome, observed_at)?;
+        let predicate = next
             .predicates
             .get_mut(predicate_index)
             .ok_or_else(|| "graph predicate index is out of bounds".to_owned())?;
@@ -186,7 +187,9 @@ impl GraphTaskSnapshotV1 {
         }
         predicate.next_due_at = next_due_at;
         predicate.operational_failure_count = operational_failure_count;
-        self.validate()
+        next.validate()?;
+        *self = next;
+        Ok(())
     }
 
     pub fn terminalize_invalid_nexus_response(
@@ -196,7 +199,8 @@ impl GraphTaskSnapshotV1 {
         origin: String,
         http_status: Option<u16>,
     ) -> Result<(), String> {
-        self.record_nexus_observation(
+        let mut next = self.clone();
+        next.record_nexus_observation(
             predicate_index,
             GraphObservationOutcome::DependencyUnavailable,
             observed_at,
@@ -205,8 +209,10 @@ impl GraphTaskSnapshotV1 {
             None,
             0,
         )?;
-        self.predicates[predicate_index].terminal_invalid = true;
-        self.validate()
+        next.predicates[predicate_index].terminal_invalid = true;
+        next.validate()?;
+        *self = next;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -280,6 +286,9 @@ impl GraphTaskSnapshotV1 {
             return Err("graph snapshot replacement changed predicate shape".to_owned());
         }
         for (current, next) in current.predicates.iter().zip(&self.predicates) {
+            if current.terminal_invalid && !next.terminal_invalid {
+                return Err("graph snapshot replacement cleared terminal-invalid state".to_owned());
+            }
             if current.first_true_observation.is_some()
                 && current.first_true_observation != next.first_true_observation
             {
@@ -293,8 +302,7 @@ impl GraphTaskSnapshotV1 {
                     return Err("graph snapshot replacement regressed observation time".to_owned());
                 }
                 (Some(current), Some(next))
-                    if next.observed_at == current.observed_at
-                        && next.outcome != current.outcome =>
+                    if next.observed_at == current.observed_at && next != current =>
                 {
                     return Err(
                         "graph snapshot replacement changed equal-time observation".to_owned()
@@ -319,7 +327,11 @@ impl GraphTaskSnapshotV1 {
         self.validate()?;
         if self.root != GraphRootState::Pending
             || self.predicates.iter().any(|state| {
-                state.latest_observation.is_some() || state.first_true_observation.is_some()
+                state.latest_observation.is_some()
+                    || state.first_true_observation.is_some()
+                    || state.next_due_at.is_some()
+                    || state.operational_failure_count != 0
+                    || state.terminal_invalid
             })
         {
             return Err("new graph task snapshot must be pristine and pending".to_owned());
@@ -458,6 +470,36 @@ impl GraphPredicateState {
         {
             if observation.observed_at < accepted_at || observation.observed_at > deadline_at {
                 return Err("stored graph observation falls outside task window".to_owned());
+            }
+            if observation
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.trim().is_empty())
+            {
+                return Err("stored Nexus observation origin is empty".to_owned());
+            }
+            if observation.http_status.is_some() && observation.origin.is_none() {
+                return Err("stored Nexus HTTP status lacks origin".to_owned());
+            }
+        }
+        if self.terminal_invalid {
+            let valid_terminal_evidence = self.latest_observation.as_ref().is_some_and(|latest| {
+                latest.outcome == GraphObservationOutcome::DependencyUnavailable
+                    && latest
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| !origin.trim().is_empty())
+                    && latest.http_status.is_some()
+            });
+            if !valid_terminal_evidence
+                || self.first_true_observation.is_some()
+                || self.next_due_at.is_some()
+                || self.operational_failure_count != 0
+            {
+                return Err(
+                    "terminal-invalid graph predicate lacks matching unavailable Nexus evidence"
+                        .to_owned(),
+                );
             }
         }
         if self

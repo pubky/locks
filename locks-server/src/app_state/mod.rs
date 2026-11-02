@@ -92,6 +92,7 @@ pub use crate::app_state::readiness::{
 use crate::config::{
     CreatorAuthorityAcquisitionMethod, LockServerRuntimeConfig, load_lock_server_signing_keypair,
 };
+use crate::nexus_http_client::{LiveNexusEndpoint, NexusEndpoint};
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::{
     InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
@@ -254,6 +255,7 @@ where
 #[derive(Clone)]
 pub struct AppState {
     config: LockServerRuntimeConfig,
+    nexus_endpoint_source: Option<Arc<LiveNexusEndpoint>>,
     private_runtime_storage_kind: RuntimeStorageKind,
     postgres_pool: Option<PgPool>,
     worker_readiness: WorkerReadiness,
@@ -841,9 +843,17 @@ impl AppState {
         let paykit_setup_status_provider = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
+        let nexus_endpoint_source = config.nexus.as_ref().map(|nexus| {
+            Arc::new(LiveNexusEndpoint::new(
+                NexusEndpoint::parse(&nexus.server_url, nexus.allow_insecure_loopback)
+                    .expect("validated Nexus config must produce a live endpoint"),
+                config.runtime.environment.is_development() && nexus.allow_insecure_loopback,
+            ))
+        });
 
         Self {
             config,
+            nexus_endpoint_source,
             private_runtime_storage_kind,
             postgres_pool,
             worker_readiness,
@@ -894,6 +904,10 @@ impl AppState {
 
     pub fn config(&self) -> &LockServerRuntimeConfig {
         &self.config
+    }
+
+    pub fn nexus_endpoint_source(&self) -> Option<&Arc<LiveNexusEndpoint>> {
+        self.nexus_endpoint_source.as_ref()
     }
 
     pub fn private_runtime_storage_kind(&self) -> RuntimeStorageKind {

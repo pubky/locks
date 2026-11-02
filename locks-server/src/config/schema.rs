@@ -478,7 +478,7 @@ pub enum ConfigError {
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
     #[error(
-        "nexus.server_url must be an exact HTTPS origin, or loopback HTTP when allow_insecure_loopback is true"
+        "nexus.server_url must be an exact HTTPS origin, or loopback HTTP in development when allow_insecure_loopback is true"
     )]
     InvalidNexusServerUrl,
     #[error("pkdns.key_republisher_interval_seconds must be greater than zero")]
