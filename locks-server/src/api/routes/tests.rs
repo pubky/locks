@@ -4842,6 +4842,40 @@ async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
 }
 
 #[tokio::test]
+async fn connect_shell_qr_copies_the_url_it_encodes() {
+    for delivery in ["&delivery=postmessage", ""] {
+        let state =
+            test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
+                .with_legacy_creator_connect_flow_client(Arc::new(
+                    CountingLegacyConnectFlowClient::default(),
+                ));
+        let response = router(state)
+            .oneshot(empty_request(
+                "GET",
+                &format!(
+                    "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s{delivery}"
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+        // A copy button, not a link: the same-device deep link stays on the signer buttons.
+        assert!(
+            body.contains(
+                "<button type=\"button\" class=\"qr\" data-testid=\"pubky-auth-qr\" data-url=\"pubkyauth://signin?secret=fake-secret-flow-url\" aria-label=\"Copy authorization link\">"
+            ),
+            "delivery={delivery:?}"
+        );
+        assert!(
+            body.contains("navigator.clipboard.writeText(qr.dataset.url)"),
+            "delivery={delivery:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_variants() {
     for (environment, bitkit_package) in [
         (RuntimeEnvironment::Development, "to.bitkit.dev"),
