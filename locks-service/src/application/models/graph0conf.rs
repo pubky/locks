@@ -13,6 +13,12 @@ pub struct GraphTaskRecord {
     pub snapshot: GraphTaskSnapshot,
     pub evaluator_revision: u64,
     pub status: super::VerificationTaskStatus,
+    /// Exact v2 payload persisted before external entitlement publication.
+    pub entitlement_to_publish: Option<locks_core::verification::VerifiedProofBundleV2>,
+    /// Stable external-effect fence retained across lease reclaim and ambiguous writes.
+    pub entitlement_publication_token: Option<uuid::Uuid>,
+    /// Durable terminal timestamp; absent while pending or publishing.
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +39,7 @@ impl GraphTaskSnapshot {
         }
     }
 
-    pub fn from_json(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+    pub fn from_json(mut value: serde_json::Value) -> Result<Self, serde_json::Error> {
         let version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -41,6 +47,7 @@ impl GraphTaskSnapshot {
         if version != u64::from(GRAPH_TASK_SNAPSHOT_VERSION) {
             return Err(json_error("unsupported graph task snapshot schema_version"));
         }
+        normalize_pre_0030_operational_failure_counts(&mut value);
         let snapshot: GraphTaskSnapshotV1 = serde_json::from_value(value)?;
         snapshot.validate().map_err(json_error)?;
         Ok(Self::V1(snapshot))
@@ -58,6 +65,40 @@ fn json_error(message: impl Into<String>) -> serde_json::Error {
         std::io::ErrorKind::InvalidData,
         message.into(),
     ))
+}
+
+fn normalize_pre_0030_operational_failure_counts(value: &mut serde_json::Value) {
+    let Some(predicates) = value
+        .get_mut("predicates")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    const AGGREGATE_FIELDS: [&str; 5] = [
+        "operational_failure_total",
+        "operational_first_failure_at",
+        "operational_last_failure_at",
+        "operational_last_category",
+        "operational_last_http_status",
+    ];
+    for predicate in predicates {
+        let Some(predicate) = predicate.as_object_mut() else {
+            continue;
+        };
+        if AGGREGATE_FIELDS
+            .iter()
+            .all(|field| !predicate.contains_key(*field))
+            && predicate
+                .get("operational_failure_count")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0)
+        {
+            predicate.insert(
+                "operational_failure_count".to_owned(),
+                serde_json::Value::from(0),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +208,7 @@ impl GraphTaskSnapshotV1 {
         observed_at: OffsetDateTime,
         origin: String,
         http_status: Option<u16>,
+        operational_category: Option<GraphOperationalErrorCategory>,
         next_due_at: Option<OffsetDateTime>,
         operational_failure_count: u32,
     ) -> Result<(), String> {
@@ -187,6 +229,23 @@ impl GraphTaskSnapshotV1 {
         }
         predicate.next_due_at = next_due_at;
         predicate.operational_failure_count = operational_failure_count;
+        if let Some(category) = operational_category {
+            if outcome != GraphObservationOutcome::DependencyUnavailable {
+                return Err("operational Nexus error must be dependency unavailable".to_owned());
+            }
+            predicate.operational_failure_total = predicate
+                .operational_failure_total
+                .checked_add(1)
+                .ok_or_else(|| "operational Nexus error total overflow".to_owned())?;
+            predicate
+                .operational_first_failure_at
+                .get_or_insert(observed_at);
+            predicate.operational_last_failure_at = Some(observed_at);
+            predicate.operational_last_category = Some(category);
+            predicate.operational_last_http_status = http_status;
+        } else if operational_failure_count != 0 {
+            return Err("operational Nexus error count lacks normalized category".to_owned());
+        }
         next.validate()?;
         *self = next;
         Ok(())
@@ -206,6 +265,7 @@ impl GraphTaskSnapshotV1 {
             observed_at,
             origin,
             http_status,
+            None,
             None,
             0,
         )?;
@@ -430,6 +490,16 @@ enum TerminalPredicateTruth {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphOperationalErrorCategory {
+    Redirect,
+    RateLimited,
+    NonSuccess,
+    Timeout,
+    Transport,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct GraphPredicateState {
@@ -440,6 +510,16 @@ pub struct GraphPredicateState {
     pub next_due_at: Option<OffsetDateTime>,
     #[serde(default)]
     pub operational_failure_count: u32,
+    #[serde(default)]
+    pub operational_failure_total: u32,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub operational_first_failure_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub operational_last_failure_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub operational_last_category: Option<GraphOperationalErrorCategory>,
+    #[serde(default)]
+    pub operational_last_http_status: Option<u16>,
     #[serde(default)]
     pub terminal_invalid: bool,
 }
@@ -452,6 +532,11 @@ impl GraphPredicateState {
             first_true_observation: None,
             next_due_at: None,
             operational_failure_count: 0,
+            operational_failure_total: 0,
+            operational_first_failure_at: None,
+            operational_last_failure_at: None,
+            operational_last_category: None,
+            operational_last_http_status: None,
             terminal_invalid: false,
         }
     }
@@ -480,6 +565,31 @@ impl GraphPredicateState {
             }
             if observation.http_status.is_some() && observation.origin.is_none() {
                 return Err("stored Nexus HTTP status lacks origin".to_owned());
+            }
+        }
+        if self.operational_failure_total == 0 {
+            if self.operational_failure_count != 0
+                || self.operational_first_failure_at.is_some()
+                || self.operational_last_failure_at.is_some()
+                || self.operational_last_category.is_some()
+                || self.operational_last_http_status.is_some()
+            {
+                return Err("graph operational error aggregate is inconsistent".to_owned());
+            }
+        } else {
+            let (Some(first), Some(last), Some(_)) = (
+                self.operational_first_failure_at,
+                self.operational_last_failure_at,
+                self.operational_last_category,
+            ) else {
+                return Err("graph operational error aggregate is incomplete".to_owned());
+            };
+            if self.operational_failure_count > self.operational_failure_total
+                || first < accepted_at
+                || last > deadline_at
+                || first > last
+            {
+                return Err("graph operational error aggregate is invalid".to_owned());
             }
         }
         if self.terminal_invalid {
@@ -565,6 +675,37 @@ pub enum GraphRootState {
     Satisfied,
     Expired(GraphDeadlineResult),
     FailedInvalidResponse,
+}
+
+impl GraphRootState {
+    /// Target durable status for a terminal root. Pending has no terminal transition.
+    pub const fn terminal_status(self) -> Option<super::VerificationTaskStatus> {
+        match self {
+            Self::Pending => None,
+            Self::Satisfied => Some(super::VerificationTaskStatus::PublishingEntitlement),
+            Self::Expired(GraphDeadlineResult::False) => {
+                Some(super::VerificationTaskStatus::Expired)
+            }
+            Self::Expired(GraphDeadlineResult::DependencyUnavailable)
+            | Self::FailedInvalidResponse => Some(super::VerificationTaskStatus::Failed),
+        }
+    }
+
+    /// One closed public root reason. Successful and pending roots omit it.
+    pub const fn terminal_reason(self) -> Option<super::VerificationTerminalReason> {
+        match self {
+            Self::Pending | Self::Satisfied => None,
+            Self::Expired(GraphDeadlineResult::False) => {
+                Some(super::VerificationTerminalReason::GraphConditionNotObservedByDeadline)
+            }
+            Self::Expired(GraphDeadlineResult::DependencyUnavailable) => {
+                Some(super::VerificationTerminalReason::VerificationUnavailableByDeadline)
+            }
+            Self::FailedInvalidResponse => {
+                Some(super::VerificationTerminalReason::InvalidVerifierResponse)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

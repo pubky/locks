@@ -33,10 +33,13 @@ use locks_service::application::use_cases::validate_paykit_payment_submission::{
 };
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
+use crate::api::auth::authenticated_creator_from_headers;
 use crate::api::dtos::{
+    CreatorVerificationEvidenceHttpRequest, CreatorVerificationEvidenceHttpResponse,
     FoldedAuthPendingHttpResponse, FoldedAuthStatusHttpRequest, FoldedAuthStatusHttpResponse,
-    PaykitConnectionStateHttpResponse, SubmitProofBundleHttpRequest,
-    VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
+    GraphVerificationTaskLifecycleHttpResponse, PaykitConnectionStateHttpResponse,
+    SubmitProofBundleHttpRequest, VerificationTaskHandleHttpRequest,
+    VerificationTaskLifecycleHttpResponse,
 };
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
@@ -99,20 +102,8 @@ fn folded_auth_unavailable() -> ApiError {
 }
 
 fn accepted_status_response(task: GraphTaskRecord) -> FoldedAuthStatusHttpResponse {
-    let snapshot = task.snapshot.as_v1();
     FoldedAuthStatusHttpResponse::Accepted {
-        task: VerificationTaskLifecycleHttpResponse {
-            creator: snapshot.creator.clone(),
-            bundle_id: snapshot.bundle_id.clone(),
-            status: task.status,
-            submitted_at: snapshot.accepted_at,
-            started_at: None,
-            completed_at: None,
-            failure_message: None,
-            status_message: None,
-            admission_deadline_at: Some(snapshot.deadline_at),
-            terminal_reason: None,
-        },
+        task: GraphVerificationTaskLifecycleHttpResponse::from(&task),
     }
 }
 
@@ -381,21 +372,49 @@ async fn maybe_prepare_paykit_submission(
 pub(super) async fn lookup_verification_task(
     State(state): State<AppState>,
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
-) -> Result<Json<VerificationTaskLifecycleHttpResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
     let task = state
         .verification_tasks()
         .get_verification_task_by_handle(&request.creator, &request.bundle_id)
-        .await?
-        .ok_or(ApplicationError::MissingRecord {
-            record: "verification_task",
-        })?;
+        .await?;
+    let Some(task) = task else {
+        let graph = state
+            .graph_tasks()
+            .get_graph_task_by_handle(&request.creator, &request.bundle_id)
+            .await?
+            .ok_or(ApplicationError::MissingRecord {
+                record: "verification_task",
+            })?;
+        return Ok(Json(graph_lifecycle_response(&graph)).into_response());
+    };
     let admission = state
         .invoice_admissions()
         .get_invoice_admission(&task.task_id)
         .await?;
     let view = locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView::from(task);
-    Ok(Json(project_lifecycle_response(view, admission.as_ref())))
+    Ok(Json(project_lifecycle_response(view, admission.as_ref())).into_response())
+}
+
+pub(super) async fn creator_verification_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<CreatorVerificationEvidenceHttpRequest>, JsonRejection>,
+) -> Result<Json<CreatorVerificationEvidenceHttpResponse>, ApiError> {
+    let creator = authenticated_creator_from_headers(&state, &headers).await?;
+    let request = parse_json(request)?;
+    let task = state
+        .graph_tasks()
+        .get_graph_task_by_handle(&creator, &request.bundle_id)
+        .await?
+        .ok_or(ApplicationError::MissingRecord {
+            record: "verification_task",
+        })?;
+    Ok(Json(task.into()))
+}
+
+fn graph_lifecycle_response(task: &GraphTaskRecord) -> GraphVerificationTaskLifecycleHttpResponse {
+    GraphVerificationTaskLifecycleHttpResponse::from(task)
 }
 
 fn project_lifecycle_response(

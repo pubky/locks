@@ -136,6 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         );
                         let graph = GraphVerificationWorker::new(
                             worker_state.graph_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
                             graph_verifier,
                             worker_state.clock().clone(),
                             Arc::new(OsGraphRetryJitter),
@@ -180,6 +181,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     (None, Some(graph_verifier)) => {
                         let graph = GraphVerificationWorker::new(
                             worker_state.graph_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
                             graph_verifier,
                             worker_state.clock().clone(),
                             Arc::new(OsGraphRetryJitter),

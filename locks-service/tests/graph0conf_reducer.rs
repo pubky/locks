@@ -7,7 +7,8 @@ use locks_core::lock_policy::{
 use locks_service::application::graph0conf_reducer::reduce_graph_snapshot;
 use locks_service::application::models::{
     GRAPH_TASK_SNAPSHOT_VERSION, GraphDeadlineResult, GraphObservationOutcome,
-    GraphPredicateObservation, GraphRootState, GraphTaskSnapshot, GraphTaskSnapshotV1,
+    GraphOperationalErrorCategory, GraphPredicateObservation, GraphRootState, GraphTaskSnapshot,
+    GraphTaskSnapshotV1, VerificationTaskStatus, VerificationTerminalReason,
 };
 use time::macros::datetime;
 
@@ -314,6 +315,152 @@ fn snapshot_decode_rejects_unknown_version_corruption_and_lock_binding_mismatch(
     let mut corrupt_window = snapshot.to_json().unwrap();
     corrupt_window["deadline_at"] = serde_json::json!("2026-10-01T12:00:59Z");
     assert!(GraphTaskSnapshot::from_json(corrupt_window).is_err());
+}
+
+#[test]
+fn pre_0030_snapshot_with_retry_count_normalizes_without_inventing_aggregate_evidence() {
+    let legacy = serde_json::json!({
+        "schema_version": 1,
+        "creator": CREATOR,
+        "bundle_id": BUNDLE_ID,
+        "pubky_lock_resource": resource().to_string(),
+        "lock_hash": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "reader": READER,
+        "accepted_at": "2026-10-01T12:00:00Z",
+        "deadline_at": "2026-10-01T12:01:00Z",
+        "operator": null,
+        "predicates": [{
+            "predicate": {
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            },
+            "latest_observation": {
+                "outcome": "dependency_unavailable",
+                "observed_at": "2026-10-01T12:00:01Z",
+                "origin": "https://nexus.example",
+                "http_status": 503
+            },
+            "first_true_observation": null,
+            "next_due_at": "2026-10-01T12:00:02Z",
+            "operational_failure_count": 3,
+            "terminal_invalid": false
+        }],
+        "root": { "status": "pending" }
+    });
+
+    let recovered = GraphTaskSnapshot::from_json(legacy).unwrap();
+    let predicate = &recovered.as_v1().predicates[0];
+    assert_eq!(predicate.operational_failure_count, 0);
+    assert_eq!(predicate.operational_failure_total, 0);
+    assert_eq!(predicate.operational_last_category, None);
+    assert_eq!(predicate.operational_first_failure_at, None);
+    assert_eq!(predicate.operational_last_failure_at, None);
+
+    let mut retry = recovered.as_v1().clone();
+    retry
+        .record_nexus_observation(
+            0,
+            GraphObservationOutcome::DependencyUnavailable,
+            ACCEPTED_AT + time::Duration::seconds(2),
+            "https://nexus.example".to_owned(),
+            Some(503),
+            Some(GraphOperationalErrorCategory::NonSuccess),
+            Some(ACCEPTED_AT + time::Duration::seconds(3)),
+            1,
+        )
+        .unwrap();
+}
+
+#[test]
+fn graph_roots_map_to_coarse_lifecycle_and_one_closed_reason() {
+    let cases = [
+        (GraphRootState::Pending, None, None),
+        (
+            GraphRootState::Satisfied,
+            Some(VerificationTaskStatus::PublishingEntitlement),
+            None,
+        ),
+        (
+            GraphRootState::Expired(GraphDeadlineResult::False),
+            Some(VerificationTaskStatus::Expired),
+            Some(VerificationTerminalReason::GraphConditionNotObservedByDeadline),
+        ),
+        (
+            GraphRootState::Expired(GraphDeadlineResult::DependencyUnavailable),
+            Some(VerificationTaskStatus::Failed),
+            Some(VerificationTerminalReason::VerificationUnavailableByDeadline),
+        ),
+        (
+            GraphRootState::FailedInvalidResponse,
+            Some(VerificationTaskStatus::Failed),
+            Some(VerificationTerminalReason::InvalidVerifierResponse),
+        ),
+    ];
+
+    for (root, status, reason) in cases {
+        assert_eq!(root.terminal_status(), status, "root={root:?}");
+        assert_eq!(root.terminal_reason(), reason, "root={root:?}");
+    }
+}
+
+#[test]
+fn operational_error_aggregate_is_bounded_normalized_and_survives_recovery() {
+    let mut state = snapshot(None, 1);
+    state
+        .record_nexus_observation(
+            0,
+            GraphObservationOutcome::DependencyUnavailable,
+            ACCEPTED_AT,
+            "https://nexus.example".to_owned(),
+            Some(503),
+            Some(GraphOperationalErrorCategory::NonSuccess),
+            Some(ACCEPTED_AT + time::Duration::seconds(1)),
+            1,
+        )
+        .unwrap();
+    state
+        .record_nexus_observation(
+            0,
+            GraphObservationOutcome::DependencyUnavailable,
+            ACCEPTED_AT + time::Duration::seconds(1),
+            "https://nexus.example".to_owned(),
+            Some(503),
+            Some(GraphOperationalErrorCategory::NonSuccess),
+            Some(ACCEPTED_AT + time::Duration::seconds(2)),
+            2,
+        )
+        .unwrap();
+    state
+        .record_nexus_observation(
+            0,
+            GraphObservationOutcome::False,
+            ACCEPTED_AT + time::Duration::seconds(2),
+            "https://nexus.example".to_owned(),
+            Some(200),
+            None,
+            Some(ACCEPTED_AT + time::Duration::seconds(3)),
+            0,
+        )
+        .unwrap();
+
+    let predicate = state.predicates[0].clone();
+    assert_eq!(predicate.operational_failure_count, 0);
+    assert_eq!(predicate.operational_failure_total, 2);
+    assert_eq!(predicate.operational_first_failure_at, Some(ACCEPTED_AT));
+    assert_eq!(
+        predicate.operational_last_failure_at,
+        Some(ACCEPTED_AT + time::Duration::seconds(1))
+    );
+    assert_eq!(
+        predicate.operational_last_category,
+        Some(GraphOperationalErrorCategory::NonSuccess)
+    );
+    assert_eq!(predicate.operational_last_http_status, Some(503));
+    let recovered =
+        GraphTaskSnapshot::from_json(GraphTaskSnapshot::V1(state).to_json().unwrap()).unwrap();
+    assert_eq!(recovered.as_v1().predicates[0], predicate);
 }
 
 fn snapshot(operator: Option<GraphOperatorV2>, count: usize) -> GraphTaskSnapshotV1 {

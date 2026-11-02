@@ -87,7 +87,7 @@ use locks_service::infrastructure::memory::folded_auth::InMemoryFoldedAuthReposi
 use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
-use locks_service::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
+
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
 use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 
@@ -888,11 +888,126 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
     assert_eq!(accepted_body["task"]["status"], "pending");
     assert_eq!(accepted_body["task"]["creator"], creator().to_string());
     assert_eq!(accepted_body["task"]["bundle_id"], BUNDLE_ID);
+    assert_json_contains_no_null(&accepted_body["task"]);
+
+    let lifecycle = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(lifecycle.status(), StatusCode::OK);
+    let lifecycle = response_json(lifecycle).await;
+    assert_eq!(lifecycle["status"], "pending");
+    assert_eq!(lifecycle["creator"], creator().to_string());
+    assert_eq!(lifecycle["bundle_id"], BUNDLE_ID);
+    assert_json_contains_no_null(&lifecycle);
 
     let replayed = app.oneshot(status_request()).await.unwrap();
     assert_eq!(replayed.status(), StatusCode::OK);
     assert_eq!(replayed.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(response_json(replayed).await, accepted_body);
+}
+
+#[tokio::test]
+async fn creator_graph_evidence_is_owner_only_and_absence_is_indistinguishable() {
+    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
+        FakeFoldedAuthPollResult::Approved,
+    )))
+    .await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    seed_frontend_session(&state, "other-session", other_creator()).await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    let submitted_body = response_json(submitted).await;
+    let accepted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted_body["state"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let owner = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BUNDLE_ID}),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), StatusCode::OK);
+    let owner = response_json(owner).await;
+    assert_eq!(owner["creator"], creator().to_string());
+    assert_eq!(owner["bundle_id"], BUNDLE_ID);
+    assert_eq!(owner["mode"], "graph");
+    assert_eq!(owner["satisfied_by"], json!([]));
+    assert_eq!(owner["graph"]["predicates"][0]["index"], 0);
+    assert_no_keys(
+        &owner["graph"]["predicates"][0],
+        &[
+            "latest_observation",
+            "first_true_observation",
+            "operational_error",
+        ],
+    );
+    assert_no_keys(
+        &owner,
+        &[
+            "task_id",
+            "claim_token",
+            "evaluator_revision",
+            "raw_body",
+            "response_digest",
+            "history",
+            "flow_secret",
+            "config",
+            "failure_message",
+        ],
+    );
+    assert_json_contains_no_null(&owner);
+
+    let non_owner = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BUNDLE_ID}),
+            "other-session",
+        ))
+        .await
+        .unwrap();
+    let non_owner_status = non_owner.status();
+    let non_owner_body = response_json(non_owner).await;
+
+    let unknown = app
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BundleId::from_bytes([9; 16])}),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(non_owner_status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response_json(unknown).await, non_owner_body);
 }
 
 #[tokio::test]
@@ -6294,16 +6409,14 @@ async fn folded_auth_test_state_with_runtime(
         .unwrap();
     let graph = match clock.as_ref() {
         Some(clock) => Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(Arc::new(
-            InMemoryVerificationTaskDeletionFence::with_clock(clock.clone()),
+            locks_service::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence::with_clock(
+                clock.clone(),
+            ),
         ))),
         None => Arc::new(InMemoryGraphTaskRepository::new()),
     };
     let master_key =
         RuntimeMasterKey::from_base64url("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
-    let folded_auth = Arc::new(InMemoryFoldedAuthRepository::new(
-        graph,
-        FoldedAuthSecretCipher::from_runtime_master_key(&master_key),
-    ));
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
         client_id: "https://pubky.app".to_owned(),
@@ -6317,7 +6430,12 @@ async fn folded_auth_test_state_with_runtime(
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
     )
-    .with_folded_auth_runtime(folded_auth, poller, Arc::new(FakeFoldedAuth));
+    .with_in_memory_graph_tasks(graph.clone());
+    let folded_auth = Arc::new(InMemoryFoldedAuthRepository::new(
+        graph,
+        FoldedAuthSecretCipher::from_runtime_master_key(&master_key),
+    ));
+    state = state.with_folded_auth_runtime(folded_auth, poller, Arc::new(FakeFoldedAuth));
     if let Some(clock) = clock {
         state = state.with_clock(clock);
     }
@@ -7258,6 +7376,15 @@ async fn response_bytes(response: axum::response::Response) -> Vec<u8> {
 fn assert_no_keys(json: &Value, keys: &[&str]) {
     for key in keys {
         assert!(json.get(*key).is_none(), "unexpected key {key} in {json}");
+    }
+}
+
+fn assert_json_contains_no_null(value: &Value) {
+    match value {
+        Value::Null => panic!("unexpected null in {value}"),
+        Value::Array(values) => values.iter().for_each(assert_json_contains_no_null),
+        Value::Object(fields) => fields.values().for_each(assert_json_contains_no_null),
+        _ => {}
     }
 }
 

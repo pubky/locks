@@ -2,11 +2,15 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::verification::{
+    SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
+};
 use sqlx::{FromRow, PgPool};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     ClaimedGraphTask, GraphRootState, GraphTaskRecord, GraphTaskSnapshot, VerificationTaskStatus,
+    VerificationTerminalReason,
 };
 use crate::application::ports::{GraphTaskClaimer, GraphTaskRepository};
 
@@ -34,10 +38,16 @@ struct GraphTaskRow {
     submitted_at: time::OffsetDateTime,
     evaluator_snapshot: serde_json::Value,
     evaluator_revision: i64,
+    completed_at: Option<time::OffsetDateTime>,
+    terminal_reason: Option<String>,
+    entitlement_to_publish: Option<serde_json::Value>,
+    entitlement_publication_claim_token: Option<uuid::Uuid>,
 }
 
 const GRAPH_TASK_COLUMNS: &str = "task_id::text AS task_id, creator, bundle_id, status, \
-    submitted_proof_bundle, submitted_at, evaluator_snapshot, evaluator_revision";
+    submitted_proof_bundle, submitted_at, evaluator_snapshot, evaluator_revision, completed_at, \
+    terminal_reason, \
+    entitlement_to_publish, entitlement_publication_claim_token";
 
 #[async_trait]
 impl GraphTaskRepository for PostgresGraphTaskRepository {
@@ -206,10 +216,27 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                 SELECT task_id FROM verification_tasks
                 WHERE evaluator_snapshot IS NOT NULL
                   AND deletion_job_id IS NULL
-                  AND evaluator_snapshot->'root'->>'status' = 'pending'
                   AND (
-                    (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
-                    OR (status = 'in_progress' AND claim_expires_at <= clock_timestamp())
+                    (
+                      evaluator_snapshot->'root'->>'status' = 'pending'
+                      AND (
+                        (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
+                        OR (status = 'in_progress' AND claim_expires_at <= clock_timestamp())
+                      )
+                    )
+                    OR (
+                      evaluator_snapshot->'root'->>'status' = 'satisfied'
+                      AND status = 'publishing_entitlement'
+                      AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())
+                    )
+                    OR (
+                      evaluator_snapshot->'root'->>'status' IN (
+                        'satisfied', 'expired', 'failed_invalid_response'
+                      )
+                      AND status = 'in_progress'
+                      AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
+                    )
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM content_lock_deletion_task_snapshot snapshot
@@ -220,7 +247,11 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                 LIMIT 1
              )
              UPDATE verification_tasks task
-             SET status = 'in_progress', claimed_by = $1, claim_token = $2,
+             SET status = CASE
+                     WHEN task.status = 'publishing_entitlement' THEN task.status
+                     ELSE 'in_progress'
+                 END,
+                 claimed_by = $1, claim_token = $2,
                  claim_expires_at = clock_timestamp() + ($3 - $4),
                  started_at = COALESCE(started_at, $4), next_attempt_at = NULL,
                  attempt_count = attempt_count + 1, updated_at = $4
@@ -228,7 +259,9 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
              WHERE task.task_id = candidate.task_id
              RETURNING task.task_id::text AS task_id, task.creator, task.bundle_id,
                        task.status, task.submitted_proof_bundle, task.submitted_at,
-                       task.evaluator_snapshot, task.evaluator_revision",
+                       task.evaluator_snapshot, task.evaluator_revision, task.completed_at,
+                       task.terminal_reason,
+                       task.entitlement_to_publish, task.entitlement_publication_claim_token",
         )
         .bind(worker_id)
         .bind(claim_token)
@@ -292,10 +325,13 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             .validate_observations_not_after(database_now)
             .map_err(invalid_snapshot)?;
         ensure_same_binding(&current.snapshot, &snapshot)?;
-        snapshot
-            .as_v1()
-            .validate_progress_from(current.snapshot.as_v1())
-            .map_err(invalid_snapshot)?;
+        if current.snapshot != snapshot || current.snapshot.as_v1().root == GraphRootState::Pending
+        {
+            snapshot
+                .as_v1()
+                .validate_progress_from(current.snapshot.as_v1())
+                .map_err(invalid_snapshot)?;
+        }
         if matches!(snapshot.as_v1().root, GraphRootState::Expired(_))
             && database_now < snapshot.as_v1().deadline_at
         {
@@ -309,17 +345,79 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                 message: "graph evaluator revision overflow".to_owned(),
             })?;
         let snapshot_json = snapshot.to_json().map_err(snapshot_encode_error)?;
+        let root = snapshot.as_v1().root;
+        let (target_status, terminal_reason, failure_message, entitlement, publication_token): (
+            &str,
+            Option<&str>,
+            Option<&str>,
+            Option<serde_json::Value>,
+            Option<uuid::Uuid>,
+        ) = match root {
+            GraphRootState::Pending => ("in_progress", None, None, None, None),
+            GraphRootState::Satisfied => {
+                let identity = snapshot.as_v1();
+                let publication = VerifiedProofBundleV2 {
+                    version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+                    creator: identity.creator.clone(),
+                    reader: identity.reader.clone(),
+                    bundle_id: identity.bundle_id.clone(),
+                    pubky_lock_resource: identity.pubky_lock_resource.clone(),
+                    verified_at: database_now,
+                    satisfied_by: vec![SatisfiedByV2::Graph],
+                };
+                publication
+                    .validate()
+                    .map_err(|error| ApplicationError::Storage {
+                        message: format!("invalid graph entitlement publication: {error}"),
+                    })?;
+                (
+                    "publishing_entitlement",
+                    None,
+                    None,
+                    Some(serde_json::to_value(publication).map_err(snapshot_encode_error)?),
+                    Some(uuid::Uuid::new_v4()),
+                )
+            }
+            GraphRootState::Expired(crate::application::models::GraphDeadlineResult::False) => (
+                "expired",
+                Some("graph_condition_not_observed_by_deadline"),
+                None,
+                None,
+                None,
+            ),
+            GraphRootState::Expired(
+                crate::application::models::GraphDeadlineResult::DependencyUnavailable,
+            ) => (
+                "failed",
+                Some("verification_unavailable_by_deadline"),
+                None,
+                None,
+                None,
+            ),
+            GraphRootState::FailedInvalidResponse => (
+                "failed",
+                Some("invalid_verifier_response"),
+                None,
+                None,
+                None,
+            ),
+        };
+        let retain_claim = matches!(root, GraphRootState::Pending | GraphRootState::Satisfied);
 
         let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "UPDATE verification_tasks
              SET evaluator_snapshot = $5,
                  evaluator_revision = evaluator_revision + 1,
-                 claimed_by = CASE
-                     WHEN $5->'root'->>'status' = 'pending' THEN claimed_by ELSE NULL END,
-                 claim_token = CASE
-                     WHEN $5->'root'->>'status' = 'pending' THEN claim_token ELSE NULL END,
-                 claim_expires_at = CASE
-                     WHEN $5->'root'->>'status' = 'pending' THEN claim_expires_at ELSE NULL END,
+                 status = $7,
+                 terminal_reason = $8,
+                 failure_message = $9,
+                 completed_at = CASE WHEN $10 THEN NULL ELSE $4 END,
+                 entitlement_to_publish = $11,
+                 entitlement_publication_claim_token = $12,
+                 claimed_by = CASE WHEN $10 THEN claimed_by ELSE NULL END,
+                 claim_token = CASE WHEN $10 THEN claim_token ELSE NULL END,
+                 claim_expires_at = CASE WHEN $10 THEN claim_expires_at ELSE NULL END,
+                 next_attempt_at = NULL,
                  updated_at = $4
              WHERE task_id = $1::uuid
                AND status = 'in_progress'
@@ -339,6 +437,12 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         .bind(database_now)
         .bind(snapshot_json)
         .bind(expected_revision)
+        .bind(target_status)
+        .bind(terminal_reason)
+        .bind(failure_message)
+        .bind(retain_claim)
+        .bind(entitlement)
+        .bind(publication_token)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -451,6 +555,51 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         transaction.commit().await.map_err(storage_error)?;
         row.map(row_to_task).transpose()
     }
+
+    async fn complete_claimed_graph_publication(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        _now: time::OffsetDateTime,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let expected_revision = match i64::try_from(expected_revision) {
+            Ok(revision) => revision,
+            Err(_) => return Ok(None),
+        };
+        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
+            "UPDATE verification_tasks
+             SET status = 'completed', completed_at = clock_timestamp(),
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 next_attempt_at = NULL,
+                 entitlement_publication_claim_token = NULL,
+                 updated_at = clock_timestamp()
+             WHERE task_id = $1::uuid
+               AND status = 'publishing_entitlement'
+               AND claimed_by = $2 AND claim_token = $3
+               AND claim_expires_at > clock_timestamp()
+               AND evaluator_revision = $4
+               AND entitlement_to_publish IS NOT NULL
+               AND entitlement_publication_claim_token = $5
+               AND deletion_job_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
+                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
+               )
+             RETURNING {GRAPH_TASK_COLUMNS}"
+        ))
+        .bind(task_id.to_string())
+        .bind(worker_id)
+        .bind(claim_token)
+        .bind(expected_revision)
+        .bind(publication_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.map(row_to_task).transpose()
+    }
 }
 
 fn row_to_task(row: GraphTaskRow) -> Result<GraphTaskRecord, ApplicationError> {
@@ -485,18 +634,117 @@ fn row_to_task(row: GraphTaskRow) -> Result<GraphTaskRecord, ApplicationError> {
         u64::try_from(row.evaluator_revision).map_err(|_| ApplicationError::Storage {
             message: "negative graph evaluator revision stored in Postgres".to_owned(),
         })?;
+    let entitlement_to_publish: Option<VerifiedProofBundleV2> = row
+        .entitlement_to_publish
+        .map(|value| {
+            serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
+                message: format!("invalid graph entitlement payload stored in Postgres: {error}"),
+            })
+        })
+        .transpose()?;
+    if let Some(entitlement) = entitlement_to_publish.as_ref() {
+        entitlement
+            .validate()
+            .map_err(|error| ApplicationError::Storage {
+                message: format!("invalid graph entitlement payload stored in Postgres: {error}"),
+            })?;
+        if entitlement.creator != identity.creator
+            || entitlement.reader != identity.reader
+            || entitlement.bundle_id != identity.bundle_id
+            || entitlement.pubky_lock_resource != identity.pubky_lock_resource
+            || entitlement.satisfied_by != [SatisfiedByV2::Graph]
+        {
+            return Err(ApplicationError::Storage {
+                message: "graph entitlement payload diverges from evaluator snapshot".to_owned(),
+            });
+        }
+    }
+    let status = status_from_database(&row.status)?;
+    let terminal_reason = row
+        .terminal_reason
+        .as_deref()
+        .map(|value| {
+            VerificationTerminalReason::from_storage_value(value).ok_or_else(|| {
+                ApplicationError::Storage {
+                    message: format!(
+                        "invalid graph task terminal reason stored in Postgres: {value}"
+                    ),
+                }
+            })
+        })
+        .transpose()?;
+    let lifecycle_matches = match status {
+        VerificationTaskStatus::Pending => {
+            identity.root == GraphRootState::Pending
+                && entitlement_to_publish.is_none()
+                && row.entitlement_publication_claim_token.is_none()
+                && row.completed_at.is_none()
+        }
+        VerificationTaskStatus::InProgress => {
+            // Pre-0030 graph workers could persist a terminal root while leaving the
+            // relational lifecycle in progress. Keep that exact shape readable so a
+            // fresh claim can finalize it through the fenced current transition.
+            entitlement_to_publish.is_none()
+                && row.entitlement_publication_claim_token.is_none()
+                && row.completed_at.is_none()
+        }
+        VerificationTaskStatus::PublishingEntitlement => {
+            identity.root == GraphRootState::Satisfied
+                && entitlement_to_publish.is_some()
+                && row.entitlement_publication_claim_token.is_some()
+                && row.completed_at.is_none()
+        }
+        VerificationTaskStatus::Completed => {
+            identity.root == GraphRootState::Satisfied
+                && entitlement_to_publish.is_some()
+                && row.entitlement_publication_claim_token.is_none()
+                && row.completed_at.is_some()
+        }
+        VerificationTaskStatus::Expired => {
+            (identity.root
+                == GraphRootState::Expired(crate::application::models::GraphDeadlineResult::False)
+                || terminal_reason == Some(VerificationTerminalReason::ContentLockDeleted))
+                && entitlement_to_publish.is_none()
+                && row.entitlement_publication_claim_token.is_none()
+                && row.completed_at.is_some()
+        }
+        VerificationTaskStatus::Failed => {
+            matches!(
+                identity.root,
+                GraphRootState::Expired(
+                    crate::application::models::GraphDeadlineResult::DependencyUnavailable
+                ) | GraphRootState::FailedInvalidResponse
+            ) && entitlement_to_publish.is_none()
+                && row.entitlement_publication_claim_token.is_none()
+                && row.completed_at.is_some()
+        }
+    };
+    if !lifecycle_matches {
+        return Err(ApplicationError::Storage {
+            message: "graph task lifecycle diverges from evaluator snapshot".to_owned(),
+        });
+    }
     Ok(GraphTaskRecord {
         task_id,
         snapshot,
         evaluator_revision,
-        status: status_from_database(&row.status)?,
+        status,
+        entitlement_to_publish,
+        entitlement_publication_token: row.entitlement_publication_claim_token,
+        completed_at: row.completed_at,
     })
 }
 
 fn validate_new_task(task: &GraphTaskRecord) -> Result<(), ApplicationError> {
-    if task.status != VerificationTaskStatus::Pending || task.evaluator_revision != 0 {
+    if task.status != VerificationTaskStatus::Pending
+        || task.evaluator_revision != 0
+        || task.entitlement_to_publish.is_some()
+        || task.entitlement_publication_token.is_some()
+        || task.completed_at.is_some()
+    {
         return Err(ApplicationError::InvalidVerificationTaskState {
-            message: "new graph task must be pending at evaluator revision zero".to_owned(),
+            message: "new graph task must be pristine and pending at evaluator revision zero"
+                .to_owned(),
         });
     }
     task.snapshot
@@ -561,8 +809,8 @@ mod tests {
     use super::PostgresGraphTaskRepository;
     use crate::application::graph0conf_reducer::reduce_graph_snapshot;
     use crate::application::models::{
-        GraphObservationOutcome, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
-        VerificationTaskStatus,
+        GraphObservationOutcome, GraphRootState, GraphTaskRecord, GraphTaskSnapshot,
+        GraphTaskSnapshotV1, VerificationTaskStatus,
     };
     use crate::application::ports::{
         GraphTaskClaimer, GraphTaskRepository, VerificationTaskClaimer, VerificationTaskRepository,
@@ -737,6 +985,7 @@ mod tests {
                 NOW + time::Duration::seconds(1),
                 "https://nexus.example".to_owned(),
                 Some(200),
+                None,
                 Some(NOW + time::Duration::seconds(5)),
                 0,
             )
@@ -780,6 +1029,266 @@ mod tests {
         .await
         .unwrap();
         assert!(persisted_due.is_some());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn claims_legacy_terminal_graph_snapshot_left_in_progress_by_prior_schema() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        let task = task();
+        repository.insert_graph_task(task.clone()).await.unwrap();
+        let mut terminal = task.snapshot;
+        let GraphTaskSnapshot::V1(snapshot) = &mut terminal;
+        snapshot
+            .record_observation(
+                0,
+                GraphObservationOutcome::True,
+                NOW + time::Duration::seconds(1),
+            )
+            .unwrap();
+        reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(1)).unwrap();
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET status = 'in_progress', started_at = $2,
+                 evaluator_snapshot = $3, claimed_by = NULL,
+                 claim_token = NULL, claim_expires_at = NULL
+             WHERE task_id = $1::uuid",
+        )
+        .bind(task.task_id.to_string())
+        .bind(NOW)
+        .bind(terminal.to_json().unwrap())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let claimed = repository
+            .claim_next_graph_task(
+                "migration-recovery-worker",
+                NOW + time::Duration::seconds(2),
+                NOW + time::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .expect("legacy terminal snapshot must remain recoverable");
+        assert_eq!(
+            claimed.task.snapshot.as_v1().root,
+            GraphRootState::Satisfied
+        );
+        assert_eq!(claimed.task.status, VerificationTaskStatus::InProgress);
+        let recovered = repository
+            .persist_claimed_graph_snapshot(
+                &claimed.task.task_id,
+                "migration-recovery-worker",
+                &claimed.claim_token,
+                NOW + time::Duration::seconds(3),
+                claimed.task.evaluator_revision,
+                claimed.task.snapshot,
+            )
+            .await
+            .unwrap()
+            .expect("legacy terminal snapshot must transition under the fresh claim");
+        assert_eq!(
+            recovered.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        assert!(recovered.entitlement_to_publish.is_some());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn graph_terminal_roots_persist_closed_status_reason_without_internal_message() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let claim = repository
+            .claim_next_graph_task("worker", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut terminal = claim.task.snapshot.clone();
+        let GraphTaskSnapshot::V1(snapshot) = &mut terminal;
+        snapshot
+            .record_observation(
+                0,
+                GraphObservationOutcome::DependencyUnavailable,
+                snapshot.deadline_at,
+            )
+            .unwrap();
+        reduce_graph_snapshot(snapshot, snapshot.deadline_at).unwrap();
+
+        let persisted = repository
+            .persist_claimed_graph_snapshot(
+                &claim.task.task_id,
+                "worker",
+                &claim.claim_token,
+                snapshot.deadline_at,
+                0,
+                terminal,
+            )
+            .await
+            .unwrap()
+            .expect("terminal graph state persists");
+        assert_eq!(persisted.status, VerificationTaskStatus::Failed);
+        let (status, reason, failure_message): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, terminal_reason, failure_message
+                 FROM verification_tasks WHERE task_id = $1::uuid",
+            )
+            .bind(claim.task.task_id.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(
+            reason.as_deref(),
+            Some("verification_unavailable_by_deadline")
+        );
+        assert_eq!(failure_message, None);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn satisfied_graph_publication_completion_is_token_revision_and_lease_fenced() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let claim = repository
+            .claim_next_graph_task("worker", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut satisfied = claim.task.snapshot.clone();
+        let GraphTaskSnapshot::V1(snapshot) = &mut satisfied;
+        snapshot
+            .record_observation(
+                0,
+                GraphObservationOutcome::True,
+                NOW + time::Duration::seconds(1),
+            )
+            .unwrap();
+        reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(1)).unwrap();
+        let publishing = repository
+            .persist_claimed_graph_snapshot(
+                &claim.task.task_id,
+                "worker",
+                &claim.claim_token,
+                NOW + time::Duration::seconds(1),
+                0,
+                satisfied,
+            )
+            .await
+            .unwrap()
+            .expect("satisfied graph enters publishing state");
+        assert_eq!(
+            publishing.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        let publication_token = publishing
+            .entitlement_publication_token
+            .expect("publication token");
+        assert!(publishing.entitlement_to_publish.is_some());
+
+        assert!(
+            repository
+                .complete_claimed_graph_publication(
+                    &claim.task.task_id,
+                    "worker",
+                    &claim.claim_token,
+                    NOW + time::Duration::seconds(2),
+                    1,
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .complete_claimed_graph_publication(
+                    &claim.task.task_id,
+                    "worker",
+                    &claim.claim_token,
+                    NOW + time::Duration::seconds(2),
+                    0,
+                    publication_token,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let completed = repository
+            .complete_claimed_graph_publication(
+                &claim.task.task_id,
+                "worker",
+                &claim.claim_token,
+                NOW + time::Duration::seconds(2),
+                1,
+                publication_token,
+            )
+            .await
+            .unwrap()
+            .expect("matching completion fence");
+        assert_eq!(completed.status, VerificationTaskStatus::Completed);
+        assert!(completed.entitlement_to_publish.is_some());
+        assert!(completed.entitlement_publication_token.is_none());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn mismatched_graph_entitlement_identity_fails_closed_on_read() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        repository.insert_graph_task(task()).await.unwrap();
+        let claim = repository
+            .claim_next_graph_task("worker", NOW, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut satisfied = claim.task.snapshot.clone();
+        let GraphTaskSnapshot::V1(snapshot) = &mut satisfied;
+        snapshot
+            .record_observation(
+                0,
+                GraphObservationOutcome::True,
+                NOW + time::Duration::seconds(1),
+            )
+            .unwrap();
+        reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(1)).unwrap();
+        repository
+            .persist_claimed_graph_snapshot(
+                &claim.task.task_id,
+                "worker",
+                &claim.claim_token,
+                NOW + time::Duration::seconds(1),
+                0,
+                satisfied,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET entitlement_to_publish = jsonb_set(
+                 entitlement_to_publish,
+                 '{reader}',
+                 to_jsonb($2::text)
+             )
+             WHERE task_id = $1::uuid",
+        )
+        .bind(claim.task.task_id.to_string())
+        .bind(creator().to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            repository
+                .get_graph_task_by_handle(&creator(), &bundle_id())
+                .await
+                .is_err()
+        );
         database.cleanup().await;
     }
 
@@ -1058,6 +1567,9 @@ mod tests {
             ),
             evaluator_revision: 0,
             status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
         }
     }
 

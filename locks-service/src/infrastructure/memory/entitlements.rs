@@ -4,17 +4,25 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use locks_core::ids::{BundleId, CreatorPubky};
-use locks_core::verification::VerifiedProofBundle;
+use locks_core::verification::{
+    VerifiedProofBundle, VerifiedProofBundlePayload, VerifiedProofBundleV2,
+};
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::EntitlementRepository;
 
 type EntitlementKey = (CreatorPubky, BundleId);
 
+#[derive(Debug, Clone)]
+enum StoredEntitlement {
+    V1(VerifiedProofBundle),
+    V2(VerifiedProofBundleV2),
+}
+
 /// In-memory entitlement repository for verified proof bundles.
 #[derive(Debug, Default)]
 pub struct InMemoryEntitlementRepository {
-    records: RwLock<HashMap<EntitlementKey, VerifiedProofBundle>>,
+    records: RwLock<HashMap<EntitlementKey, StoredEntitlement>>,
 }
 
 impl InMemoryEntitlementRepository {
@@ -40,7 +48,7 @@ impl EntitlementRepository for InMemoryEntitlementRepository {
                 record: "verified_proof_bundle",
             });
         }
-        records.insert(key, verified_proof_bundle);
+        records.insert(key, StoredEntitlement::V1(verified_proof_bundle));
         Ok(())
     }
 
@@ -54,7 +62,27 @@ impl EntitlementRepository for InMemoryEntitlementRepository {
             .read()
             .await
             .get(&(creator.clone(), bundle_id.clone()))
-            .cloned())
+            .and_then(|record| match record {
+                StoredEntitlement::V1(bundle) => Some(bundle.clone()),
+                StoredEntitlement::V2(_) => None,
+            }))
+    }
+
+    async fn get_verified_proof_bundle_payload(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<VerifiedProofBundlePayload>, ApplicationError> {
+        let key = (creator.clone(), bundle_id.clone());
+        Ok(self
+            .records
+            .read()
+            .await
+            .get(&key)
+            .map(|record| match record {
+                StoredEntitlement::V1(bundle) => VerifiedProofBundlePayload::V1(bundle.clone()),
+                StoredEntitlement::V2(bundle) => VerifiedProofBundlePayload::V2(bundle.clone()),
+            }))
     }
 
     async fn delete_verified_proof_bundle(
@@ -62,11 +90,53 @@ impl EntitlementRepository for InMemoryEntitlementRepository {
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<(), ApplicationError> {
-        self.records
-            .write()
-            .await
-            .remove(&(creator.clone(), bundle_id.clone()));
+        let key = (creator.clone(), bundle_id.clone());
+        self.records.write().await.remove(&key);
         Ok(())
+    }
+
+    async fn insert_verified_proof_bundle_v2(
+        &self,
+        verified_proof_bundle: VerifiedProofBundleV2,
+    ) -> Result<(), ApplicationError> {
+        verified_proof_bundle
+            .validate()
+            .map_err(|error| ApplicationError::Storage {
+                message: error.to_string(),
+            })?;
+        let key = (
+            verified_proof_bundle.creator.clone(),
+            verified_proof_bundle.bundle_id.clone(),
+        );
+        let mut records = self.records.write().await;
+        if let Some(existing) = records.get(&key) {
+            return if matches!(existing, StoredEntitlement::V2(bundle) if bundle == &verified_proof_bundle)
+            {
+                Ok(())
+            } else {
+                Err(ApplicationError::DuplicateRecord {
+                    record: "verified_proof_bundle_v2",
+                })
+            };
+        }
+        records.insert(key, StoredEntitlement::V2(verified_proof_bundle));
+        Ok(())
+    }
+
+    async fn get_verified_proof_bundle_v2(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<VerifiedProofBundleV2>, ApplicationError> {
+        Ok(self
+            .records
+            .read()
+            .await
+            .get(&(creator.clone(), bundle_id.clone()))
+            .and_then(|record| match record {
+                StoredEntitlement::V1(_) => None,
+                StoredEntitlement::V2(bundle) => Some(bundle.clone()),
+            }))
     }
 }
 
@@ -76,11 +146,11 @@ mod tests {
 
     use time::macros::datetime;
 
-    use locks_core::ids::{BundleId, LockServerPubky, PubkyLockResource};
+    use locks_core::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
     use locks_core::lock_policy::VerifierType;
     use locks_core::verification::{
-        CriterionVerificationResult, EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION,
-        VerificationResult,
+        CriterionVerificationResult, EntitlementLifetime, SatisfiedByV2,
+        VERIFIED_PROOF_BUNDLE_V2_VERSION, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
     };
 
     use super::*;
@@ -129,6 +199,117 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_v2_entitlement_at_same_canonical_bundle_path() {
+        let repo = InMemoryEntitlementRepository::new();
+        let bundle = verified_bundle_v2();
+        let creator = bundle.creator.clone();
+        let bundle_id = bundle.bundle_id.clone();
+
+        repo.insert_verified_proof_bundle_v2(bundle).await.unwrap();
+        repo.delete_verified_proof_bundle(&creator, &bundle_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.get_verified_proof_bundle_v2(&creator, &bundle_id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_version_inserts_have_one_atomic_winner_and_delete_clears_the_path() {
+        use std::sync::Arc;
+
+        use tokio::sync::Barrier;
+
+        let repo = Arc::new(InMemoryEntitlementRepository::new());
+        let v1 = verified_bundle();
+        let v2 = verified_bundle_v2();
+        let creator = v2.creator.clone();
+        let bundle_id = v2.bundle_id.clone();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let insert_v1 = {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                repo.insert_verified_proof_bundle(v1).await
+            })
+        };
+        let insert_v2 = {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                repo.insert_verified_proof_bundle_v2(v2).await
+            })
+        };
+        barrier.wait().await;
+
+        let results = [insert_v1.await.unwrap(), insert_v2.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(ApplicationError::DuplicateRecord { .. })))
+                .count(),
+            1
+        );
+        assert!(
+            repo.get_verified_proof_bundle_payload(&creator, &bundle_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        repo.delete_verified_proof_bundle(&creator, &bundle_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_verified_proof_bundle_payload(&creator, &bundle_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get_verified_proof_bundle(&creator, &bundle_id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get_verified_proof_bundle_v2(&creator, &bundle_id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    fn verified_bundle_v2() -> VerifiedProofBundleV2 {
+        VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            reader: CreatorPubky::from_str(
+                "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/{LOCK_ID}.json"
+            ))
+            .unwrap(),
+            verified_at: datetime!(2026-05-29 12:00:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Graph],
+        }
     }
 
     fn verified_bundle() -> VerifiedProofBundle {

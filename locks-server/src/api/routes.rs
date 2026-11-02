@@ -23,8 +23,8 @@ use crate::api::creator_publishing::{
 use crate::api::paykit::paykit_setup_status_for_authenticated_creator;
 use crate::api::runtime::{healthz, readyz, well_known_locks_server};
 use crate::api::verification::{
-    complete_verification_task, lookup_folded_auth_status, lookup_paykit_connection_state,
-    lookup_verification_task, submit_proof_bundle,
+    complete_verification_task, creator_verification_evidence, lookup_folded_auth_status,
+    lookup_paykit_connection_state, lookup_verification_task, submit_proof_bundle,
 };
 use crate::app_state::AppState;
 
@@ -48,6 +48,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/creator/paykit/setup-status",
             get(paykit_setup_status_for_authenticated_creator),
+        )
+        .route(
+            "/creator/verification-evidence",
+            post(creator_verification_evidence),
         )
         .route(
             "/priv-resources/content/{*tail}",

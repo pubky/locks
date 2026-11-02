@@ -297,7 +297,7 @@ async fn replay_is_exact_and_snapshot_binding_cannot_change() {
 }
 
 #[tokio::test]
-async fn terminal_graph_snapshot_is_not_reclaimed_after_lease_expiry() {
+async fn satisfied_graph_persists_canonical_publication_and_reclaims_after_restart() {
     let repository = InMemoryGraphTaskRepository::new();
     repository
         .insert_graph_task(support::graph_task())
@@ -318,7 +318,7 @@ async fn terminal_graph_snapshot_is_not_reclaimed_after_lease_expiry() {
         )
         .unwrap();
     reduce_graph_snapshot(snapshot, NOW + time::Duration::seconds(1)).unwrap();
-    repository
+    let persisted = repository
         .persist_claimed_graph_snapshot(
             &claim.task.task_id,
             "worker-a",
@@ -331,15 +331,88 @@ async fn terminal_graph_snapshot_is_not_reclaimed_after_lease_expiry() {
         .unwrap()
         .unwrap();
     assert_eq!(
+        persisted.status,
+        locks_service::application::models::VerificationTaskStatus::PublishingEntitlement
+    );
+    let publication = persisted
+        .entitlement_to_publish
+        .as_ref()
+        .expect("satisfied graph stores exact publication before external I/O");
+    assert_eq!(
+        publication.satisfied_by,
+        vec![locks_core::verification::SatisfiedByV2::Graph]
+    );
+    assert_eq!(publication.creator, support::creator());
+    assert_eq!(publication.reader, persisted.snapshot.as_v1().reader);
+    let publication_token = persisted
+        .entitlement_publication_token
+        .expect("publication marker is durable");
+
+    let reclaimed = repository
+        .claim_next_graph_task(
+            "worker-b",
+            LEASE_END,
+            LEASE_END + time::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .expect("ambiguous publication is reclaimable after lease expiry");
+    assert_ne!(reclaimed.claim_token, claim.claim_token);
+    assert_eq!(
+        reclaimed.task.entitlement_publication_token,
+        Some(publication_token),
+        "reclaim preserves stable publication fence"
+    );
+    assert_eq!(
+        reclaimed.task.entitlement_to_publish,
+        Some(publication.clone())
+    );
+
+    assert!(
         repository
-            .claim_next_graph_task(
-                "worker-b",
-                LEASE_END,
-                LEASE_END + time::Duration::minutes(5),
+            .complete_claimed_graph_publication(
+                &reclaimed.task.task_id,
+                "worker-a",
+                &claim.claim_token,
+                LEASE_END + time::Duration::seconds(1),
+                reclaimed.task.evaluator_revision,
+                publication_token,
             )
             .await
-            .unwrap(),
-        None
+            .unwrap()
+            .is_none()
+    );
+    let completed = repository
+        .complete_claimed_graph_publication(
+            &reclaimed.task.task_id,
+            "worker-b",
+            &reclaimed.claim_token,
+            LEASE_END + time::Duration::seconds(1),
+            reclaimed.task.evaluator_revision,
+            publication_token,
+        )
+        .await
+        .unwrap()
+        .expect("current publication claim completes task");
+    assert_eq!(
+        completed.status,
+        locks_service::application::models::VerificationTaskStatus::Completed
+    );
+    assert_eq!(
+        completed.completed_at,
+        Some(LEASE_END + time::Duration::seconds(1))
+    );
+    assert_eq!(completed.entitlement_publication_token, None);
+    assert!(
+        repository
+            .claim_next_graph_task(
+                "worker-c",
+                LEASE_END + time::Duration::minutes(10),
+                LEASE_END + time::Duration::minutes(15),
+            )
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 

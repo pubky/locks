@@ -1865,7 +1865,7 @@ mod tests {
                 AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
                 AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
                 ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-                ContentLockOwnershipStatus, GraphTaskRecord, GraphTaskSnapshot,
+                ContentLockOwnershipStatus, GraphRootState, GraphTaskRecord, GraphTaskSnapshot,
                 GraphTaskSnapshotV1, InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
                 PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
             },
@@ -5004,7 +5004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_paykit_drain_expires_claimed_graph_task_and_fences_stale_write() {
+    async fn no_paykit_drain_expires_claimed_graph_task_and_preserves_readable_lifecycle() {
         let database = TestDatabase::create().await;
         let lock = content_lock();
         let accepted_at = database_now(&database).await;
@@ -5057,6 +5057,23 @@ mod tests {
         .unwrap();
         assert_eq!(status, "expired");
         assert_eq!(resolved.as_deref(), Some("expired"));
+        let terminal_reason: Option<String> =
+            sqlx::query_scalar("SELECT terminal_reason FROM verification_tasks WHERE task_id = $1")
+                .bind(task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(terminal_reason.as_deref(), Some("content_lock_deleted"));
+        let hydrated = graph
+            .get_graph_task_by_handle(
+                &graph_claim.task.snapshot.as_v1().creator,
+                &graph_claim.task.snapshot.as_v1().bundle_id,
+            )
+            .await
+            .unwrap()
+            .expect("deletion-terminalized graph lifecycle remains readable");
+        assert_eq!(hydrated.status, VerificationTaskStatus::Expired);
+        assert_eq!(hydrated.snapshot.as_v1().root, GraphRootState::Pending);
         assert_eq!(
             graph
                 .persist_claimed_graph_snapshot(
@@ -5065,11 +5082,31 @@ mod tests {
                     &graph_claim.claim_token,
                     accepted_at,
                     0,
-                    graph_claim.task.snapshot,
+                    graph_claim.task.snapshot.clone(),
                 )
                 .await
                 .unwrap(),
             None
+        );
+
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET terminal_reason = 'graph_condition_not_observed_by_deadline'
+             WHERE task_id = $1",
+        )
+        .bind(task_id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            graph
+                .get_graph_task_by_handle(
+                    &graph_claim.task.snapshot.as_v1().creator,
+                    &graph_claim.task.snapshot.as_v1().bundle_id,
+                )
+                .await
+                .is_err(),
+            "the deletion exception must not weaken ordinary expired-root validation"
         );
         database.cleanup().await;
     }
@@ -6115,6 +6152,9 @@ mod tests {
             ),
             evaluator_revision: 0,
             status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
         }
     }
 

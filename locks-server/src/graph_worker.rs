@@ -5,9 +5,10 @@ use locks_core::ids::TaskId;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::graph0conf_reducer::reduce_graph_snapshot;
 use locks_service::application::models::{
-    GraphObservationOutcome, GraphRootState, GraphTaskSnapshot,
+    GraphObservationOutcome, GraphOperationalErrorCategory, GraphRootState, GraphTaskSnapshot,
+    VerificationTaskStatus,
 };
-use locks_service::application::ports::{Clock, GraphTaskClaimer};
+use locks_service::application::ports::{Clock, EntitlementRepository, GraphTaskClaimer};
 
 use crate::nexus_http_client::{NexusGraphVerifier, NexusObservation, TimedNexusObservation};
 
@@ -22,6 +23,7 @@ pub enum GraphWorkerTick {
     Persisted(TaskId),
     RetryScheduled(TaskId),
     Terminal(TaskId),
+    PublicationDeferred(TaskId),
     ClaimLost,
 }
 
@@ -46,6 +48,7 @@ impl GraphRetryJitter for OsGraphRetryJitter {
 
 pub struct GraphVerificationWorker {
     claimer: Arc<dyn GraphTaskClaimer>,
+    entitlements: Arc<dyn EntitlementRepository>,
     verifier: Arc<dyn NexusGraphVerifier>,
     clock: Arc<dyn Clock>,
     jitter: Arc<dyn GraphRetryJitter>,
@@ -56,6 +59,7 @@ pub struct GraphVerificationWorker {
 impl GraphVerificationWorker {
     pub fn new(
         claimer: Arc<dyn GraphTaskClaimer>,
+        entitlements: Arc<dyn EntitlementRepository>,
         verifier: Arc<dyn NexusGraphVerifier>,
         clock: Arc<dyn Clock>,
         jitter: Arc<dyn GraphRetryJitter>,
@@ -64,6 +68,7 @@ impl GraphVerificationWorker {
     ) -> Self {
         Self {
             claimer,
+            entitlements,
             verifier,
             clock,
             jitter,
@@ -84,6 +89,22 @@ impl GraphVerificationWorker {
         let task_id = claim.task.task_id;
         let expected_revision = claim.task.evaluator_revision;
         let claim_token = claim.claim_token;
+        if claim.task.status == VerificationTaskStatus::PublishingEntitlement {
+            return self
+                .publish_claimed_entitlement(claim.task, claim_token, expected_revision)
+                .await;
+        }
+        if claim.task.snapshot.as_v1().root != GraphRootState::Pending {
+            return self
+                .persist_terminal_or_pending(
+                    task_id,
+                    claim_token,
+                    expected_revision,
+                    claim.task.snapshot,
+                    self.clock.now(),
+                )
+                .await;
+        }
         let mut snapshot = claim.task.snapshot.clone();
         let deadline = snapshot.as_v1().deadline_at;
         let dispatch_now = self.clock.now();
@@ -202,7 +223,12 @@ impl GraphVerificationWorker {
                 return Ok(());
             }
             let ticks = self.run_wave().await?;
-            if ticks.iter().all(|tick| *tick == GraphWorkerTick::Idle) {
+            if ticks.iter().all(|tick| {
+                matches!(
+                    tick,
+                    GraphWorkerTick::Idle | GraphWorkerTick::PublicationDeferred(_)
+                )
+            }) {
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -235,15 +261,92 @@ impl GraphVerificationWorker {
                     snapshot,
                 )
                 .await?;
-            return Ok(if persisted.is_some() {
-                GraphWorkerTick::Terminal(task_id)
-            } else {
-                GraphWorkerTick::ClaimLost
-            });
+            let Some(persisted) = persisted else {
+                return Ok(GraphWorkerTick::ClaimLost);
+            };
+            if persisted.status == VerificationTaskStatus::PublishingEntitlement {
+                return self
+                    .publish_claimed_entitlement(persisted, claim_token, expected_revision + 1)
+                    .await;
+            }
+            return Ok(GraphWorkerTick::Terminal(task_id));
         }
         let due = next_due(snapshot.as_v1(), now);
         self.schedule_retry(task_id, claim_token, expected_revision, snapshot, now, due)
             .await
+    }
+
+    async fn publish_claimed_entitlement(
+        &self,
+        task: locks_service::application::models::GraphTaskRecord,
+        claim_token: uuid::Uuid,
+        expected_revision: u64,
+    ) -> Result<GraphWorkerTick, ApplicationError> {
+        let task_id = task.task_id;
+        let payload = task
+            .entitlement_to_publish
+            .ok_or_else(|| ApplicationError::Storage {
+                message: "publishing graph task is missing durable entitlement payload".to_owned(),
+            })?;
+        let publication_token =
+            task.entitlement_publication_token
+                .ok_or_else(|| ApplicationError::Storage {
+                    message: "publishing graph task is missing external-effect fence".to_owned(),
+                })?;
+        let existing = match self
+            .entitlements
+            .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
+            .await
+        {
+            Ok(existing) => existing,
+            Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
+        };
+        match existing {
+            Some(existing) if existing == payload => {}
+            Some(_) => {
+                return Err(ApplicationError::Storage {
+                    message: "published v2 entitlement conflicts with durable graph payload"
+                        .to_owned(),
+                });
+            }
+            None => {
+                if self
+                    .entitlements
+                    .insert_verified_proof_bundle_v2(payload.clone())
+                    .await
+                    .is_err()
+                {
+                    return Ok(GraphWorkerTick::PublicationDeferred(task_id));
+                }
+                let readback = match self
+                    .entitlements
+                    .get_verified_proof_bundle_v2(&payload.creator, &payload.bundle_id)
+                    .await
+                {
+                    Ok(readback) => readback,
+                    Err(_) => return Ok(GraphWorkerTick::PublicationDeferred(task_id)),
+                };
+                if readback.as_ref() != Some(&payload) {
+                    return Ok(GraphWorkerTick::PublicationDeferred(task_id));
+                }
+            }
+        }
+        let completed = self
+            .claimer
+            .complete_claimed_graph_publication(
+                &task_id,
+                &self.worker_id,
+                &claim_token,
+                self.clock.now(),
+                expected_revision,
+                publication_token,
+            )
+            .await?;
+        Ok(if completed.is_some() {
+            GraphWorkerTick::Terminal(task_id)
+        } else {
+            GraphWorkerTick::ClaimLost
+        })
     }
 
     async fn schedule_retry(
@@ -309,6 +412,7 @@ fn apply_observation(
                     observed_at,
                     origin,
                     Some(status),
+                    None,
                     next_due,
                     0,
                 )
@@ -318,10 +422,10 @@ fn apply_observation(
             .terminalize_invalid_nexus_response(index, observed_at, origin, Some(status))
             .map_err(invalid_snapshot),
         NexusObservation::Operational {
+            kind,
             origin,
             status,
             retry_after_seconds,
-            ..
         } => {
             let failures = snapshot.predicates[index]
                 .operational_failure_count
@@ -345,6 +449,23 @@ fn apply_observation(
                     observed_at,
                     origin,
                     status,
+                    Some(match kind {
+                        crate::nexus_http_client::NexusOperationalError::Redirect => {
+                            GraphOperationalErrorCategory::Redirect
+                        }
+                        crate::nexus_http_client::NexusOperationalError::RateLimited => {
+                            GraphOperationalErrorCategory::RateLimited
+                        }
+                        crate::nexus_http_client::NexusOperationalError::NonSuccess => {
+                            GraphOperationalErrorCategory::NonSuccess
+                        }
+                        crate::nexus_http_client::NexusOperationalError::Timeout => {
+                            GraphOperationalErrorCategory::Timeout
+                        }
+                        crate::nexus_http_client::NexusOperationalError::Transport => {
+                            GraphOperationalErrorCategory::Transport
+                        }
+                    }),
                     Some(next_due),
                     failures,
                 )
@@ -403,11 +524,15 @@ mod tests {
         BundleId, CreatorPubky, LockHash, LockId, LockServerPubky, PubkyLockResource, TaskId,
     };
     use locks_core::lock_policy::{GraphParticipantV2, GraphPolicyV2, GraphPredicateV2};
+    use locks_core::verification::{VerifiedProofBundle, VerifiedProofBundleV2};
+    use locks_service::application::errors::ApplicationError;
     use locks_service::application::models::{
         GraphTaskRecord, GraphTaskSnapshotV1, VerificationTaskStatus,
     };
-    use locks_service::application::ports::GraphTaskRepository;
-    use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
+    use locks_service::application::ports::{EntitlementRepository, GraphTaskRepository};
+    use locks_service::infrastructure::memory::{
+        entitlements::InMemoryEntitlementRepository, graph_tasks::InMemoryGraphTaskRepository,
+    };
     use pubky_common::crypto::Keypair;
     use time::macros::datetime;
     use tokio::sync::Semaphore;
@@ -470,6 +595,70 @@ mod tests {
         ) -> TimedNexusObservation {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.responses.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    struct AmbiguousOnceEntitlements {
+        inner: Arc<InMemoryEntitlementRepository>,
+        fail_after_first_write: std::sync::atomic::AtomicBool,
+        insert_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EntitlementRepository for AmbiguousOnceEntitlements {
+        async fn insert_verified_proof_bundle(
+            &self,
+            payload: VerifiedProofBundle,
+        ) -> Result<(), ApplicationError> {
+            self.inner.insert_verified_proof_bundle(payload).await
+        }
+
+        async fn get_verified_proof_bundle(
+            &self,
+            creator: &CreatorPubky,
+            bundle_id: &BundleId,
+        ) -> Result<Option<VerifiedProofBundle>, ApplicationError> {
+            self.inner
+                .get_verified_proof_bundle(creator, bundle_id)
+                .await
+        }
+
+        async fn delete_verified_proof_bundle(
+            &self,
+            creator: &CreatorPubky,
+            bundle_id: &BundleId,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .delete_verified_proof_bundle(creator, bundle_id)
+                .await
+        }
+
+        async fn insert_verified_proof_bundle_v2(
+            &self,
+            payload: VerifiedProofBundleV2,
+        ) -> Result<(), ApplicationError> {
+            self.insert_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.insert_verified_proof_bundle_v2(payload).await?;
+            if self
+                .fail_after_first_write
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ApplicationError::Storage {
+                    message: "ambiguous publication result".to_owned(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn get_verified_proof_bundle_v2(
+            &self,
+            creator: &CreatorPubky,
+            bundle_id: &BundleId,
+        ) -> Result<Option<VerifiedProofBundleV2>, ApplicationError> {
+            self.inner
+                .get_verified_proof_bundle_v2(creator, bundle_id)
+                .await
         }
     }
 
@@ -570,6 +759,7 @@ mod tests {
     #[tokio::test]
     async fn false_repolls_then_true_is_sticky_and_persisted() {
         let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        let entitlements = Arc::new(InMemoryEntitlementRepository::new());
         repository.insert_graph_task(task()).await.unwrap();
         let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let verifier = Arc::new(FakeNexus {
@@ -595,6 +785,7 @@ mod tests {
         });
         let worker = GraphVerificationWorker::new(
             repository.clone(),
+            entitlements.clone(),
             verifier.clone(),
             clock.clone(),
             Arc::new(FixedJitter),
@@ -620,11 +811,97 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.snapshot.as_v1().root, GraphRootState::Satisfied);
+        assert_eq!(stored.status, VerificationTaskStatus::Completed);
+        let published = entitlements
+            .get_verified_proof_bundle_v2(&creator(), &bundle_id())
+            .await
+            .unwrap()
+            .expect("graph entitlement published");
+        assert_eq!(
+            published.satisfied_by,
+            vec![locks_core::verification::SatisfiedByV2::Graph]
+        );
         let evidence = stored.snapshot.as_v1().predicates[0]
             .first_true_observation
             .as_ref()
             .unwrap();
         assert_eq!(evidence.origin.as_deref(), Some("https://nexus.example"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_publication_is_reconciled_after_lease_reclaim_without_republishing() {
+        let repository = Arc::new(InMemoryGraphTaskRepository::new());
+        repository.insert_graph_task(task()).await.unwrap();
+        let published = Arc::new(InMemoryEntitlementRepository::new());
+        let entitlements = Arc::new(AmbiguousOnceEntitlements {
+            inner: published.clone(),
+            fail_after_first_write: std::sync::atomic::AtomicBool::new(true),
+            insert_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let verifier = Arc::new(FakeNexus {
+            responses: Mutex::new(VecDeque::from([TimedNexusObservation {
+                observation: NexusObservation::Valid {
+                    value: true,
+                    origin: "https://nexus.example".to_owned(),
+                    status: 200,
+                },
+                observed_at: NOW,
+            }])),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = GraphVerificationWorker::new(
+            repository.clone(),
+            entitlements.clone(),
+            verifier.clone(),
+            clock.clone(),
+            Arc::new(FixedJitter),
+            "first-worker".to_owned(),
+            time::Duration::seconds(30),
+        );
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            GraphWorkerTick::PublicationDeferred(task().task_id)
+        );
+        let publishing = repository
+            .get_graph_task_by_handle(&creator(), &bundle_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publishing.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+
+        clock.set(NOW + time::Duration::seconds(30));
+        assert!(matches!(
+            worker.run_once().await.unwrap(),
+            GraphWorkerTick::Terminal(_)
+        ));
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            entitlements
+                .insert_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            repository
+                .get_graph_task_by_handle(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            VerificationTaskStatus::Completed
+        );
+        assert!(
+            published
+                .get_verified_proof_bundle_v2(&creator(), &bundle_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -634,6 +911,7 @@ mod tests {
         let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let worker = GraphVerificationWorker::new(
             repository.clone(),
+            Arc::new(InMemoryEntitlementRepository::new()),
             Arc::new(CompletingNexus {
                 clock: clock.clone(),
             }),
@@ -674,6 +952,7 @@ mod tests {
         });
         let worker = GraphVerificationWorker::new(
             repository,
+            Arc::new(InMemoryEntitlementRepository::new()),
             verifier.clone(),
             clock,
             Arc::new(FixedJitter),
@@ -703,6 +982,7 @@ mod tests {
         });
         let worker = Arc::new(GraphVerificationWorker::new(
             repository,
+            Arc::new(InMemoryEntitlementRepository::new()),
             verifier.clone(),
             Arc::new(MutableClock(Mutex::new(NOW))),
             Arc::new(FixedJitter),
@@ -766,6 +1046,7 @@ mod tests {
         });
         let graph = GraphVerificationWorker::new(
             state.graph_task_claimer().clone(),
+            Arc::new(InMemoryEntitlementRepository::new()),
             nexus,
             clock,
             Arc::new(FixedJitter),
@@ -819,6 +1100,9 @@ mod tests {
             ),
             evaluator_revision: 0,
             status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
         }
     }
 
@@ -853,6 +1137,9 @@ mod tests {
             ),
             evaluator_revision: 0,
             status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
         }
     }
 

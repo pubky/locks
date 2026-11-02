@@ -35,6 +35,9 @@ pub fn graph_task() -> GraphTaskRecord {
         ),
         evaluator_revision: 0,
         status: VerificationTaskStatus::Pending,
+        entitlement_to_publish: None,
+        entitlement_publication_token: None,
+        completed_at: None,
     }
 }
 

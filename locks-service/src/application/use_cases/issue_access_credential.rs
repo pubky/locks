@@ -100,12 +100,9 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
         )
         .await?;
 
-        let requested_ttl_seconds = self.policy.validate_requested_ttl_seconds(
-            valid_entitlement
-                .content_lock
-                .access_policy
-                .requested_credential_ttl_seconds,
-        )?;
+        let requested_ttl_seconds = self
+            .policy
+            .validate_requested_ttl_seconds(valid_entitlement.requested_credential_ttl_seconds())?;
         let expires_at = now + Duration::seconds(requested_ttl_seconds as i64);
         let credential = self
             .credential_generator

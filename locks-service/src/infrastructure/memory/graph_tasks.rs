@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, LockId, TaskId};
+use locks_core::verification::{
+    SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
+};
 use time::OffsetDateTime;
 use tokio::sync::OwnedMutexGuard;
 
@@ -264,10 +267,12 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         let fence = self.deletion_fence.records.read().await;
         let mut records = self.deletion_fence.graph_records.write().await;
         let Some(stored) = records.iter_mut().find(|stored| {
-            matches!(
+            ((matches!(
                 stored.task.status,
                 VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
-            ) && stored.task.snapshot.as_v1().root == GraphRootState::Pending
+            ) && stored.task.snapshot.as_v1().root == GraphRootState::Pending)
+                || (stored.task.status == VerificationTaskStatus::PublishingEntitlement
+                    && stored.task.snapshot.as_v1().root == GraphRootState::Satisfied))
                 && stored.next_attempt_at.is_none_or(|due| due <= now)
                 && stored
                     .claim_expires_at
@@ -278,7 +283,9 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         }) else {
             return Ok(None);
         };
-        stored.task.status = VerificationTaskStatus::InProgress;
+        if stored.task.status != VerificationTaskStatus::PublishingEntitlement {
+            stored.task.status = VerificationTaskStatus::InProgress;
+        }
         stored.claimed_by = Some(worker_id.to_owned());
         let claim_token = uuid::Uuid::new_v4();
         stored.claim_token = Some(claim_token);
@@ -299,7 +306,8 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
-        let fence = self.deletion_fence.records.read().await;
+        let mut fence = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.deletion_fence.graph_records.write().await;
         let Some(stored) = records.iter_mut().find(|stored| {
             stored.task.task_id == *task_id
@@ -339,10 +347,48 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
                 .ok_or_else(|| ApplicationError::Storage {
                     message: "graph evaluator revision overflow".to_owned(),
                 })?;
-        let terminal = snapshot.as_v1().root != GraphRootState::Pending;
+        let root = snapshot.as_v1().root;
+        let terminal = root != GraphRootState::Pending;
         stored.task.snapshot = snapshot;
         stored.task.evaluator_revision = next_revision;
-        if terminal {
+        match root {
+            GraphRootState::Pending => {}
+            GraphRootState::Satisfied => {
+                let identity = stored.task.snapshot.as_v1();
+                let publication = VerifiedProofBundleV2 {
+                    version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+                    creator: identity.creator.clone(),
+                    reader: identity.reader.clone(),
+                    bundle_id: identity.bundle_id.clone(),
+                    pubky_lock_resource: identity.pubky_lock_resource.clone(),
+                    verified_at: now,
+                    satisfied_by: vec![SatisfiedByV2::Graph],
+                };
+                publication
+                    .validate()
+                    .map_err(|error| ApplicationError::Storage {
+                        message: format!("invalid graph entitlement publication: {error}"),
+                    })?;
+                let publication_token = uuid::Uuid::new_v4();
+                stored.task.status = VerificationTaskStatus::PublishingEntitlement;
+                stored.task.entitlement_to_publish = Some(publication);
+                stored.task.entitlement_publication_token = Some(publication_token);
+                current_statuses.insert(*task_id, VerificationTaskStatus::PublishingEntitlement);
+                if let Some(record) = fence.get_mut(task_id) {
+                    record.status = VerificationTaskStatus::PublishingEntitlement;
+                    record.entitlement_publication_claim_token = Some(publication_token);
+                }
+            }
+            GraphRootState::Expired(_) | GraphRootState::FailedInvalidResponse => {
+                stored.task.status = root.terminal_status().expect("terminal root has status");
+                stored.task.completed_at = Some(now);
+                current_statuses.insert(*task_id, stored.task.status);
+                if let Some(record) = fence.get_mut(task_id) {
+                    record.status = stored.task.status;
+                }
+            }
+        }
+        if terminal && root != GraphRootState::Satisfied {
             stored.claimed_by = None;
             stored.claim_token = None;
             stored.claim_expires_at = None;
@@ -412,12 +458,63 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
         stored.next_attempt_at = Some(next_attempt_at);
         Ok(Some(stored.task.clone()))
     }
+
+    async fn complete_claimed_graph_publication(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        let mut fence = self.deletion_fence.records.write().await;
+        let mut current_statuses = self.deletion_fence.current_statuses.write().await;
+        let mut records = self.deletion_fence.graph_records.write().await;
+        let Some(stored) = records.iter_mut().find(|stored| {
+            stored.task.task_id == *task_id
+                && stored.task.status == VerificationTaskStatus::PublishingEntitlement
+                && stored.task.evaluator_revision == expected_revision
+                && stored.task.entitlement_to_publish.is_some()
+                && stored.task.entitlement_publication_token == Some(publication_token)
+                && stored.claimed_by.as_deref() == Some(worker_id)
+                && stored.claim_token.as_ref() == Some(claim_token)
+                && stored
+                    .claim_expires_at
+                    .is_some_and(|claim_expires_at| claim_expires_at > now)
+                && fence.get(task_id).is_some_and(|record| {
+                    record.deletion_job_id.is_none()
+                        && record.entitlement_publication_claim_token == Some(publication_token)
+                })
+        }) else {
+            return Ok(None);
+        };
+        stored.task.status = VerificationTaskStatus::Completed;
+        stored.task.completed_at = Some(now);
+        stored.task.entitlement_publication_token = None;
+        stored.claimed_by = None;
+        stored.claim_token = None;
+        stored.claim_expires_at = None;
+        stored.next_attempt_at = None;
+        current_statuses.insert(*task_id, VerificationTaskStatus::Completed);
+        if let Some(record) = fence.get_mut(task_id) {
+            record.status = VerificationTaskStatus::Completed;
+            record.entitlement_publication_claim_token = None;
+        }
+        Ok(Some(stored.task.clone()))
+    }
 }
 
 fn validate_new_task(task: &GraphTaskRecord) -> Result<(), ApplicationError> {
-    if task.status != VerificationTaskStatus::Pending || task.evaluator_revision != 0 {
+    if task.status != VerificationTaskStatus::Pending
+        || task.evaluator_revision != 0
+        || task.entitlement_to_publish.is_some()
+        || task.entitlement_publication_token.is_some()
+        || task.completed_at.is_some()
+    {
         return Err(ApplicationError::InvalidVerificationTaskState {
-            message: "new graph task must be pending at evaluator revision zero".to_owned(),
+            message: "new graph task must be pristine and pending at evaluator revision zero"
+                .to_owned(),
         });
     }
     task.snapshot

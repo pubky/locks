@@ -156,6 +156,9 @@ pub enum VerificationTerminalReason {
     ProposalExpired,
     PaymentDeadlineExpired,
     ContentLockDeleted,
+    GraphConditionNotObservedByDeadline,
+    VerificationUnavailableByDeadline,
+    InvalidVerifierResponse,
 }
 
 impl VerificationTerminalReason {
@@ -166,6 +169,9 @@ impl VerificationTerminalReason {
             Self::ProposalExpired => "proposal_expired",
             Self::PaymentDeadlineExpired => "payment_deadline_expired",
             Self::ContentLockDeleted => "content_lock_deleted",
+            Self::GraphConditionNotObservedByDeadline => "graph_condition_not_observed_by_deadline",
+            Self::VerificationUnavailableByDeadline => "verification_unavailable_by_deadline",
+            Self::InvalidVerifierResponse => "invalid_verifier_response",
         }
     }
 
@@ -176,6 +182,11 @@ impl VerificationTerminalReason {
             "proposal_expired" => Some(Self::ProposalExpired),
             "payment_deadline_expired" => Some(Self::PaymentDeadlineExpired),
             "content_lock_deleted" => Some(Self::ContentLockDeleted),
+            "graph_condition_not_observed_by_deadline" => {
+                Some(Self::GraphConditionNotObservedByDeadline)
+            }
+            "verification_unavailable_by_deadline" => Some(Self::VerificationUnavailableByDeadline),
+            "invalid_verifier_response" => Some(Self::InvalidVerifierResponse),
             _ => None,
         }
     }
@@ -445,4 +456,33 @@ pub struct CriterionVerificationRequest {
     pub verified_by: LockServerPubky,
     /// Timestamp to place on successful criterion evidence.
     pub verified_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod graph_terminal_reason_tests {
+    use super::VerificationTerminalReason;
+
+    #[test]
+    fn graph_terminal_reasons_have_closed_storage_and_public_strings() {
+        for (value, expected) in [
+            (
+                "graph_condition_not_observed_by_deadline",
+                VerificationTerminalReason::GraphConditionNotObservedByDeadline,
+            ),
+            (
+                "verification_unavailable_by_deadline",
+                VerificationTerminalReason::VerificationUnavailableByDeadline,
+            ),
+            (
+                "invalid_verifier_response",
+                VerificationTerminalReason::InvalidVerifierResponse,
+            ),
+        ] {
+            assert_eq!(
+                VerificationTerminalReason::from_storage_value(value),
+                Some(expected)
+            );
+            assert_eq!(expected.as_str(), value);
+        }
+    }
 }

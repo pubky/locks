@@ -54,4 +54,18 @@ pub trait GraphTaskClaimer: Send + Sync {
         snapshot: GraphTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
+
+    /// Mark exact persisted graph entitlement published after equivalent readback.
+    ///
+    /// Claim token, evaluator revision, stable publication token, deletion cutoff,
+    /// and unexpired lease are checked atomically.
+    async fn complete_claimed_graph_publication(
+        &self,
+        task_id: &TaskId,
+        worker_id: &str,
+        claim_token: &uuid::Uuid,
+        now: time::OffsetDateTime,
+        expected_revision: u64,
+        publication_token: uuid::Uuid,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
 }

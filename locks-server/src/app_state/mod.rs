@@ -1101,6 +1101,16 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub fn with_in_memory_graph_tasks(
+        mut self,
+        graph_tasks: Arc<InMemoryGraphTaskRepository>,
+    ) -> Self {
+        self.graph_tasks = graph_tasks.clone();
+        self.graph_task_claimer = graph_tasks;
+        self
+    }
+
+    #[cfg(test)]
     pub fn with_access_credentials(
         mut self,
         access_credentials: Arc<dyn AccessCredentialStore>,

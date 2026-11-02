@@ -112,7 +112,6 @@ impl<'a> ProxyReadGuardedResourceUseCase<'a> {
             OrdinaryCredentialLookupResult::OrdinaryCurrent => {
                 let entitlement = ordinary_validation?;
                 let guarded_resource = entitlement
-                    .content_lock
                     .resource_for_path(&request.path)
                     .ok_or(ApplicationError::GuardedResourceUnavailable)?;
                 let guarded_record = self

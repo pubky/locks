@@ -339,6 +339,9 @@ async fn successful_exchange_then_accept_failure_restarts_after_reconstruction()
         ),
         evaluator_revision: 0,
         status: VerificationTaskStatus::Pending,
+        entitlement_to_publish: None,
+        entitlement_publication_token: None,
+        completed_at: None,
     };
     graph.insert_graph_task(other_task).await.unwrap();
 

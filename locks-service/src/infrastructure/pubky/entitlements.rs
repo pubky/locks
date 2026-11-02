@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::verified_proof_bundle_path;
-use locks_core::verification::VerifiedProofBundle;
+use locks_core::verification::{
+    VerifiedProofBundle, VerifiedProofBundlePayload, VerifiedProofBundleV2,
+};
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::EntitlementRepository;
@@ -77,6 +79,25 @@ where
             .transpose()
     }
 
+    async fn get_verified_proof_bundle_payload(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<VerifiedProofBundlePayload>, ApplicationError> {
+        let path = verified_proof_bundle_path(bundle_id);
+        self.client
+            .get_json_value_as_creator(creator, &path)
+            .await?
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
+                    message: format!(
+                        "failed to deserialize verified proof bundle payload from Pubky storage: {error}"
+                    ),
+                })
+            })
+            .transpose()
+    }
+
     async fn delete_verified_proof_bundle(
         &self,
         creator: &CreatorPubky,
@@ -84,6 +105,61 @@ where
     ) -> Result<(), ApplicationError> {
         let path = verified_proof_bundle_path(bundle_id);
         self.client.delete_as_creator(creator, &path).await
+    }
+
+    async fn insert_verified_proof_bundle_v2(
+        &self,
+        verified_proof_bundle: VerifiedProofBundleV2,
+    ) -> Result<(), ApplicationError> {
+        verified_proof_bundle
+            .validate()
+            .map_err(|error| ApplicationError::Storage {
+                message: error.to_string(),
+            })?;
+        let creator = verified_proof_bundle.creator.clone();
+        let path = verified_proof_bundle_path(&verified_proof_bundle.bundle_id);
+        let body = serde_json::to_value(&verified_proof_bundle).map_err(|error| {
+            ApplicationError::Storage {
+                message: format!(
+                    "failed to serialize v2 verified proof bundle for Pubky storage: {error}"
+                ),
+            }
+        })?;
+        if let Some(existing) = self
+            .client
+            .get_json_value_as_creator(&creator, &path)
+            .await?
+        {
+            return if existing == body {
+                Ok(())
+            } else {
+                Err(ApplicationError::DuplicateRecord {
+                    record: "verified_proof_bundle_v2",
+                })
+            };
+        }
+        self.client
+            .put_json_value_as_creator(&creator, &path, body)
+            .await
+    }
+
+    async fn get_verified_proof_bundle_v2(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<VerifiedProofBundleV2>, ApplicationError> {
+        let path = verified_proof_bundle_path(bundle_id);
+        self.client
+            .get_json_value_as_creator(creator, &path)
+            .await?
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
+                    message: format!(
+                        "failed to deserialize v2 verified proof bundle from Pubky storage: {error}"
+                    ),
+                })
+            })
+            .transpose()
     }
 }
 
