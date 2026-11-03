@@ -236,6 +236,8 @@ const connectUrl = await locks.createConnectUrl(new ConnectUrlOptions(returnTo, 
 window.location.href = connectUrl;
 ```
 
+When the app already knows the signed-in creator, pass their pubky as the optional third argument, `new ConnectUrlOptions(returnTo, state, creatorPubky)`. Pubky Ring then opens that key instead of asking which one to use, and the Lock Server refuses an approval from any other key.
+
 Callback page:
 
 ```ts

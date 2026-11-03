@@ -1,3 +1,4 @@
+use locks_core::ids::CreatorPubky;
 use time::{Duration, OffsetDateTime};
 
 use crate::application::errors::ApplicationError;
@@ -20,6 +21,9 @@ pub struct StartCreatorConnectFlowRequest {
     pub return_to: String,
     /// Opaque frontend state that must later match session-code exchange state.
     pub state: String,
+    /// Creator the embedding app expects to approve, when it already knows them. Grant connect
+    /// links name it so the signer opens that key; legacy cookie links cannot carry it.
+    pub expected_creator: Option<CreatorPubky>,
 }
 
 /// Secret-bearing response for pubky.app to render as QR/deeplink.
@@ -55,6 +59,7 @@ pub async fn start_creator_connect_flow(
                 .start_grant_creator_connect_flow(
                     &requested_scopes,
                     &GrantPopKeyId::for_connect_flow(&flow_id),
+                    request.expected_creator.as_ref(),
                 )
                 .await?
         }
@@ -110,7 +115,10 @@ fn validate_start_request(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use async_trait::async_trait;
+    use locks_core::ids::CreatorPubky;
     use time::{Duration, OffsetDateTime};
 
     use super::{StartCreatorConnectFlowRequest, start_creator_connect_flow};
@@ -139,6 +147,7 @@ mod tests {
             StartCreatorConnectFlowRequest {
                 return_to: "https://pubky.app/locks/connected".to_owned(),
                 state: "opaque-state".to_owned(),
+                expected_creator: None,
             },
         )
         .await
@@ -152,6 +161,37 @@ mod tests {
         assert_eq!(
             store.record().unwrap().authorization_url,
             response.authorization_url
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_connect_names_the_expected_creator() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let creator =
+            CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap();
+        let grant = RecordingGrantConnectFlowClient::default();
+
+        for expected_creator in [Some(creator.clone()), None] {
+            start_creator_connect_flow(
+                &RecordingFlowStore::default(),
+                &PanicLegacyConnectFlowClient,
+                Some(&grant),
+                &FixedFlowIdGenerator,
+                &FixedClock(now),
+                StartCreatorConnectFlowRequest {
+                    return_to: "https://pubky.app/locks/connected".to_owned(),
+                    state: "opaque-state".to_owned(),
+                    expected_creator,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            *grant.expected_creators.lock().unwrap(),
+            vec![Some(creator), None]
         );
     }
 
@@ -172,6 +212,7 @@ mod tests {
             StartCreatorConnectFlowRequest {
                 return_to: "https://pubky.app/locks/connected".to_owned(),
                 state: "opaque-state".to_owned(),
+                expected_creator: None,
             },
         )
         .await
@@ -215,10 +256,12 @@ mod tests {
             StartCreatorConnectFlowRequest {
                 return_to: "".to_owned(),
                 state: "state".to_owned(),
+                expected_creator: None,
             },
             StartCreatorConnectFlowRequest {
                 return_to: "https://pubky.app/locks/connected".to_owned(),
                 state: "".to_owned(),
+                expected_creator: None,
             },
         ] {
             let error =
@@ -327,6 +370,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingGrantConnectFlowClient {
         started: std::sync::Mutex<Vec<GrantPopKeyId>>,
+        expected_creators: std::sync::Mutex<Vec<Option<CreatorPubky>>>,
     }
 
     #[async_trait]
@@ -335,8 +379,13 @@ mod tests {
             &self,
             _requested_scopes: &[String],
             pop_key_id: &GrantPopKeyId,
+            expected_creator: Option<&CreatorPubky>,
         ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
             self.started.lock().unwrap().push(pop_key_id.clone());
+            self.expected_creators
+                .lock()
+                .unwrap()
+                .push(expected_creator.cloned());
             Ok(CreatorConnectAuthorizationUrl::new(
                 "pubkyauth://signin_grant?secret=grant",
             ))
