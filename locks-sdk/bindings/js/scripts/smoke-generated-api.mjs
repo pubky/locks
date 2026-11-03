@@ -61,6 +61,8 @@ const requiredSnippets = [
   'static generate(): BundleId;',
   'toString(): string;',
   'submitProofBundle(submitted_proof_bundle: any): Promise<any>;',
+  'pollFoldedAuth(state: string): Promise<any>;',
+  'lookupGraphVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
   'lookupVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
   'lookupPaykitConnectionState(options: VerificationTaskHandleOptions): Promise<any>;',
   'issueAccessCredential(options: VerificationTaskHandleOptions): Promise<any>;',
@@ -80,6 +82,7 @@ const requiredSnippets = [
   'deleteGuardedResource(options: DeleteGuardedResourceOptions): Promise<void>;',
   'setLockServicePointer(options: SetLockServicePointerOptions): Promise<void>;',
   'paykitSetupStatus(asset: string): Promise<any>;',
+  'verificationEvidence(bundle_id: string): Promise<any>;',
   'export class CreateContentLockRequestBuilder',
   'primaryResource(resource: any): CreateContentLockRequestBuilder;',
   'secondaryResource(resource: any): CreateContentLockRequestBuilder;',
@@ -102,6 +105,21 @@ for (const snippet of requiredSnippets) {
 
 const sdk = await import(pathToFileURL(jsPath));
 await sdk.default(await readFile(wasmPath));
+
+for (const forbidden of ['localStorage', 'sessionStorage', 'indexedDB', 'CacheStorage']) {
+  if (readFileSync(jsPath, 'utf8').includes(forbidden)) {
+    throw new Error(`generated browser package must not persist graph secrets via ${forbidden}`);
+  }
+}
+
+for (const method of ['pollFoldedAuth', 'lookupGraphVerificationTask']) {
+  if (typeof sdk.Viewer.prototype[method] !== 'function') {
+    throw new Error(`generated Viewer missing ${method}`);
+  }
+}
+if (typeof sdk.Creator.prototype.verificationEvidence !== 'function') {
+  throw new Error('generated Creator missing verificationEvidence');
+}
 
 if (typeof sdk.Creator.prototype.paykitSetupStatus !== 'function') {
   throw new Error('generated Creator missing paykitSetupStatus');

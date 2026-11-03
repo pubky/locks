@@ -8,7 +8,7 @@ use crate::session::{BrowserPkarrResolver, fetch_authorized_empty, fetch_authori
 #[cfg(any(test, target_arch = "wasm32"))]
 use crate::session::{JsAuthorizedRequestPlan, JsRequestBody};
 #[cfg(any(test, target_arch = "wasm32"))]
-use locks_core::ids::{LockId, LockServerPubky};
+use locks_core::ids::{BundleId, LockId, LockServerPubky};
 #[cfg(any(test, target_arch = "wasm32"))]
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
@@ -499,6 +499,31 @@ impl Creator {
         to_plain_js_value(&validated)
             .map_err(|_| crate::js_error::invalid_input("invalid paykit setup status response"))
     }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = verificationEvidence)]
+    pub async fn verification_evidence(
+        &self,
+        bundle_id: String,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let request = self
+            .build_verification_evidence_request(&bundle_id)
+            .map_err(crate::js_error::invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let value = fetch_authorized_json(&request).await?;
+        let value = serde_wasm_bindgen::from_value(value).map_err(|err| {
+            crate::js_error::invalid_input(format!("invalid verification evidence: {err}"))
+        })?;
+        let validated = validate_verification_evidence_response_for_tests(value)
+            .map_err(crate::js_error::invalid_input)?;
+        to_plain_js_value(&validated).map_err(|err| {
+            crate::js_error::invalid_input(format!("invalid verification evidence: {err:?}"))
+        })
+    }
 }
 
 impl Creator {
@@ -615,6 +640,21 @@ impl Creator {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_verification_evidence_request(
+        &self,
+        bundle_id: &str,
+    ) -> Result<JsAuthorizedRequestPlan, String> {
+        let bundle_id =
+            BundleId::from_str(bundle_id).map_err(|err| format!("invalid bundle id: {err}"))?;
+        Ok(self.authorized_request_plan(
+            self.session
+                .inner()
+                .creator()
+                .verification_evidence(bundle_id),
+        ))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn create_build_content_lock_request(
         &self,
@@ -655,6 +695,16 @@ fn validate_paykit_setup_status_response_for_tests(
     let status = locks_sdk::CreatorLocks::parse_paykit_setup_status_response(value)
         .map_err(|_| "invalid paykit setup status response".to_owned())?;
     serde_json::to_value(status).map_err(|_| "invalid paykit setup status response".to_owned())
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg_attr(test, allow(dead_code))]
+fn validate_verification_evidence_response_for_tests(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    locks_sdk::CreatorLocks::parse_verification_evidence_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1019,6 +1069,87 @@ mod tests {
             serde_json::json!({}),
         ] {
             assert!(validate_paykit_setup_status_response_for_tests(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn creator_verification_evidence_request_keeps_bundle_secret_in_body() {
+        let creator = Creator::new(test_session());
+        let request = creator
+            .build_verification_evidence_request("000G40R40M30E209185GR38E1W")
+            .unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/creator/verification-evidence");
+        assert_eq!(request.authorization, "Bearer frontend-session-secret");
+        assert_eq!(
+            request.body,
+            JsRequestBody::Json(serde_json::json!({
+                "bundle_id":"000G40R40M30E209185GR38E1W"
+            }))
+        );
+        assert!(!request.url.as_str().contains("000G40R40M30E209185GR38E1W"));
+    }
+
+    #[test]
+    fn creator_graph_evidence_js_boundary_rejects_invalid_satisfaction_and_reasons() {
+        const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+        const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+        let evidence = |status: &str, reason: Option<&str>, satisfied_by: &[&str]| {
+            let mut value = serde_json::json!({
+                "creator": CREATOR,
+                "reader": READER,
+                "bundle_id": "000G40R40M30E209185GR38E1W",
+                "pubky_lock_resource": LOCK_RESOURCE,
+                "mode": "graph",
+                "status": status,
+                "submitted_at": "2026-11-03T12:00:00Z",
+                "deadline_at": "2026-11-03T12:10:00Z",
+                "satisfied_by": satisfied_by,
+                "graph": {"predicates": [{
+                    "index": 0,
+                    "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+                    "state": "pending"
+                }]}
+            });
+            if matches!(status, "completed" | "failed" | "expired") {
+                value["completed_at"] = serde_json::json!("2026-11-03T12:01:00Z");
+            }
+            if let Some(reason) = reason {
+                value["terminal_reason"] = serde_json::json!(reason);
+            }
+            value
+        };
+
+        for valid in [
+            evidence("publishing_entitlement", None, &["graph"]),
+            evidence("completed", None, &["graph"]),
+            evidence(
+                "expired",
+                Some("graph_condition_not_observed_by_deadline"),
+                &[],
+            ),
+            evidence("failed", Some("verification_unavailable_by_deadline"), &[]),
+            evidence("failed", Some("invalid_verifier_response"), &[]),
+        ] {
+            assert!(validate_verification_evidence_response_for_tests(valid).is_ok());
+        }
+        for invalid in [
+            evidence("publishing_entitlement", None, &[]),
+            evidence("completed", None, &[]),
+            evidence("completed", None, &["payment"]),
+            evidence("expired", Some("verification_unavailable_by_deadline"), &[]),
+            evidence(
+                "failed",
+                Some("graph_condition_not_observed_by_deadline"),
+                &[],
+            ),
+            evidence("failed", Some("payment_request_canceled"), &[]),
+        ] {
+            assert!(
+                validate_verification_evidence_response_for_tests(invalid.clone()).is_err(),
+                "accepted impossible JS graph evidence: {invalid}"
+            );
         }
     }
 
