@@ -161,10 +161,18 @@ body.embed{background:#1d1d20}
 .desc{margin:0;font-size:16px;line-height:24px;letter-spacing:-0.5px;color:#d4d4db}
 .desc strong{color:#fff;font-weight:700}
 .scan{display:flex;flex-direction:column;align-items:center;gap:24px}
-.qr{position:relative;display:block;width:192px;height:192px;padding:10px;background:#fff;border-radius:8px;overflow:hidden}
+.qr{position:relative;display:block;width:192px;height:192px;padding:10px;border:0;background:#fff;border-radius:8px;overflow:hidden;font:inherit;cursor:pointer}
+/* Inside the QR: pubky.app sizes its frame to the QR's 192px, which cuts off a ring drawn outside. */
+.qr:focus-visible{outline-offset:-3px}
 .qr>svg{width:172px;height:172px;display:block}
+.qr>svg,.qr-badge{transition:opacity .15s}.qr:hover>svg,.qr:hover>.qr-badge{opacity:.9}.qr:active>svg,.qr:active>.qr-badge{opacity:.8}
 .qr-badge{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:39px;height:39px;display:flex;align-items:center;justify-content:center;border-radius:999px;background:#05050a}
 .qr-badge svg{width:14.37px;height:21.94px}
+/* Screen readers skip a button's content and can miss a live region that appears with its text, so
+   the copy status sits beside the QR button and an empty one is transparent, not display:none. */
+.qr-wrap{position:relative}
+.qr-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:6px 12px;border-radius:9999px;background:#303034;color:#d4d4db;font-weight:700;font-size:14px;line-height:20px;white-space:nowrap;pointer-events:none}
+.qr-status:empty{opacity:0}
 .signer-logos{display:flex;align-items:center;gap:14px}
 .ring-logo{width:101px;height:22px}
 .bitkit-logo{width:75px;height:22px}
@@ -181,7 +189,7 @@ body.embed{background:#1d1d20}
 .desc-use,.authorize-btn{display:none}
 .authorize-btn{align-self:stretch;align-items:center;justify-content:center;gap:8px;height:60px;padding:20px 32px;border:0;border-radius:9999px;background:#303034;box-shadow:0 1px 2px rgba(5,5,10,.2);color:#d4d4db;font:inherit;font-weight:700;font-size:14px;line-height:20px;text-decoration:none}
 .authorize-btn svg{display:block;width:20px;height:20px}
-@media (pointer:coarse){.scan{gap:12px}.qr,.signer-logos,.desc-scan{display:none}.desc-use{display:inline}.authorize-btn{display:flex}}
+@media (pointer:coarse){.scan{gap:12px}.qr-wrap,.signer-logos,.desc-scan{display:none}.desc-use{display:inline}.authorize-btn{display:flex}}
 /* Embedded, the parent modal draws the signer logos below this frame, so the shell's own copy would
    be a second one. */
 body.embed .signer-logos,body.embed .caption{display:none}
@@ -238,6 +246,27 @@ const SIGNER_LINKS_SCRIPT: &str = r#"<script>
     }
   </script>"#;
 
+/// A QR click copies its URL for a device that cannot scan the screen. Embedded, Chromium allows the
+/// write only when the embedder's iframe has `allow="clipboard-write"`.
+const QR_COPY_SCRIPT: &str = r#"<script>
+    {
+      const qr = document.querySelector(".qr");
+      const status = document.querySelector(".qr-status");
+      let timer;
+      qr.addEventListener("click", async () => {
+        try {
+          // No await before this call: Safari rejects the write once the click's activation is gone.
+          await navigator.clipboard.writeText(qr.dataset.url);
+          status.textContent = "Copied";
+        } catch (_e) {
+          status.textContent = "Could not copy";
+        }
+        clearTimeout(timer);
+        timer = setTimeout(() => { status.textContent = ""; }, 2000);
+      });
+    }
+  </script>"#;
+
 fn render_connect_shell_html(
     flow_id: &str,
     authorization_url: &str,
@@ -247,6 +276,7 @@ fn render_connect_shell_html(
     callback_state: &str,
 ) -> String {
     let escaped_flow_id = escape_html(flow_id);
+    let escaped_authorization_url = escape_html(authorization_url);
     let qr_svg = render_authorization_qr_svg(authorization_url);
     let badge_mark_svg = format!(
         r#"<svg viewBox="0 0 14.3656 21.9429" fill="none" aria-hidden="true">{PUBKY_MARK_PATH}</svg>"#
@@ -277,15 +307,18 @@ fn render_connect_shell_html(
         ),
         None => (String::new(), String::new(), ""),
     };
-    // Desktop: a plain (non-interactive) QR to scan from a separate device. Touch devices swap it for
-    // the deep-link buttons below — the same-device deep link lives only on those buttons, so the QR
-    // itself is not a link (per the team decision: desktop QR is scan-only).
+    // Desktop: a QR to scan from a separate device; a click copies its URL for a device that cannot
+    // scan. Touch devices swap it for the deep-link buttons below — the same-device deep link lives
+    // only on those buttons, so the QR itself is not a link (per the team decision).
     let scan = format!(
         r#"<div class="scan">
-      <span class="qr" data-testid="pubky-auth-qr">
-        {qr_svg}
-        <span class="qr-badge">{badge_mark_svg}</span>
-      </span>
+      <div class="qr-wrap">
+        <button type="button" class="qr" data-testid="pubky-auth-qr" data-url="{escaped_authorization_url}" aria-label="Copy authorization link">
+          {qr_svg}
+          <span class="qr-badge">{badge_mark_svg}</span>
+        </button>
+        <span class="qr-status" role="status"></span>
+      </div>
       <span class="signer-logos" aria-hidden="true">
         <span class="ring-logo">{RING_LOGO_SVG}</span>{bitkit_logo}
       </span>{ring_link}{bitkit_link}
@@ -311,6 +344,7 @@ fn render_connect_shell_html(
 <body class="embed">
   {scan}
   {SIGNER_LINKS_SCRIPT}
+  {QR_COPY_SCRIPT}
   {script}
 </body>
 </html>"#
@@ -331,6 +365,7 @@ fn render_connect_shell_html(
     </form>
   </main>
   {SIGNER_LINKS_SCRIPT}
+  {QR_COPY_SCRIPT}
 </body>
 </html>"#
         ),
