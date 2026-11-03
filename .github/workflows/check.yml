@@ -87,6 +87,12 @@ jobs:
       - name: Compose bootstrap regression
         run: ./scripts/test-compose-bootstrap.sh
 
+      - name: Graph Stage 1 deterministic Compose E2E and repeatability
+        run: |
+          cargo test -p locks-e2e --test graph_stage1_repository_contract
+          ./scripts/test-graph-stage1-compose.sh
+          ./scripts/test-graph-stage1-compose.sh
+
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

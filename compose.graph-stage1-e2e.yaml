@@ -1,0 +1,74 @@
+name: locks-graph-stage1-e2e
+
+x-graph-stage1-contract: graph-e2e-contract-v1
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    environment:
+      POSTGRES_DB: locks_graph_e2e
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d locks_graph_e2e"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  fake-graph-dependencies:
+    image: python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
+    working_dir: /workspace
+    volumes:
+      - ./scripts/graph-e2e-fake-dependencies.py:/workspace/fake-dependencies.py:ro
+    command: ["python", "/workspace/fake-dependencies.py"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=1)",
+        ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  graph-e2e:
+    image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
+    working_dir: /workspace
+    network_mode: service:fake-graph-dependencies
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fake-graph-dependencies:
+        condition: service_healthy
+    environment:
+      TEST_DATABASE_URL: postgres://postgres:postgres@postgres:5432/locks_graph_e2e
+      GRAPH_FAKE_DEPENDENCY_URL: http://127.0.0.1:18080
+      GRAPH_FAKE_NEXUS_URL: http://127.0.0.1:18081
+      CARGO_HOME: /usr/local/cargo
+      CARGO_TARGET_DIR: /cargo-target
+      RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace:ro
+      - graph-cargo-registry:/usr/local/cargo/registry
+      - graph-cargo-target:/cargo-target
+    command:
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "locks-e2e",
+        "--test",
+        "graph_stage1_compose",
+        "--",
+        "--nocapture",
+      ]
+
+volumes:
+  graph-cargo-registry:
+  graph-cargo-target:

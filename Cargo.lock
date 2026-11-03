@@ -1839,6 +1839,7 @@ dependencies = [
  "locks-server",
  "locks-service",
  "pubky-common",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tempfile",
