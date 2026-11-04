@@ -89,7 +89,7 @@ const requiredSnippets = [
   'export class DeleteGuardedResourceOptions',
   'constructor(path: string);',
   'export class ConnectUrlOptions',
-  'constructor(return_to: string, state: string);',
+  'constructor(return_to: string, state: string, creator?: string | null);',
   'export class ExchangeFrontendSessionCodeOptions',
   'constructor(code: string, state: string);',
 ];

@@ -266,6 +266,7 @@ fn pubky_error_kind(error: &pubky::Error) -> &'static str {
         pubky::Error::Authentication(pubky::errors::AuthError::Validation(_)) => "auth_validation",
         pubky::Error::Authentication(pubky::errors::AuthError::RequestExpired) => "auth_expired",
         pubky::Error::Build(_) => "client_build",
+        pubky::Error::CredentialRefresh(_) => "credential_refresh",
     }
 }
 

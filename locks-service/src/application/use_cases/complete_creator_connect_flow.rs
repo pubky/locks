@@ -649,6 +649,7 @@ mod tests {
             &self,
             _requested_scopes: &[String],
             _pop_key_id: &GrantPopKeyId,
+            _expected_creator: Option<&CreatorPubky>,
         ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
             unreachable!()
         }
@@ -694,6 +695,7 @@ mod tests {
             &self,
             _requested_scopes: &[String],
             _pop_key_id: &GrantPopKeyId,
+            _expected_creator: Option<&CreatorPubky>,
         ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
             unreachable!()
         }
@@ -728,6 +730,7 @@ mod tests {
             &self,
             _requested_scopes: &[String],
             _pop_key_id: &GrantPopKeyId,
+            _expected_creator: Option<&CreatorPubky>,
         ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
             unreachable!()
         }
