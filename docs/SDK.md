@@ -496,7 +496,11 @@ let issued: AccessCredentialResponse =
     ViewerLocks::parse_access_credential_response(response_json)?;
 ```
 
-`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
+`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`.
+
+These parsers ignore unknown response fields, so a Lock Server can add a response field before every consumer upgrades its SDK. Fields that would carry internal or secret material (`task_id`, `credential` outside the access-credential response, `credential_issuance`, `submitted_proof_bundle`, `proofs`, `entitlement`, `verified_proof_bundle`, `entitlement_to_publish`) still fail the parse, and a lifecycle response carrying `connection_state` fails as the superseded submit contract. Closed vocabularies stay closed: an unknown lifecycle `status`, `terminal_reason`, or connection `state` value is an error.
+
+JS/WASM viewer methods run the matching Rust parser and return the typed response re-serialized, not the raw server JSON. Browser callers therefore receive exactly the fields this SDK release knows; fields it ignores never reach them.
 
 ## Current verification commands
 
