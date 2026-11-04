@@ -455,6 +455,37 @@ const lifecycle = await viewer.submitProofBundle({
 
 `submitProofBundle` parses the submitted object through the Rust `SubmittedProofBundle` contract before sending it, so identifiers such as `bundle_id` are validated and serialized in canonical form. It does not generate verifier proofs for callers.
 
+### Relying-service client reference
+
+A relying service that sells access per business object (for example per order payment) mints an opaque `client_reference` for that object and has the reader include it in the submitted bundle:
+
+```ts
+const lifecycle = await viewer.submitProofBundle({
+  version: 1,
+  bundle_id: bundleId,
+  pubky_lock_resource: `${creator}/pub/app.locks/<lock_id>.json`,
+  reader_public_key: readerPubky,
+  client_reference: referenceFromRelyingService,
+  proofs: [{ criterion_id: "paykit", verifier_type: "paykit-payment", payload: {} }],
+});
+```
+
+The reference is 1 to 64 bytes of UTF-8 without control characters; Locks stores it verbatim. It is part of the bundle's replay identity, so resubmitting the bundle ID with a different reference, or without it, returns `409 task_state_conflict`.
+
+Lifecycle responses for such a bundle carry `client_binding`:
+
+```json
+{
+  "client_binding": {
+    "client_reference": "<as submitted>",
+    "pubky_lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
+    "criterion_ids": ["paykit"]
+  }
+}
+```
+
+Rust callers read it as `VerificationTaskLifecycleResponse::client_binding` (`ClientBindingResponse`). The relying service accepts a `completed` task for its object only when `client_reference` equals the value it minted for that object and `pubky_lock_resource` and `criterion_ids` match the terms it expects. A response without `client_binding` never matches. Bundles submitted without a reference return no `client_binding` key, so their responses keep the shape earlier SDK releases parse. Lifecycle responses never include `reader_public_key`.
+
 ```ts
 const handle = new VerificationTaskHandleOptions(creator, bundleId);
 const current = await viewer.lookupVerificationTask(handle);

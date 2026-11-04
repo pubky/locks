@@ -317,6 +317,8 @@ Likely fields:
 - `version`
 - `bundle_id: BundleId`
 - `pubky_lock_resource: PubkyLockResource`
+- `reader_public_key: Option<CreatorPubky>`
+- `client_reference: Option<ClientReference>`
 - `proofs: Vec<Proof>`
 
 Invariants:
@@ -325,6 +327,7 @@ Invariants:
 - Bundle ID is a canonical 128-bit cryptographically random value encoded with Crockford base32.
 - Bundle ID must be safe to use as a filename after validation.
 - Submitted proof bundle is not an entitlement.
+- `client_reference` is an opaque value a relying service mints for one of its own business objects (for example one payment) and the reader carries in the bundle. It is 1 to 64 bytes of UTF-8 without control characters, stored verbatim, and never trimmed, folded, or interpreted. It is part of the bundle's replay identity and grants nothing by itself; see [ADR 0021](ADRs/0021-relying-service-client-reference.md).
 
 ### VerificationTask Aggregate
 
@@ -355,7 +358,9 @@ Invariants:
 - Completed successful verification must attempt entitlement persistence before access credential issuance.
 - Task records store operational lifecycle state only; they do not store `VerificationResult` because successful verification evidence lives in `VerifiedProofBundle`.
 - Public lifecycle responses replace internal `task_id` with `creator` and `bundle_id`, keep status/timestamp/failure fields, and must not expose submitted proof material, raw credentials, entitlement evidence, or worker claim metadata.
-- `{ creator, bundle_id }` is a permanent one-attempt lifecycle identity. After current canonical preflight, re-submitting the exact same submitted proof bundle returns the existing lifecycle state without creating new work or another Paykit invoice; different proof material for the same identity is a conflict.
+- `{ creator, bundle_id }` is a permanent one-attempt lifecycle identity. After current canonical preflight, re-submitting the exact same submitted proof bundle returns the existing lifecycle state without creating new work or another Paykit invoice; different proof material for the same identity is a conflict. A changed, added, or removed `client_reference` is different proof material.
+- Task identity (`task_id`, `creator`, `submitted_proof_bundle`, `submitted_at`) is written once at insert. Every task update, including atomic batch updates and claimed worker transitions, writes lifecycle fields only, so no update can rewrite a stored client reference.
+- When the stored bundle carries a `client_reference`, public lifecycle responses add `client_binding: { client_reference, pubky_lock_resource, criterion_ids }`. Bundles without one get no `client_binding` key. Lifecycle responses never carry `reader_public_key`: the lookup is authorized by the bundle ID alone, so a leaked bundle ID must not also name the reader.
 - Paykit lifecycle lookup uses a signed `{ creator, bundle_id }` request to `/payment-requests/status`. Request and payment states remain separate. Rejection, cancellation, proposal expiry, and payment deadline expiry terminalize the current attempt as `expired` with a typed reason, no failure message, no entitlement, and no retry. Content-lock deletion likewise expires unresolved non-Paykit attempts with typed reason `content_lock_deleted`. Transport failures, timeouts, response-body read failures, and non-`200` responses remain no-entitlement and pending for durable retry; `409 Conflict` remains operator-visible. Malformed JSON, missing or unknown fields, unknown states, oversized bodies, and invalid or misordered timestamps in a `200` response are permanent contract failures that terminalize the attempt as `failed` with no entitlement.
 - Retrying after `failed` or `expired` requires a new Bundle ID.
 - Allowed transitions are `pending -> in_progress`, `pending -> expired`, `in_progress -> completed`, `in_progress -> failed`, and `in_progress -> expired`. Pending tasks expire only when content-lock deletion closes the attempt and initializes both lifecycle timestamps.
