@@ -156,18 +156,16 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         task: VerificationTaskRecord,
     ) -> Result<(), ApplicationError> {
         let row = VerificationTaskWriteRow::try_from(&task)?;
+        // Lifecycle columns only: creator, bundle_id, submitted_proof_bundle, and submitted_at
+        // are written once at insert, so an update cannot rewrite a stored client reference.
         let result = sqlx::query(
             "UPDATE verification_tasks
-            SET creator = $2,
-                bundle_id = $3,
-                status = $4,
-                submitted_proof_bundle = $5,
-                submitted_at = $6,
-                started_at = $7,
-                completed_at = $8,
-                failure_message = $9,
-                terminal_reason = $10,
-                entitlement_to_publish = $11,
+            SET status = $2,
+                started_at = $3,
+                completed_at = $4,
+                failure_message = $5,
+                terminal_reason = $6,
+                entitlement_to_publish = $7,
                 updated_at = now()
             WHERE task_id = $1::uuid
               AND NOT EXISTS (
@@ -176,11 +174,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
               )",
         )
         .bind(row.task_id)
-        .bind(row.creator)
-        .bind(row.bundle_id)
         .bind(row.status)
-        .bind(row.submitted_proof_bundle)
-        .bind(row.submitted_at)
         .bind(row.started_at)
         .bind(row.completed_at)
         .bind(row.failure_message)
@@ -925,7 +919,7 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
 
-    use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
     use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 
@@ -937,6 +931,9 @@ mod tests {
         VerificationTerminalReason,
     };
     use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
+    use crate::application::use_cases::submit_proof_bundle::{
+        SubmitProofBundleRequest, SubmitProofBundleUseCase,
+    };
     use crate::infrastructure::postgres::testing::TestDatabase;
 
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
@@ -1741,6 +1738,269 @@ mod tests {
         ));
 
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_update_never_rewrites_the_stored_bundle_or_client_reference() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let mut stored = task(VerificationTaskStatus::Pending);
+        stored.submitted_proof_bundle.client_reference = Some(client_reference("order-1"));
+        repo.insert_verification_task(stored.clone()).await.unwrap();
+
+        let mut update = stored
+            .transition_to(
+                VerificationTaskStatus::InProgress,
+                datetime!(2026-05-29 12:01:00 UTC),
+                None,
+            )
+            .unwrap();
+        update.submitted_proof_bundle.client_reference = Some(client_reference("order-2"));
+        update.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap(),
+        );
+        update.submitted_proof_bundle.proofs[0].payload = json!({ "satisfied": false });
+        update.submitted_at = datetime!(2026-05-30 12:00:00 UTC);
+        repo.update_verification_task(update.clone()).await.unwrap();
+
+        let reread = PostgresVerificationTaskRepository::new(database.pool().clone())
+            .get_verification_task(&stored.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.status, VerificationTaskStatus::InProgress);
+        assert_eq!(reread.started_at, update.started_at);
+        assert_eq!(reread.submitted_proof_bundle, stored.submitted_proof_bundle);
+        assert_eq!(reread.submitted_at, stored.submitted_at);
+        let stored_json: serde_json::Value = sqlx::query_scalar(
+            "SELECT submitted_proof_bundle FROM verification_tasks WHERE task_id = $1::uuid",
+        )
+        .bind(stored.task_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_json["client_reference"], "order-1");
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_submissions_with_different_client_references_store_one() {
+        const RACERS: u8 = 8;
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(usize::from(RACERS)));
+        let mut racers = Vec::new();
+        for index in 0..RACERS {
+            let repo = repo.clone();
+            let barrier = barrier.clone();
+            let mut candidate = task_with(
+                &format!("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2e{index:02}"),
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                BUNDLE_ID,
+                VerificationTaskStatus::Pending,
+            );
+            candidate.submitted_proof_bundle.client_reference =
+                Some(client_reference(&format!("order-{index}")));
+            racers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = repo.insert_verification_task(candidate.clone()).await;
+                (candidate, result)
+            }));
+        }
+        let mut winners = Vec::new();
+        for racer in racers {
+            let (candidate, result) = racer.await.unwrap();
+            match result {
+                Ok(()) => winners.push(candidate),
+                Err(ApplicationError::VerificationTaskConflict) => {}
+                other => panic!("unexpected concurrent insert result: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        let stored = repo
+            .get_verification_task_by_handle(
+                &winners[0].creator,
+                &winners[0].submitted_proof_bundle.bundle_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, winners[0]);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification_tasks")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_invoice_pending_submissions_admit_one_client_reference() {
+        const RACERS: u8 = 8;
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(usize::from(RACERS)));
+        let mut racers = Vec::new();
+        for index in 0..RACERS {
+            let repo = repo.clone();
+            let barrier = barrier.clone();
+            let mut candidate = task_with(
+                &format!("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2f{index:02}"),
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                BUNDLE_ID,
+                VerificationTaskStatus::Pending,
+            );
+            candidate.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+            // Even racers replay one reference exactly; odd racers each change it.
+            let reference = if index % 2 == 0 {
+                "order-shared".to_owned()
+            } else {
+                format!("order-{index}")
+            };
+            candidate.submitted_proof_bundle.client_reference = Some(client_reference(&reference));
+            let intent = InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: candidate.creator.clone(),
+                bundle_id: candidate.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: candidate.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader: reader.clone(),
+                payment_in: 24,
+            };
+            racers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = repo
+                    .insert_invoice_pending_task(candidate.clone(), intent)
+                    .await;
+                (candidate, result)
+            }));
+        }
+        let mut admitted = Vec::new();
+        let mut conflicts = 0;
+        for racer in racers {
+            let (candidate, result) = racer.await.unwrap();
+            match result {
+                Ok(admission) => admitted.push((candidate, admission)),
+                Err(ApplicationError::VerificationTaskConflict) => conflicts += 1,
+                other => panic!("unexpected concurrent invoice admission result: {other:?}"),
+            }
+        }
+        let rows: Vec<serde_json::Value> =
+            sqlx::query_scalar("SELECT submitted_proof_bundle FROM verification_tasks")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        let stored_reference = rows[0]["client_reference"].as_str().unwrap().to_owned();
+        assert!(!admitted.is_empty());
+        for (candidate, admission) in &admitted {
+            assert_eq!(
+                candidate
+                    .submitted_proof_bundle
+                    .client_reference
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                stored_reference
+            );
+            assert_eq!(
+                admission.task.submitted_proof_bundle,
+                candidate.submitted_proof_bundle
+            );
+        }
+        assert_eq!(admitted.len() + conflicts, usize::from(RACERS));
+        if stored_reference == "order-shared" {
+            assert_eq!(admitted.len(), usize::from(RACERS / 2));
+        } else {
+            assert_eq!(admitted.len(), 1);
+        }
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cross_lock_race_on_one_bundle_id_binds_one_lock_and_reference() {
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let task_ids = RandomTaskIds;
+        let clock = FixedClock;
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let mut cheap = task(VerificationTaskStatus::Pending).submitted_proof_bundle;
+        cheap.client_reference = Some(client_reference("order-cheap"));
+        let mut expensive = cheap.clone();
+        let other_lock =
+            locks_core::ids::LockId::from_hash(locks_core::ids::LockHash::from_bytes([9; 32]));
+        expensive.pubky_lock_resource =
+            PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{other_lock}.json"))
+                .unwrap();
+        expensive.client_reference = Some(client_reference("order-expensive"));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let (task_ids, clock) = (&task_ids, &clock);
+        let submit = |bundle: SubmittedProofBundle| {
+            let repo = repo.clone();
+            let barrier = barrier.clone();
+            async move {
+                let use_case = SubmitProofBundleUseCase::new(task_ids, &repo, clock);
+                barrier.wait().await;
+                let result = use_case
+                    .execute(SubmitProofBundleRequest {
+                        submitted_proof_bundle: bundle.clone(),
+                    })
+                    .await;
+                (bundle, result)
+            }
+        };
+        let (first, second) = tokio::join!(submit(cheap), submit(expensive));
+        let outcomes = [first, second];
+        let winners: Vec<_> = outcomes
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .collect();
+        assert_eq!(winners.len(), 1, "{outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .filter(|(_, result)| result.is_err())
+                .all(|(_, result)| result == &Err(ApplicationError::VerificationTaskConflict))
+        );
+        let stored = repo
+            .get_verification_task_by_handle(
+                &CreatorPubky::from_str(creator).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.submitted_proof_bundle, winners[0].0);
+
+        database.cleanup().await;
+    }
+
+    fn client_reference(value: &str) -> ClientReference {
+        ClientReference::from_str(value).unwrap()
+    }
+
+    struct RandomTaskIds;
+
+    #[async_trait::async_trait]
+    impl crate::application::ports::VerificationTaskIdGenerator for RandomTaskIds {
+        async fn generate_task_id(&self) -> Result<TaskId, ApplicationError> {
+            Ok(TaskId::from_str(&uuid::Uuid::new_v4().to_string()).unwrap())
+        }
+    }
+
+    struct FixedClock;
+
+    impl crate::application::ports::Clock for FixedClock {
+        fn now(&self) -> time::OffsetDateTime {
+            datetime!(2026-05-29 12:00:00 UTC)
+        }
     }
 
     fn task(status: VerificationTaskStatus) -> VerificationTaskRecord {
