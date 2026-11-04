@@ -9,6 +9,8 @@ use super::{GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1, Verificatio
 
 pub const FOLDED_AUTH_TTL: Duration = Duration::minutes(10);
 pub const FOLDED_AUTH_TOMBSTONE_TTL: Duration = Duration::hours(24);
+/// Durable dispatches younger than this may still have a live approval poll.
+pub const FOLDED_AUTH_POLL_ABANDONED_AFTER: Duration = Duration::minutes(1);
 const STATE_HASH_DOMAIN: &[u8] = b"pubky-locks/folded-auth-state/v2\0";
 
 #[derive(Clone, PartialEq, Eq, Hash)]

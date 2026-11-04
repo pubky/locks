@@ -196,7 +196,7 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
             );
             response.headers_mut().insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_static("authorization, content-type"),
+                HeaderValue::from_static("authorization, content-type, pubky-host"),
             );
         }
     }

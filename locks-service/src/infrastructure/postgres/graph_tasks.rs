@@ -565,10 +565,10 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        let next_attempt_at = database_now + retry_delay;
-        if !retry_delay.is_positive() || next_attempt_at > snapshot.as_v1().deadline_at {
+        let next_attempt_at = (database_now + retry_delay).min(snapshot.as_v1().deadline_at);
+        if !retry_delay.is_positive() {
             return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "graph retry must be after now and no later than deadline".to_owned(),
+                message: "graph retry delay must be positive".to_owned(),
             });
         }
         snapshot.as_v1().validate().map_err(invalid_snapshot)?;
@@ -1244,6 +1244,70 @@ mod tests {
         .await
         .unwrap();
         assert!(persisted_due.is_some());
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_final_graph_retry_is_clamped_to_deadline_after_database_time_advances() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresGraphTaskRepository::new(database.pool().clone());
+        let database_now: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT date_trunc('microseconds', clock_timestamp())")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let accepted_at = database_now - time::Duration::seconds(59);
+        repository
+            .insert_graph_task(task_at(accepted_at))
+            .await
+            .unwrap();
+        let claim = repository
+            .claim_next_graph_task(
+                "graph-worker",
+                database_now,
+                database_now + time::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut next = claim.task.snapshot.clone();
+        let GraphTaskSnapshot::V1(snapshot) = &mut next;
+        let deadline = snapshot.deadline_at;
+        snapshot
+            .record_nexus_observation(
+                0,
+                GraphObservationOutcome::False,
+                database_now,
+                "https://nexus.example".to_owned(),
+                Some(200),
+                None,
+                Some(deadline),
+                0,
+            )
+            .unwrap();
+
+        let scheduled = repository
+            .schedule_graph_task_retry(
+                &claim.task.task_id,
+                "graph-worker",
+                &claim.claim_token,
+                database_now - time::Duration::SECOND,
+                claim.task.evaluator_revision,
+                next,
+                deadline,
+            )
+            .await
+            .unwrap()
+            .expect("final retry remains schedulable at deadline");
+        assert_eq!(scheduled.status, VerificationTaskStatus::Pending);
+        let persisted_due: time::OffsetDateTime = sqlx::query_scalar(
+            "SELECT next_attempt_at FROM verification_tasks WHERE task_id = $1::uuid",
+        )
+        .bind(claim.task.task_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(persisted_due, deadline);
         database.cleanup().await;
     }
 

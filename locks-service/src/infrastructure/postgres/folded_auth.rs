@@ -9,10 +9,10 @@ use time::OffsetDateTime;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_TOMBSTONE_TTL, FOLDED_AUTH_TTL, FoldedAuthAttempt,
-    FoldedAuthSecretContext, FoldedAuthStartDisposition, FoldedAuthStartResult,
-    FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, RestoredFoldedAuthAttempt,
-    StartFoldedAuthAttempt,
+    EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL,
+    FOLDED_AUTH_TTL, FoldedAuthAttempt, FoldedAuthSecretContext, FoldedAuthStartDisposition,
+    FoldedAuthStartResult, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
+    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
 use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository};
 use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
@@ -419,6 +419,7 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             .await
             .map_err(storage_error)?;
         let purge_after = checked_purge_after(database_now)?;
+        let abandoned_before = database_now - FOLDED_AUTH_POLL_ABANDONED_AFTER;
         sqlx::query(
             "UPDATE folded_auth_attempts
              SET status = 'expired', encrypted_flow_secret = NULL,
@@ -434,10 +435,11 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             "UPDATE folded_auth_attempts
              SET status = 'restart_required', encrypted_flow_secret = NULL,
                  poll_dispatched_at = NULL, terminal_at = $1, purge_after = $2
-             WHERE status = 'pending' AND poll_dispatched_at IS NOT NULL",
+             WHERE status = 'pending' AND poll_dispatched_at <= $3",
         )
         .bind(database_now)
         .bind(purge_after)
+        .bind(abandoned_before)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -779,8 +781,8 @@ mod tests {
         VerificationTaskStatus,
     };
     use crate::application::ports::{
-        Clock, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthPollCall,
-        FoldedAuthRepository, GraphTaskRepository, VerificationTaskRepository,
+        Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller,
+        FoldedAuthPollCall, FoldedAuthRepository, GraphTaskRepository, VerificationTaskRepository,
     };
     use crate::application::use_cases::poll_folded_auth::{
         PollFoldedAuthAttempt, PollFoldedAuthOutcome,
@@ -1214,6 +1216,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_cleanup_preserves_active_approval_poll_and_accepts_its_result() {
+        let database = TestDatabase::create().await;
+        let repository = Arc::new(PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        ));
+        let now = time::OffsetDateTime::now_utc();
+        let started = repository
+            .start_or_rotate(start_request(
+                &graph_lock(),
+                FoldedAuthStateHash::derive(b"postgres-active-cleanup"),
+                b"postgres-active-cleanup-flow",
+                now,
+            ))
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let use_case = Arc::new(PollFoldedAuthAttempt::new(
+            Arc::clone(&repository),
+            Arc::new(BlockingApprovedPoller {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                reader: reader(),
+            }),
+            Arc::new(FixedClock(now)),
+        ));
+        let state_hash = started.attempt.state_hash.clone();
+        let polling = tokio::spawn(async move { use_case.execute(&state_hash).await.unwrap() });
+        entered.notified().await;
+
+        assert_eq!(repository.purge_terminal_before(now).await.unwrap(), 0);
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::Pending
+        );
+        release.notify_one();
+
+        assert!(matches!(
+            polling.await.unwrap(),
+            PollFoldedAuthOutcome::Accepted(_)
+        ));
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::Accepted
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_requires_restart_for_abandoned_approval_dispatch() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        let now = time::OffsetDateTime::now_utc();
+        let started = repository
+            .start_or_rotate(start_request(
+                &graph_lock(),
+                FoldedAuthStateHash::derive(b"postgres-abandoned-cleanup"),
+                b"postgres-abandoned-cleanup-flow",
+                now,
+            ))
+            .await
+            .unwrap();
+        repository
+            .mark_poll_dispatched(&started.attempt.state_hash, started.attempt.generation, now)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "UPDATE folded_auth_attempts
+             SET poll_dispatched_at = clock_timestamp() - INTERVAL '61 seconds'
+             WHERE state_hash = $1",
+        )
+        .bind(started.attempt.state_hash.as_bytes().as_slice())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(repository.purge_terminal_before(now).await.unwrap(), 0);
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::RestartRequired
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn acceptance_and_rotation_share_row_before_admission_lock_order() {
         let database = TestDatabase::create().await;
         let repository = PostgresFoldedAuthRepository::new(
@@ -1488,6 +1595,23 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
             FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError))
+        }
+    }
+
+    struct BlockingApprovedPoller {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        reader: CreatorPubky,
+    }
+
+    #[async_trait]
+    impl FoldedAuthApprovalPoller for BlockingApprovedPoller {
+        async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+            self.entered.notify_one();
+            self.release.notified().await;
+            FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Approved {
+                reader: self.reader.clone(),
+            }))
         }
     }
 

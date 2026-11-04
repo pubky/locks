@@ -5,8 +5,8 @@ use tokio::sync::RwLock;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_TOMBSTONE_TTL, FoldedAuthAttempt,
-    FoldedAuthSecretContext, FoldedAuthStartDisposition, FoldedAuthStartResult,
+    EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL,
+    FoldedAuthAttempt, FoldedAuthSecretContext, FoldedAuthStartDisposition, FoldedAuthStartResult,
     FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, RestoredFoldedAuthAttempt,
     StartFoldedAuthAttempt,
 };
@@ -19,6 +19,7 @@ use super::graph_tasks::InMemoryGraphTaskRepository;
 struct StoredAttempt {
     attempt: FoldedAuthAttempt,
     encrypted_flow_secret: Option<EncryptedFoldedAuthFlowSecret>,
+    poll_dispatched_at: Option<time::OffsetDateTime>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +191,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         state.records.push(StoredAttempt {
             attempt: attempt.clone(),
             encrypted_flow_secret: Some(encrypted),
+            poll_dispatched_at: None,
         });
         Ok(FoldedAuthStartResult {
             attempt,
@@ -254,6 +256,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             return Ok(None);
         }
         stored.attempt.poll_dispatched = true;
+        stored.poll_dispatched_at = Some(self.graph.authoritative_time());
         Ok(Some(stored.attempt.clone()))
     }
 
@@ -271,6 +274,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             return Ok(None);
         }
         stored.attempt.poll_dispatched = false;
+        stored.poll_dispatched_at = None;
         Ok(Some(stored.attempt.clone()))
     }
 
@@ -293,6 +297,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
                 .await;
         } else {
             stored.attempt.poll_dispatched = false;
+            stored.poll_dispatched_at = None;
         }
         Ok(Some(stored.attempt.clone()))
     }
@@ -416,7 +421,9 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
                             &stored.attempt.bundle_id,
                         )
                         .await;
-                } else if stored.attempt.poll_dispatched {
+                } else if stored.poll_dispatched_at.is_some_and(|dispatched_at| {
+                    dispatched_at <= now - FOLDED_AUTH_POLL_ABANDONED_AFTER
+                }) {
                     terminalize(stored, FoldedAuthStatus::RestartRequired, now, purge_after);
                     self.graph
                         .release_folded_auth_reservation(
@@ -460,6 +467,7 @@ fn terminalize(
 ) {
     stored.attempt.status = status;
     stored.attempt.poll_dispatched = false;
+    stored.poll_dispatched_at = None;
     stored.attempt.terminal_at = Some(now);
     stored.attempt.purge_after = Some(purge_after);
     stored.encrypted_flow_secret = None;
@@ -502,8 +510,9 @@ mod tests {
     use super::InMemoryFoldedAuthRepository;
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        FoldedAuthFlowSecret, FoldedAuthStateHash, GraphTaskRecord, GraphTaskSnapshot,
-        GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
+        FOLDED_AUTH_POLL_ABANDONED_AFTER, FoldedAuthFlowSecret, FoldedAuthStateHash,
+        FoldedAuthStatus, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
+        StartFoldedAuthAttempt, VerificationTaskStatus,
     };
     use crate::application::ports::{
         Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPoller, FoldedAuthPollCall,
@@ -569,6 +578,55 @@ mod tests {
             .unwrap()
             .is_some();
         assert_ne!(has_attempt, has_task);
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_fresh_dispatch_then_recovers_abandoned_dispatch() {
+        let now = datetime!(2026-10-30 12:00:00 UTC);
+        let clock = Arc::new(MutableClock::new(now));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(fence));
+        let repository = InMemoryFoldedAuthRepository::new(graph, cipher());
+        let creator = creator();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let resource = PubkyLockResource::new(creator, ContentLockPath::from_lock_id(lock_id()));
+        let started = repository
+            .start_or_rotate(start_request(bundle_id, resource))
+            .await
+            .unwrap();
+        repository
+            .mark_poll_dispatched(&started.attempt.state_hash, started.attempt.generation, now)
+            .await
+            .unwrap()
+            .unwrap();
+
+        repository.purge_terminal_before(now).await.unwrap();
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::Pending
+        );
+
+        clock.set(now + FOLDED_AUTH_POLL_ABANDONED_AFTER);
+        repository
+            .purge_terminal_before(now + FOLDED_AUTH_POLL_ABANDONED_AFTER)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::RestartRequired
+        );
     }
 
     #[tokio::test]

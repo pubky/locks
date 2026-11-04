@@ -1165,40 +1165,52 @@ async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
 }
 
 #[tokio::test]
-async fn folded_auth_cors_preflight_allows_authorization_and_content_type() {
-    let response = router(test_state_with_folded_auth_origins(vec![
+async fn folded_auth_cors_preflight_allows_browser_sdk_headers_on_both_routes() {
+    let app = router(test_state_with_folded_auth_origins(vec![
         "https://pubky.app".to_owned(),
-    ]))
-    .oneshot(
-        Request::builder()
-            .method("OPTIONS")
-            .uri("/proof-bundles/auth-status")
-            .header(header::ORIGIN, "https://pubky.app")
-            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-            .header(
-                header::ACCESS_CONTROL_REQUEST_HEADERS,
-                "authorization, content-type",
-            )
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    ]));
 
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-        "https://pubky.app"
-    );
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
-        "POST"
-    );
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
-        "authorization, content-type"
-    );
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    for uri in ["/proof-bundles", "/proof-bundles/auth-status"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://pubky.app")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization, content-type, pubky-host",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://pubky.app",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "POST",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization, content-type, pubky-host",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{uri}"
+        );
+    }
 }
 
 #[tokio::test]
