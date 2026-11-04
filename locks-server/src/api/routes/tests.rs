@@ -12,8 +12,8 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::post;
 use axum::{Json, Router};
 use locks_core::ids::{
-    BundleId, ContentLockPath, CreatorPubky, GuardedResourceHash, LockId, LockServerPubky,
-    PubkyLockResource,
+    BundleId, ClientReference, ContentLockPath, CreatorPubky, GuardedResourceHash, LockId,
+    LockServerPubky, PubkyLockResource,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
@@ -78,6 +78,8 @@ use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockSe
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+/// Shaped like the base64url 32-byte reference a relying service mints per payment.
+const SHOP_REFERENCE: &str = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU";
 
 #[derive(Debug, Clone, Copy)]
 enum CreatorRepositoryBackend {
@@ -1490,6 +1492,26 @@ async fn viewer_access_contract_fixtures_submit_proof_bundle() {
     );
 }
 
+#[tokio::test]
+async fn viewer_access_contract_fixtures_submit_proof_bundle_with_client_reference() {
+    let request = fixture_value("submit_proof_bundle_with_client_reference_request.json");
+    serde_json::from_value::<SubmitProofBundleHttpRequest>(request.clone()).unwrap();
+    let response_shape =
+        fixture_value("submit_proof_bundle_with_client_reference_response_shape.json");
+
+    let app = router(test_state());
+    let response = app
+        .oneshot(json_request("POST", "/proof-bundles", request))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response_json(response).await;
+    assert_placeholder_string(&body["submitted_at"], "<submitted_at>");
+    body["submitted_at"] = response_shape["submitted_at"].clone();
+    assert_eq!(body, response_shape);
+}
+
 #[test]
 fn viewer_access_contract_fixtures_verification_task_handle_request() {
     let request = fixture_value("verification_task_handle_request.json");
@@ -2394,6 +2416,210 @@ async fn duplicate_changed_proof_submission_maps_to_task_state_conflict() {
         .unwrap();
 
     assert_error_response(second, StatusCode::CONFLICT, "task_state_conflict").await;
+}
+
+#[tokio::test]
+async fn paykit_submission_and_lookup_echo_client_binding_without_reader_identity() {
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:9", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let (content_lock, mut bundle) = paykit_content_lock_and_bundle();
+    bundle.client_reference = Some(ClientReference::from_str(SHOP_REFERENCE).unwrap());
+    let reader = bundle.reader_public_key.clone().unwrap().to_string();
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state);
+    let expected_binding = json!({
+        "client_reference": SHOP_REFERENCE,
+        "pubky_lock_resource": bundle.pubky_lock_resource.to_string(),
+        "criterion_ids": ["criterion-1"],
+    });
+
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let lookup = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": bundle.pubky_lock_resource.creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(lookup.status(), StatusCode::OK);
+
+    for body in [response_json(submitted).await, response_json(lookup).await] {
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["client_binding"], expected_binding);
+        assert_no_keys(
+            &body,
+            &[
+                "reader_public_key",
+                "pubky_lock_resource",
+                "submitted_proof_bundle",
+                "proofs",
+                "task_id",
+            ],
+        );
+        assert_no_keys(&body["client_binding"], &["reader_public_key", "reader"]);
+        assert!(
+            !body.to_string().contains(&reader),
+            "the unauthenticated lifecycle must not name the reader: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bundle_without_client_reference_keeps_the_existing_lifecycle_shape() {
+    let app = router(test_state());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": submitted_proof_bundle() }),
+        ))
+        .await
+        .unwrap();
+    let lookup = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            handle_request(),
+        ))
+        .await
+        .unwrap();
+
+    for body in [response_json(submitted).await, response_json(lookup).await] {
+        let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "admission_deadline_at",
+                "bundle_id",
+                "completed_at",
+                "creator",
+                "failure_message",
+                "started_at",
+                "status",
+                "status_message",
+                "submitted_at",
+                "terminal_reason",
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn changed_added_or_removed_client_reference_replay_maps_to_task_state_conflict() {
+    let app = router(test_state());
+    let mut original = submitted_proof_bundle();
+    original.client_reference = Some(ClientReference::from_str(SHOP_REFERENCE).unwrap());
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": original.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let mut changed = original.clone();
+    changed.client_reference = Some(ClientReference::from_str("order-2").unwrap());
+    let mut removed = original.clone();
+    removed.client_reference = None;
+    for replay in [changed, removed] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/proof-bundles",
+                json!({ "submitted_proof_bundle": replay }),
+            ))
+            .await
+            .unwrap();
+        assert_error_response(response, StatusCode::CONFLICT, "task_state_conflict").await;
+    }
+
+    let exact = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": original }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exact.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(exact).await["client_binding"]["client_reference"],
+        SHOP_REFERENCE
+    );
+
+    let mut other = submitted_proof_bundle_with_bundle_id("000G40R40M30E209185GR38E1V");
+    let first_without = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": other.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_without.status(), StatusCode::OK);
+    other.client_reference = Some(ClientReference::from_str(SHOP_REFERENCE).unwrap());
+    let added = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": other }),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(added, StatusCode::CONFLICT, "task_state_conflict").await;
+}
+
+#[tokio::test]
+async fn malformed_client_reference_is_rejected_before_any_task_exists() {
+    let app = router(test_state());
+    for reference in [
+        json!(""),
+        json!("r".repeat(65)),
+        json!("order\n7"),
+        json!(7),
+    ] {
+        let mut body = json!({ "submitted_proof_bundle": submitted_proof_bundle() });
+        body["submitted_proof_bundle"]["client_reference"] = reference;
+        let response = app
+            .clone()
+            .oneshot(json_request("POST", "/proof-bundles", body))
+            .await
+            .unwrap();
+        assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    }
+    let lookup = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            handle_request(),
+        ))
+        .await
+        .unwrap();
+    assert_error_response(lookup, StatusCode::NOT_FOUND, "verification_task_not_found").await;
 }
 
 #[tokio::test]
@@ -5808,6 +6034,16 @@ fn fixture_value(file_name: &str) -> Value {
         "access_credential_response_shape.json" => {
             include_str!(
                 "../../../tests/fixtures/viewer_access/access_credential_response_shape.json"
+            )
+        }
+        "submit_proof_bundle_with_client_reference_request.json" => {
+            include_str!(
+                "../../../tests/fixtures/viewer_access/submit_proof_bundle_with_client_reference_request.json"
+            )
+        }
+        "submit_proof_bundle_with_client_reference_response_shape.json" => {
+            include_str!(
+                "../../../tests/fixtures/viewer_access/submit_proof_bundle_with_client_reference_response_shape.json"
             )
         }
         other => panic!("unknown fixture: {other}"),

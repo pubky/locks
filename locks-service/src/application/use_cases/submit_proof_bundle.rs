@@ -172,7 +172,7 @@ mod tests {
     use time::OffsetDateTime;
     use time::macros::datetime;
 
-    use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource, TaskId};
     use locks_core::lock_policy::VerifierType;
     use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
 
@@ -381,6 +381,119 @@ mod tests {
         assert_eq!(task_ids.generate_count(), 1);
         assert_eq!(tasks.insert_count(), 1);
         assert_eq!(tasks.update_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn client_reference_is_part_of_the_replay_identity() {
+        let with_reference = |value: Option<&str>| {
+            let mut bundle = submitted_proof_bundle();
+            bundle.client_reference = value.map(|value| ClientReference::from_str(value).unwrap());
+            bundle
+        };
+        for (stored, replayed) in [
+            (Some("order-1"), Some("order-2")),
+            (None, Some("order-1")),
+            (Some("order-1"), None),
+            (Some("order-1"), Some("Order-1")),
+            (Some("order-1"), Some(" order-1")),
+        ] {
+            let tasks = CapturingTaskRepository::with_existing(verification_task_with_bundle(
+                with_reference(stored),
+            ));
+            let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+            let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+            let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+
+            assert_eq!(
+                use_case
+                    .execute(SubmitProofBundleRequest {
+                        submitted_proof_bundle: with_reference(replayed),
+                    })
+                    .await,
+                Err(ApplicationError::VerificationTaskConflict),
+                "{stored:?} replayed as {replayed:?}"
+            );
+            assert_eq!(tasks.insert_count(), 0);
+        }
+
+        let tasks = CapturingTaskRepository::with_existing(verification_task_with_bundle(
+            with_reference(Some("order-1")),
+        ));
+        let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+        let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+        let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+        let replay = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: with_reference(Some("order-1")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay
+                .client_binding
+                .map(|binding| binding.client_reference.as_str().to_owned()),
+            Some("order-1".to_owned())
+        );
+        assert_eq!(tasks.insert_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_cutoff_still_fences_bundles_that_carry_a_client_reference() {
+        let fence = std::sync::Arc::new(
+            crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence::new(),
+        );
+        let tasks = crate::infrastructure::memory::verification_tasks::InMemoryVerificationTaskRepository::with_deletion_fence(
+            std::sync::Arc::clone(&fence),
+        );
+        let task_ids = FixedTaskIdGenerator::new(TaskId::from_str(TASK_ID).unwrap());
+        let clock = FixedClock::new(datetime!(2026-05-29 12:05:00 UTC));
+        let use_case = SubmitProofBundleUseCase::new(&task_ids, &tasks, &clock);
+        let mut admitted = submitted_proof_bundle();
+        admitted.client_reference = Some(ClientReference::from_str("order-1").unwrap());
+        use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: admitted.clone(),
+            })
+            .await
+            .unwrap();
+        fence
+            .deletion_cutoffs
+            .write()
+            .await
+            .insert((creator(), admitted.pubky_lock_resource.lock_id().clone()));
+
+        let replay = use_case
+            .execute(SubmitProofBundleRequest {
+                submitted_proof_bundle: admitted.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.client_binding.unwrap().client_reference,
+            admitted.client_reference.clone().unwrap()
+        );
+
+        let mut changed = admitted.clone();
+        changed.client_reference = Some(ClientReference::from_str("order-2").unwrap());
+        assert_eq!(
+            use_case
+                .execute(SubmitProofBundleRequest {
+                    submitted_proof_bundle: changed,
+                })
+                .await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+
+        let mut fresh = admitted;
+        fresh.bundle_id = BundleId::from_bytes([7; 16]);
+        assert_eq!(
+            use_case
+                .execute(SubmitProofBundleRequest {
+                    submitted_proof_bundle: fresh,
+                })
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
     }
 
     fn creator() -> CreatorPubky {

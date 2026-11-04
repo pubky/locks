@@ -843,6 +843,37 @@ mod tests {
     }
 
     #[test]
+    fn viewer_lifecycle_returns_client_binding_to_js_when_present() {
+        let binding = json!({
+            "client_reference": "order-1",
+            "pubky_lock_resource": format!(
+                "{CREATOR}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            ),
+            "criterion_ids": ["criterion-1"]
+        });
+        let lifecycle = validate_lifecycle_response_for_tests(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null,
+            "client_binding": binding.clone()
+        }))
+        .unwrap();
+        assert_eq!(lifecycle["client_binding"], binding);
+        assert!(
+            lifecycle["client_binding"]
+                .get("reader_public_key")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn viewer_response_validation_drops_unknown_fields_before_returning_to_js() {
         let lifecycle = validate_lifecycle_response_for_tests(json!({
             "creator": CREATOR,

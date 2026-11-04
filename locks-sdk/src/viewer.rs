@@ -1,4 +1,4 @@
-use locks_core::ids::{BundleId, CreatorPubky};
+use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource};
 use locks_core::verification::SubmittedProofBundle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +115,21 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub admission_deadline_at: Option<time::OffsetDateTime>,
     pub terminal_reason: Option<VerificationTerminalReason>,
+    /// Present only for bundles submitted with a client reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_binding: Option<ClientBindingResponse>,
+}
+
+/// Relying-service binding echoed for a bundle submitted with a client reference.
+///
+/// A relying service accepts a completed task for one of its business objects only when
+/// `client_reference` equals the value it minted for that object and `pubky_lock_resource` and
+/// `criterion_ids` match the terms it expects. An absent binding never matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBindingResponse {
+    pub client_reference: ClientReference,
+    pub pubky_lock_resource: PubkyLockResource,
+    pub criterion_ids: Vec<String>,
 }
 
 /// Paykit connection state. Unknown fields are ignored; secret-bearing fields are rejected.
@@ -256,6 +271,13 @@ fn reject_fields(value: &Value, forbidden: &[&str]) -> Result<()> {
 }
 
 fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> Result<()> {
+    if let Some(binding) = &response.client_binding
+        && binding.pubky_lock_resource.creator() != &response.creator
+    {
+        return Err(LocksSdkError::InvalidResponse(
+            "client binding names a lock of another creator".to_owned(),
+        ));
+    }
     let valid = match response.status {
         VerificationTaskStatus::Pending => {
             response.started_at.is_none()
@@ -665,6 +687,72 @@ mod tests {
                 "terminal_reason": null
             })
         );
+    }
+
+    #[test]
+    fn lifecycle_response_exposes_client_binding_only_when_present() {
+        let resource = format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json");
+        let mut body = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null
+        });
+        let without = ViewerLocks::parse_lifecycle_response(body.clone()).unwrap();
+        assert_eq!(without.client_binding, None);
+        assert_eq!(serde_json::to_value(&without).unwrap(), body);
+
+        body["client_binding"] = json!({
+            "client_reference": "order-1",
+            "pubky_lock_resource": resource,
+            "criterion_ids": ["criterion-1"]
+        });
+        let with = ViewerLocks::parse_lifecycle_response(body.clone()).unwrap();
+        let binding = with.client_binding.clone().unwrap();
+        assert_eq!(binding.client_reference.as_str(), "order-1");
+        assert_eq!(binding.pubky_lock_resource.to_string(), resource);
+        assert_eq!(binding.criterion_ids, vec!["criterion-1".to_owned()]);
+        assert_eq!(serde_json::to_value(&with).unwrap(), body);
+    }
+
+    #[test]
+    fn lifecycle_response_rejects_malformed_or_foreign_client_binding() {
+        let other_creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+        for binding in [
+            json!({
+                "client_reference": "order-1",
+                "pubky_lock_resource": format!("{other_creator}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+            json!({
+                "client_reference": "",
+                "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+            json!({
+                "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+        ] {
+            let body = json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null,
+                "terminal_reason": null,
+                "client_binding": binding
+            });
+            assert!(ViewerLocks::parse_lifecycle_response(body).is_err());
+        }
     }
 
     #[test]

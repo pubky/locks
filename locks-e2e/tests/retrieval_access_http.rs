@@ -5,7 +5,8 @@ use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use locks_core::ids::{
-    BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource,
+    BundleId, ClientReference, CreatorPubky, GuardedResourceHash, LockServerPubky,
+    PubkyLockResource,
 };
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
@@ -19,6 +20,7 @@ use time::macros::datetime;
 use tower::ServiceExt;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
+const CLIENT_REFERENCE: &str = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU";
 
 #[tokio::test]
 async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
@@ -50,6 +52,15 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
     assert_eq!(submit_json["bundle_id"], BUNDLE_ID);
     assert_eq!(submit_json["status"], "pending");
     assert!(submit_json.get("task_id").is_none());
+    let submitted_resource = submitted_proof_bundle_for(&content_lock)
+        .pubky_lock_resource
+        .to_string();
+    let expected_binding = json!({
+        "client_reference": CLIENT_REFERENCE,
+        "pubky_lock_resource": submitted_resource,
+        "criterion_ids": ["criterion-1"],
+    });
+    assert_eq!(submit_json["client_binding"], expected_binding);
 
     let task = test_app
         .state()
@@ -86,10 +97,10 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
         .await
         .unwrap();
     assert_eq!(completed_response.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(completed_response).await["status"],
-        "completed"
-    );
+    let completed_json = response_json(completed_response).await;
+    assert_eq!(completed_json["status"], "completed");
+    assert_eq!(completed_json["client_binding"], expected_binding);
+    assert!(completed_json.get("reader_public_key").is_none());
 
     let credential_response = router
         .clone()
@@ -131,7 +142,7 @@ fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundl
             content_lock.content_lock_path().unwrap(),
         ),
         reader_public_key: None,
-        client_reference: None,
+        client_reference: Some(ClientReference::from_str(CLIENT_REFERENCE).unwrap()),
         proofs: vec![Proof {
             criterion_id: "criterion-1".to_owned(),
             verifier_type: VerifierType::DevStatic,
