@@ -1,5 +1,5 @@
 pub use locks_core::creator_publishing::{CreateContentLockRequest, SetLockServicePointerRequest};
-use locks_core::ids::LockId;
+use locks_core::ids::{BundleId, LockId};
 pub use locks_core::lock_policy::PaykitPaymentAsset;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -183,6 +183,19 @@ impl CreatorLocks {
 
     pub fn paykit_setup_status(&self, asset: PaykitPaymentAsset) -> SdkRequest {
         self.paykit_setup_status_request(asset)
+    }
+
+    pub fn verification_evidence(&self, bundle_id: BundleId) -> SdkRequest {
+        self.post_json(
+            "/creator/verification-evidence",
+            serde_json::json!({ "bundle_id": bundle_id }),
+        )
+    }
+
+    pub fn parse_verification_evidence_response(
+        value: Value,
+    ) -> crate::Result<crate::CreatorVerificationEvidenceResponse> {
+        crate::graph::parse_creator_verification_evidence_response(value)
     }
 
     pub fn parse_paykit_setup_status_response(value: Value) -> crate::Result<PaykitSetupStatus> {

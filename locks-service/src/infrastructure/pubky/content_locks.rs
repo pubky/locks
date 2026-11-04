@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::{ContentLock, ContentLockPayload};
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::{ContentLockRepository, ContentLockWriteError};
@@ -29,6 +29,21 @@ impl<C> ContentLockRepository for PubkyContentLockRepository<C>
 where
     C: PubkyHomeserverStorageClient,
 {
+    async fn upsert_content_lock_payload(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLockPayload,
+    ) -> Result<(), ApplicationError> {
+        let body =
+            serde_json::to_value(content_lock).map_err(|error| ApplicationError::Storage {
+                message: format!("failed to serialize content lock for Pubky storage: {error}"),
+            })?;
+        self.client
+            .put_json_value_as_creator(&creator, &content_lock_path.to_string(), body)
+            .await
+    }
+
     async fn upsert_content_lock(
         &self,
         creator: CreatorPubky,
@@ -65,6 +80,24 @@ where
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError> {
+        self.client
+            .get_json_value_as_creator(creator, &content_lock_path.to_string())
+            .await?
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
+                    message: format!(
+                        "failed to deserialize content lock from Pubky storage: {error}"
+                    ),
+                })
+            })
+            .transpose()
+    }
+
+    async fn get_content_lock_payload(
+        &self,
+        creator: &CreatorPubky,
+        content_lock_path: &ContentLockPath,
+    ) -> Result<Option<ContentLockPayload>, ApplicationError> {
         self.client
             .get_json_value_as_creator(creator, &content_lock_path.to_string())
             .await?

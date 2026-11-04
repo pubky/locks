@@ -38,6 +38,16 @@ pub trait ContentLockDeletionActionOwnership: Send + Sync {
         claim: ContentLockDeletionActionClaim<'_>,
     ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError>;
 
+    /// Acquires the per-job lane for request-path graceful withdrawal, then
+    /// validates that the job still owns an unforced withdraw phase.
+    async fn try_acquire_graceful_withdrawal(
+        &self,
+        job_id: Uuid,
+    ) -> Result<ContentLockDeletionActionAcquireResult, ApplicationError> {
+        let _ = job_id;
+        Ok(ContentLockDeletionActionAcquireResult::ClaimLost)
+    }
+
     /// Acquires the same per-job lane for synchronous force cleanup after a
     /// failed or completed graceful job established a pending force receipt.
     async fn try_acquire_synchronous_force(

@@ -57,6 +57,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                   AND bundle_id = submitted_proof_bundle->>'bundle_id'
                   AND invoice_admission_phase = 'ready'
                   AND deletion_job_id IS NULL
+                  AND evaluator_snapshot IS NULL
                   AND (
                       NOT EXISTS (
                           SELECT 1
@@ -117,6 +118,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
               AND claim_token = $3
               AND claim_expires_at > clock_timestamp()
               AND deletion_job_id IS NULL
+              AND evaluator_snapshot IS NULL
             RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
@@ -182,6 +184,7 @@ impl VerificationTaskClaimer for PostgresVerificationTaskClaimer {
                AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
                AND deletion_job_id IS NULL
+               AND evaluator_snapshot IS NULL
              RETURNING {VERIFICATION_TASK_ROW_COLUMNS}"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)

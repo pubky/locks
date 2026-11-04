@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -13,27 +14,35 @@ use axum::routing::post;
 use axum::{Json, Router};
 use locks_core::ids::{
     BundleId, ClientReference, ContentLockPath, CreatorPubky, GuardedResourceHash, LockId,
-    LockServerPubky, PubkyLockResource,
+    LockServerPubky, PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
+    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
+    GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
     LockServerConfig, PaykitPaymentAsset, SecondaryGuardedResource, VerifierType,
 };
-use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+use locks_core::verification::{
+    Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     AccessCredentialLookupKey, AccessCredentialRecord, ContentLockDeletionFailureCode,
     ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, DeletionReadAuthorization,
+    FoldedAuthAttempt, FoldedAuthFlowSecret, FoldedAuthStartResult, FoldedAuthStateHash,
     FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
-    GuardedResourceRecord, InvoiceAdmissionRetryReason, LegacyCreatorConnectFlowApproval,
-    OrdinaryCredentialLookupResult, PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
+    GraphTaskRecord, GuardedResourceRecord, InvoiceAdmissionRetryReason,
+    LegacyCreatorConnectFlowApproval, OrdinaryCredentialLookupResult,
+    PendingCreatorConnectFlowRecord, PrepareForceDeletionResult, RestoredFoldedAuthAttempt,
+    StartFoldedAuthAttempt,
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
     ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-    ContentLockDeletionRepository, ContentLockRepository, GrantCreatorConnectFlowClient,
+    ContentLockDeletionRepository, ContentLockRepository, FoldedAuthApprovalPoll,
+    FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthFlowStarter,
+    FoldedAuthPollCall, FoldedAuthRepository, GrantCreatorConnectFlowClient,
     GuardedResourceRepository, LegacyCreatorConnectFlowClient,
 };
 
@@ -70,12 +79,18 @@ use crate::paykit_http_client::{
 };
 use crate::worker::{InvoiceAdmissionWorker, InvoiceRetryJitter, InvoiceWorkerTick};
 
+use locks_service::infrastructure::folded_auth::FoldedAuthSecretCipher;
 use locks_service::infrastructure::memory::content_lock_tombstones::InMemoryContentLockTombstoneRepository;
 use locks_service::infrastructure::memory::content_locks::InMemoryContentLockRepository;
 use locks_service::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
+use locks_service::infrastructure::memory::folded_auth::InMemoryFoldedAuthRepository;
+use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
+use locks_service::infrastructure::memory::public_content_locks::InMemoryPublicContentLockStore;
+
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
+use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 /// Shaped like the base64url 32-byte reference a relying service mints per payment.
@@ -84,6 +99,173 @@ const SHOP_REFERENCE: &str = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU";
 #[derive(Debug, Clone, Copy)]
 enum CreatorRepositoryBackend {
     PubkyHomeserver,
+}
+
+struct FakeFoldedAuth;
+
+impl FoldedAuthFlowStarter for FakeFoldedAuth {
+    fn start(
+        &self,
+        _key_id: &GrantPopKeyId,
+    ) -> Result<(String, FoldedAuthFlowSecret), ApplicationError> {
+        Ok((
+            "https://auth.example/approve".to_owned(),
+            FoldedAuthFlowSecret::new(b"test-flow-secret".to_vec()),
+        ))
+    }
+}
+
+#[async_trait]
+impl FoldedAuthApprovalPoller for FakeFoldedAuth {
+    async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+        FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Pending))
+    }
+}
+
+struct FakeFoldedAuthPoller(FakeFoldedAuthPollResult);
+
+enum FakeFoldedAuthPollResult {
+    Approved,
+    Ambiguous,
+    Unavailable,
+}
+
+#[async_trait]
+impl FoldedAuthApprovalPoller for FakeFoldedAuthPoller {
+    async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+        match self.0 {
+            FakeFoldedAuthPollResult::Approved => {
+                FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Approved {
+                    reader: other_creator(),
+                }))
+            }
+            FakeFoldedAuthPollResult::Ambiguous => {
+                FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError))
+            }
+            FakeFoldedAuthPollResult::Unavailable => FoldedAuthPollCall::TransientBeforePoll(
+                ApplicationError::VerificationDependencyUnavailable,
+            ),
+        }
+    }
+}
+
+struct StorageFailingFoldedAuthRepository;
+
+fn folded_auth_storage_failure() -> ApplicationError {
+    ApplicationError::Storage {
+        message: "injected folded auth repository failure".to_owned(),
+    }
+}
+
+#[async_trait]
+impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
+    async fn get_latest_by_handle(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn start_or_rotate(
+        &self,
+        _request: StartFoldedAuthAttempt,
+    ) -> Result<FoldedAuthStartResult, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn get_by_state_hash(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn restore_pending(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<RestoredFoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn mark_poll_dispatched(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn renew_poll_dispatch(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn confirm_not_attempted(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn confirm_pending_generation(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn require_restart(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn expire(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn accept_and_insert_graph_task(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _task_id: TaskId,
+        _reader: CreatorPubky,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn purge_terminal_before(
+        &self,
+        _now: time::OffsetDateTime,
+    ) -> Result<u64, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn accepted_graph_task(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -538,6 +720,808 @@ async fn well_known_locks_server_returns_service_version_and_lock_server_identit
 }
 
 #[tokio::test]
+async fn graph_v2_submission_starts_folded_auth_then_polls_pending_without_secrets() {
+    let (state, bundle) = folded_auth_test_state().await;
+    let app = router(state);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "auth_pending");
+    assert_eq!(body["auth_url"], "https://auth.example/approve");
+    assert!(
+        body["state"]
+            .as_str()
+            .is_some_and(|state| !state.is_empty())
+    );
+    assert!(body.get("flow_secret").is_none());
+
+    let status = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": body["state"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store");
+    let status_body = response_json(status).await;
+    assert_eq!(status_body["status"], "pending");
+    assert!(status_body.get("flow_secret").is_none());
+}
+
+#[tokio::test]
+async fn folded_auth_changed_same_handle_submission_is_exact_conflict_cors_and_no_store() {
+    let (state, bundle) = folded_auth_test_state().await;
+    let original_path = bundle.pubky_lock_resource.content_lock_path().clone();
+    let mut changed_lock = match state
+        .content_locks()
+        .get_content_lock_payload(&creator(), &original_path)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ContentLockPayload::V2(lock) => lock,
+        ContentLockPayload::V1(_) => panic!("folded auth fixture must use v2 content lock"),
+    };
+    changed_lock.created_at += time::Duration::seconds(1);
+    let changed_path = ContentLockPath::from_lock_id(changed_lock.lock_id().unwrap());
+    state
+        .content_locks()
+        .upsert_content_lock_payload(
+            creator(),
+            changed_path.clone(),
+            ContentLockPayload::V2(changed_lock),
+        )
+        .await
+        .unwrap();
+    let changed_bundle = SubmittedProofBundleV2 {
+        pubky_lock_resource: PubkyLockResource::new(creator(), changed_path),
+        ..bundle.clone()
+    };
+    let app = router(state);
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let conflict = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://pubky.app")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41003))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": changed_bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        conflict.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(conflict.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        response_json(conflict).await["error"]["code"],
+        "task_state_conflict"
+    );
+}
+
+#[tokio::test]
+async fn folded_auth_repository_failure_is_closed_500_cors_and_no_store() {
+    let (state, bundle) = folded_auth_test_state().await;
+    let state = state.with_folded_auth_runtime(
+        Arc::new(StorageFailingFoldedAuthRepository),
+        Arc::new(FakeFoldedAuth),
+        Arc::new(FakeFoldedAuth),
+    );
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://pubky.app")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41004))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "internal_error"
+    );
+}
+
+#[tokio::test]
+async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_http_response() {
+    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
+        FakeFoldedAuthPollResult::Approved,
+    )))
+    .await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted_body = response_json(submitted).await;
+    let status_request = || {
+        json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted_body["state"]}),
+        )
+    };
+
+    let accepted = app.clone().oneshot(status_request()).await.unwrap();
+    let accepted_status = accepted.status();
+    assert_eq!(accepted.headers()[header::CACHE_CONTROL], "no-store");
+    let accepted_body = response_json(accepted).await;
+    assert_eq!(accepted_status, StatusCode::OK, "{accepted_body}");
+    assert_eq!(accepted_body["status"], "accepted");
+    assert_eq!(accepted_body["task"]["status"], "pending");
+    assert_eq!(accepted_body["task"]["creator"], creator().to_string());
+    assert_eq!(accepted_body["task"]["bundle_id"], BUNDLE_ID);
+    assert_json_contains_no_null(&accepted_body["task"]);
+
+    let lifecycle = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(lifecycle.status(), StatusCode::OK);
+    let lifecycle = response_json(lifecycle).await;
+    assert_eq!(lifecycle["status"], "pending");
+    assert_eq!(lifecycle["creator"], creator().to_string());
+    assert_eq!(lifecycle["bundle_id"], BUNDLE_ID);
+    assert_json_contains_no_null(&lifecycle);
+
+    let replayed = app.oneshot(status_request()).await.unwrap();
+    assert_eq!(replayed.status(), StatusCode::OK);
+    assert_eq!(replayed.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response_json(replayed).await, accepted_body);
+}
+
+#[tokio::test]
+async fn creator_graph_evidence_is_owner_only_and_absence_is_indistinguishable() {
+    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
+        FakeFoldedAuthPollResult::Approved,
+    )))
+    .await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    seed_frontend_session(&state, "other-session", other_creator()).await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    let submitted_body = response_json(submitted).await;
+    let accepted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted_body["state"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let owner = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BUNDLE_ID}),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), StatusCode::OK);
+    let owner = response_json(owner).await;
+    assert_eq!(owner["creator"], creator().to_string());
+    assert_eq!(owner["bundle_id"], BUNDLE_ID);
+    assert_eq!(owner["mode"], "graph");
+    assert_eq!(owner["satisfied_by"], json!([]));
+    assert_eq!(owner["graph"]["predicates"][0]["index"], 0);
+    assert_no_keys(
+        &owner["graph"]["predicates"][0],
+        &[
+            "latest_observation",
+            "first_true_observation",
+            "operational_error",
+        ],
+    );
+    assert_no_keys(
+        &owner,
+        &[
+            "task_id",
+            "claim_token",
+            "evaluator_revision",
+            "raw_body",
+            "response_digest",
+            "history",
+            "flow_secret",
+            "config",
+            "failure_message",
+        ],
+    );
+    assert_json_contains_no_null(&owner);
+
+    let non_owner = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BUNDLE_ID}),
+            "other-session",
+        ))
+        .await
+        .unwrap();
+    let non_owner_status = non_owner.status();
+    let non_owner_body = response_json(non_owner).await;
+
+    let unknown = app
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BundleId::from_bytes([9; 16])}),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(non_owner_status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response_json(unknown).await, non_owner_body);
+}
+
+#[tokio::test]
+async fn folded_auth_attempted_ambiguity_durably_requires_restart() {
+    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
+        FakeFoldedAuthPollResult::Ambiguous,
+    )))
+    .await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    let submitted_body = response_json(submitted).await;
+    let request = || {
+        json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted_body["state"]}),
+        )
+    };
+
+    for _ in 0..2 {
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response_json(response).await,
+            json!({"status": "restart_required"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn folded_auth_pre_poll_unavailable_is_503_and_remains_pending_for_retry() {
+    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
+        FakeFoldedAuthPollResult::Unavailable,
+    )))
+    .await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    let submitted_body = response_json(submitted).await;
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/proof-bundles/auth-status",
+                json!({"state": submitted_body["state"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "folded_auth_unavailable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn folded_auth_expired_status_is_terminal_exact_cors_and_no_store() {
+    let clock = Arc::new(AdjustableClock::new(datetime!(2026-10-30 12:00:00 UTC)));
+    let (state, bundle) = folded_auth_test_state_with_clock(clock.clone()).await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted_body = response_json(submitted).await;
+    clock.set(datetime!(2026-10-30 12:11:00 UTC));
+
+    let expired = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles/auth-status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://pubky.app")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"state": submitted_body["state"]})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(expired.status(), StatusCode::OK);
+    assert_eq!(
+        expired.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(expired.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        response_json(expired).await,
+        json!({"status": "expired", "expired_at": "2026-10-30T12:11:00Z"})
+    );
+}
+
+#[tokio::test]
+async fn folded_auth_unknown_state_is_404_and_no_store() {
+    let (state, _) = folded_auth_test_state().await;
+    let response = router(state)
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": "unknown-opaque-state"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["code"], "folded_auth_state_not_found");
+}
+
+#[tokio::test]
+async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
+    let response = router(test_state())
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": "opaque-public-state"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["code"], "folded_auth_unavailable");
+}
+
+#[tokio::test]
+async fn folded_auth_cors_preflight_allows_browser_sdk_headers_on_both_routes() {
+    let app = router(test_state_with_folded_auth_origins(vec![
+        "https://pubky.app".to_owned(),
+    ]));
+
+    for uri in ["/proof-bundles", "/proof-bundles/auth-status"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://pubky.app")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization, content-type, pubky-host",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://pubky.app",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "POST",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization, content-type, pubky-host",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn folded_auth_cors_rejects_duplicate_origin_headers() {
+    let response = router(test_state_with_folded_auth_origins(vec![
+        "https://pubky.app".to_owned(),
+    ]))
+    .oneshot(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/proof-bundles/auth-status")
+            .header(header::ORIGIN, "https://pubky.app")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_exact_origin_applies_to_submit_status_and_preflight() {
+    let origin = "https://pubky.app";
+    let (state, bundle) = folded_auth_test_state_with_poller_and_origins(
+        Arc::new(FakeFoldedAuth),
+        vec![origin.to_owned()],
+    )
+    .await;
+    let app = router(state);
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41002))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle.clone()})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(submitted.headers()[header::CACHE_CONTROL], "no-store");
+    let submitted_body = response_json(submitted).await;
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles/auth-status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"state": submitted_body["state"]})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store");
+
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/proof-bundles/auth-status")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(preflight.headers()[header::CACHE_CONTROL], "no-store");
+
+    for invalid_origin in [
+        "null",
+        "https://user@example.com",
+        "https://example.com/",
+        "https://example.com/path",
+        "https://example.com?query",
+        "https://example.com#fragment",
+        "https://example.com:not-a-port",
+        "data:text/plain,opaque",
+        "ftp://example.com",
+        "not an origin",
+    ] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/proof-bundles/auth-status")
+                    .header(header::ORIGIN, invalid_origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid.status(),
+            StatusCode::FORBIDDEN,
+            "unexpectedly accepted Origin {invalid_origin:?}"
+        );
+        assert!(
+            invalid
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        assert_eq!(invalid.headers()[header::CACHE_CONTROL], "no-store");
+
+        let invalid_status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/proof-bundles/auth-status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, invalid_origin)
+                    .body(Body::from(r#"{"state":"unknown-opaque-state"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_status.status(), StatusCode::FORBIDDEN);
+        assert!(
+            invalid_status
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        assert_eq!(invalid_status.headers()[header::CACHE_CONTROL], "no-store");
+
+        let invalid_submit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/proof-bundles")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, invalid_origin)
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41005))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"submitted_proof_bundle": bundle.clone()}))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_submit.status(), StatusCode::FORBIDDEN);
+        assert!(
+            invalid_submit
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        assert_eq!(invalid_submit.headers()[header::CACHE_CONTROL], "no-store");
+    }
+}
+
+#[tokio::test]
+async fn proof_submission_cors_preserves_v1_while_rejecting_unconfigured_v2_origin() {
+    let v1_request = fixture_value("submit_proof_bundle_request.json");
+    let v1_response = router(test_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://legacy-reader.example")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41000))))
+                .body(Body::from(serde_json::to_vec(&v1_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v1_response.status(), StatusCode::OK);
+    assert_eq!(
+        v1_response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://legacy-reader.example"
+    );
+
+    let (state, bundle) = folded_auth_test_state().await;
+    let v2_response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://evil.example")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41001))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(v2_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(v2_response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(
+        v2_response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+    assert!(
+        v2_response
+            .headers()
+            .get("x-locks-folded-auth-origin-denied")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn folded_auth_cors_rejects_unconfigured_origin_without_reflection() {
+    let response = router(test_state_with_folded_auth_origins(vec![
+        "https://pubky.app".to_owned(),
+    ]))
+    .oneshot(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/proof-bundles/auth-status")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_malformed_error_reflects_exact_configured_origin_and_is_no_store() {
+    let response = router(test_state_with_folded_auth_origins(vec![
+        "https://pubky.app".to_owned(),
+    ]))
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/proof-bundles/auth-status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://pubky.app")
+            .body(Body::from(r#"{"unexpected":true}"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
 async fn cors_preflight_allows_browser_sdk_requests() {
     let response = router(test_state())
         .oneshot(
@@ -871,6 +1855,117 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
 }
 
 #[tokio::test]
+async fn committed_graceful_withdrawal_miss_returns_durable_failed_lifecycle() {
+    let content_locks = Arc::new(InMemoryContentLockRepository::new());
+    let guarded_resources = Arc::new(InMemoryGuardedResourceRepository::new());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        guarded_resources,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "status": "failed",
+            "failure_code": "tombstone_missing"
+        })
+    );
+    let job = state
+        .content_lock_deletions()
+        .get_job(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.state, ContentLockDeletionState::Failed);
+    assert_eq!(
+        job.failure_code,
+        Some(ContentLockDeletionFailureCode::TombstoneMissing)
+    );
+}
+
+#[tokio::test]
+async fn completed_force_fences_stale_graceful_withdrawal() {
+    let state = test_state();
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("force-first", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            job.job_id,
+            "force-first",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(&creator(), &lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+    let force_guard = match state
+        .content_lock_deletion_action_ownership()
+        .try_acquire_synchronous_force(job.job_id)
+        .await
+        .unwrap()
+    {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        _ => panic!("force action lane must be acquired"),
+    };
+    assert!(
+        state
+            .content_lock_deletions()
+            .complete_synchronous_force_deletion(&creator(), &lock_id, state.clock().now())
+            .await
+            .unwrap()
+    );
+    force_guard.release().await.unwrap();
+
+    assert!(matches!(
+        state
+            .content_lock_deletion_action_ownership()
+            .try_acquire_graceful_withdrawal(job.job_id)
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
+}
+
+#[tokio::test]
 async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -922,13 +2017,21 @@ async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
             .await
             .unwrap()
     );
-    assert!(
+    let tombstone = locks_core::content_lock_deletion::ContentLockDeletionTombstone::new(
+        lock_id.clone(),
+        job.deletion_started_at,
+    );
+    assert_eq!(
         state
-            .content_locks()
-            .get_content_lock(&creator(), &ContentLockPath::from_lock_id(lock_id))
+            .content_lock_tombstones()
+            .read_tombstone(
+                &creator(),
+                &ContentLockPath::from_lock_id(lock_id),
+                &tombstone,
+            )
             .await
-            .unwrap()
-            .is_some()
+            .unwrap(),
+        locks_service::application::ports::TombstoneReadback::Exact
     );
 }
 
@@ -955,6 +2058,24 @@ async fn force_after_terminal_graceful_failure_completes_synchronously() {
         .await
         .unwrap();
     assert_eq!(graceful.status(), StatusCode::ACCEPTED);
+    let tombstone = locks_core::content_lock_deletion::ContentLockDeletionTombstone::new(
+        lock_id.clone(),
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deletion_started_at,
+    );
+    assert_eq!(
+        state
+            .content_lock_tombstones()
+            .read_tombstone(&creator(), &path, &tombstone)
+            .await
+            .unwrap(),
+        locks_service::application::ports::TombstoneReadback::Exact
+    );
 
     let now = state.clock().now();
     let claimed = state
@@ -5630,10 +6751,15 @@ fn test_state_with_runtime(
     expose_dev_completion_route: bool,
 ) -> AppState {
     let config = test_config(environment, expose_dev_completion_route);
+    let public_content_locks = InMemoryPublicContentLockStore::new();
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
-        Arc::new(InMemoryContentLockRepository::new()),
-        Arc::new(InMemoryContentLockTombstoneRepository::new()),
+        Arc::new(InMemoryContentLockRepository::with_public_store(
+            public_content_locks.clone(),
+        )),
+        Arc::new(InMemoryContentLockTombstoneRepository::with_public_store(
+            public_content_locks,
+        )),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),
@@ -5659,6 +6785,124 @@ fn test_state_with_creator_connect_return_origins(allowed_return_origins: Vec<St
         .creator_authority_acquisition
         .legacy_connect
         .allowed_return_origins = allowed_return_origins;
+    AppState::new_empty_in_memory(config)
+}
+
+async fn folded_auth_test_state() -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuth)).await
+}
+
+async fn folded_auth_test_state_with_poller(
+    poller: Arc<dyn FoldedAuthApprovalPoller>,
+) -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_poller_and_origins(poller, vec!["https://pubky.app".to_owned()])
+        .await
+}
+
+async fn folded_auth_test_state_with_poller_and_origins(
+    poller: Arc<dyn FoldedAuthApprovalPoller>,
+    allowed_return_origins: Vec<String>,
+) -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_runtime(poller, allowed_return_origins, None).await
+}
+
+async fn folded_auth_test_state_with_clock(
+    clock: Arc<dyn Clock>,
+) -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_runtime(
+        Arc::new(FakeFoldedAuth),
+        vec!["https://pubky.app".to_owned()],
+        Some(clock),
+    )
+    .await
+}
+
+async fn folded_auth_test_state_with_runtime(
+    poller: Arc<dyn FoldedAuthApprovalPoller>,
+    allowed_return_origins: Vec<String>,
+    clock: Option<Arc<dyn Clock>>,
+) -> (AppState, SubmittedProofBundleV2) {
+    let lock = ContentLockV2 {
+        version: 2,
+        creator: creator(),
+        primary_resource: Some(
+            GuardedResource::new(
+                "/priv/app.locks/content/item.txt",
+                GuardedResourceHash::from_bytes([3; 32]),
+                "text/plain",
+                4,
+            )
+            .unwrap(),
+        ),
+        secondary_resources: BTreeMap::new(),
+        payment: None,
+        graph: Some(GraphPolicyV2 {
+            predicates: vec![GraphPredicateV2::Follows {
+                follower: GraphParticipantV2::Reader,
+                followed: GraphParticipantV2::Creator,
+            }],
+            operator: None,
+        }),
+        verification_window_seconds: 300,
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 300,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: datetime!(2026-10-30 11:00:00 UTC),
+    };
+    let path = ContentLockPath::from_lock_id(lock.lock_id().unwrap());
+    let bundle = SubmittedProofBundleV2 {
+        version: 2,
+        bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+        pubky_lock_resource: PubkyLockResource::new(creator(), path.clone()),
+        reader_pubky: None,
+    };
+    let content_locks = Arc::new(InMemoryContentLockRepository::new());
+    content_locks
+        .upsert_content_lock_payload(creator(), path, ContentLockPayload::V2(lock))
+        .await
+        .unwrap();
+    let graph = match clock.as_ref() {
+        Some(clock) => Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(Arc::new(
+            locks_service::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence::with_clock(
+                clock.clone(),
+            ),
+        ))),
+        None => Arc::new(InMemoryGraphTaskRepository::new()),
+    };
+    let master_key =
+        RuntimeMasterKey::from_base64url("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "https://pubky.app".to_owned(),
+        allowed_return_origins,
+    });
+    let mut state = AppState::new_empty_in_memory_with_creator_repositories(
+        config,
+        content_locks,
+        Arc::new(InMemoryContentLockTombstoneRepository::new()),
+        Arc::new(InMemoryGuardedResourceRepository::new()),
+        Arc::new(InMemoryLockServicePointerRepository::new()),
+        Arc::new(InMemoryEntitlementRepository::new()),
+    )
+    .with_in_memory_graph_tasks(graph.clone());
+    let folded_auth = Arc::new(InMemoryFoldedAuthRepository::new(
+        graph,
+        FoldedAuthSecretCipher::from_runtime_master_key(&master_key),
+    ));
+    state = state.with_folded_auth_runtime(folded_auth, poller, Arc::new(FakeFoldedAuth));
+    if let Some(clock) = clock {
+        state = state.with_clock(clock);
+    }
+    (state, bundle)
+}
+
+fn test_state_with_folded_auth_origins(allowed_return_origins: Vec<String>) -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "https://pubky.app".to_owned(),
+        allowed_return_origins,
+    });
     AppState::new_empty_in_memory(config)
 }
 
@@ -5727,6 +6971,7 @@ fn test_config(
         deletion: crate::config::DeletionConfig::default(),
         deletion_worker: crate::config::DeletionWorkerConfig::default(),
         paykit: None,
+        nexus: None,
     }
 }
 
@@ -6288,6 +7533,24 @@ impl Clock for FixedClock {
     }
 }
 
+struct AdjustableClock(Mutex<time::OffsetDateTime>);
+
+impl AdjustableClock {
+    fn new(now: time::OffsetDateTime) -> Self {
+        Self(Mutex::new(now))
+    }
+
+    fn set(&self, now: time::OffsetDateTime) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl Clock for AdjustableClock {
+    fn now(&self) -> time::OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
 struct ZeroInvoiceJitter;
 
 impl InvoiceRetryJitter for ZeroInvoiceJitter {
@@ -6422,6 +7685,33 @@ fn creator_lock_service_config_request() -> Value {
     })
 }
 
+#[tokio::test]
+async fn folded_auth_status_malformed_request_is_no_store_invalid_request() {
+    let response = router(test_state())
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({ "unexpected": true }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "error": {
+                "code": "invalid_request",
+                "message": "invalid request"
+            }
+        })
+    );
+}
+
 fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
     let mut request = json_request_with_client_address(method, uri, body, [127, 0, 0, 1]);
     if uri.starts_with("/creator/content-locks") || uri.starts_with("/creator/lock-service-config")
@@ -6553,6 +7843,15 @@ async fn response_bytes(response: axum::response::Response) -> Vec<u8> {
 fn assert_no_keys(json: &Value, keys: &[&str]) {
     for key in keys {
         assert!(json.get(*key).is_none(), "unexpected key {key} in {json}");
+    }
+}
+
+fn assert_json_contains_no_null(value: &Value) {
+    match value {
+        Value::Null => panic!("unexpected null in {value}"),
+        Value::Array(values) => values.iter().for_each(assert_json_contains_no_null),
+        Value::Object(fields) => fields.values().for_each(assert_json_contains_no_null),
+        _ => {}
     }
 }
 

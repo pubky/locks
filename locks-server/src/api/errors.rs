@@ -12,6 +12,8 @@ pub enum ApiErrorCode {
     ExpiredAccessCredential,
     EntitlementNotAuthorized,
     VerificationTaskNotFound,
+    FoldedAuthStateNotFound,
+    FoldedAuthUnavailable,
     GuardedResourceNotFound,
     ContentLockNotFound,
     CreatorAuthorityUnavailable,
@@ -48,6 +50,8 @@ impl ApiErrorCode {
             Self::ExpiredAccessCredential => "expired_access_credential",
             Self::EntitlementNotAuthorized => "entitlement_not_authorized",
             Self::VerificationTaskNotFound => "verification_task_not_found",
+            Self::FoldedAuthStateNotFound => "folded_auth_state_not_found",
+            Self::FoldedAuthUnavailable => "folded_auth_unavailable",
             Self::GuardedResourceNotFound => "guarded_resource_not_found",
             Self::ContentLockNotFound => "content_lock_not_found",
             Self::CreatorAuthorityUnavailable => "creator_authority_unavailable",
@@ -84,12 +88,15 @@ impl ApiErrorCode {
             }
             Self::EntitlementNotAuthorized => StatusCode::FORBIDDEN,
             Self::VerificationTaskNotFound
+            | Self::FoldedAuthStateNotFound
             | Self::GuardedResourceNotFound
             | Self::ContentLockNotFound
             | Self::ContentLockDeletionNotFound
             | Self::CreatorConnectFlowUnavailable
             | Self::FrontendSessionCodeUnavailable => StatusCode::NOT_FOUND,
-            Self::CreatorAuthorityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::CreatorAuthorityUnavailable | Self::FoldedAuthUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::CreatorConnectFlowExpired
             | Self::FrontendSessionCodeExpired
             | Self::FrontendSessionCodeAlreadyConsumed => StatusCode::GONE,
@@ -266,6 +273,8 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::Storage { .. }
             | ApplicationError::VerificationDependencyUnavailable
             | ApplicationError::FinalCredentialSecret { .. }
+            | ApplicationError::FoldedAuthSecret { .. }
+            | ApplicationError::InvalidFoldedAuthState { .. }
             | ApplicationError::InvalidContentLockDeletionState { .. }
             | ApplicationError::Verifier { .. }
             | ApplicationError::CredentialGeneration { .. }

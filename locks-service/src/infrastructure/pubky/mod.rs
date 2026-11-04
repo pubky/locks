@@ -1,6 +1,7 @@
 pub mod content_lock_tombstones;
 pub mod content_locks;
 pub mod entitlements;
+pub mod folded_auth_flow;
 pub mod grant_connect_flow;
 mod grant_session_cache;
 pub mod legacy_connect_flow;
@@ -12,6 +13,7 @@ pub mod storage_client;
 pub use content_lock_tombstones::PubkyContentLockTombstoneRepository;
 pub use content_locks::PubkyContentLockRepository;
 pub use entitlements::PubkyEntitlementRepository;
+pub use folded_auth_flow::{PubkyFoldedAuthApprovalPoller, PubkyFoldedAuthFlowStarter};
 pub use grant_connect_flow::{LockServerGrantPopKeys, PubkyGrantCreatorConnectFlowClient};
 pub use grant_session_cache::{CachedGrantSession, GrantSessionCache};
 pub use legacy_connect_flow::{

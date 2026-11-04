@@ -149,6 +149,11 @@ Design of this proposal was created with the following goals:
 For the implemented authorization boundary, see
 [ADR 0017](docs/ADRs/0017-creator-granted-auth-boundary.md).
 
+Graph-only Content Lock v2 verification, folded-auth restart behavior, selected Nexus
+`app_spec_v0_7` reads, SDK flow, and deterministic fake-dependency Compose E2E are
+documented in [Graph Stage 1](docs/GRAPH_STAGE1.md) and
+[ADR 0022](docs/ADRs/0022-graph-stage1-folded-auth-nexus.md).
+
 **Content creator** is a Pubky user who creates content they want to put behind a lock.
 
 **Content viewer** is a user or non-user who is able to provide satisfactory proof for a lock's criteria. A viewer does not necessarily have a Pubky identity. Some lock types may require viewer identity; others may support anonymous viewers.

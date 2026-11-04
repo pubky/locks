@@ -30,7 +30,7 @@
     "tag": "latest"
   },
   "scripts": {
-    "build": "wasm-pack build --target web --out-dir pkg",
+    "build": "wasm-pack build --target web --out-dir pkg && node scripts/prepare-package.mjs",
     "check:wasm": "cargo check -p locks-sdk-wasm --target wasm32-unknown-unknown",
     "smoke:pkg": "npm run build && node scripts/smoke-generated-api.mjs",
     "smoke:demo": "node scripts/smoke-demo.mjs",

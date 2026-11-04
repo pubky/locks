@@ -1,4 +1,5 @@
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
+use locks_service::infrastructure::folded_auth::FoldedAuthSecretCipher;
 use locks_service::infrastructure::postgres::{
     CreatorAuthoritySecretCipher, PostgresError, run_migrations,
 };
@@ -32,18 +33,19 @@ pub enum RuntimeStorageError {
 pub async fn build_runtime_state(
     config: LockServerRuntimeConfig,
 ) -> Result<AppState, RuntimeStorageError> {
-    let (creator_authority_cipher, final_credential_cipher) =
+    let (creator_authority_cipher, final_credential_cipher, folded_auth_cipher) =
         runtime_ciphers_from_env(&config.secrets)?;
     let pool = connect_database(&config.database).await?;
     if config.database.run_migrations_on_startup {
         run_migrations(&pool).await?;
     }
 
-    Ok(AppState::new_with_postgres_runtime(
+    Ok(AppState::new_with_postgres_runtime_and_folded_auth(
         config,
         pool,
         creator_authority_cipher,
         final_credential_cipher,
+        folded_auth_cipher,
     ))
 }
 
@@ -51,12 +53,19 @@ pub async fn build_runtime_state(
 fn creator_authority_cipher_from_env(
     config: &SecretsConfig,
 ) -> Result<CreatorAuthoritySecretCipher, RuntimeStorageError> {
-    runtime_ciphers_from_env(config).map(|(creator, _)| creator)
+    runtime_ciphers_from_env(config).map(|(creator, _, _)| creator)
 }
 
 fn runtime_ciphers_from_env(
     config: &SecretsConfig,
-) -> Result<(CreatorAuthoritySecretCipher, FinalCredentialCipher), RuntimeStorageError> {
+) -> Result<
+    (
+        CreatorAuthoritySecretCipher,
+        FinalCredentialCipher,
+        FoldedAuthSecretCipher,
+    ),
+    RuntimeStorageError,
+> {
     let key = std::env::var(&config.runtime_master_key_env).map_err(|_| {
         RuntimeStorageError::MissingRuntimeMasterKeyEnv(config.runtime_master_key_env.clone())
     })?;
@@ -66,6 +75,7 @@ fn runtime_ciphers_from_env(
     Ok((
         CreatorAuthoritySecretCipher::new(master_key.creator_authority_key()),
         FinalCredentialCipher::new(master_key.final_credential_key()),
+        FoldedAuthSecretCipher::from_runtime_master_key(&master_key),
     ))
 }
 

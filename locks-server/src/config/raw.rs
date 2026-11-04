@@ -20,7 +20,7 @@ use super::schema::{
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
     GrantConnectAcquisitionConfig, LegacyConnectAcquisitionConfig, LockServerCredentialsConfig,
     LockServerRuntimeConfig, LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS,
-    MAX_TRUSTED_PROXY_HOPS, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
+    MAX_TRUSTED_PROXY_HOPS, NexusConfig, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
     PaykitConnectionStateLookupRateLimitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
     PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
     VerificationSubmissionRateLimitConfig, WorkerConfig,
@@ -54,6 +54,44 @@ pub(super) struct RawConfig {
     deletion_worker: RawDeletionWorkerConfig,
     #[serde(default)]
     paykit: Option<RawPaykitConfig>,
+    #[serde(default)]
+    nexus: Option<RawNexusConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNexusConfig {
+    server_url: String,
+    #[serde(default)]
+    allow_insecure_loopback: bool,
+}
+
+impl RawNexusConfig {
+    fn into_nexus_config(
+        self,
+        environment: RuntimeEnvironment,
+    ) -> Result<NexusConfig, ConfigError> {
+        let parsed =
+            Url::parse(&self.server_url).map_err(|_| ConfigError::InvalidNexusServerUrl)?;
+        let exact = parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && (parsed.path().is_empty() || parsed.path() == "/");
+        let secure = parsed.scheme() == "https";
+        let loopback = environment.is_development()
+            && self.allow_insecure_loopback
+            && parsed.scheme() == "http"
+            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if !exact || (!secure && !loopback) {
+            return Err(ConfigError::InvalidNexusServerUrl);
+        }
+        Ok(NexusConfig {
+            server_url: self.server_url,
+            allow_insecure_loopback: self.allow_insecure_loopback,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +423,26 @@ fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, C
         .into_iter()
         .map(validate_allowed_return_origin)
         .collect::<Result<Vec<_>, _>>()
+}
+
+fn validate_grant_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values
+        .into_iter()
+        .map(|value| {
+            let Some(origin) = super::canonical_grant_origin(&value) else {
+                return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
+                    value,
+                ));
+            };
+            if !seen.insert(origin.clone()) {
+                return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
+                    origin,
+                ));
+            }
+            Ok(origin)
+        })
+        .collect()
 }
 
 fn validate_allowed_return_origin(value: String) -> Result<String, ConfigError> {
@@ -787,7 +845,7 @@ impl RawCreatorAuthorityAcquisitionConfig {
                 |grant| -> Result<GrantConnectAcquisitionConfig, ConfigError> {
                     Ok(GrantConnectAcquisitionConfig {
                         client_id: validate_grant_connect_client_id(grant.client_id)?,
-                        allowed_return_origins: validate_allowed_return_origins(
+                        allowed_return_origins: validate_grant_return_origins(
                             grant.allowed_return_origins,
                         )?,
                     })
@@ -964,6 +1022,10 @@ impl RawConfig {
             .paykit
             .map(RawPaykitConfig::into_paykit_config)
             .transpose()?;
+        let nexus = self
+            .nexus
+            .map(|nexus| nexus.into_nexus_config(runtime.environment))
+            .transpose()?;
         if self.worker.poll_interval_ms == 0 {
             return Err(ConfigError::InvalidWorkerPollInterval);
         }
@@ -1010,6 +1072,7 @@ impl RawConfig {
             deletion,
             deletion_worker,
             paykit,
+            nexus,
         })
     }
 }

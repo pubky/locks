@@ -7,17 +7,23 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use locks_core::lock_policy::VerifierType;
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::lock_policy::{ContentLockPayload, VerifierType};
+use locks_core::verification::{
+    SubmittedProofBundle, SubmittedProofBundlePayload, validate_content_lock_submission,
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    InvoiceAdmissionPhase, InvoiceAdmissionRecord, InvoiceAdmissionRetryReason,
+    FoldedAuthStateHash, FoldedAuthStatus, GrantPopKeyId, GraphTaskRecord, InvoiceAdmissionPhase,
+    InvoiceAdmissionRecord, InvoiceAdmissionRetryReason, StartFoldedAuthAttempt,
 };
 use locks_service::application::use_cases::complete_verification_task::{
     CompleteVerificationTaskRequest, CompleteVerificationTaskUseCase,
 };
 use locks_service::application::use_cases::get_verification_task::{
     GetVerificationTaskByHandleRequest, GetVerificationTaskByHandleUseCase,
+};
+use locks_service::application::use_cases::poll_folded_auth::{
+    PollFoldedAuthAttempt, PollFoldedAuthOutcome,
 };
 use locks_service::application::use_cases::submit_proof_bundle::{
     SubmitProofBundleRequest, SubmitProofBundleUseCase, SubmittedVerificationTask,
@@ -27,9 +33,13 @@ use locks_service::application::use_cases::validate_paykit_payment_submission::{
 };
 use locks_service::infrastructure::verifiers::registry::StaticCriterionVerifierRegistry;
 
+use crate::api::auth::authenticated_creator_from_headers;
 use crate::api::dtos::{
-    PaykitConnectionStateHttpResponse, SubmitProofBundleHttpRequest,
-    VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
+    CreatorVerificationEvidenceHttpRequest, CreatorVerificationEvidenceHttpResponse,
+    FoldedAuthPendingHttpResponse, FoldedAuthStatusHttpRequest, FoldedAuthStatusHttpResponse,
+    GraphVerificationTaskLifecycleHttpResponse, PaykitConnectionStateHttpResponse,
+    SubmitProofBundleHttpRequest, VerificationTaskHandleHttpRequest,
+    VerificationTaskLifecycleHttpResponse,
 };
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
@@ -39,6 +49,64 @@ use crate::rate_limit::{
     PaykitConnectionStateLookupRateLimitKey, VerificationSubmissionRateLimitKey, client_ip,
 };
 
+pub(super) async fn lookup_folded_auth_status(
+    State(state): State<AppState>,
+    request: Result<Json<FoldedAuthStatusHttpRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let request = parse_json(request)?;
+    if request.state.is_empty() || request.state.len() > 512 {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "invalid request",
+        ));
+    }
+    let repository = state.folded_auth().ok_or_else(folded_auth_unavailable)?;
+    let poller = state
+        .folded_auth_poller()
+        .ok_or_else(folded_auth_unavailable)?;
+    let outcome = PollFoldedAuthAttempt::new(
+        Arc::clone(repository),
+        Arc::clone(poller),
+        Arc::clone(state.clock()),
+    )
+    .execute(&FoldedAuthStateHash::derive(request.state.as_bytes()))
+    .await
+    .map_err(|error| match error {
+        ApplicationError::VerificationDependencyUnavailable => folded_auth_unavailable(),
+        other => ApiError::from(other),
+    })?;
+    let response = match outcome {
+        PollFoldedAuthOutcome::Pending(attempt) => FoldedAuthStatusHttpResponse::Pending {
+            expires_at: attempt.expires_at,
+        },
+        PollFoldedAuthOutcome::Accepted(task) => accepted_status_response(task),
+        PollFoldedAuthOutcome::RestartRequired(_) => FoldedAuthStatusHttpResponse::RestartRequired,
+        PollFoldedAuthOutcome::Expired(attempt) => FoldedAuthStatusHttpResponse::Expired {
+            expired_at: attempt.terminal_at.unwrap_or(attempt.expires_at),
+        },
+        PollFoldedAuthOutcome::Stale => {
+            return Err(ApiError::new(
+                ApiErrorCode::FoldedAuthStateNotFound,
+                "folded auth state not found",
+            ));
+        }
+    };
+    Ok(Json(response).into_response())
+}
+
+fn folded_auth_unavailable() -> ApiError {
+    ApiError::new(
+        ApiErrorCode::FoldedAuthUnavailable,
+        "folded auth is unavailable",
+    )
+}
+
+fn accepted_status_response(task: GraphTaskRecord) -> FoldedAuthStatusHttpResponse {
+    FoldedAuthStatusHttpResponse::Accepted {
+        task: GraphVerificationTaskLifecycleHttpResponse::from(&task),
+    }
+}
+
 pub(super) async fn submit_proof_bundle(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -46,11 +114,10 @@ pub(super) async fn submit_proof_bundle(
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
-    let creator = request
-        .submitted_proof_bundle
-        .pubky_lock_resource
-        .creator()
-        .clone();
+    let creator = match &request.submitted_proof_bundle {
+        SubmittedProofBundlePayload::V1(bundle) => bundle.pubky_lock_resource.creator().clone(),
+        SubmittedProofBundlePayload::V2(bundle) => bundle.pubky_lock_resource.creator().clone(),
+    };
     let decision = state.verification_submission_rate_limiter().check(
         &VerificationSubmissionRateLimitKey {
             client_address: client_ip(
@@ -73,19 +140,48 @@ pub(super) async fn submit_proof_bundle(
         )
             .into_response());
     }
+    let submitted_proof_bundle = match request.submitted_proof_bundle {
+        SubmittedProofBundlePayload::V1(bundle) => bundle,
+        SubmittedProofBundlePayload::V2(bundle) => {
+            if let Some(origin) = headers.get(header::ORIGIN) {
+                let allowed = origin.to_str().ok().is_some_and(|origin| {
+                    state
+                        .config()
+                        .creator_authority_acquisition
+                        .grant_connect
+                        .as_ref()
+                        .is_some_and(|grant| {
+                            crate::api::routes::auth_origin_allowed(
+                                &grant.allowed_return_origins,
+                                origin,
+                            )
+                        })
+                });
+                if !allowed {
+                    let mut response = StatusCode::FORBIDDEN.into_response();
+                    response.headers_mut().insert(
+                        "x-locks-folded-auth-origin-denied",
+                        header::HeaderValue::from_static("1"),
+                    );
+                    return Ok(response);
+                }
+            }
+            return start_folded_auth(&state, bundle).await;
+        }
+    };
     let use_case = SubmitProofBundleUseCase::new(
         state.task_ids().as_ref(),
         state.verification_tasks().as_ref(),
         state.clock().as_ref(),
     );
     let prepared =
-        maybe_prepare_paykit_submission(&state, &request.submitted_proof_bundle, &use_case).await?;
+        maybe_prepare_paykit_submission(&state, &submitted_proof_bundle, &use_case).await?;
     let submitted = match prepared.existing {
         Some(existing) => existing,
         None => {
             use_case
                 .execute(SubmitProofBundleRequest {
-                    submitted_proof_bundle: request.submitted_proof_bundle,
+                    submitted_proof_bundle,
                 })
                 .await?
         }
@@ -103,6 +199,98 @@ pub(super) async fn submit_proof_bundle(
         .get_invoice_admission(&task.task_id)
         .await?;
     Ok(Json(project_lifecycle_response(submitted, admission.as_ref())).into_response())
+}
+
+async fn start_folded_auth(
+    state: &AppState,
+    submitted: locks_core::verification::SubmittedProofBundleV2,
+) -> Result<Response, ApiError> {
+    let repository = state.folded_auth().ok_or_else(folded_auth_unavailable)?;
+    let starter = state
+        .folded_auth_flow_starter()
+        .ok_or_else(folded_auth_unavailable)?;
+    let resource = submitted.pubky_lock_resource.clone();
+    let payload = state
+        .content_locks()
+        .get_content_lock_payload(resource.creator(), resource.content_lock_path())
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(ApiErrorCode::ContentLockNotFound, "content lock not found")
+        })?;
+    validate_content_lock_submission(
+        &payload,
+        &SubmittedProofBundlePayload::V2(submitted.clone()),
+    )
+    .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
+    let ContentLockPayload::V2(lock) = payload else {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "invalid request",
+        ));
+    };
+    if lock.payment.is_some() {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "invalid request",
+        ));
+    }
+    let graph = lock
+        .graph
+        .clone()
+        .ok_or_else(|| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
+    let lock_hash = *lock
+        .lock_hash()
+        .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?
+        .as_bytes();
+    if let Some(existing) = repository
+        .get_latest_by_handle(resource.creator(), &submitted.bundle_id)
+        .await?
+    {
+        let exact_match = existing.submitted_proof_bundle == submitted
+            && existing.pubky_lock_resource == resource
+            && existing.lock_hash == lock_hash
+            && existing.verification_window_seconds == lock.verification_window_seconds
+            && existing.graph == graph;
+        if !exact_match {
+            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
+        }
+        if existing.status == FoldedAuthStatus::Accepted {
+            let task = repository
+                .accepted_graph_task(&existing.state_hash)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::from(ApplicationError::Storage {
+                        message: "accepted folded auth task is missing".to_owned(),
+                    })
+                })?;
+            return Ok(Json(accepted_status_response(task)).into_response());
+        }
+    }
+    let state_token = uuid::Uuid::new_v4().to_string();
+    let key_id = GrantPopKeyId::new(uuid::Uuid::new_v4().to_string());
+    let (auth_url, flow_secret) = starter.start(&key_id).map_err(ApiError::from)?;
+    let created_at = state.clock().now();
+    let request = StartFoldedAuthAttempt {
+        submitted_proof_bundle: submitted,
+        pubky_lock_resource: resource,
+        lock_hash,
+        verification_window_seconds: lock.verification_window_seconds,
+        graph,
+        state_hash: FoldedAuthStateHash::derive(state_token.as_bytes()),
+        flow_secret,
+        created_at,
+    };
+    let started = repository.start_or_rotate(request).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(FoldedAuthPendingHttpResponse {
+            status: "auth_pending",
+            auth_url,
+            state: state_token,
+            expires_at: started.attempt.expires_at,
+        }),
+    )
+        .into_response())
 }
 
 struct PreparedSubmission {
@@ -184,21 +372,49 @@ async fn maybe_prepare_paykit_submission(
 pub(super) async fn lookup_verification_task(
     State(state): State<AppState>,
     request: Result<Json<VerificationTaskHandleHttpRequest>, JsonRejection>,
-) -> Result<Json<VerificationTaskLifecycleHttpResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
     let task = state
         .verification_tasks()
         .get_verification_task_by_handle(&request.creator, &request.bundle_id)
-        .await?
-        .ok_or(ApplicationError::MissingRecord {
-            record: "verification_task",
-        })?;
+        .await?;
+    let Some(task) = task else {
+        let graph = state
+            .graph_tasks()
+            .get_graph_task_by_handle(&request.creator, &request.bundle_id)
+            .await?
+            .ok_or(ApplicationError::MissingRecord {
+                record: "verification_task",
+            })?;
+        return Ok(Json(graph_lifecycle_response(&graph)).into_response());
+    };
     let admission = state
         .invoice_admissions()
         .get_invoice_admission(&task.task_id)
         .await?;
     let view = locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView::from(task);
-    Ok(Json(project_lifecycle_response(view, admission.as_ref())))
+    Ok(Json(project_lifecycle_response(view, admission.as_ref())).into_response())
+}
+
+pub(super) async fn creator_verification_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<CreatorVerificationEvidenceHttpRequest>, JsonRejection>,
+) -> Result<Json<CreatorVerificationEvidenceHttpResponse>, ApiError> {
+    let creator = authenticated_creator_from_headers(&state, &headers).await?;
+    let request = parse_json(request)?;
+    let task = state
+        .graph_tasks()
+        .get_graph_task_by_handle(&creator, &request.bundle_id)
+        .await?
+        .ok_or(ApplicationError::MissingRecord {
+            record: "verification_task",
+        })?;
+    Ok(Json(task.into()))
+}
+
+fn graph_lifecycle_response(task: &GraphTaskRecord) -> GraphVerificationTaskLifecycleHttpResponse {
+    GraphVerificationTaskLifecycleHttpResponse::from(task)
 }
 
 fn project_lifecycle_response(

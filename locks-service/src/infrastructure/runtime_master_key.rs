@@ -7,6 +7,8 @@ const CREATOR_AUTHORITY_KEY_CONTEXT: &str =
     "pubky-locks v1 runtime master key: creator authority secrets";
 const FINAL_CREDENTIAL_KEY_CONTEXT: &str =
     "pubky-locks v1 runtime master key: final deletion credentials";
+const FOLDED_AUTH_KEY_CONTEXT: &str =
+    "pubky-locks v1 runtime master key: folded auth pending flows";
 
 /// Root key for deriving independent runtime encryption keys.
 #[derive(Clone)]
@@ -42,6 +44,10 @@ impl RuntimeMasterKey {
     pub fn final_credential_key(&self) -> [u8; 32] {
         blake3::derive_key(FINAL_CREDENTIAL_KEY_CONTEXT, &self.bytes)
     }
+
+    pub fn folded_auth_key(&self) -> [u8; 32] {
+        blake3::derive_key(FOLDED_AUTH_KEY_CONTEXT, &self.bytes)
+    }
 }
 
 #[cfg(test)]
@@ -59,9 +65,13 @@ mod tests {
             second.creator_authority_key()
         );
         assert_eq!(first.final_credential_key(), second.final_credential_key());
+        assert_eq!(first.folded_auth_key(), second.folded_auth_key());
         assert_ne!(first.creator_authority_key(), first.final_credential_key());
+        assert_ne!(first.folded_auth_key(), first.creator_authority_key());
+        assert_ne!(first.folded_auth_key(), first.final_credential_key());
         assert_ne!(first.creator_authority_key(), [7u8; 32]);
         assert_ne!(first.final_credential_key(), [7u8; 32]);
+        assert_ne!(first.folded_auth_key(), [7u8; 32]);
     }
 
     #[test]

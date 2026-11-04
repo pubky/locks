@@ -70,6 +70,8 @@ They are application examples, not operator scripts. Use them when integrating t
 
 For a focused, copyable Paykit viewer flow plus exact request/response and terminal-state handling, see [`SDK_PAYKIT_VIEWER.md`](SDK_PAYKIT_VIEWER.md) and [`examples/js-sdk/paykit-viewer-flow.js`](../examples/js-sdk/paykit-viewer-flow.js). The signed Paykit lifecycle integration adds no new SDK export; that flow composes existing public viewer calls.
 
+For graph-only Content Lock v2, folded-auth polling, restart semantics, Nexus `app_spec_v0_7`, Rust/JS method names, browser secret handling, and deterministic Compose verification, see [`GRAPH_STAGE1.md`](GRAPH_STAGE1.md). Public JS uses `submitProofBundle`, `pollFoldedAuth`, and `lookupGraphVerificationTask`; Creator evidence uses `verificationEvidence`. These wrap canonical Rust planners and closed parsers rather than duplicating route shapes.
+
 Run the static drift check:
 
 ```bash

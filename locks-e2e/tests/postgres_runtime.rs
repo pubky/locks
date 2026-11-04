@@ -1922,6 +1922,7 @@ fn test_config() -> LockServerRuntimeConfig {
         pkdns: PkdnsConfig::default(),
         content_locks: ContentLocksConfig::default(),
         paykit: None,
+        nexus: None,
     }
 }
 

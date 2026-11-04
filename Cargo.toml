@@ -25,6 +25,10 @@ base64 = "0.22"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 locks-core = { path = "locks-core" }
 locks-service = { path = "locks-service" }
 mime = "0.3"
@@ -37,6 +41,7 @@ pkarr = "8.0.0"
 percent-encoding = "2"
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3.2"

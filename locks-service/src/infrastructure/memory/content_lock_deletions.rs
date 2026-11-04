@@ -81,9 +81,12 @@ pub struct InMemoryContentLockDeletionRepository {
 
 impl Default for InMemoryContentLockDeletionRepository {
     fn default() -> Self {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
         Self::with_dependencies(
-            Arc::new(InMemoryAccessCredentialStore::new()),
-            Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+            Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+                Arc::clone(&fence),
+            )),
+            fence,
             OwnershipRecords::default(),
         )
     }
@@ -98,7 +101,9 @@ impl InMemoryContentLockDeletionRepository {
         verification_task_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     ) -> Self {
         Self::with_access_credentials_and_verification_task_fence(
-            Arc::new(InMemoryAccessCredentialStore::new()),
+            Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+                Arc::clone(&verification_task_fence),
+            )),
             verification_task_fence,
         )
     }
@@ -173,6 +178,18 @@ impl InMemoryContentLockDeletionRepository {
             .await
             .get(key)
             .is_some_and(|receipt| receipt.completed_at.is_none())
+    }
+
+    pub(super) async fn graceful_withdrawal_action_is_live(&self, job_id: Uuid) -> bool {
+        self.jobs.read().await.values().any(|stored| {
+            stored.job.job_id == job_id
+                && matches!(
+                    stored.job.state,
+                    ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+                )
+                && stored.job.phase == ContentLockDeletionPhase::Withdraw
+                && stored.job.force_requested_at.is_none()
+        })
     }
 
     #[cfg(test)]
@@ -703,6 +720,34 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             ContentLockDeletionState::Completed
         };
         stored.job.failure_code = failure_code;
+        stored.job.next_attempt_at = None;
+        clear_claim(stored);
+        self.access_credentials
+            .synchronize_job(&stored.job, None, None, None)
+            .await;
+        Ok(Some(stored.job.clone()))
+    }
+
+    async fn fail_graceful_withdrawal(
+        &self,
+        job_id: Uuid,
+        failure_code: ContentLockDeletionFailureCode,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let _claim_transition = self.claim_transition_gate.lock().await;
+        let mut jobs = self.jobs.write().await;
+        let Some(stored) = jobs.values_mut().find(|stored| {
+            stored.job.job_id == job_id
+                && matches!(
+                    stored.job.state,
+                    ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+                )
+                && stored.job.phase == ContentLockDeletionPhase::Withdraw
+                && stored.job.force_requested_at.is_none()
+        }) else {
+            return Ok(None);
+        };
+        stored.job.state = ContentLockDeletionState::Failed;
+        stored.job.failure_code = Some(failure_code);
         stored.job.next_attempt_at = None;
         clear_claim(stored);
         self.access_credentials

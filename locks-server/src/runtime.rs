@@ -90,6 +90,7 @@ pub struct RuntimeTasks {
     shutdown_timeout: Duration,
     http: Option<HttpTaskFactory>,
     pkarr_republisher: Option<LifecycleTaskFactory>,
+    folded_auth_cleanup: Option<LifecycleTaskFactory>,
     verification_worker: Option<WorkerTaskFactory>,
     deletion_worker: Option<WorkerTaskFactory>,
 }
@@ -109,6 +110,11 @@ impl RuntimeTasks {
 
     pub fn with_pkarr_republisher(mut self, factory: LifecycleTaskFactory) -> Self {
         self.pkarr_republisher = Some(factory);
+        self
+    }
+
+    pub fn with_folded_auth_cleanup(mut self, factory: LifecycleTaskFactory) -> Self {
+        self.folded_auth_cleanup = Some(factory);
         self
     }
 
@@ -142,6 +148,7 @@ pub enum RuntimeError {
 enum OwnedTask {
     Http,
     PkarrRepublisher,
+    FoldedAuthCleanup,
     Verification,
     Deletion,
     Unknown,
@@ -152,6 +159,7 @@ impl OwnedTask {
         match self {
             Self::Http => "HTTP server",
             Self::PkarrRepublisher => "PKARR republisher",
+            Self::FoldedAuthCleanup => "folded auth cleanup",
             Self::Verification => "verification worker",
             Self::Deletion => "deletion worker",
             Self::Unknown => "owned runtime task",
@@ -160,7 +168,7 @@ impl OwnedTask {
 
     fn worker(self) -> Option<WorkerKind> {
         match self {
-            Self::Http | Self::PkarrRepublisher | Self::Unknown => None,
+            Self::Http | Self::PkarrRepublisher | Self::FoldedAuthCleanup | Self::Unknown => None,
             Self::Verification => Some(WorkerKind::Verification),
             Self::Deletion => Some(WorkerKind::Deletion),
         }
@@ -195,6 +203,15 @@ pub async fn supervise(
             &mut roots,
             &mut root_tasks,
             OwnedTask::PkarrRepublisher,
+            factory(shutdown),
+        );
+    }
+    if let Some(factory) = tasks.folded_auth_cleanup {
+        let shutdown = service_shutdown_tx.subscribe();
+        spawn_root(
+            &mut roots,
+            &mut root_tasks,
+            OwnedTask::FoldedAuthCleanup,
             factory(shutdown),
         );
     }

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -12,12 +12,14 @@ use locks_core::ids::{
     PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
+    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
+    GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
     LockServerConfig, VerifierType,
 };
 use locks_core::verification::{
-    CriterionVerificationResult, EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION,
-    VerificationResult, VerifiedProofBundle,
+    CriterionVerificationResult, EntitlementLifetime, SatisfiedByV2,
+    VERIFIED_PROOF_BUNDLE_V2_VERSION, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult,
+    VerifiedProofBundle, VerifiedProofBundleV2,
 };
 
 use crate::application::errors::ApplicationError;
@@ -36,6 +38,8 @@ use crate::application::use_cases::issue_access_credential::{
 use crate::application::use_cases::validate_access_credential::{
     ValidateAccessCredentialRequest, ValidateAccessCredentialUseCase,
 };
+use crate::infrastructure::memory::content_locks::InMemoryContentLockRepository;
+use crate::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 
@@ -105,6 +109,82 @@ async fn issue_access_credential_rechecks_entitlement_and_stores_lookup_key() {
     assert_eq!(stored_record.creator, creator());
     assert_eq!(stored_record.bundle_id, bundle_id());
     assert_eq!(stored_record.expires_at, issued.expires_at);
+}
+
+#[tokio::test]
+async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
+    let content_lock = ContentLockV2 {
+        version: 2,
+        creator: creator(),
+        primary_resource: Some(
+            GuardedResource::new(
+                "/priv/app.locks/content/item.txt",
+                GuardedResourceHash::from_bytes([3; 32]),
+                "text/plain",
+                4,
+            )
+            .unwrap(),
+        ),
+        secondary_resources: BTreeMap::new(),
+        payment: None,
+        graph: Some(GraphPolicyV2 {
+            predicates: vec![GraphPredicateV2::Follows {
+                follower: GraphParticipantV2::Reader,
+                followed: GraphParticipantV2::Creator,
+            }],
+            operator: None,
+        }),
+        verification_window_seconds: 300,
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 900,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: datetime!(2026-05-29 11:00:00 UTC),
+    };
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = ContentLockPath::from_lock_id(lock_id);
+    let resource = PubkyLockResource::new(creator(), path.clone());
+    let content_locks = InMemoryContentLockRepository::new();
+    content_locks
+        .upsert_content_lock_payload(creator(), path, ContentLockPayload::V2(content_lock))
+        .await
+        .unwrap();
+    let entitlements = InMemoryEntitlementRepository::new();
+    entitlements
+        .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: creator(),
+            reader: other_creator(),
+            bundle_id: bundle_id(),
+            pubky_lock_resource: resource,
+            verified_at: datetime!(2026-05-29 12:00:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Graph],
+        })
+        .await
+        .unwrap();
+    let store = FakeAccessCredentialStore::default();
+    let generator = FakeGenerator::new(AccessCredential::new("graph-bearer-credential"));
+    let clock = FakeClock::new(datetime!(2026-05-29 12:00:00 UTC));
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+
+    let issued = use_case
+        .execute(IssueAccessCredentialRequest {
+            creator: creator(),
+            bundle_id: bundle_id(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(issued.credential.as_str(), "graph-bearer-credential");
+    assert_eq!(issued.expires_at, datetime!(2026-05-29 12:15:00 UTC));
+    assert_eq!(store.stored_record().1.bundle_id, bundle_id());
 }
 
 #[tokio::test]
@@ -436,6 +516,10 @@ async fn validate_access_credential_deletes_when_content_lock_hash_mismatches_pa
 
 fn creator() -> CreatorPubky {
     CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap()
+}
+
+fn other_creator() -> CreatorPubky {
+    CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky").unwrap()
 }
 
 fn server() -> LockServerPubky {

@@ -35,6 +35,7 @@ pub struct LockServerRuntimeConfig {
     pub deletion: DeletionConfig,
     pub deletion_worker: DeletionWorkerConfig,
     pub paykit: Option<PaykitConfig>,
+    pub nexus: Option<NexusConfig>,
 }
 
 pub const MAX_DELETION_CREDENTIAL_WINDOW_SECONDS: u64 = 3600;
@@ -86,6 +87,12 @@ impl Default for DeletionWorkerConfig {
 pub struct PaykitConfig {
     pub server_url: String,
     pub minimum_confirmations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NexusConfig {
+    pub server_url: String,
+    pub allow_insecure_loopback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +477,10 @@ pub enum ConfigError {
     InvalidPubkyPkarrRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
+    #[error(
+        "nexus.server_url must be an exact HTTPS origin, or loopback HTTP in development when allow_insecure_loopback is true"
+    )]
+    InvalidNexusServerUrl,
     #[error("pkdns.key_republisher_interval_seconds must be greater than zero")]
     InvalidPkarrRepublisherInterval,
     #[error("pkdns.pkarr_relays must contain valid http(s) URLs: {0}")]

@@ -3,13 +3,18 @@ use axum::body::{Body, to_bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
+use locks_core::{
+    content_lock_deletion::ContentLockDeletionTombstone,
+    ids::{ContentLockPath, CreatorPubky, LockId},
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
-    PrepareForceDeletionResult,
+    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+    ContentLockDeletionState, PrepareForceDeletionResult,
 };
-use locks_service::application::ports::ContentLockDeletionActionAcquireResult;
+use locks_service::application::ports::{
+    ContentLockDeletionActionAcquireResult, TombstoneReadback,
+};
 use locks_service::application::use_cases::create_content_lock::{
     CreateContentLockRequest, CreateContentLockUseCase,
 };
@@ -112,6 +117,15 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
         } else {
             job
         };
+        let job = match ensure_graceful_tombstone(&state, &job).await? {
+            GracefulTombstoneOutcome::Job(job) => *job,
+            GracefulTombstoneOutcome::ForceCompleted => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({ "lock_id": lock_id, "status": "completed" })),
+                ));
+            }
+        };
         let status = match job.state {
             ContentLockDeletionState::Queued | ContentLockDeletionState::Running => {
                 StatusCode::ACCEPTED
@@ -158,10 +172,43 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
 
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now())?;
     match state.content_lock_deletions().insert_job(job.clone()).await {
-        Ok(()) => Ok((
-            StatusCode::ACCEPTED,
-            Json(deletion_status_json(lock_id, job.state, job.failure_code)),
-        )),
+        Ok(()) => {
+            let persisted = state
+                .content_lock_deletions()
+                .get_job(&creator, &lock_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InternalError,
+                        "content lock deletion unavailable",
+                    )
+                })?;
+            let persisted = match ensure_graceful_tombstone(&state, &persisted).await? {
+                GracefulTombstoneOutcome::Job(job) => *job,
+                GracefulTombstoneOutcome::ForceCompleted => {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({ "lock_id": lock_id, "status": "completed" })),
+                    ));
+                }
+            };
+            let status = match persisted.state {
+                ContentLockDeletionState::Queued | ContentLockDeletionState::Running => {
+                    StatusCode::ACCEPTED
+                }
+                ContentLockDeletionState::Completed | ContentLockDeletionState::Failed => {
+                    StatusCode::OK
+                }
+            };
+            Ok((
+                status,
+                Json(deletion_status_json(
+                    lock_id,
+                    persisted.state,
+                    persisted.failure_code,
+                )),
+            ))
+        }
         Err(locks_service::application::errors::ApplicationError::DuplicateRecord {
             record: "content_lock_deletion_job",
         }) => {
@@ -175,6 +222,15 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
                         "content lock deletion unavailable",
                     )
                 })?;
+            let persisted = match ensure_graceful_tombstone(&state, &persisted).await? {
+                GracefulTombstoneOutcome::Job(job) => *job,
+                GracefulTombstoneOutcome::ForceCompleted => {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({ "lock_id": lock_id, "status": "completed" })),
+                    ));
+                }
+            };
             let status = match persisted.state {
                 ContentLockDeletionState::Queued | ContentLockDeletionState::Running => {
                     StatusCode::ACCEPTED
@@ -210,6 +266,103 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+enum GracefulTombstoneOutcome {
+    Job(Box<ContentLockDeletionJob>),
+    ForceCompleted,
+}
+
+async fn ensure_graceful_tombstone(
+    state: &AppState,
+    job: &ContentLockDeletionJob,
+) -> Result<GracefulTombstoneOutcome, ApiError> {
+    if job.phase != ContentLockDeletionPhase::Withdraw
+        || !matches!(
+            job.state,
+            ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+        )
+    {
+        return Ok(GracefulTombstoneOutcome::Job(Box::new(job.clone())));
+    }
+
+    let guard = match state
+        .content_lock_deletion_action_ownership()
+        .try_acquire_graceful_withdrawal(job.job_id)
+        .await?
+    {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        ContentLockDeletionActionAcquireResult::Busy => {
+            return Ok(GracefulTombstoneOutcome::Job(Box::new(job.clone())));
+        }
+        ContentLockDeletionActionAcquireResult::ClaimLost => {
+            if state
+                .content_lock_deletions()
+                .get_force_receipt(&job.creator, &job.lock_id)
+                .await?
+                .is_some_and(|receipt| receipt.completed_at.is_some())
+            {
+                return Ok(GracefulTombstoneOutcome::ForceCompleted);
+            }
+            let current = state
+                .content_lock_deletions()
+                .get_job(&job.creator, &job.lock_id)
+                .await?
+                .unwrap_or_else(|| job.clone());
+            return Ok(GracefulTombstoneOutcome::Job(Box::new(current)));
+        }
+    };
+
+    let Some(current) = state
+        .content_lock_deletions()
+        .get_job(&job.creator, &job.lock_id)
+        .await?
+    else {
+        guard.release().await?;
+        return Ok(GracefulTombstoneOutcome::Job(Box::new(job.clone())));
+    };
+    if current.job_id != job.job_id
+        || current.phase != ContentLockDeletionPhase::Withdraw
+        || !matches!(
+            current.state,
+            ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+        )
+        || current.force_requested_at.is_some()
+    {
+        guard.release().await?;
+        return Ok(GracefulTombstoneOutcome::Job(Box::new(current)));
+    }
+
+    let tombstone =
+        ContentLockDeletionTombstone::new(current.lock_id.clone(), current.deletion_started_at);
+    let path = ContentLockPath::from_lock_id(current.lock_id.clone());
+    let readback = state
+        .content_lock_tombstones()
+        .withdraw_content_lock(
+            current.creator.clone(),
+            path,
+            &current.frozen_content_lock,
+            &tombstone,
+        )
+        .await?;
+    let outcome = match readback {
+        TombstoneReadback::Exact => GracefulTombstoneOutcome::Job(Box::new(current)),
+        TombstoneReadback::Missing | TombstoneReadback::Replaced => {
+            let failure_code = if readback == TombstoneReadback::Missing {
+                ContentLockDeletionFailureCode::TombstoneMissing
+            } else {
+                ContentLockDeletionFailureCode::TombstoneReplaced
+            };
+            let failed = state
+                .content_lock_deletions()
+                .fail_graceful_withdrawal(current.job_id, failure_code)
+                .await?
+                .unwrap_or(current);
+            GracefulTombstoneOutcome::Job(Box::new(failed))
+        }
+    };
+    guard.release().await?;
+    Ok(outcome)
 }
 
 async fn force_delete_content_lock(

@@ -20,21 +20,23 @@ use locks_service::{
             AccessCredentialStore, Clock, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, ContentLockOwnershipRepository, ContentLockRepository,
             ContentLockTombstoneRepository, CreatorAuthorityManager, CreatorAuthorityStore,
-            CreatorConnectFlowStore, EntitlementRepository, FrontendSessionCodeStore,
-            FrontendSessionStore, GrantCreatorConnectFlowClient, GuardedResourceRepository,
-            InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient,
-            LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
-            VerificationTaskClaimer, VerificationTaskRepository,
+            CreatorConnectFlowStore, EntitlementRepository, FoldedAuthApprovalPoller,
+            FoldedAuthFlowStarter, FoldedAuthRepository, FrontendSessionCodeStore,
+            FrontendSessionStore, GrantCreatorConnectFlowClient, GraphTaskClaimer,
+            GraphTaskRepository, GuardedResourceRepository, InvoiceAdmissionRepository,
+            LegacyCreatorConnectFlowClient, LockServicePointerRepository, PaymentDrainClient,
+            PaymentDrainRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::start_creator_connect_flow::default_requested_scopes,
     },
     infrastructure::{
         final_credentials::FinalCredentialCipher,
+        folded_auth::FoldedAuthSecretCipher,
         memory::{
             access_credentials::InMemoryAccessCredentialStore,
             content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
             content_lock_tombstones::InMemoryContentLockTombstoneRepository,
-            content_locks::InMemoryContentLockRepository,
+            content_locks::InMemoryContentLockRepository, graph_tasks::InMemoryGraphTaskRepository,
             public_content_locks::InMemoryPublicContentLockStore,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
@@ -44,18 +46,20 @@ use locks_service::{
             CreatorAuthoritySecretCipher, PostgresAccessCredentialStore,
             PostgresContentLockDeletionActionOwnership, PostgresContentLockDeletionRepository,
             PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
-            PostgresCreatorConnectFlowStore, PostgresFrontendSessionCodeStore,
-            PostgresFrontendSessionStore, PostgresPaymentDrainRepository,
+            PostgresCreatorConnectFlowStore, PostgresFoldedAuthRepository,
+            PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
+            PostgresGraphTaskRepository, PostgresPaymentDrainRepository,
             PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
             GrantSessionCache, LegacyCookieCreatorAuthorityManager, LockServerGrantPopKeys,
             PubkyBytesResource, PubkyContentLockRepository, PubkyContentLockTombstoneRepository,
-            PubkyEntitlementRepository, PubkyGrantCreatorConnectFlowClient,
-            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionImporter,
-            PubkyLegacyCookieSessionRevalidator, PubkyLegacyCreatorConnectFlowClient,
-            PubkyLockServicePointerRepository, PubkyPrivResourceRepository, PubkyResourceMetadata,
+            PubkyEntitlementRepository, PubkyFoldedAuthApprovalPoller, PubkyFoldedAuthFlowStarter,
+            PubkyGrantCreatorConnectFlowClient, PubkyHomeserverStorageClient,
+            PubkyLegacyCookieSessionImporter, PubkyLegacyCookieSessionRevalidator,
+            PubkyLegacyCreatorConnectFlowClient, PubkyLockServicePointerRepository,
+            PubkyPrivResourceRepository, PubkyResourceMetadata,
         },
         verifiers::dev_static::DevStaticVerifier,
         verifiers::paykit_payment::PaykitPaymentVerifier,
@@ -88,6 +92,7 @@ pub use crate::app_state::readiness::{
 use crate::config::{
     CreatorAuthorityAcquisitionMethod, LockServerRuntimeConfig, load_lock_server_signing_keypair,
 };
+use crate::nexus_http_client::{LiveNexusEndpoint, NexusEndpoint};
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::{
     InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
@@ -250,6 +255,7 @@ where
 #[derive(Clone)]
 pub struct AppState {
     config: LockServerRuntimeConfig,
+    nexus_endpoint_source: Option<Arc<LiveNexusEndpoint>>,
     private_runtime_storage_kind: RuntimeStorageKind,
     postgres_pool: Option<PgPool>,
     worker_readiness: WorkerReadiness,
@@ -264,6 +270,8 @@ pub struct AppState {
     invoice_admissions: Arc<dyn InvoiceAdmissionRepository>,
     verification_tasks: Arc<dyn VerificationTaskRepository>,
     verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
+    graph_tasks: Arc<dyn GraphTaskRepository>,
+    graph_task_claimer: Arc<dyn GraphTaskClaimer>,
     entitlements: Arc<dyn EntitlementRepository>,
     access_credentials: Arc<dyn AccessCredentialStore>,
     creator_authorities: Arc<dyn CreatorAuthorityStore>,
@@ -290,6 +298,9 @@ pub struct AppState {
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
+    folded_auth: Option<Arc<dyn FoldedAuthRepository>>,
+    folded_auth_poller: Option<Arc<dyn FoldedAuthApprovalPoller>>,
+    folded_auth_flow_starter: Option<Arc<dyn FoldedAuthFlowStarter>>,
 }
 
 /// Purpose-separated runtime ciphers derived from the configured master key.
@@ -344,6 +355,9 @@ impl AppState {
         let verification_task_deletion_fence =
             Arc::new(InMemoryVerificationTaskDeletionFence::new());
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
+        let graph_tasks = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
         let verification_task_claimer = Arc::new(
@@ -401,6 +415,8 @@ impl AppState {
             ),
             verification_tasks,
             verification_task_claimer,
+            graph_tasks: graph_tasks.clone(),
+            graph_task_claimer: graph_tasks,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -431,6 +447,9 @@ impl AppState {
         let verification_task_deletion_fence =
             Arc::new(InMemoryVerificationTaskDeletionFence::new());
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
+        let graph_tasks = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
         let verification_task_claimer = Arc::new(
@@ -477,6 +496,8 @@ impl AppState {
             ),
             verification_tasks,
             verification_task_claimer,
+            graph_tasks: graph_tasks.clone(),
+            graph_task_claimer: graph_tasks,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -506,6 +527,9 @@ impl AppState {
         let verification_task_deletion_fence =
             Arc::new(InMemoryVerificationTaskDeletionFence::new());
         let verification_tasks = Arc::new(InMemoryVerificationTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
+        let graph_tasks = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
         let verification_task_claimer = Arc::new(
@@ -566,6 +590,8 @@ impl AppState {
             ),
             verification_tasks,
             verification_task_claimer,
+            graph_tasks: graph_tasks.clone(),
+            graph_task_claimer: graph_tasks,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -594,6 +620,7 @@ impl AppState {
         let verification_tasks = Arc::new(PostgresVerificationTaskRepository::new(pool.clone()));
         let verification_task_claimer =
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
+        let graph_tasks = Arc::new(PostgresGraphTaskRepository::new(pool.clone()));
         let access_credentials =
             Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
                 pool.clone(),
@@ -628,6 +655,8 @@ impl AppState {
             ),
             verification_tasks,
             verification_task_claimer,
+            graph_tasks: graph_tasks.clone(),
+            graph_task_claimer: graph_tasks,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(PostgresCreatorConnectFlowStore::new(pool.clone())),
@@ -647,6 +676,49 @@ impl AppState {
         )
     }
 
+    pub fn new_with_postgres_runtime_and_folded_auth(
+        config: LockServerRuntimeConfig,
+        pool: PgPool,
+        creator_authority_cipher: CreatorAuthoritySecretCipher,
+        final_credential_cipher: FinalCredentialCipher,
+        folded_auth_cipher: FoldedAuthSecretCipher,
+    ) -> Self {
+        let repository: Arc<dyn FoldedAuthRepository> = Arc::new(
+            PostgresFoldedAuthRepository::new(pool.clone(), folded_auth_cipher),
+        );
+        let mut state = Self::new_with_postgres_runtime(
+            config,
+            pool,
+            creator_authority_cipher,
+            final_credential_cipher,
+        );
+        state.folded_auth = Some(repository);
+        if let Some(grant) = state
+            .config
+            .creator_authority_acquisition
+            .grant_connect
+            .as_ref()
+        {
+            let keypair = load_lock_server_signing_keypair(&state.config.credentials)
+                .expect("folded auth requires keypair-seed Lock Server secret");
+            let keys = LockServerGrantPopKeys::from_lock_server_seed(keypair.secret());
+            let client_id =
+                pubky::ClientId::new(&grant.client_id).expect("validated grant-connect client_id");
+            let client = build_pubky_http_client(&state.config.pubky);
+            state.folded_auth_poller = Some(Arc::new(PubkyFoldedAuthApprovalPoller::new(
+                client.clone(),
+                keys.clone(),
+            )));
+            state.folded_auth_flow_starter = Some(Arc::new(PubkyFoldedAuthFlowStarter::new(
+                client,
+                pubky_auth_relay_for_network(state.config.pubky.network),
+                client_id,
+                keys,
+            )));
+        }
+        state
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_postgres_runtime_and_creator_repositories(
         config: LockServerRuntimeConfig,
@@ -661,6 +733,7 @@ impl AppState {
         let verification_tasks = Arc::new(PostgresVerificationTaskRepository::new(pool.clone()));
         let verification_task_claimer =
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
+        let graph_tasks = Arc::new(PostgresGraphTaskRepository::new(pool.clone()));
         let access_credentials =
             Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
                 pool.clone(),
@@ -696,6 +769,8 @@ impl AppState {
             ),
             verification_tasks,
             verification_task_claimer,
+            graph_tasks: graph_tasks.clone(),
+            graph_task_claimer: graph_tasks,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(PostgresCreatorConnectFlowStore::new(pool.clone())),
@@ -768,9 +843,17 @@ impl AppState {
         let paykit_setup_status_provider = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
+        let nexus_endpoint_source = config.nexus.as_ref().map(|nexus| {
+            Arc::new(LiveNexusEndpoint::new(
+                NexusEndpoint::parse(&nexus.server_url, nexus.allow_insecure_loopback)
+                    .expect("validated Nexus config must produce a live endpoint"),
+                config.runtime.environment.is_development() && nexus.allow_insecure_loopback,
+            ))
+        });
 
         Self {
             config,
+            nexus_endpoint_source,
             private_runtime_storage_kind,
             postgres_pool,
             worker_readiness,
@@ -786,6 +869,8 @@ impl AppState {
             invoice_admissions: private_runtime.invoice_admissions,
             verification_tasks: private_runtime.verification_tasks,
             verification_task_claimer: private_runtime.verification_task_claimer,
+            graph_tasks: private_runtime.graph_tasks,
+            graph_task_claimer: private_runtime.graph_task_claimer,
             entitlements: creator_repositories.entitlements,
             access_credentials: private_runtime.access_credentials,
             creator_authorities: private_runtime.creator_authorities,
@@ -811,11 +896,18 @@ impl AppState {
             paykit_http_client,
             paykit_setup_status_provider,
             payment_drain_client,
+            folded_auth: None,
+            folded_auth_poller: None,
+            folded_auth_flow_starter: None,
         }
     }
 
     pub fn config(&self) -> &LockServerRuntimeConfig {
         &self.config
+    }
+
+    pub fn nexus_endpoint_source(&self) -> Option<&Arc<LiveNexusEndpoint>> {
+        self.nexus_endpoint_source.as_ref()
     }
 
     pub fn private_runtime_storage_kind(&self) -> RuntimeStorageKind {
@@ -881,6 +973,31 @@ impl AppState {
         self.payment_drain_client.as_ref()
     }
 
+    pub fn folded_auth(&self) -> Option<&Arc<dyn FoldedAuthRepository>> {
+        self.folded_auth.as_ref()
+    }
+
+    pub fn folded_auth_poller(&self) -> Option<&Arc<dyn FoldedAuthApprovalPoller>> {
+        self.folded_auth_poller.as_ref()
+    }
+
+    pub fn folded_auth_flow_starter(&self) -> Option<&Arc<dyn FoldedAuthFlowStarter>> {
+        self.folded_auth_flow_starter.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_folded_auth_runtime(
+        mut self,
+        repository: Arc<dyn FoldedAuthRepository>,
+        poller: Arc<dyn FoldedAuthApprovalPoller>,
+        starter: Arc<dyn FoldedAuthFlowStarter>,
+    ) -> Self {
+        self.folded_auth = Some(repository);
+        self.folded_auth_poller = Some(poller);
+        self.folded_auth_flow_starter = Some(starter);
+        self
+    }
+
     pub fn lock_service_pointers(&self) -> &Arc<dyn LockServicePointerRepository> {
         &self.lock_service_pointers
     }
@@ -895,6 +1012,14 @@ impl AppState {
 
     pub fn verification_task_claimer(&self) -> &Arc<dyn VerificationTaskClaimer> {
         &self.verification_task_claimer
+    }
+
+    pub fn graph_tasks(&self) -> &Arc<dyn GraphTaskRepository> {
+        &self.graph_tasks
+    }
+
+    pub fn graph_task_claimer(&self) -> &Arc<dyn GraphTaskClaimer> {
+        &self.graph_task_claimer
     }
 
     pub fn entitlements(&self) -> &Arc<dyn EntitlementRepository> {
@@ -972,6 +1097,16 @@ impl AppState {
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_in_memory_graph_tasks(
+        mut self,
+        graph_tasks: Arc<InMemoryGraphTaskRepository>,
+    ) -> Self {
+        self.graph_tasks = graph_tasks.clone();
+        self.graph_task_claimer = graph_tasks;
         self
     }
 

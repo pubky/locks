@@ -21,7 +21,7 @@ mod tests {
 
     use super::super::testing::TestDatabase;
 
-    const EXACT_PR19_MIGRATION_SHA384: [&str; 23] = [
+    const EXACT_PUBLISHED_MIGRATION_SHA384: [&str; 26] = [
         "482b82635a50208e887c12d2c9a81828578eea71ad6005281552bae23d74d945095e257d89671bba929b09e95f55a8eb",
         "1bbe43ea9ca0331bac97135625a73c04e7b570631b9603b5a3211b92ea727d30d370f219654fab08b68b796caf99b976",
         "f18e63c7518ade25470087d8d39f91bc214ee8c7882ad4482f995650af82ecbfe0acbf6c5b2242ea6e2e2726a9b84556",
@@ -45,14 +45,17 @@ mod tests {
         "2fa8062175b72c149d67a603cc864fa98b8d1e713e3f68b902062738c4f9a587afb601a563b70e31130d39a94515d56d",
         "bd6f355ca99d2166f9ecaa55b36f21218260ec82b59f5744b6b05809f4e3edc819795607030300bcb3c9024e696c6284",
         "3247642df5d61ee2dbaceaa74b5f0555fa723c1719fa335b6ae5815176f3d67a823ee3fe47c14ee0e5cd9d20b29cd7a6",
+        "3392fd4107c555661da722e5389f13703b185c4c7272af41695da6346fc699d372ceffe3c834dbd3ff0c8507cf6626e1",
+        "969587bd999941575899dac2fb322dee6bba266ee74d7b20c4b1053e58355eca4498913aedccb175d347f2b8e2293297",
+        "3b4c9a739458b5da0391d8a6ebd159584f229d66f039dac52ff3ee2eae0fbc03d40d723fd6502c20d1e699c21c13602a",
     ];
 
     fn checksum_hex(checksum: &[u8]) -> String {
         checksum.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn exact_pr19_migrator() -> Migrator {
-        let migrations = EXACT_PR19_MIGRATION_SHA384
+    fn exact_published_migrator() -> Migrator {
+        let migrations = EXACT_PUBLISHED_MIGRATION_SHA384
             .iter()
             .enumerate()
             .map(|(index, expected_checksum)| {
@@ -60,11 +63,11 @@ mod tests {
                 let migration = super::MIGRATOR
                     .iter()
                     .find(|migration| migration.version == version)
-                    .unwrap_or_else(|| panic!("exact PR19 migration {version:04} is missing"));
+                    .unwrap_or_else(|| panic!("exact published migration {version:04} is missing"));
                 assert_eq!(
                     checksum_hex(migration.checksum.as_ref()),
                     *expected_checksum,
-                    "migration {:04} differs from the exact published PR19 artifact",
+                    "migration {:04} differs from the exact published artifact",
                     migration.version
                 );
                 migration.clone()
@@ -166,6 +169,8 @@ mod tests {
             "entitlement_to_publish",
         )
         .await;
+        assert_column_exists(&mut connection, "verification_tasks", "evaluator_snapshot").await;
+        assert_column_exists(&mut connection, "verification_tasks", "evaluator_revision").await;
         assert_column_exists(
             &mut connection,
             "content_lock_deletion_task_snapshot",
@@ -183,6 +188,12 @@ mod tests {
             &mut connection,
             "verification_tasks",
             "verification_tasks_due_pending_idx",
+        )
+        .await;
+        assert_index_exists(
+            &mut connection,
+            "verification_tasks",
+            "verification_tasks_due_graph_idx",
         )
         .await;
         assert_column_exists(&mut connection, "creator_authorities", "auth_kind").await;
@@ -518,16 +529,21 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=26).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=30).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
 
     #[tokio::test]
-    async fn exact_pr19_migration_prefix_upgrades_through_current_without_collision() {
-        let pr19 = exact_pr19_migrator();
+    async fn exact_published_migration_prefix_upgrades_through_current_without_collision() {
+        assert_eq!(
+            EXACT_PUBLISHED_MIGRATION_SHA384.len(),
+            26,
+            "published migration checksum fixture must cover 0001 through 0026"
+        );
+        let published = exact_published_migrator();
         let database = TestDatabase::create_unmigrated().await;
-        pr19.run(database.pool()).await.unwrap();
+        published.run(database.pool()).await.unwrap();
         let before: Vec<(i64, Vec<u8>)> =
             sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
                 .fetch_all(database.pool())
@@ -535,15 +551,15 @@ mod tests {
                 .unwrap();
         assert_eq!(
             before.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=23).collect::<Vec<_>>()
+            (1..=26).collect::<Vec<_>>()
         );
         assert_eq!(
             before
                 .iter()
                 .map(|row| checksum_hex(&row.1))
                 .collect::<Vec<_>>(),
-            EXACT_PR19_MIGRATION_SHA384,
-            "seeded migration ledger must contain exact published PR19 checksums"
+            EXACT_PUBLISHED_MIGRATION_SHA384,
+            "seeded migration ledger must contain exact published checksums"
         );
 
         super::run_migrations(database.pool()).await.unwrap();
@@ -554,12 +570,12 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=26).collect::<Vec<_>>()
+            (1..=30).collect::<Vec<_>>()
         );
         assert_eq!(
-            &after[..23],
+            &after[..26],
             before.as_slice(),
-            "PR19 migration checksums changed"
+            "published migration checksums changed"
         );
         database.cleanup().await;
     }

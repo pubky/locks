@@ -1038,6 +1038,32 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         Ok(Some(row_to_job(updated)?))
     }
 
+    async fn fail_graceful_withdrawal(
+        &self,
+        job_id: Uuid,
+        failure_code: ContentLockDeletionFailureCode,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let sql = format!(
+            "UPDATE content_lock_deletion_jobs
+             SET state = 'failed', failure_code = $2, next_attempt_at = NULL,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 updated_at = clock_timestamp()
+             WHERE job_id = $1
+               AND state IN ('queued', 'running')
+               AND phase = 'withdraw'
+               AND force_requested_at IS NULL
+             RETURNING {ROW_COLUMNS}"
+        );
+        sqlx::query_as::<_, DeletionJobRow>(&sql)
+            .bind(job_id)
+            .bind(failure_code.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .map(row_to_job)
+            .transpose()
+    }
+
     async fn resume_failed_job(
         &self,
         creator: &CreatorPubky,
@@ -1841,8 +1867,8 @@ mod tests {
             BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
         },
         lock_policy::{
-            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
-            LockServerConfig, VerifierType,
+            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
+            GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, VerifierType,
         },
         verification::{
             CriterionVerificationResult, EntitlementLifetime, Proof,
@@ -1865,18 +1891,19 @@ mod tests {
                 AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
                 AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
                 ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-                ContentLockOwnershipStatus, InitializeFinalAccessWindowsResult,
-                InvoiceAdmissionIntentV1, PrepareForceDeletionResult, VerificationTaskRecord,
-                VerificationTaskStatus,
+                ContentLockOwnershipStatus, GraphRootState, GraphTaskRecord, GraphTaskSnapshot,
+                GraphTaskSnapshotV1, InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
+                PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
             },
             ports::{
                 AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
                 ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
                 ContentLockDeletionRepository, ContentLockOwnershipRepository,
-                EntitlementRepository, InvoiceAdmissionRepository, PaymentDrainCleanupToken,
-                PaymentDrainClient, PaymentDrainClientError, PaymentDrainRepository,
-                PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
-                PaymentRequestState, PaymentRequestStatus, PaymentState, VerificationTaskClaimer,
+                EntitlementRepository, GraphTaskClaimer, GraphTaskRepository,
+                InvoiceAdmissionRepository, PaymentDrainCleanupToken, PaymentDrainClient,
+                PaymentDrainClientError, PaymentDrainRepository, PaymentDrainStatus,
+                PaymentDrainSummary, PaymentDrainTerminalTransition, PaymentRequestState,
+                PaymentRequestStatus, PaymentState, VerificationTaskClaimer,
                 VerificationTaskRepository,
             },
             use_cases::drain_lock_payments::DrainLockPaymentsUseCase,
@@ -1884,9 +1911,9 @@ mod tests {
         infrastructure::memory::entitlements::InMemoryEntitlementRepository,
         infrastructure::postgres::{
             PostgresAccessCredentialStore, PostgresContentLockDeletionActionOwnership,
-            PostgresContentLockOwnershipRepository, PostgresPaymentDrainRepository,
-            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
-            testing::TestDatabase,
+            PostgresContentLockOwnershipRepository, PostgresGraphTaskRepository,
+            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
+            PostgresVerificationTaskRepository, testing::TestDatabase,
         },
     };
 
@@ -2291,6 +2318,51 @@ mod tests {
         };
         assert!(matches!(
             second_owner.try_acquire(wrong_mode).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_graceful_withdrawal_lane_fences_force_and_persists_failure() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let first_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let second_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+
+        let ContentLockDeletionActionAcquireResult::Acquired(guard) = first_owner
+            .try_acquire_graceful_withdrawal(job.job_id)
+            .await
+            .unwrap()
+        else {
+            panic!("live graceful withdrawal must acquire")
+        };
+        assert!(matches!(
+            second_owner
+                .try_acquire_graceful_withdrawal(job.job_id)
+                .await
+                .unwrap(),
+            ContentLockDeletionActionAcquireResult::Busy
+        ));
+        let failed = repository
+            .fail_graceful_withdrawal(job.job_id, ContentLockDeletionFailureCode::TombstoneMissing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, ContentLockDeletionState::Failed);
+        assert_eq!(
+            failed.failure_code,
+            Some(ContentLockDeletionFailureCode::TombstoneMissing)
+        );
+        guard.release().await.unwrap();
+        assert!(matches!(
+            second_owner
+                .try_acquire_graceful_withdrawal(job.job_id)
+                .await
+                .unwrap(),
             ContentLockDeletionActionAcquireResult::ClaimLost
         ));
 
@@ -5082,6 +5154,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_paykit_drain_expires_claimed_graph_task_and_preserves_readable_lifecycle() {
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let accepted_at = database_now(&database).await;
+        let task = graph_task(&lock, accepted_at);
+        let task_id = task.task_id;
+        let graph = PostgresGraphTaskRepository::new(database.pool().clone());
+        graph.insert_graph_task(task).await.unwrap();
+        let graph_claim = graph
+            .claim_next_graph_task(
+                "graph-worker",
+                accepted_at,
+                accepted_at + time::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        repository.insert_job(job.clone()).await.unwrap();
+        let claim_token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET phase = 'drain_payments', state = 'running', claimed_by = 'worker',
+                 claim_token = $2, claim_expires_at = $3
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .bind(claim_token)
+        .bind(database_now(&database).await + time::Duration::minutes(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            repository
+                .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim_token)
+                .await
+                .unwrap()
+        );
+        let (status, resolved): (String, Option<String>) = sqlx::query_as(
+            "SELECT task.status, snapshot.resolved_status
+             FROM verification_tasks task
+             JOIN content_lock_deletion_task_snapshot snapshot
+               ON snapshot.verification_task_id = task.task_id
+             WHERE task.task_id = $1",
+        )
+        .bind(task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(resolved.as_deref(), Some("expired"));
+        let terminal_reason: Option<String> =
+            sqlx::query_scalar("SELECT terminal_reason FROM verification_tasks WHERE task_id = $1")
+                .bind(task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(terminal_reason.as_deref(), Some("content_lock_deleted"));
+        let hydrated = graph
+            .get_graph_task_by_handle(
+                &graph_claim.task.snapshot.as_v1().creator,
+                &graph_claim.task.snapshot.as_v1().bundle_id,
+            )
+            .await
+            .unwrap()
+            .expect("deletion-terminalized graph lifecycle remains readable");
+        assert_eq!(hydrated.status, VerificationTaskStatus::Expired);
+        assert_eq!(hydrated.snapshot.as_v1().root, GraphRootState::Pending);
+        assert_eq!(
+            graph
+                .persist_claimed_graph_snapshot(
+                    &task_id,
+                    "graph-worker",
+                    &graph_claim.claim_token,
+                    accepted_at,
+                    0,
+                    graph_claim.task.snapshot.clone(),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET terminal_reason = 'graph_condition_not_observed_by_deadline'
+             WHERE task_id = $1",
+        )
+        .bind(task_id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            graph
+                .get_graph_task_by_handle(
+                    &graph_claim.task.snapshot.as_v1().creator,
+                    &graph_claim.task.snapshot.as_v1().bundle_id,
+                )
+                .await
+                .is_err(),
+            "the deletion exception must not weaken ordinary expired-root validation"
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn non_paykit_expiry_skips_paykit_and_missing_paykit_aggregate_still_blocks() {
         let database = TestDatabase::create().await;
         let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
@@ -6090,6 +6270,42 @@ mod tests {
             pubky_lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
             verification_result: VerificationResult { criteria: vec![] },
             entitlement_lifetime: EntitlementLifetime::Unbounded,
+        }
+    }
+
+    fn graph_task(lock: &ContentLock, accepted_at: time::OffsetDateTime) -> GraphTaskRecord {
+        let lock_hash = lock.lock_hash().unwrap();
+        let lock_id = lock.lock_id().unwrap();
+        GraphTaskRecord {
+            task_id: TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d29").unwrap(),
+            snapshot: GraphTaskSnapshot::V1(
+                GraphTaskSnapshotV1::new(
+                    lock.creator.clone(),
+                    BundleId::new_random(),
+                    PubkyLockResource::from_str(&format!(
+                        "{}/pub/app.locks/{lock_id}.json",
+                        lock.creator
+                    ))
+                    .unwrap(),
+                    *lock_hash.as_bytes(),
+                    lock.creator.clone(),
+                    accepted_at,
+                    60,
+                    GraphPolicyV2 {
+                        predicates: vec![GraphPredicateV2::Follows {
+                            follower: GraphParticipantV2::Reader,
+                            followed: GraphParticipantV2::Creator,
+                        }],
+                        operator: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
         }
     }
 

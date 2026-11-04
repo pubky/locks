@@ -15,7 +15,7 @@ use crate::application::models::{
 };
 use crate::application::ports::{InvoiceAdmissionRepository, VerificationTaskRepository};
 
-use super::proof_admission::lock_proof_admission;
+use super::proof_admission::{lock_proof_admission, lock_proof_handle_admission};
 
 /// Postgres-backed repository for Lock Server private verification task state.
 #[derive(Debug, Clone)]
@@ -94,6 +94,35 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let lock_id = task.submitted_proof_bundle.pubky_lock_resource.lock_id();
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+        lock_proof_handle_admission(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?;
+        let folded_auth_pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM folded_auth_attempts
+                WHERE creator = $1 AND bundle_id = $2 AND status = 'pending'
+             )",
+        )
+        .bind(task.creator.to_string())
+        .bind(task.submitted_proof_bundle.bundle_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if folded_auth_pending {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
+        if graph_task_exists_by_handle(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?
+        {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if let Some(existing) = get_task_by_handle_in_transaction(
             &mut transaction,
             &task.creator,
@@ -168,6 +197,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 entitlement_to_publish = $7,
                 updated_at = now()
             WHERE task_id = $1::uuid
+              AND evaluator_snapshot IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
                   WHERE snapshot.verification_task_id = verification_tasks.task_id
@@ -200,7 +230,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE task_id = $1::uuid"
+            WHERE task_id = $1::uuid AND evaluator_snapshot IS NULL"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(task_id.to_string())
@@ -219,7 +249,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE creator = $1 AND bundle_id = $2"
+            WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NULL"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(creator.to_string())
@@ -232,11 +262,14 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
     }
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
-        sqlx::query("DELETE FROM verification_tasks WHERE task_id = $1::uuid")
-            .bind(task_id.to_string())
-            .execute(&self.pool)
-            .await
-            .map_err(storage_error)?;
+        sqlx::query(
+            "DELETE FROM verification_tasks
+             WHERE task_id = $1::uuid AND evaluator_snapshot IS NULL",
+        )
+        .bind(task_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
         Ok(())
     }
 }
@@ -257,6 +290,15 @@ impl InvoiceAdmissionRepository for PostgresVerificationTaskRepository {
             })?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, &task.creator, lock_id).await?;
+        if graph_task_exists_by_handle(
+            &mut transaction,
+            &task.creator,
+            &task.submitted_proof_bundle.bundle_id,
+        )
+        .await?
+        {
+            return Err(ApplicationError::VerificationTaskConflict);
+        }
         if let Some(existing) = get_task_by_handle_in_transaction(
             &mut transaction,
             &task.creator,
@@ -849,7 +891,9 @@ pub(super) fn status_to_database(status: VerificationTaskStatus) -> &'static str
     }
 }
 
-fn status_from_database(status: &str) -> Result<VerificationTaskStatus, ApplicationError> {
+pub(super) fn status_from_database(
+    status: &str,
+) -> Result<VerificationTaskStatus, ApplicationError> {
     match status {
         "pending" => Ok(VerificationTaskStatus::Pending),
         "in_progress" => Ok(VerificationTaskStatus::InProgress),
@@ -871,7 +915,7 @@ async fn get_task_by_handle_in_transaction(
     let sql = format!(
         "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
          FROM verification_tasks
-         WHERE creator = $1 AND bundle_id = $2"
+         WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NULL"
     );
     sqlx::query_as::<_, VerificationTaskRow>(&sql)
         .bind(creator.to_string())
@@ -883,7 +927,25 @@ async fn get_task_by_handle_in_transaction(
         .transpose()
 }
 
-async fn reject_deletion_cutoff(
+async fn graph_task_exists_by_handle(
+    transaction: &mut Transaction<'_, Postgres>,
+    creator: &CreatorPubky,
+    bundle_id: &BundleId,
+) -> Result<bool, ApplicationError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM verification_tasks
+            WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NOT NULL
+        )",
+    )
+    .bind(creator.to_string())
+    .bind(bundle_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)
+}
+
+pub(super) async fn reject_deletion_cutoff(
     transaction: &mut Transaction<'_, Postgres>,
     creator: &CreatorPubky,
     lock_id: &LockId,

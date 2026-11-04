@@ -5,6 +5,8 @@ pub mod content_lock_ownership;
 pub mod content_lock_tombstones;
 pub mod content_locks;
 pub mod entitlements;
+pub mod folded_auth;
+pub mod graph_tasks;
 pub mod guarded_resources;
 pub mod lock_service_pointers;
 pub mod public_content_locks;
@@ -24,9 +26,12 @@ pub fn content_lock_publication_repositories() -> (
     InMemoryContentLockDeletionRepository,
     InMemoryContentLockOwnershipRepository,
 ) {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
     content_lock_publication_repositories_with_dependencies(
-        Arc::new(InMemoryAccessCredentialStore::new()),
-        Arc::new(InMemoryVerificationTaskDeletionFence::new()),
+        Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        )),
+        fence,
     )
 }
 

@@ -1,9 +1,13 @@
 use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource};
-use locks_core::verification::SubmittedProofBundle;
+use locks_core::verification::{SubmittedProofBundle, SubmittedProofBundleV2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::creator::encode_content_path;
+use crate::graph::{
+    FoldedAuthStatusRequest, FoldedAuthStatusResponse, GraphSubmitResponse,
+    GraphVerificationTaskLifecycleResponse,
+};
 use crate::{LocksSdkError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,11 +38,17 @@ struct SubmitProofBundleRequest {
     submitted_proof_bundle: SubmittedProofBundle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SubmitGraphProofBundleRequest {
+    submitted_proof_bundle: SubmittedProofBundleV2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerificationTaskStatus {
     Pending,
     InProgress,
+    PublishingEntitlement,
     Completed,
     Failed,
     Expired,
@@ -52,6 +62,9 @@ pub enum VerificationTerminalReason {
     ProposalExpired,
     PaymentDeadlineExpired,
     ContentLockDeleted,
+    GraphConditionNotObservedByDeadline,
+    VerificationUnavailableByDeadline,
+    InvalidVerifierResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +177,29 @@ impl ViewerLocks {
         )
     }
 
+    pub fn submit_graph_proof_bundle(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundleV2,
+    ) -> SdkViewerRequest {
+        self.post_json(
+            "/proof-bundles",
+            SubmitGraphProofBundleRequest {
+                submitted_proof_bundle,
+            },
+        )
+    }
+
+    pub fn poll_folded_auth(&self, request: FoldedAuthStatusRequest) -> SdkViewerRequest {
+        self.post_json("/proof-bundles/auth-status", request)
+    }
+
+    pub fn lookup_graph_verification_task(
+        &self,
+        request: VerificationTaskHandleRequest,
+    ) -> SdkViewerRequest {
+        self.lookup_verification_task(request)
+    }
+
     pub fn lookup_verification_task(
         &self,
         request: VerificationTaskHandleRequest,
@@ -228,6 +264,20 @@ impl ViewerLocks {
         value: Value,
     ) -> Result<VerificationTaskLifecycleResponse> {
         Self::parse_lifecycle_response(value)
+    }
+
+    pub fn parse_graph_submit_response(value: Value) -> Result<GraphSubmitResponse> {
+        crate::graph::parse_graph_submit_response(value)
+    }
+
+    pub fn parse_folded_auth_status_response(value: Value) -> Result<FoldedAuthStatusResponse> {
+        crate::graph::parse_folded_auth_status_response(value)
+    }
+
+    pub fn parse_graph_lifecycle_response(
+        value: Value,
+    ) -> Result<GraphVerificationTaskLifecycleResponse> {
+        crate::graph::parse_graph_lifecycle_response(value)
     }
 
     pub fn parse_paykit_connection_state_response(
@@ -297,6 +347,7 @@ fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> 
                 && response.admission_deadline_at.is_none()
                 && response.terminal_reason.is_none()
         }
+        VerificationTaskStatus::PublishingEntitlement => false,
         VerificationTaskStatus::Completed => {
             response.started_at.is_some()
                 && response.completed_at.is_some()

@@ -130,8 +130,12 @@ impl Viewer {
         &self,
         submitted_proof_bundle: wasm_bindgen::JsValue,
     ) -> JsResult<wasm_bindgen::JsValue> {
-        let submitted_proof_bundle = serde_wasm_bindgen::from_value(submitted_proof_bundle)
+        let submitted_proof_bundle: Value = serde_wasm_bindgen::from_value(submitted_proof_bundle)
             .map_err(|err| invalid_input(format!("invalid submitted proof bundle: {err}")))?;
+        let graph = submitted_proof_bundle
+            .get("version")
+            .and_then(Value::as_u64)
+            == Some(2);
         let resolver = BrowserPkarrResolver::new_with_options(&self.options)
             .map_err(|err| invalid_input(err.to_string()))?;
         let request = self
@@ -140,7 +144,41 @@ impl Viewer {
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
-        fetch_submit_proof_bundle_json(&request).await
+        if graph {
+            fetch_graph_submit_json(&request).await
+        } else {
+            fetch_submit_proof_bundle_json(&request).await
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = pollFoldedAuth)]
+    pub async fn poll_folded_auth(&self, state: String) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_poll_folded_auth_request(&state)
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_folded_auth_status_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = lookupGraphVerificationTask)]
+    pub async fn lookup_graph_verification_task(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_lookup_verification_task_request(options)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_graph_lifecycle_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -275,9 +313,26 @@ impl Viewer {
         &self,
         submitted_proof_bundle: Value,
     ) -> Result<JsViewerRequestPlan, String> {
-        let submitted_proof_bundle = serde_json::from_value(submitted_proof_bundle)
-            .map_err(|err| format!("invalid submitted proof bundle: {err}"))?;
-        Ok(self.request_plan(self.inner.submit_proof_bundle(submitted_proof_bundle)))
+        let submitted_proof_bundle: locks_core::verification::SubmittedProofBundlePayload =
+            serde_json::from_value(submitted_proof_bundle)
+                .map_err(|err| format!("invalid submitted proof bundle: {err}"))?;
+        let request = match submitted_proof_bundle {
+            locks_core::verification::SubmittedProofBundlePayload::V1(bundle) => {
+                self.inner.submit_proof_bundle(bundle)
+            }
+            locks_core::verification::SubmittedProofBundlePayload::V2(bundle) => {
+                self.inner.submit_graph_proof_bundle(bundle)
+            }
+        };
+        Ok(self.request_plan(request))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_poll_folded_auth_request(&self, state: &str) -> JsViewerRequestPlan {
+        self.request_plan(
+            self.inner
+                .poll_folded_auth(locks_sdk::FoldedAuthStatusRequest::new(state)),
+        )
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -430,6 +485,27 @@ fn validate_access_credential_response_for_tests(value: Value) -> Result<Value, 
     typed_response_json(&response)
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_graph_submit_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_graph_submit_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_folded_auth_status_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_folded_auth_status_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_graph_lifecycle_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_graph_lifecycle_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn fetch_viewer_lifecycle_json(
     request: &JsPreparedViewerRequest,
@@ -449,6 +525,36 @@ async fn fetch_submit_proof_bundle_json(
         validate_submit_proof_bundle_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode proof bundle response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_graph_submit_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_graph_submit_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode graph submit response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_folded_auth_status_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_folded_auth_status_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode folded auth response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_graph_lifecycle_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_graph_lifecycle_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode graph lifecycle: {err:?}")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -607,6 +713,14 @@ mod tests {
         })
     }
 
+    fn graph_proof_bundle() -> Value {
+        json!({
+            "version": 2,
+            "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json")
+        })
+    }
+
     #[test]
     fn bundle_id_constructor_canonicalizes_and_rejects_invalid_values() {
         assert_eq!(
@@ -683,6 +797,104 @@ mod tests {
             request.body["submitted_proof_bundle"]["bundle_id"],
             BUNDLE_ID
         );
+    }
+
+    #[test]
+    fn graph_submit_and_folded_auth_poll_delegate_to_closed_rust_sdk() {
+        let viewer = test_viewer();
+        let create = viewer
+            .build_submit_proof_bundle_request(graph_proof_bundle())
+            .unwrap();
+        assert_eq!(create.path, "/proof-bundles");
+        assert_eq!(create.body["submitted_proof_bundle"]["version"], 2);
+
+        let poll = viewer.build_poll_folded_auth_request("opaque-state");
+        assert_eq!(poll.path, "/proof-bundles/auth-status");
+        assert_eq!(poll.authorization, None);
+        assert_eq!(poll.body, json!({"state":"opaque-state"}));
+    }
+
+    #[test]
+    fn graph_response_validation_is_closed_for_restart_status_and_omission() {
+        let accepted = json!({
+            "status":"accepted",
+            "task": {
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "in_progress",
+                "submitted_at": "2026-11-03T12:00:00Z",
+                "admission_deadline_at": "2026-11-03T12:10:00Z"
+            }
+        });
+        assert_eq!(
+            validate_graph_submit_response_for_tests(accepted.clone()).unwrap(),
+            accepted
+        );
+        let restart = json!({"status":"restart_required"});
+        assert_eq!(
+            validate_folded_auth_status_response_for_tests(restart.clone()).unwrap(),
+            restart
+        );
+        assert!(
+            validate_folded_auth_status_response_for_tests(
+                json!({"status":"restart_required", "state":"secret"})
+            )
+            .is_err()
+        );
+
+        let graph = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "in_progress",
+            "submitted_at": "2026-11-03T12:00:00Z",
+            "admission_deadline_at": "2026-11-03T12:10:00Z"
+        });
+        assert_eq!(
+            validate_graph_lifecycle_response_for_tests(graph.clone()).unwrap(),
+            graph
+        );
+        let mut null_completed = graph;
+        null_completed["completed_at"] = Value::Null;
+        assert!(validate_graph_lifecycle_response_for_tests(null_completed).is_err());
+    }
+
+    #[test]
+    fn graph_lifecycle_js_boundary_rejects_invalid_reason_cross_product() {
+        let reasons = [
+            "payment_request_rejected",
+            "payment_request_canceled",
+            "proposal_expired",
+            "payment_deadline_expired",
+            "content_lock_deleted",
+            "graph_condition_not_observed_by_deadline",
+            "verification_unavailable_by_deadline",
+            "invalid_verifier_response",
+        ];
+        for status in ["expired", "failed"] {
+            for reason in reasons {
+                let value = json!({
+                    "creator": CREATOR,
+                    "bundle_id": BUNDLE_ID,
+                    "status": status,
+                    "submitted_at": "2026-11-03T12:00:00Z",
+                    "completed_at": "2026-11-03T12:01:00Z",
+                    "admission_deadline_at": "2026-11-03T12:10:00Z",
+                    "terminal_reason": reason
+                });
+                let allowed = (status == "expired"
+                    && reason == "graph_condition_not_observed_by_deadline")
+                    || (status == "failed"
+                        && matches!(
+                            reason,
+                            "verification_unavailable_by_deadline" | "invalid_verifier_response"
+                        ));
+                assert_eq!(
+                    validate_graph_lifecycle_response_for_tests(value).is_ok(),
+                    allowed,
+                    "wrong JS graph lifecycle decision: {status} + {reason}"
+                );
+            }
+        }
     }
 
     #[test]
