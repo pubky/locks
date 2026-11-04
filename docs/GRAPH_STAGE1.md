@@ -11,6 +11,8 @@ Architecture decisions: [ADR 0021](ADRs/0021-graph-stage1-folded-auth-nexus.md).
 3. Server returns `202 auth_pending` with public folded-auth `state`, `auth_url`, and `expires_at`.
 4. Viewer approves in folded-auth UI, then calls `POST /proof-bundles/auth-status` with `state`.
 5. `pending` means poll later. Failure before dependency dispatch is retryable. Ambiguous failure after attempted dispatch returns `restart_required`; resubmit same immutable bundle to create fresh auth state. Expired state returns `expired`.
+
+Lock Server renews durable ownership while an approval poll is live. Cleanup recovers a crashed or abandoned poll after one minute without renewal; concurrent status requests remain `pending` and cannot invalidate active ownership.
 6. Approved auth atomically binds Reader and creates durable graph task. Viewer polls `POST /verification-task-lookups` with `{ creator, bundle_id }`.
 7. Worker evaluates Nexus. Operational failures retry until deadline. Invalid successful response fails closed. Valid false remains pending until policy can no longer be satisfied. Valid true is retained monotonically.
 8. Satisfied policy enters `publishing_entitlement`; publication retries under claim fencing. Completed lifecycle enables existing access-credential flow.

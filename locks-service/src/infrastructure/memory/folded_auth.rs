@@ -260,6 +260,23 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         Ok(Some(stored.attempt.clone()))
     }
 
+    async fn renew_poll_dispatch(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let mut state = self.state.write().await;
+        let Some(stored) = exact_pending_mut(&mut state, state_hash, expected_generation) else {
+            return Ok(None);
+        };
+        if !stored.attempt.poll_dispatched {
+            return Ok(None);
+        }
+        stored.poll_dispatched_at = Some(self.graph.authoritative_time());
+        Ok(Some(stored.attempt.clone()))
+    }
+
     async fn confirm_not_attempted(
         &self,
         state_hash: &FoldedAuthStateHash,
@@ -497,6 +514,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Duration as StdDuration;
 
     use async_trait::async_trait;
     use locks_core::ids::{
@@ -630,6 +648,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_poll_renews_ownership_past_abandonment_cutoff() {
+        let now = datetime!(2026-10-30 12:00:00 UTC);
+        let clock = Arc::new(MutableClock::new(now));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(fence));
+        let repository = Arc::new(InMemoryFoldedAuthRepository::new(graph, cipher()));
+        let started = repository
+            .start_or_rotate(start_request(
+                BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                PubkyLockResource::new(creator(), ContentLockPath::from_lock_id(lock_id())),
+            ))
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let use_case = Arc::new(PollFoldedAuthAttempt::with_poll_lease_renewal_interval(
+            Arc::clone(&repository),
+            Arc::new(BlockingApprovedPoller {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                reader: creator(),
+            }),
+            clock.clone(),
+            StdDuration::from_millis(10),
+        ));
+        let state_hash = started.attempt.state_hash.clone();
+        let polling_use_case = Arc::clone(&use_case);
+        let polling =
+            tokio::spawn(async move { polling_use_case.execute(&state_hash).await.unwrap() });
+        entered.notified().await;
+        assert!(matches!(
+            use_case.execute(&started.attempt.state_hash).await.unwrap(),
+            PollFoldedAuthOutcome::Pending(_)
+        ));
+
+        clock.set(now + FOLDED_AUTH_POLL_ABANDONED_AFTER);
+        tokio::time::sleep(StdDuration::from_millis(25)).await;
+        repository
+            .purge_terminal_before(now + FOLDED_AUTH_POLL_ABANDONED_AFTER)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_by_state_hash(&started.attempt.state_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            FoldedAuthStatus::Pending
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            polling.await.unwrap(),
+            PollFoldedAuthOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn terminal_folded_attempt_releases_handle_reservation_for_ordinary_admission() {
         let graph = Arc::new(InMemoryGraphTaskRepository::new());
         let repository = InMemoryFoldedAuthRepository::new(Arc::clone(&graph), cipher());
@@ -706,6 +785,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    struct BlockingApprovedPoller {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        reader: CreatorPubky,
+    }
+
+    #[async_trait]
+    impl FoldedAuthApprovalPoller for BlockingApprovedPoller {
+        async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+            self.entered.notify_one();
+            self.release.notified().await;
+            FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Approved {
+                reader: self.reader.clone(),
+            }))
+        }
     }
 
     struct ApprovedPoller {

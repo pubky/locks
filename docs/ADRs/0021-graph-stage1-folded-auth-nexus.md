@@ -18,6 +18,8 @@ Stage 1 must coexist with `paykit-payment` v1 without importing, calling, or cre
 
 A poll which was dispatched to the folded-auth dependency but does not produce a trustworthy `pending` or `approved` result consumes that auth attempt and returns `restart_required`. Clients start a fresh flow by resubmitting the same graph bundle. Locks does not silently retry an attempted ambiguous poll because doing so could consume or reinterpret a one-shot upstream approval.
 
+While a dependency poll is live, Lock Server renews its durable dispatch ownership every 20 seconds. Cleanup treats an unrenewed dispatch as abandoned at one minute, marks it `restart_required`, and generation-fences any later stale completion. Concurrent status requests observe `pending`; they do not take ownership from the active poll.
+
 A failure before dispatch is retryable on the same public state. Expired state returns `expired`. Neither route returns folded-auth flow secret, encrypted state, internal attempt key, raw dependency body, or Reader identity before approval.
 
 ### D2: minimum durable restore state is encrypted

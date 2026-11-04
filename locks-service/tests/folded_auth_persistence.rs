@@ -14,8 +14,9 @@ use locks_core::lock_policy::{
 use locks_core::verification::SubmittedProofBundleV2;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    FoldedAuthFlowSecret, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
-    GraphTaskSnapshot, GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
+    FOLDED_AUTH_POLL_ABANDONED_AFTER, FoldedAuthFlowSecret, FoldedAuthStateHash, FoldedAuthStatus,
+    GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1, StartFoldedAuthAttempt,
+    VerificationTaskStatus,
 };
 use locks_service::application::ports::{
     Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller,
@@ -304,7 +305,7 @@ impl FoldedAuthApprovalPoller for MustNotPoll {
 }
 
 #[tokio::test]
-async fn successful_exchange_then_accept_failure_restarts_after_reconstruction() {
+async fn successful_exchange_then_accept_failure_restarts_after_abandoned_lease() {
     let (graph, clock) = graph_at(datetime!(2026-10-30 12:00:00 UTC));
     let cipher = folded_auth_cipher();
     let repository = Arc::new(InMemoryFoldedAuthRepository::new(
@@ -380,8 +381,13 @@ async fn successful_exchange_then_accept_failure_restarts_after_reconstruction()
     clock.set(now + Duration::SECOND);
     assert!(matches!(
         use_case.execute(&started.attempt.state_hash).await.unwrap(),
-        PollFoldedAuthOutcome::RestartRequired(_)
+        PollFoldedAuthOutcome::Pending(_)
     ));
+    clock.set(now + FOLDED_AUTH_POLL_ABANDONED_AFTER);
+    reconstructed
+        .purge_terminal_before(now + FOLDED_AUTH_POLL_ABANDONED_AFTER)
+        .await
+        .unwrap();
     assert_eq!(
         reconstructed
             .get_by_state_hash(&started.attempt.state_hash)

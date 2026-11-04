@@ -195,6 +195,15 @@ impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
         Err(folded_auth_storage_failure())
     }
 
+    async fn renew_poll_dispatch(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
     async fn confirm_not_attempted(
         &self,
         _state_hash: &FoldedAuthStateHash,

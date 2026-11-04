@@ -45,6 +45,14 @@ pub trait FoldedAuthRepository: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError>;
 
+    /// Renews ownership while the exact generation's dependency poll remains live.
+    async fn renew_poll_dispatch(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        now: OffsetDateTime,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError>;
+
     async fn confirm_not_attempted(
         &self,
         state_hash: &FoldedAuthStateHash,

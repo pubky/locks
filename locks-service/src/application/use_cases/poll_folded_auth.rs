@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use locks_core::ids::TaskId;
 
@@ -25,7 +26,10 @@ pub struct PollFoldedAuthAttempt<R: ?Sized, P: ?Sized> {
     repository: Arc<R>,
     poller: Arc<P>,
     clock: Arc<dyn Clock>,
+    poll_lease_renewal_interval: Duration,
 }
+
+const POLL_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(20);
 
 impl<R, P> PollFoldedAuthAttempt<R, P>
 where
@@ -37,6 +41,23 @@ where
             repository,
             poller,
             clock,
+            poll_lease_renewal_interval: POLL_LEASE_RENEWAL_INTERVAL,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_poll_lease_renewal_interval(
+        repository: Arc<R>,
+        poller: Arc<P>,
+        clock: Arc<dyn Clock>,
+        poll_lease_renewal_interval: Duration,
+    ) -> Self {
+        assert!(!poll_lease_renewal_interval.is_zero());
+        Self {
+            repository,
+            poller,
+            clock,
+            poll_lease_renewal_interval,
         }
     }
 
@@ -65,21 +86,7 @@ where
         }
         let generation = attempt.generation;
         if attempt.poll_dispatched {
-            return Ok(
-                match self
-                    .repository
-                    .require_restart(state_hash, generation, before_poll)
-                    .await?
-                {
-                    Some(attempt) if attempt.status == FoldedAuthStatus::Expired => {
-                        PollFoldedAuthOutcome::Expired(attempt)
-                    }
-                    Some(attempt) if attempt.status == FoldedAuthStatus::RestartRequired => {
-                        PollFoldedAuthOutcome::RestartRequired(attempt)
-                    }
-                    _ => PollFoldedAuthOutcome::Stale,
-                },
-            );
+            return Ok(PollFoldedAuthOutcome::Pending(attempt));
         }
         if attempt.expires_at <= before_poll {
             return Ok(
@@ -111,7 +118,38 @@ where
         }
 
         // No repository transaction or row lock is held across this awaited SDK/relay call.
-        let polled = self.poller.poll_approval(&restored.flow_secret).await;
+        // Renewing durable ownership keeps cleanup from abandoning a still-live poll.
+        let polled = {
+            let poll = self.poller.poll_approval(&restored.flow_secret);
+            tokio::pin!(poll);
+            let renewal_delay = tokio::time::sleep(self.poll_lease_renewal_interval);
+            tokio::pin!(renewal_delay);
+            'polling: loop {
+                tokio::select! {
+                    result = &mut poll => break 'polling result,
+                    _ = &mut renewal_delay => {
+                        let renewal = self.repository.renew_poll_dispatch(
+                            state_hash,
+                            generation,
+                            self.clock.now(),
+                        );
+                        tokio::pin!(renewal);
+                        tokio::select! {
+                            // Keep polling the potentially one-shot dependency call while
+                            // a storage renewal waits. Every completion remains fenced by
+                            // state hash and generation if ownership was already lost.
+                            result = &mut poll => break 'polling result,
+                            _ = &mut renewal => {
+                                renewal_delay.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + self.poll_lease_renewal_interval,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
         let result_time = self.clock.now();
         match polled {
             FoldedAuthPollCall::TransientBeforePoll(error) => {
