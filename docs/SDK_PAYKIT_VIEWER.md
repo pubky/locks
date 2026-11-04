@@ -129,7 +129,7 @@ Handle lifecycle states as closed vocabulary:
 
 All five outcomes are terminal: stop browser/Rust polling, issue no access credential, and grant no entitlement. Payment retries require a fresh Bundle ID and payment request; replaying same Bundle ID returns same terminal lifecycle. A deleted content lock must be recreated before any new attempt.
 
-JS/WASM methods reject unknown statuses, unknown terminal reasons, extra private fields, and invalid tuples. Keep application handling closed too:
+JS/WASM methods reject unknown statuses, unknown terminal reasons, secret-bearing fields, and invalid tuples. Other unknown fields are dropped: the methods return only the fields this SDK release knows. Keep application handling closed too:
 
 ```js
 function nextAction(lifecycle) {
@@ -236,6 +236,6 @@ fn expired_message(reason: VerificationTerminalReason) -> &'static str {
 }
 ```
 
-Send returned request through caller transport. Parse each later lifecycle response with `parse_lifecycle_response`; it rejects unknown/invalid response shapes. Parse credential response with `parse_access_credential_response`, then pass only its `credential` field to `proxy_read_guarded_resource`. `Failed` and `Expired` are terminal and must not issue a credential; a retry needs a fresh Bundle ID and payment request.
+Send returned request through caller transport. Parse each later lifecycle response with `parse_lifecycle_response`. It ignores additive unknown fields, so a newer Lock Server can add one before this SDK knows it. It still fails on fields that would carry internal or secret material (`task_id`, `credential`, `credential_issuance`, `submitted_proof_bundle`, `proofs`, `entitlement`, `verified_proof_bundle`, `entitlement_to_publish`), on `connection_state` (the superseded submit contract), on an unknown `status` or `terminal_reason` value, and on an invalid combination of known lifecycle fields. Parse credential response with `parse_access_credential_response`, then pass only its `credential` field to `proxy_read_guarded_resource`. `Failed` and `Expired` are terminal and must not issue a credential; a retry needs a fresh Bundle ID and payment request.
 
 Compile-enforced public consumer contract: [`locks-sdk/tests/paykit_viewer_flow.rs`](../locks-sdk/tests/paykit_viewer_flow.rs). It verifies exact request bodies/routes, every lifecycle and connection state, invalid-state rejection, and bearer-only credential placement.
