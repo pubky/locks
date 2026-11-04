@@ -101,6 +101,18 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
     ) -> Result<FoldedAuthStartResult, ApplicationError> {
         request.validate().map_err(invalid_state)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Match acceptance's row-before-admission lock order. The second read below
+        // closes the no-row race after admission fences serialize concurrent starts.
+        sqlx::query(
+            "SELECT state_hash FROM folded_auth_attempts
+             WHERE creator = $1 AND bundle_id = $2
+             ORDER BY generation DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.creator().to_string())
+        .bind(request.bundle_id().to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
         lock_proof_admission(
             &mut transaction,
             request.creator(),
@@ -349,6 +361,13 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
         };
+        lock_proof_admission(
+            &mut transaction,
+            &attempt.creator,
+            attempt.pubky_lock_resource.lock_id(),
+        )
+        .await?;
+        lock_proof_handle_admission(&mut transaction, &attempt.creator, &attempt.bundle_id).await?;
         let database_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *transaction)
             .await
@@ -910,11 +929,12 @@ mod tests {
                 started.attempt.generation,
                 TaskId::from_str(TASK_ID).unwrap(),
                 reader(),
-                time::OffsetDateTime::now_utc(),
+                datetime!(2000-01-01 00:00:00 UTC),
             )
             .await
             .unwrap()
             .unwrap();
+        assert!(task.snapshot.as_v1().accepted_at > datetime!(2020-01-01 00:00:00 UTC));
         let graph = PostgresGraphTaskRepository::new(database.pool().clone());
         assert_eq!(
             graph
@@ -1194,6 +1214,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acceptance_and_rotation_share_row_before_admission_lock_order() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        let lock = graph_lock();
+        let started = repository
+            .start_or_rotate(start_request(
+                &lock,
+                FoldedAuthStateHash::derive(b"lock-order-initial"),
+                b"lock-order-flow",
+                time::OffsetDateTime::now_utc(),
+            ))
+            .await
+            .unwrap();
+
+        let mut blocker = database.pool().begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT state_hash FROM folded_auth_attempts WHERE state_hash = $1 FOR UPDATE")
+            .bind(started.attempt.state_hash.as_bytes().as_slice())
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let accepting_repository = repository.clone();
+        let accepting_state = started.attempt.state_hash.clone();
+        let accepting = tokio::spawn(async move {
+            accepting_repository
+                .accept_and_insert_graph_task(
+                    &accepting_state,
+                    started.attempt.generation,
+                    TaskId::from_str(TASK_ID).unwrap(),
+                    reader(),
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await
+        });
+        wait_for_lock_waiters(database.pool(), blocker_pid, 1).await;
+
+        let rotating_repository = repository.clone();
+        let rotating_lock = lock.clone();
+        let rotating = tokio::spawn(async move {
+            rotating_repository
+                .start_or_rotate(start_request(
+                    &rotating_lock,
+                    FoldedAuthStateHash::derive(b"lock-order-rotation"),
+                    b"lock-order-flow-rotation",
+                    time::OffsetDateTime::now_utc(),
+                ))
+                .await
+        });
+        wait_for_lock_waiters(database.pool(), blocker_pid, 2).await;
+        blocker.rollback().await.unwrap();
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), accepting)
+            .await
+            .expect("acceptance must not deadlock with rotation")
+            .unwrap()
+            .unwrap();
+        let rotated = tokio::time::timeout(std::time::Duration::from_secs(2), rotating)
+            .await
+            .expect("rotation must not deadlock with acceptance")
+            .unwrap();
+        assert!(accepted.is_some());
+        assert!(matches!(
+            rotated,
+            Err(crate::application::errors::ApplicationError::VerificationTaskConflict)
+        ));
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn pending_folded_auth_and_ordinary_v1_admission_are_exclusive_in_both_commit_orders() {
         for folded_first in [true, false] {
             let database = TestDatabase::create().await;
@@ -1274,6 +1370,10 @@ mod tests {
             let task = ordinary_graph_task(&lock);
 
             let mut blocker = database.pool().begin().await.unwrap();
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await
+                .unwrap();
             super::super::proof_admission::lock_proof_admission(
                 &mut blocker,
                 &creator(),
@@ -1287,7 +1387,7 @@ mod tests {
                 let first = tokio::spawn(async move {
                     first_repository.start_or_rotate(request).await.map(|_| ())
                 });
-                wait_for_advisory_waiters(database.pool(), 1).await;
+                wait_for_advisory_waiters(database.pool(), blocker_pid, 1).await;
                 let second = tokio::spawn(async move {
                     graph_repository.insert_graph_task(task).await.map(|_| ())
                 });
@@ -1297,13 +1397,13 @@ mod tests {
                 let first = tokio::spawn(async move {
                     first_repository.insert_graph_task(task).await.map(|_| ())
                 });
-                wait_for_advisory_waiters(database.pool(), 1).await;
+                wait_for_advisory_waiters(database.pool(), blocker_pid, 1).await;
                 let second = tokio::spawn(async move {
                     folded_repository.start_or_rotate(request).await.map(|_| ())
                 });
                 (first, second)
             };
-            wait_for_advisory_waiters(database.pool(), 2).await;
+            wait_for_advisory_waiters(database.pool(), blocker_pid, 2).await;
             blocker.rollback().await.unwrap();
 
             assert!(first.await.unwrap().is_ok());
@@ -1329,13 +1429,41 @@ mod tests {
         }
     }
 
-    async fn wait_for_advisory_waiters(pool: &sqlx::PgPool, expected: i64) {
+    async fn wait_for_lock_waiters(pool: &sqlx::PgPool, blocker_pid: i32, expected: i64) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let waiters: i64 = sqlx::query_scalar(
+                    "WITH RECURSIVE blocked(pid) AS (
+                         SELECT pid FROM pg_stat_activity
+                         WHERE $1 = ANY(pg_blocking_pids(pid))
+                         UNION
+                         SELECT activity.pid FROM pg_stat_activity AS activity
+                         JOIN blocked ON blocked.pid = ANY(pg_blocking_pids(activity.pid))
+                     )
+                     SELECT COUNT(*) FROM blocked",
+                )
+                .bind(blocker_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiters >= expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contenders wait on the folded-auth row lock");
+    }
+
+    async fn wait_for_advisory_waiters(pool: &sqlx::PgPool, blocker_pid: i32, expected: i64) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let waiters: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM pg_stat_activity
-                     WHERE datname = current_database() AND wait_event = 'advisory'",
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory'",
                 )
+                .bind(blocker_pid)
                 .fetch_one(pool)
                 .await
                 .unwrap();

@@ -3,13 +3,18 @@ use axum::body::{Body, to_bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
+use locks_core::{
+    content_lock_deletion::ContentLockDeletionTombstone,
+    ids::{ContentLockPath, CreatorPubky, LockId},
+};
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionState,
-    PrepareForceDeletionResult,
+    ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+    ContentLockDeletionState, PrepareForceDeletionResult,
 };
-use locks_service::application::ports::ContentLockDeletionActionAcquireResult;
+use locks_service::application::ports::{
+    ContentLockDeletionActionAcquireResult, TombstoneReadback,
+};
 use locks_service::application::use_cases::create_content_lock::{
     CreateContentLockRequest, CreateContentLockUseCase,
 };
@@ -112,6 +117,7 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
         } else {
             job
         };
+        ensure_graceful_tombstone(&state, &job).await?;
         let status = match job.state {
             ContentLockDeletionState::Queued | ContentLockDeletionState::Running => {
                 StatusCode::ACCEPTED
@@ -158,10 +164,27 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
 
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now())?;
     match state.content_lock_deletions().insert_job(job.clone()).await {
-        Ok(()) => Ok((
-            StatusCode::ACCEPTED,
-            Json(deletion_status_json(lock_id, job.state, job.failure_code)),
-        )),
+        Ok(()) => {
+            let persisted = state
+                .content_lock_deletions()
+                .get_job(&creator, &lock_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InternalError,
+                        "content lock deletion unavailable",
+                    )
+                })?;
+            ensure_graceful_tombstone(&state, &persisted).await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(deletion_status_json(
+                    lock_id,
+                    persisted.state,
+                    persisted.failure_code,
+                )),
+            ))
+        }
         Err(locks_service::application::errors::ApplicationError::DuplicateRecord {
             record: "content_lock_deletion_job",
         }) => {
@@ -175,6 +198,7 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
                         "content lock deletion unavailable",
                     )
                 })?;
+            ensure_graceful_tombstone(&state, &persisted).await?;
             let status = match persisted.state {
                 ContentLockDeletionState::Queued | ContentLockDeletionState::Running => {
                     StatusCode::ACCEPTED
@@ -209,6 +233,38 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
             }
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+async fn ensure_graceful_tombstone(
+    state: &AppState,
+    job: &ContentLockDeletionJob,
+) -> Result<(), ApiError> {
+    if job.phase != ContentLockDeletionPhase::Withdraw
+        || !matches!(
+            job.state,
+            ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+        )
+    {
+        return Ok(());
+    }
+    let tombstone = ContentLockDeletionTombstone::new(job.lock_id.clone(), job.deletion_started_at);
+    let path = ContentLockPath::from_lock_id(job.lock_id.clone());
+    match state
+        .content_lock_tombstones()
+        .withdraw_content_lock(
+            job.creator.clone(),
+            path,
+            &job.frozen_content_lock,
+            &tombstone,
+        )
+        .await?
+    {
+        TombstoneReadback::Exact => Ok(()),
+        TombstoneReadback::Missing | TombstoneReadback::Replaced => Err(ApiError::new(
+            ApiErrorCode::ContentLockPathConflict,
+            "content lock changed before deletion withdrawal",
+        )),
     }
 }
 

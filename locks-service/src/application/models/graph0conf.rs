@@ -446,10 +446,10 @@ impl GraphTaskSnapshotV1 {
         let truth = match self.operator {
             None => values[0],
             Some(GraphOperatorV2::And) => {
-                if values.contains(&TerminalPredicateTruth::Invalid) {
-                    TerminalPredicateTruth::Invalid
-                } else if values.contains(&TerminalPredicateTruth::False) {
+                if values.contains(&TerminalPredicateTruth::False) {
                     TerminalPredicateTruth::False
+                } else if values.contains(&TerminalPredicateTruth::Invalid) {
+                    TerminalPredicateTruth::Invalid
                 } else if values.contains(&TerminalPredicateTruth::Unavailable) {
                     TerminalPredicateTruth::Unavailable
                 } else {
@@ -459,10 +459,7 @@ impl GraphTaskSnapshotV1 {
             Some(GraphOperatorV2::Or) => {
                 if values.contains(&TerminalPredicateTruth::True) {
                     TerminalPredicateTruth::True
-                } else if values
-                    .iter()
-                    .all(|value| *value == TerminalPredicateTruth::Invalid)
-                {
+                } else if values.contains(&TerminalPredicateTruth::Invalid) {
                     TerminalPredicateTruth::Invalid
                 } else if values.contains(&TerminalPredicateTruth::Unavailable) {
                     TerminalPredicateTruth::Unavailable

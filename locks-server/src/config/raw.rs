@@ -425,6 +425,27 @@ fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, C
         .collect::<Result<Vec<_>, _>>()
 }
 
+fn validate_grant_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values
+        .into_iter()
+        .map(|value| {
+            if value == "*" {
+                return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
+                    value,
+                ));
+            }
+            let origin = validate_allowed_return_origin(value)?;
+            if !origin.starts_with("https://") || !seen.insert(origin.clone()) {
+                return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
+                    origin,
+                ));
+            }
+            Ok(origin)
+        })
+        .collect()
+}
+
 fn validate_allowed_return_origin(value: String) -> Result<String, ConfigError> {
     let invalid = || ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(value.clone());
     if value.contains('#') {
@@ -825,7 +846,7 @@ impl RawCreatorAuthorityAcquisitionConfig {
                 |grant| -> Result<GrantConnectAcquisitionConfig, ConfigError> {
                     Ok(GrantConnectAcquisitionConfig {
                         client_id: validate_grant_connect_client_id(grant.client_id)?,
-                        allowed_return_origins: validate_allowed_return_origins(
+                        allowed_return_origins: validate_grant_return_origins(
                             grant.allowed_return_origins,
                         )?,
                     })

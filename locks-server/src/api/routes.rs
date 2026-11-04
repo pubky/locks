@@ -142,7 +142,7 @@ pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> b
     let Ok(parsed) = url::Url::parse(origin) else {
         return false;
     };
-    if !matches!(parsed.scheme(), "http" | "https")
+    if parsed.scheme() != "https"
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -153,26 +153,27 @@ pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> b
     {
         return false;
     }
-    allowed_origins
-        .iter()
-        .any(|allowed| allowed == origin || allowed == "*")
+    allowed_origins.iter().any(|allowed| allowed == origin)
 }
 
 async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let is_submission = request.uri().path() == "/proof-bundles";
-    let origin = request.headers().get(header::ORIGIN).cloned();
-    let allowed = is_submission
-        || origin.as_ref().is_none_or(|origin| {
-            let Ok(origin) = origin.to_str() else {
-                return false;
-            };
-            state
-                .config()
-                .creator_authority_acquisition
-                .grant_connect
-                .as_ref()
-                .is_some_and(|grant| auth_origin_allowed(&grant.allowed_return_origins, origin))
-        });
+    let mut origins = request.headers().get_all(header::ORIGIN).iter();
+    let origin = origins.next().cloned();
+    let duplicate_origin = origins.next().is_some();
+    let allowed = !duplicate_origin
+        && (is_submission
+            || origin.as_ref().is_none_or(|origin| {
+                let Ok(origin) = origin.to_str() else {
+                    return false;
+                };
+                state
+                    .config()
+                    .creator_authority_acquisition
+                    .grant_connect
+                    .as_ref()
+                    .is_some_and(|grant| auth_origin_allowed(&grant.allowed_return_origins, origin))
+            }));
     if !allowed {
         let mut response = StatusCode::FORBIDDEN.into_response();
         response
@@ -206,7 +207,7 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
             );
             response.headers_mut().insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_static("content-type"),
+                HeaderValue::from_static("authorization, content-type"),
             );
         }
     }

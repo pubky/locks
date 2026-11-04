@@ -63,10 +63,10 @@ pub fn reduce_graph_snapshot(
     let truth = match snapshot.operator {
         None => values[0],
         Some(GraphOperatorV2::And) => {
-            if values.contains(&PredicateTruth::Invalid) {
-                PredicateTruth::Invalid
-            } else if values.contains(&PredicateTruth::False) {
+            if values.contains(&PredicateTruth::False) {
                 PredicateTruth::False
+            } else if values.contains(&PredicateTruth::Invalid) {
+                PredicateTruth::Invalid
             } else if values.contains(&PredicateTruth::Unavailable) {
                 PredicateTruth::Unavailable
             } else if values.contains(&PredicateTruth::Unknown) {
@@ -78,7 +78,7 @@ pub fn reduce_graph_snapshot(
         Some(GraphOperatorV2::Or) => {
             if values.contains(&PredicateTruth::True) {
                 PredicateTruth::True
-            } else if values.iter().all(|value| *value == PredicateTruth::Invalid) {
+            } else if values.contains(&PredicateTruth::Invalid) {
                 PredicateTruth::Invalid
             } else if values.contains(&PredicateTruth::Unavailable) && deadline_reached {
                 PredicateTruth::Unavailable

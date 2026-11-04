@@ -114,7 +114,7 @@ where
         let polled = self.poller.poll_approval(&restored.flow_secret).await;
         let result_time = self.clock.now();
         match polled {
-            FoldedAuthPollCall::NotAttempted(error) => {
+            FoldedAuthPollCall::TransientBeforePoll(error) => {
                 if self
                     .repository
                     .confirm_not_attempted(state_hash, generation, result_time)
@@ -125,6 +125,21 @@ where
                 }
                 Err(error)
             }
+            FoldedAuthPollCall::UnrecoverableBeforePoll => Ok(
+                match self
+                    .repository
+                    .require_restart(state_hash, generation, result_time)
+                    .await?
+                {
+                    Some(attempt) if attempt.status == FoldedAuthStatus::Expired => {
+                        PollFoldedAuthOutcome::Expired(attempt)
+                    }
+                    Some(attempt) if attempt.status == FoldedAuthStatus::RestartRequired => {
+                        PollFoldedAuthOutcome::RestartRequired(attempt)
+                    }
+                    _ => PollFoldedAuthOutcome::Stale,
+                },
+            ),
             FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Pending)) => Ok(
                 match self
                     .repository

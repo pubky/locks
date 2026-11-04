@@ -821,7 +821,58 @@ allowed_return_origins = ["*"]
 
     assert!(matches!(
         load_existing_config_from_path(&config_path).unwrap_err(),
-        ConfigError::WildcardReturnOriginInProduction
+        ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(_)
+    ));
+}
+
+#[test]
+fn grant_connect_rejects_non_https_wildcard_and_duplicate_origins_in_every_environment() {
+    for origins in [
+        r#"["*"]"#,
+        r#"["http://localhost:4173"]"#,
+        r#"["https://pubky.app", "https://pubky.app"]"#,
+    ] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config(&secret_path, &public_key, "development")
+            .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+            + &format!(
+                r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = {origins}
+"#,
+            );
+        std::fs::write(&config_path, config).unwrap();
+
+        assert!(matches!(
+            load_existing_config_from_path(&config_path).unwrap_err(),
+            ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(_)
+        ));
+    }
+}
+
+#[test]
+fn grant_connect_rejects_unknown_fields() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["https://pubky.app"]
+unexpected = true
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::ParseConfig { .. }
     ));
 }
 

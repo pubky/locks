@@ -558,8 +558,55 @@ struct NotAttemptedPoller;
 #[async_trait]
 impl FoldedAuthApprovalPoller for NotAttemptedPoller {
     async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
-        FoldedAuthPollCall::NotAttempted(ApplicationError::VerificationDependencyUnavailable)
+        FoldedAuthPollCall::TransientBeforePoll(ApplicationError::VerificationDependencyUnavailable)
     }
+}
+
+struct UnrecoverableBeforePoll;
+
+#[async_trait]
+impl FoldedAuthApprovalPoller for UnrecoverableBeforePoll {
+    async fn poll_approval(&self, _flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
+        FoldedAuthPollCall::UnrecoverableBeforePoll
+    }
+}
+
+#[tokio::test]
+async fn unrecoverable_restore_failure_requires_restart_and_erases_pending_secret() {
+    let (graph, _clock) = graph_at(datetime!(2026-10-30 12:00:00 UTC));
+    let repository = Arc::new(InMemoryFoldedAuthRepository::new(
+        graph,
+        folded_auth_cipher(),
+    ));
+    let now = datetime!(2026-10-30 12:00:00 UTC);
+    let started = repository
+        .start_or_rotate(start_request_with(
+            &graph_lock(),
+            FoldedAuthStateHash::derive(b"unrecoverable-state"),
+            b"unrecoverable-flow",
+            now,
+        ))
+        .await
+        .unwrap();
+    let use_case = PollFoldedAuthAttempt::new(
+        repository.clone(),
+        Arc::new(UnrecoverableBeforePoll),
+        Arc::new(FixedClock(now + Duration::SECOND)),
+    );
+
+    assert!(matches!(
+        use_case.execute(&started.attempt.state_hash).await.unwrap(),
+        PollFoldedAuthOutcome::RestartRequired(_)
+    ));
+    assert_eq!(
+        repository
+            .get_by_state_hash(&started.attempt.state_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        FoldedAuthStatus::RestartRequired
+    );
 }
 
 #[tokio::test]

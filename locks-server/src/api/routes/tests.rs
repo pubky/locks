@@ -87,6 +87,7 @@ use locks_service::infrastructure::memory::folded_auth::InMemoryFoldedAuthReposi
 use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
+use locks_service::infrastructure::memory::public_content_locks::InMemoryPublicContentLockStore;
 
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
 use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
@@ -139,7 +140,7 @@ impl FoldedAuthApprovalPoller for FakeFoldedAuthPoller {
             FakeFoldedAuthPollResult::Ambiguous => {
                 FoldedAuthPollCall::Attempted(Err(FoldedAuthApprovalPollError))
             }
-            FakeFoldedAuthPollResult::Unavailable => FoldedAuthPollCall::NotAttempted(
+            FakeFoldedAuthPollResult::Unavailable => FoldedAuthPollCall::TransientBeforePoll(
                 ApplicationError::VerificationDependencyUnavailable,
             ),
         }
@@ -1164,7 +1165,7 @@ async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
 }
 
 #[tokio::test]
-async fn folded_auth_cors_preflight_reflects_only_configured_origin_and_is_no_store() {
+async fn folded_auth_cors_preflight_allows_authorization_and_content_type() {
     let response = router(test_state_with_folded_auth_origins(vec![
         "https://pubky.app".to_owned(),
     ]))
@@ -1174,7 +1175,10 @@ async fn folded_auth_cors_preflight_reflects_only_configured_origin_and_is_no_st
             .uri("/proof-bundles/auth-status")
             .header(header::ORIGIN, "https://pubky.app")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            )
             .body(Body::empty())
             .unwrap(),
     )
@@ -1192,17 +1196,45 @@ async fn folded_auth_cors_preflight_reflects_only_configured_origin_and_is_no_st
     );
     assert_eq!(
         response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
-        "content-type"
+        "authorization, content-type"
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 }
 
 #[tokio::test]
-async fn folded_auth_wildcard_reflects_valid_concrete_origin_on_submit_status_and_preflight() {
-    let origin = "http://localhost:4173";
+async fn folded_auth_cors_rejects_duplicate_origin_headers() {
+    let response = router(test_state_with_folded_auth_origins(vec![
+        "https://pubky.app".to_owned(),
+    ]))
+    .oneshot(
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/proof-bundles/auth-status")
+            .header(header::ORIGIN, "https://pubky.app")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_exact_origin_applies_to_submit_status_and_preflight() {
+    let origin = "https://pubky.app";
     let (state, bundle) = folded_auth_test_state_with_poller_and_origins(
         Arc::new(FakeFoldedAuth),
-        vec!["*".to_owned()],
+        vec![origin.to_owned()],
     )
     .await;
     let app = router(state);
@@ -1851,13 +1883,21 @@ async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
             .await
             .unwrap()
     );
-    assert!(
+    let tombstone = locks_core::content_lock_deletion::ContentLockDeletionTombstone::new(
+        lock_id.clone(),
+        job.deletion_started_at,
+    );
+    assert_eq!(
         state
-            .content_locks()
-            .get_content_lock(&creator(), &ContentLockPath::from_lock_id(lock_id))
+            .content_lock_tombstones()
+            .read_tombstone(
+                &creator(),
+                &ContentLockPath::from_lock_id(lock_id),
+                &tombstone,
+            )
             .await
-            .unwrap()
-            .is_some()
+            .unwrap(),
+        locks_service::application::ports::TombstoneReadback::Exact
     );
 }
 
@@ -1884,6 +1924,24 @@ async fn force_after_terminal_graceful_failure_completes_synchronously() {
         .await
         .unwrap();
     assert_eq!(graceful.status(), StatusCode::ACCEPTED);
+    let tombstone = locks_core::content_lock_deletion::ContentLockDeletionTombstone::new(
+        lock_id.clone(),
+        state
+            .content_lock_deletions()
+            .get_job(&creator(), &lock_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deletion_started_at,
+    );
+    assert_eq!(
+        state
+            .content_lock_tombstones()
+            .read_tombstone(&creator(), &path, &tombstone)
+            .await
+            .unwrap(),
+        locks_service::application::ports::TombstoneReadback::Exact
+    );
 
     let now = state.clock().now();
     let claimed = state
@@ -6301,10 +6359,15 @@ fn test_state_with_runtime(
     expose_dev_completion_route: bool,
 ) -> AppState {
     let config = test_config(environment, expose_dev_completion_route);
+    let public_content_locks = InMemoryPublicContentLockStore::new();
     AppState::new_empty_in_memory_with_creator_repositories(
         config,
-        Arc::new(InMemoryContentLockRepository::new()),
-        Arc::new(InMemoryContentLockTombstoneRepository::new()),
+        Arc::new(InMemoryContentLockRepository::with_public_store(
+            public_content_locks.clone(),
+        )),
+        Arc::new(InMemoryContentLockTombstoneRepository::with_public_store(
+            public_content_locks,
+        )),
         Arc::new(InMemoryGuardedResourceRepository::new()),
         Arc::new(InMemoryLockServicePointerRepository::new()),
         Arc::new(InMemoryEntitlementRepository::new()),

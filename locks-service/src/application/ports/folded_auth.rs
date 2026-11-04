@@ -112,7 +112,8 @@ pub struct FoldedAuthApprovalPollError;
 
 #[derive(Debug)]
 pub enum FoldedAuthPollCall {
-    NotAttempted(ApplicationError),
+    TransientBeforePoll(ApplicationError),
+    UnrecoverableBeforePoll,
     Attempted(Result<FoldedAuthApprovalPoll, FoldedAuthApprovalPollError>),
 }
 

@@ -89,6 +89,42 @@ fn all_and_any_deadline_tables_preserve_false_vs_unavailable() {
 }
 
 #[test]
+fn terminal_invalid_obeys_and_or_precedence_with_false_at_deadline() {
+    let mut or_snapshot = snapshot(Some(GraphOperatorV2::Or), 2);
+    or_snapshot
+        .terminalize_invalid_nexus_response(
+            0,
+            DEADLINE_AT,
+            "https://nexus.example".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+    or_snapshot
+        .record_observation(1, GraphObservationOutcome::False, DEADLINE_AT)
+        .unwrap();
+    reduce_graph_snapshot(&mut or_snapshot, DEADLINE_AT).unwrap();
+    assert_eq!(or_snapshot.root, GraphRootState::FailedInvalidResponse);
+
+    let mut and_snapshot = snapshot(Some(GraphOperatorV2::And), 2);
+    and_snapshot
+        .terminalize_invalid_nexus_response(
+            0,
+            DEADLINE_AT,
+            "https://nexus.example".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+    and_snapshot
+        .record_observation(1, GraphObservationOutcome::False, DEADLINE_AT)
+        .unwrap();
+    reduce_graph_snapshot(&mut and_snapshot, DEADLINE_AT).unwrap();
+    assert_eq!(
+        and_snapshot.root,
+        GraphRootState::Expired(GraphDeadlineResult::False)
+    );
+}
+
+#[test]
 fn false_and_unavailable_repoll_while_true_is_sticky() {
     let before_deadline = DEADLINE_AT - time::Duration::seconds(1);
     let mut snapshot = snapshot(None, 1);

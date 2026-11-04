@@ -77,7 +77,7 @@ impl FoldedAuthApprovalPoller for DependencyAuth {
         {
             Ok(response) => response,
             Err(error) => {
-                return FoldedAuthPollCall::NotAttempted(ApplicationError::Storage {
+                return FoldedAuthPollCall::TransientBeforePoll(ApplicationError::Storage {
                     message: format!("fake auth unavailable before dispatch: {error}"),
                 });
             }

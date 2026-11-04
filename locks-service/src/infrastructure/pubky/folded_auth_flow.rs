@@ -193,11 +193,11 @@ impl FoldedAuthApprovalPoller for PubkyFoldedAuthApprovalPoller {
     async fn poll_approval(&self, flow_secret: &FoldedAuthFlowSecret) -> FoldedAuthPollCall {
         let (state, expected_client_id) = match decode_flow_state_with_client_id(flow_secret) {
             Ok(state) => state,
-            Err(error) => return FoldedAuthPollCall::NotAttempted(error),
+            Err(_) => return FoldedAuthPollCall::UnrecoverableBeforePoll,
         };
         let key_id = GrantPopKeyId::new(state.key_id.clone());
         if state.client_pk != self.pop_keys.public_key(&key_id) {
-            return FoldedAuthPollCall::NotAttempted(flow_error("invalid delegated key binding"));
+            return FoldedAuthPollCall::UnrecoverableBeforePoll;
         }
         let expected_client_pk = state.client_pk.clone();
         let expected_key_id = state.key_id.clone();
@@ -217,7 +217,7 @@ impl FoldedAuthApprovalPoller for PubkyFoldedAuthApprovalPoller {
                 ) {
                     Ok(flow) => Arc::new(Mutex::new(flow)),
                     Err(_) => {
-                        return FoldedAuthPollCall::NotAttempted(flow_error("failed to restore"));
+                        return FoldedAuthPollCall::UnrecoverableBeforePoll;
                     }
                 };
                 if flows.len() >= MAX_CACHED_FLOWS
