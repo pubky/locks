@@ -1038,6 +1038,32 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         Ok(Some(row_to_job(updated)?))
     }
 
+    async fn fail_graceful_withdrawal(
+        &self,
+        job_id: Uuid,
+        failure_code: ContentLockDeletionFailureCode,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let sql = format!(
+            "UPDATE content_lock_deletion_jobs
+             SET state = 'failed', failure_code = $2, next_attempt_at = NULL,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 updated_at = clock_timestamp()
+             WHERE job_id = $1
+               AND state IN ('queued', 'running')
+               AND phase = 'withdraw'
+               AND force_requested_at IS NULL
+             RETURNING {ROW_COLUMNS}"
+        );
+        sqlx::query_as::<_, DeletionJobRow>(&sql)
+            .bind(job_id)
+            .bind(failure_code.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .map(row_to_job)
+            .transpose()
+    }
+
     async fn resume_failed_job(
         &self,
         creator: &CreatorPubky,
@@ -2292,6 +2318,51 @@ mod tests {
         };
         assert!(matches!(
             second_owner.try_acquire(wrong_mode).await.unwrap(),
+            ContentLockDeletionActionAcquireResult::ClaimLost
+        ));
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_graceful_withdrawal_lane_fences_force_and_persists_failure() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let first_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let second_owner = PostgresContentLockDeletionActionOwnership::new(database.pool().clone());
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+
+        let ContentLockDeletionActionAcquireResult::Acquired(guard) = first_owner
+            .try_acquire_graceful_withdrawal(job.job_id)
+            .await
+            .unwrap()
+        else {
+            panic!("live graceful withdrawal must acquire")
+        };
+        assert!(matches!(
+            second_owner
+                .try_acquire_graceful_withdrawal(job.job_id)
+                .await
+                .unwrap(),
+            ContentLockDeletionActionAcquireResult::Busy
+        ));
+        let failed = repository
+            .fail_graceful_withdrawal(job.job_id, ContentLockDeletionFailureCode::TombstoneMissing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, ContentLockDeletionState::Failed);
+        assert_eq!(
+            failed.failure_code,
+            Some(ContentLockDeletionFailureCode::TombstoneMissing)
+        );
+        guard.release().await.unwrap();
+        assert!(matches!(
+            second_owner
+                .try_acquire_graceful_withdrawal(job.job_id)
+                .await
+                .unwrap(),
             ContentLockDeletionActionAcquireResult::ClaimLost
         ));
 

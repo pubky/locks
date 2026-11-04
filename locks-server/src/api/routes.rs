@@ -139,21 +139,10 @@ async fn auth_preflight() -> StatusCode {
 }
 
 pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(origin) else {
+    let Some(origin) = crate::config::canonical_grant_origin(origin) else {
         return false;
     };
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.path() != "/"
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.origin().ascii_serialization() != origin
-    {
-        return false;
-    }
-    allowed_origins.iter().any(|allowed| allowed == origin)
+    allowed_origins.iter().any(|allowed| allowed == &origin)
 }
 
 async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) -> Response {

@@ -830,7 +830,9 @@ fn grant_connect_rejects_non_https_wildcard_and_duplicate_origins_in_every_envir
     for origins in [
         r#"["*"]"#,
         r#"["http://localhost:4173"]"#,
+        r#"["https://pubky.app:443"]"#,
         r#"["https://pubky.app", "https://pubky.app"]"#,
+        r#"["https://pubky.app", "https://pubky.app:443"]"#,
     ] {
         let temp_dir = tempdir().unwrap();
         let secret_path = temp_dir.path().join("secret.sess");

@@ -1832,6 +1832,117 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
 }
 
 #[tokio::test]
+async fn committed_graceful_withdrawal_miss_returns_durable_failed_lifecycle() {
+    let content_locks = Arc::new(InMemoryContentLockRepository::new());
+    let guarded_resources = Arc::new(InMemoryGuardedResourceRepository::new());
+    let state = test_state_with_force_repositories(
+        Arc::clone(&content_locks) as Arc<dyn ContentLockRepository>,
+        guarded_resources,
+    );
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    seed_content_lock(&state, content_lock).await;
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "status": "failed",
+            "failure_code": "tombstone_missing"
+        })
+    );
+    let job = state
+        .content_lock_deletions()
+        .get_job(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.state, ContentLockDeletionState::Failed);
+    assert_eq!(
+        job.failure_code,
+        Some(ContentLockDeletionFailureCode::TombstoneMissing)
+    );
+}
+
+#[tokio::test]
+async fn completed_force_fences_stale_graceful_withdrawal() {
+    let state = test_state();
+    let content_lock = content_lock(true);
+    let lock_id = content_lock.lock_id().unwrap();
+    let job =
+        ContentLockDeletionJob::new(Uuid::new_v4(), content_lock, state.clock().now()).unwrap();
+    state
+        .content_lock_deletions()
+        .insert_job(job.clone())
+        .await
+        .unwrap();
+    let claim = state
+        .content_lock_deletions()
+        .claim_next("force-first", time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .content_lock_deletions()
+        .finish(
+            job.job_id,
+            "force-first",
+            claim.claim_token,
+            Some(ContentLockDeletionFailureCode::StateCorrupt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        state
+            .content_lock_deletions()
+            .prepare_force_deletion(&creator(), &lock_id)
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(Some(_))
+    ));
+    let force_guard = match state
+        .content_lock_deletion_action_ownership()
+        .try_acquire_synchronous_force(job.job_id)
+        .await
+        .unwrap()
+    {
+        ContentLockDeletionActionAcquireResult::Acquired(guard) => guard,
+        _ => panic!("force action lane must be acquired"),
+    };
+    assert!(
+        state
+            .content_lock_deletions()
+            .complete_synchronous_force_deletion(&creator(), &lock_id, state.clock().now())
+            .await
+            .unwrap()
+    );
+    force_guard.release().await.unwrap();
+
+    assert!(matches!(
+        state
+            .content_lock_deletion_action_ownership()
+            .try_acquire_graceful_withdrawal(job.job_id)
+            .await
+            .unwrap(),
+        ContentLockDeletionActionAcquireResult::ClaimLost
+    ));
+}
+
+#[tokio::test]
 async fn force_escalation_marks_existing_job_for_worker_owned_async_force() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;

@@ -173,6 +173,20 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         failure_code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError>;
 
+    /// Persists a request-path graceful-withdrawal failure while caller owns
+    /// job's external-action lane.
+    async fn fail_graceful_withdrawal(
+        &self,
+        job_id: Uuid,
+        failure_code: ContentLockDeletionFailureCode,
+    ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        let _ = (job_id, failure_code);
+        Err(ApplicationError::InvalidContentLockDeletionState {
+            message: "request-path graceful withdrawal is not supported by this repository"
+                .to_owned(),
+        })
+    }
+
     /// Requeues a failed job with its frozen manifest unless a permanent force receipt exists.
     async fn resume_failed_job(
         &self,

@@ -65,12 +65,12 @@ pub fn reduce_graph_snapshot(
         Some(GraphOperatorV2::And) => {
             if values.contains(&PredicateTruth::False) {
                 PredicateTruth::False
+            } else if values.contains(&PredicateTruth::Unknown) {
+                PredicateTruth::Unknown
             } else if values.contains(&PredicateTruth::Invalid) {
                 PredicateTruth::Invalid
             } else if values.contains(&PredicateTruth::Unavailable) {
                 PredicateTruth::Unavailable
-            } else if values.contains(&PredicateTruth::Unknown) {
-                PredicateTruth::Unknown
             } else {
                 PredicateTruth::True
             }
@@ -78,12 +78,12 @@ pub fn reduce_graph_snapshot(
         Some(GraphOperatorV2::Or) => {
             if values.contains(&PredicateTruth::True) {
                 PredicateTruth::True
+            } else if values.contains(&PredicateTruth::Unknown) {
+                PredicateTruth::Unknown
             } else if values.contains(&PredicateTruth::Invalid) {
                 PredicateTruth::Invalid
             } else if values.contains(&PredicateTruth::Unavailable) && deadline_reached {
                 PredicateTruth::Unavailable
-            } else if values.contains(&PredicateTruth::Unknown) {
-                PredicateTruth::Unknown
             } else {
                 PredicateTruth::False
             }

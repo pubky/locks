@@ -20,3 +20,4 @@ pub use schema::{
 };
 pub use secrets::{FilesystemLockServerIdentityProvider, LockServerIdentityProvider};
 pub(crate) use secrets::{LockServerSigningKeyError, load_lock_server_signing_keypair};
+pub(crate) use validation::canonical_grant_origin;

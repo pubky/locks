@@ -430,13 +430,12 @@ fn validate_grant_return_origins(values: Vec<String>) -> Result<Vec<String>, Con
     values
         .into_iter()
         .map(|value| {
-            if value == "*" {
+            let Some(origin) = super::canonical_grant_origin(&value) else {
                 return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
                     value,
                 ));
-            }
-            let origin = validate_allowed_return_origin(value)?;
-            if !origin.starts_with("https://") || !seen.insert(origin.clone()) {
+            };
+            if !seen.insert(origin.clone()) {
                 return Err(ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(
                     origin,
                 ));

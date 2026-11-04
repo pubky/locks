@@ -89,6 +89,62 @@ fn all_and_any_deadline_tables_preserve_false_vs_unavailable() {
 }
 
 #[test]
+fn or_invalid_and_false_stays_pending_until_other_predicate_succeeds() {
+    let before_deadline = DEADLINE_AT - time::Duration::seconds(1);
+    let mut snapshot = snapshot(Some(GraphOperatorV2::Or), 2);
+    snapshot
+        .terminalize_invalid_nexus_response(
+            0,
+            before_deadline,
+            "https://nexus.example".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+    snapshot
+        .record_observation(1, GraphObservationOutcome::False, before_deadline)
+        .unwrap();
+
+    reduce_graph_snapshot(&mut snapshot, before_deadline).unwrap();
+    assert_eq!(snapshot.root, GraphRootState::Pending);
+
+    snapshot
+        .record_observation(1, GraphObservationOutcome::True, before_deadline)
+        .unwrap();
+    reduce_graph_snapshot(&mut snapshot, before_deadline).unwrap();
+    assert_eq!(snapshot.root, GraphRootState::Satisfied);
+}
+
+#[test]
+fn and_invalid_stays_pending_until_deadline_can_resolve_false() {
+    let before_deadline = DEADLINE_AT - time::Duration::seconds(1);
+    for observe_false in [false, true] {
+        let mut snapshot = snapshot(Some(GraphOperatorV2::And), 2);
+        snapshot
+            .terminalize_invalid_nexus_response(
+                0,
+                before_deadline,
+                "https://nexus.example".to_owned(),
+                Some(200),
+            )
+            .unwrap();
+        if observe_false {
+            snapshot
+                .record_observation(1, GraphObservationOutcome::False, before_deadline)
+                .unwrap();
+        }
+
+        reduce_graph_snapshot(&mut snapshot, before_deadline).unwrap();
+        assert_eq!(snapshot.root, GraphRootState::Pending);
+
+        reduce_graph_snapshot(&mut snapshot, DEADLINE_AT).unwrap();
+        assert_eq!(
+            snapshot.root,
+            GraphRootState::Expired(GraphDeadlineResult::False)
+        );
+    }
+}
+
+#[test]
 fn terminal_invalid_obeys_and_or_precedence_with_false_at_deadline() {
     let mut or_snapshot = snapshot(Some(GraphOperatorV2::Or), 2);
     or_snapshot
