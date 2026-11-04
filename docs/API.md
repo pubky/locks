@@ -654,7 +654,7 @@ When the stored bundle carries a `client_reference`, this response and the submi
 }
 ```
 
-`criterion_ids` lists the submitted proofs' `criterion_id` values in submission order. A relying service accepts a `completed` task for its object only when all three match what it expects; an absent `client_binding` never matches. Bundles without a reference return no `client_binding` key at all, so their responses keep the shape earlier SDK releases parse. The route has no authentication beyond the bundle ID, so lifecycle responses never include `reader_public_key`: a leaked bundle ID must not also name the reader. The stored reference is write-once; task updates never rewrite it.
+`criterion_ids` lists the submitted proofs' `criterion_id` values in submission order. A relying service accepts a `completed` task for its object only when all three match what it expects; an absent `client_binding` never matches. Bundles without a reference return no `client_binding` key at all, so their responses keep the shape earlier SDK releases parse. The route has no authentication beyond the `{ creator, bundle_id }` handle, whose one secret is the bundle ID, so lifecycle responses never include `reader_public_key`: a leaked bundle ID must not also name the reader. The stored reference is write-once; task updates never rewrite it.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
 

@@ -86,6 +86,8 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
     assert_eq!(complete_json["bundle_id"], BUNDLE_ID);
     assert_eq!(complete_json["status"], "completed");
     assert!(complete_json.get("task_id").is_none());
+    assert_eq!(complete_json["client_binding"], expected_binding);
+    assert!(complete_json.get("reader_public_key").is_none());
 
     let completed_response = router
         .clone()

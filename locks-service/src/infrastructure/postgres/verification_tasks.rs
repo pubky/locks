@@ -1982,6 +1982,93 @@ mod tests {
         database.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn postgres_cross_lock_invoice_pending_race_returns_only_matching_admissions() {
+        const ROUNDS: u8 = 12;
+        let database = TestDatabase::create().await;
+        let repo = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        let other_lock =
+            locks_core::ids::LockId::from_hash(locks_core::ids::LockHash::from_bytes([9; 32]));
+        for round in 0..ROUNDS {
+            let bundle_id = BundleId::from_bytes([round + 1; 16]);
+            let candidate = |task_id: String, lock: String, reference: &str| {
+                let mut task = task(VerificationTaskStatus::Pending);
+                task.task_id = TaskId::from_str(&task_id).unwrap();
+                task.submitted_proof_bundle.bundle_id = bundle_id.clone();
+                task.submitted_proof_bundle.pubky_lock_resource =
+                    PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{lock}.json"))
+                        .unwrap();
+                task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+                task.submitted_proof_bundle.client_reference = Some(client_reference(reference));
+                let intent = InvoiceAdmissionIntentV1 {
+                    version: INVOICE_ADMISSION_INTENT_VERSION,
+                    creator: task.creator.clone(),
+                    bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                    lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                    reader: reader.clone(),
+                    payment_in: 24,
+                };
+                (task, intent)
+            };
+            let racers = [
+                candidate(
+                    uuid::Uuid::new_v4().to_string(),
+                    LOCK_ID.to_owned(),
+                    "order-cheap",
+                ),
+                candidate(
+                    uuid::Uuid::new_v4().to_string(),
+                    other_lock.to_string(),
+                    "order-expensive",
+                ),
+            ];
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers.len()));
+            let handles: Vec<_> = racers
+                .into_iter()
+                .map(|(task, intent)| {
+                    let repo = repo.clone();
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        let result = repo.insert_invoice_pending_task(task.clone(), intent).await;
+                        (task, result)
+                    })
+                })
+                .collect();
+            let mut admitted = Vec::new();
+            for handle in handles {
+                let (task, result) = handle.await.unwrap();
+                match result {
+                    Ok(admission) => {
+                        assert_eq!(
+                            admission.task.submitted_proof_bundle, task.submitted_proof_bundle,
+                            "an admission returned to a racer must be its own"
+                        );
+                        admitted.push(task);
+                    }
+                    Err(ApplicationError::VerificationTaskConflict) => {}
+                    other => panic!("unexpected cross-lock admission result: {other:?}"),
+                }
+            }
+            assert_eq!(admitted.len(), 1, "round {round}");
+            let stored = repo
+                .get_verification_task_by_handle(&admitted[0].creator, &bundle_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.submitted_proof_bundle,
+                admitted[0].submitted_proof_bundle
+            );
+        }
+
+        database.cleanup().await;
+    }
+
     fn client_reference(value: &str) -> ClientReference {
         ClientReference::from_str(value).unwrap()
     }

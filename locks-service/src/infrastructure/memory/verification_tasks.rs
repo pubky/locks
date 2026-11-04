@@ -522,7 +522,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
-        records.insert(*task_id, state.record.task.clone());
+        let updated = task.with_lifecycle_of(&state.record.task);
+        records.insert(*task_id, updated);
         current_statuses.insert(*task_id, VerificationTaskStatus::Failed);
         if let Some(fence_record) = fence_records.get_mut(task_id) {
             fence_record.status = VerificationTaskStatus::Failed;

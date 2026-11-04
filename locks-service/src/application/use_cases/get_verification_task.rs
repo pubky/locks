@@ -60,8 +60,9 @@ pub struct VerificationTaskLifecycleView {
 /// What a relying service needs to tie a task to the business object it minted a client
 /// reference for: the reference itself and the lock terms the task verifies.
 ///
-/// It never carries `reader_public_key`. The lifecycle lookup needs only the bundle ID, so a
-/// leaked bundle ID must not also reveal who the reader is.
+/// It never carries `reader_public_key`. The lifecycle lookup needs only the
+/// `{ creator, bundle_id }` handle, whose one secret is the bundle ID, so a leaked bundle ID must
+/// not also reveal who the reader is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientBindingView {
     /// Reference exactly as submitted.

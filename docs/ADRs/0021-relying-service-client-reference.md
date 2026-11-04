@@ -15,7 +15,7 @@ Status alone cannot tell the relying service that:
 
 The relying service can only tell these cases apart with a value it mints itself before the reader submits, carried by the task and echoed back, plus the lock terms the task verified.
 
-`POST /verification-task-lookups` is authorized by the bundle ID alone, and `POST /access-credentials` issues a content credential for the same `{ creator, bundle_id }` once the task completes. A leaked bundle ID therefore already exposes the lock's content. The reader's identity is the one fact it does not expose today.
+`POST /verification-task-lookups` is authorized only by the `{ creator, bundle_id }` handle, whose one secret is the bundle ID, and `POST /access-credentials` issues a content credential for the same handle once the task completes. A leaked bundle ID therefore already exposes the lock's content. The reader's identity is the one fact it does not expose today.
 
 ## Decision
 
@@ -64,7 +64,7 @@ A relying service accepts a `completed` task for one of its objects only when `c
 
 - **Uniqueness of bundle IDs on the relying-service side only:** rejected because it cannot refuse a bundle the relying service has never seen, such as one completed in another application for the same lock and reader.
 - **Echo only `client_reference`:** rejected because a reader can pair the reference with a cheaper lock of the same creator.
-- **Echo `reader_public_key` with the lock fields:** rejected because the lookup is authorized by the bundle ID alone, and a leaked bundle ID would name the reader.
+- **Echo `reader_public_key` with the lock fields:** rejected because the lookup is authorized only by the `{ creator, bundle_id }` handle, and a leaked bundle ID would name the reader.
 - **Return the binding only to holders of an access credential:** rejected because the credential is issued for the same bundle ID with no further authentication, so it adds no protection, and the relying service does not hold it.
 - **Let Locks interpret references or orders:** rejected because order semantics belong to the relying service.
 
