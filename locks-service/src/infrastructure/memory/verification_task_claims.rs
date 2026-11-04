@@ -313,6 +313,7 @@ impl VerificationTaskClaimer for InMemoryVerificationTaskClaimer {
         }) else {
             return Ok(None);
         };
+        let task = record.task.with_lifecycle_of(&task);
         if let Some(task_repository) = &self.task_repository {
             task_repository
                 .update_verification_task(task.clone())
@@ -914,6 +915,7 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

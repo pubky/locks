@@ -2529,6 +2529,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletion_cutoff_fences_client_reference_bundles_on_both_admission_paths() {
+        let database = TestDatabase::create().await;
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        let tasks = PostgresVerificationTaskRepository::new(database.pool().clone());
+        let lock = content_lock();
+        let with_reference = |mut task: VerificationTaskRecord, value: &str| {
+            task.submitted_proof_bundle.client_reference =
+                Some(locks_core::ids::ClientReference::from_str(value).unwrap());
+            task
+        };
+
+        let admitted_before = with_reference(
+            verification_task(&lock, BundleId::from_bytes([1; 16])),
+            "order-1",
+        );
+        tasks
+            .insert_verification_task(admitted_before.clone())
+            .await
+            .unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock.clone(), NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+
+        assert_eq!(
+            tasks
+                .insert_verification_task(admitted_before.clone())
+                .await,
+            Err(ApplicationError::DuplicateRecord {
+                record: "verification_task"
+            })
+        );
+        let mut changed_reference = admitted_before.clone();
+        changed_reference.task_id = TaskId::from_str(&Uuid::new_v4().to_string()).unwrap();
+        changed_reference.submitted_proof_bundle.client_reference =
+            Some(locks_core::ids::ClientReference::from_str("order-2").unwrap());
+        assert_eq!(
+            tasks.insert_verification_task(changed_reference).await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+        let mut rewrite = admitted_before
+            .transition_to(VerificationTaskStatus::InProgress, NOW, None)
+            .unwrap();
+        rewrite.submitted_proof_bundle.client_reference =
+            Some(locks_core::ids::ClientReference::from_str("order-3").unwrap());
+        assert_eq!(
+            tasks.update_verification_task(rewrite).await,
+            Err(ApplicationError::MissingRecord {
+                record: "verification_task"
+            })
+        );
+
+        let after = with_reference(
+            verification_task(&lock, BundleId::from_bytes([2; 16])),
+            "order-4",
+        );
+        assert_eq!(
+            tasks.insert_verification_task(after).await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+        let paykit_after = with_reference(
+            paykit_verification_task(&lock, BundleId::from_bytes([3; 16])),
+            "order-5",
+        );
+        assert_eq!(
+            tasks
+                .insert_invoice_pending_task(paykit_after.clone(), invoice_intent(&paykit_after))
+                .await,
+            Err(ApplicationError::ContentLockDeletionInProgress)
+        );
+        let stored = tasks
+            .get_verification_task(&admitted_before.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, admitted_before);
+
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn credential_committed_before_deletion_is_classified_and_enrolled_at_cutoff() {
         let database = TestDatabase::create().await;
         let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
@@ -6016,6 +6095,7 @@ mod tests {
                 bundle_id,
                 pubky_lock_resource: lock_resource,
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

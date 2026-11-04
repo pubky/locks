@@ -235,6 +235,26 @@ pub struct ClaimedVerificationTask {
 }
 
 impl VerificationTaskRecord {
+    /// Returns this stored record carrying only the lifecycle fields of `update`.
+    ///
+    /// Task identity (`task_id`, `creator`, `submitted_proof_bundle`, `submitted_at`) is written
+    /// once at insert. Repository updates go through this merge, so no update can rewrite the
+    /// stored bundle or its client reference, whatever record the caller passes.
+    pub fn with_lifecycle_of(&self, update: &Self) -> Self {
+        Self {
+            task_id: self.task_id,
+            creator: self.creator.clone(),
+            submitted_proof_bundle: self.submitted_proof_bundle.clone(),
+            submitted_at: self.submitted_at,
+            status: update.status,
+            started_at: update.started_at,
+            completed_at: update.completed_at,
+            failure_message: update.failure_message.clone(),
+            terminal_reason: update.terminal_reason,
+            entitlement_to_publish: update.entitlement_to_publish.clone(),
+        }
+    }
+
     /// Returns a new task record transitioned to the requested next status.
     ///
     /// The current record must satisfy lifecycle invariants before any transition

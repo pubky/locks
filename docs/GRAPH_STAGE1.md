@@ -2,7 +2,7 @@
 
 Graph Stage 1 is bounded support for graph-only Content Lock v2 policies. It binds Reader identity through folded auth, evaluates selected Nexus `app_spec_v0_7` predicates, durably publishes entitlement, and exposes redacted lifecycle/evidence. It does not compose Graph with Paykit.
 
-Architecture decisions: [ADR 0021](ADRs/0021-graph-stage1-folded-auth-nexus.md).
+Architecture decisions: [ADR 0022](ADRs/0022-graph-stage1-folded-auth-nexus.md).
 
 ## Wire flow
 

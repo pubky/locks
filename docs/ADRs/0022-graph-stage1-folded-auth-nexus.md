@@ -1,4 +1,4 @@
-# ADR 0021: Graph Stage 1 uses folded auth and bounded Nexus verification
+# ADR 0022: Graph Stage 1 uses folded auth and bounded Nexus verification
 
 - Status: Accepted
 - Date: 2026-11-03

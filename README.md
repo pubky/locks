@@ -152,7 +152,7 @@ For the implemented authorization boundary, see
 Graph-only Content Lock v2 verification, folded-auth restart behavior, selected Nexus
 `app_spec_v0_7` reads, SDK flow, and deterministic fake-dependency Compose E2E are
 documented in [Graph Stage 1](docs/GRAPH_STAGE1.md) and
-[ADR 0021](docs/ADRs/0021-graph-stage1-folded-auth-nexus.md).
+[ADR 0022](docs/ADRs/0022-graph-stage1-folded-auth-nexus.md).
 
 **Content creator** is a Pubky user who creates content they want to put behind a lock.
 

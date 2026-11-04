@@ -12,6 +12,8 @@ const BUNDLE_ID_LEN: usize = 26;
 const BUNDLE_ID_BYTES: usize = 16;
 const CONTENT_LOCK_PREFIX: &str = "/pub/app.locks/";
 const CONTENT_LOCK_SUFFIX: &str = ".json";
+/// Maximum encoded length of a [`ClientReference`], in UTF-8 bytes.
+pub const CLIENT_REFERENCE_MAX_BYTES: usize = 64;
 
 /// Errors returned when parsing Locks identifier and path value objects.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -37,6 +39,11 @@ pub enum IdParseError {
     /// A Pubky lock resource did not match `pubky<creator_pubky>/pub/app.locks/<lock_id>.json`.
     #[error("Pubky lock resource must match pubky<creator_pubky>/pub/app.locks/<lock_id>.json")]
     InvalidPubkyLockResource,
+    /// A relying-service client reference was empty, too long, or contained control characters.
+    #[error(
+        "client reference must be 1 to {CLIENT_REFERENCE_MAX_BYTES} bytes of UTF-8 without control characters"
+    )]
+    InvalidClientReference,
 }
 
 /// Identifier for a content lock.
@@ -148,6 +155,60 @@ impl FromStr for BundleId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         parse_crockford_id("bundle id", value, BUNDLE_ID_LEN, BUNDLE_ID_BYTES).map(Self)
+    }
+}
+
+/// Opaque value a relying service mints for one of its own business objects (for example one
+/// payment) and asks the reader to carry in a submitted proof bundle.
+///
+/// Locks stores it verbatim, never trims, folds, or interprets it, and echoes it on the task's
+/// lifecycle so the relying service can require exact equality with the value it minted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientReference(String);
+
+impl ClientReference {
+    /// Returns the reference exactly as submitted.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ClientReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ClientReference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for ClientReference {
+    type Err = IdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > CLIENT_REFERENCE_MAX_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(IdParseError::InvalidClientReference);
+        }
+        Ok(Self(value.to_owned()))
     }
 }
 
@@ -714,5 +775,47 @@ mod tests {
         );
         assert!(ContentLockPath::from_str(&format!("/pub/other.app/{LOCK_ID}.json")).is_err());
         assert!(ContentLockPath::from_str(&format!("/pub/app.locks/{LOCK_ID}")).is_err());
+    }
+
+    #[test]
+    fn client_reference_is_stored_verbatim_within_the_byte_bound() {
+        for value in [
+            "a",
+            " padded order 7 ",
+            "Order-ABC",
+            "ünïcödé",
+            "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU",
+        ] {
+            let reference = ClientReference::from_str(value).unwrap();
+            assert_eq!(reference.as_str(), value);
+            assert_eq!(
+                serde_json::to_value(&reference).unwrap(),
+                serde_json::json!(value)
+            );
+        }
+        let max = "r".repeat(CLIENT_REFERENCE_MAX_BYTES);
+        assert_eq!(ClientReference::from_str(&max).unwrap().as_str(), max);
+        let multibyte_at_bound = "é".repeat(CLIENT_REFERENCE_MAX_BYTES / 2);
+        assert!(ClientReference::from_str(&multibyte_at_bound).is_ok());
+    }
+
+    #[test]
+    fn client_reference_rejects_empty_oversized_and_control_characters() {
+        for value in [
+            String::new(),
+            "r".repeat(CLIENT_REFERENCE_MAX_BYTES + 1),
+            "é".repeat(CLIENT_REFERENCE_MAX_BYTES / 2 + 1),
+            "order\n7".to_owned(),
+            "order\u{0}".to_owned(),
+            "\u{7f}".to_owned(),
+            "tab\there".to_owned(),
+        ] {
+            assert_eq!(
+                ClientReference::from_str(&value),
+                Err(IdParseError::InvalidClientReference),
+                "{value:?}"
+            );
+            assert!(serde_json::from_value::<ClientReference>(serde_json::json!(value)).is_err());
+        }
     }
 }

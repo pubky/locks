@@ -450,32 +450,39 @@ impl JsViewerRequestPlan {
     }
 }
 
+/// Browser callers receive the typed response re-serialized, so fields the Rust parser ignores
+/// never reach JS.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn typed_response_json(response: &impl serde::Serialize) -> Result<Value, String> {
+    serde_json::to_value(response).map_err(|err| format!("failed to encode response: {err}"))
+}
+
 #[cfg(any(test, target_arch = "wasm32"))]
 fn validate_lifecycle_response_for_tests(value: Value) -> Result<Value, String> {
-    locks_sdk::ViewerLocks::parse_lifecycle_response(value.clone())
-        .map_err(|err| err.to_string())?;
-    Ok(value)
+    let response =
+        locks_sdk::ViewerLocks::parse_lifecycle_response(value).map_err(|err| err.to_string())?;
+    typed_response_json(&response)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
 fn validate_submit_proof_bundle_response_for_tests(value: Value) -> Result<Value, String> {
-    locks_sdk::ViewerLocks::parse_submit_proof_bundle_response(value.clone())
+    let response = locks_sdk::ViewerLocks::parse_submit_proof_bundle_response(value)
         .map_err(|err| err.to_string())?;
-    Ok(value)
+    typed_response_json(&response)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
 fn validate_paykit_connection_state_response_for_tests(value: Value) -> Result<Value, String> {
-    locks_sdk::ViewerLocks::parse_paykit_connection_state_response(value.clone())
+    let response = locks_sdk::ViewerLocks::parse_paykit_connection_state_response(value)
         .map_err(|err| err.to_string())?;
-    Ok(value)
+    typed_response_json(&response)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
 fn validate_access_credential_response_for_tests(value: Value) -> Result<Value, String> {
-    locks_sdk::ViewerLocks::parse_access_credential_response(value.clone())
+    let response = locks_sdk::ViewerLocks::parse_access_credential_response(value)
         .map_err(|err| err.to_string())?;
-    Ok(value)
+    typed_response_json(&response)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -1048,6 +1055,78 @@ mod tests {
     }
 
     #[test]
+    fn viewer_lifecycle_returns_client_binding_to_js_when_present() {
+        let binding = json!({
+            "client_reference": "order-1",
+            "pubky_lock_resource": format!(
+                "{CREATOR}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+            ),
+            "criterion_ids": ["criterion-1"]
+        });
+        let lifecycle = validate_lifecycle_response_for_tests(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "pending",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": null,
+            "completed_at": null,
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null,
+            "client_binding": binding.clone()
+        }))
+        .unwrap();
+        assert_eq!(lifecycle["client_binding"], binding);
+        assert!(
+            lifecycle["client_binding"]
+                .get("reader_public_key")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn viewer_response_validation_drops_unknown_fields_before_returning_to_js() {
+        let lifecycle = validate_lifecycle_response_for_tests(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null,
+            "future_object": { "nested": true }
+        }))
+        .unwrap();
+        assert_eq!(lifecycle["status"], "completed");
+        assert!(lifecycle.get("future_object").is_none());
+
+        let connection = validate_paykit_connection_state_response_for_tests(json!({
+            "state": "handshake",
+            "observed_generation": 3
+        }))
+        .unwrap();
+        assert_eq!(connection, json!({ "state": "handshake" }));
+
+        let credential = validate_access_credential_response_for_tests(json!({
+            "credential": "raw-access-credential",
+            "expires_at": "2026-06-01T12:15:00Z",
+            "credential_version": 2
+        }))
+        .unwrap();
+        assert_eq!(
+            credential,
+            json!({
+                "credential": "raw-access-credential",
+                "expires_at": "2026-06-01T12:15:00Z"
+            })
+        );
+    }
+
+    #[test]
     fn submit_response_rejects_connection_state_and_lookup_accepts_closed_state() {
         let response = json!({
             "creator": CREATOR,
@@ -1057,6 +1136,8 @@ mod tests {
             "started_at": null,
             "completed_at": null,
             "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
             "terminal_reason": null
         });
         assert_eq!(

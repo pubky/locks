@@ -12,7 +12,7 @@ fn graph_stage1_docs_compose_and_ci_remain_one_reproducible_contract() {
     let fake = fs::read_to_string(root.join("scripts/graph-e2e-fake-dependencies.py")).unwrap();
     let docs = fs::read_to_string(root.join("docs/GRAPH_STAGE1.md")).unwrap();
     let adr =
-        fs::read_to_string(root.join("docs/ADRs/0021-graph-stage1-folded-auth-nexus.md")).unwrap();
+        fs::read_to_string(root.join("docs/ADRs/0022-graph-stage1-folded-auth-nexus.md")).unwrap();
     let ci = fs::read_to_string(root.join(".github/workflows/check.yml")).unwrap();
 
     let pinned_images = [
