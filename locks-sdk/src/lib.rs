@@ -21,8 +21,8 @@ pub use error::{LocksSdkError, Result};
 pub use paykit::has_paykit_data;
 pub use session::LocksSession;
 pub use viewer::{
-    AccessCredentialResponse, PaykitConnectionState, PaykitConnectionStateResponse,
-    ReadLockedResourceRequest, SdkViewerRequest, VerificationTaskHandleRequest,
-    VerificationTaskLifecycleResponse, VerificationTaskStatus, VerificationTerminalReason,
-    ViewerLocks,
+    AccessCredentialResponse, ClientBindingResponse, PaykitConnectionState,
+    PaykitConnectionStateResponse, ReadLockedResourceRequest, SdkViewerRequest,
+    VerificationTaskHandleRequest, VerificationTaskLifecycleResponse, VerificationTaskStatus,
+    VerificationTerminalReason, ViewerLocks,
 };

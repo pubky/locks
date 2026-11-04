@@ -319,6 +319,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: Some(CreatorPubky::from_str(READER).unwrap()),
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: criterion_id.to_owned(),
                 verifier_type: VerifierType::PaykitPayment,

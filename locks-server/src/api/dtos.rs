@@ -2,7 +2,10 @@ pub use locks_core::creator_publishing::{
     CreateContentLockRequest as AuthenticatedCreateContentLockHttpRequest,
     SetLockServicePointerRequest as AuthenticatedSetLockServicePointerHttpRequest,
 };
-use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, LockId, LockServerPubky};
+use locks_core::ids::{
+    BundleId, ClientReference, ContentLockPath, CreatorPubky, LockId, LockServerPubky,
+    PubkyLockResource,
+};
 use locks_core::lock_policy::{ContentLock, GuardedResource};
 use locks_core::lock_service_pointer::LockServicePointer;
 use locks_core::verification::SubmittedProofBundle;
@@ -13,7 +16,9 @@ use locks_service::application::use_cases::exchange_frontend_session_code::{
     ExchangeFrontendSessionCodeRequest, ExchangeFrontendSessionCodeResponse,
 };
 use locks_service::application::use_cases::get_creator_authority_status::CreatorAuthorityStatusView;
-use locks_service::application::use_cases::get_verification_task::VerificationTaskLifecycleView;
+use locks_service::application::use_cases::get_verification_task::{
+    ClientBindingView, VerificationTaskLifecycleView,
+};
 use locks_service::application::use_cases::issue_access_credential::IssuedAccessCredential;
 
 use serde::{Deserialize, Serialize};
@@ -102,6 +107,29 @@ pub struct VerificationTaskLifecycleHttpResponse {
     pub admission_deadline_at: Option<OffsetDateTime>,
     #[serde(serialize_with = "serialize_optional_terminal_reason")]
     pub terminal_reason: Option<VerificationTerminalReason>,
+    /// Omitted, not `null`, for bundles without a client reference, so their responses keep the
+    /// exact shape older SDK releases parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_binding: Option<ClientBindingHttpResponse>,
+}
+
+/// Relying-service binding echoed for bundles that carry a client reference. Carries no reader
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientBindingHttpResponse {
+    pub client_reference: ClientReference,
+    pub pubky_lock_resource: PubkyLockResource,
+    pub criterion_ids: Vec<String>,
+}
+
+impl From<ClientBindingView> for ClientBindingHttpResponse {
+    fn from(view: ClientBindingView) -> Self {
+        Self {
+            client_reference: view.client_reference,
+            pubky_lock_resource: view.pubky_lock_resource,
+            criterion_ids: view.criterion_ids,
+        }
+    }
 }
 
 impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpResponse {
@@ -117,6 +145,7 @@ impl From<VerificationTaskLifecycleView> for VerificationTaskLifecycleHttpRespon
             status_message: None,
             admission_deadline_at: None,
             terminal_reason: view.terminal_reason,
+            client_binding: view.client_binding.map(ClientBindingHttpResponse::from),
         }
     }
 }
@@ -305,6 +334,7 @@ mod tests {
             completed_at: None,
             failure_message: None,
             terminal_reason: None,
+            client_binding: None,
         });
 
         let json = serde_json::to_value(response).unwrap();
@@ -341,6 +371,7 @@ mod tests {
             completed_at: Some(datetime!(2026-05-29 12:02:00 UTC)),
             failure_message: None,
             terminal_reason: None,
+            client_binding: None,
         });
 
         let json = serde_json::to_value(response).unwrap();
@@ -373,6 +404,7 @@ mod tests {
             terminal_reason: Some(
                 locks_service::application::models::VerificationTerminalReason::ProposalExpired,
             ),
+            client_binding: None,
         });
 
         let json = serde_json::to_value(response).unwrap();
@@ -539,6 +571,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,

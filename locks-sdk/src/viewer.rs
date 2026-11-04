@@ -1,4 +1,4 @@
-use locks_core::ids::{BundleId, CreatorPubky};
+use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource};
 use locks_core::verification::SubmittedProofBundle;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,7 +34,7 @@ struct SubmitProofBundleRequest {
     submitted_proof_bundle: SubmittedProofBundle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VerificationTaskStatus {
     Pending,
@@ -44,7 +44,7 @@ pub enum VerificationTaskStatus {
     Expired,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationTerminalReason {
     PaymentRequestRejected,
@@ -54,7 +54,7 @@ pub enum VerificationTerminalReason {
     ContentLockDeleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaykitConnectionState {
     Connected,
@@ -64,8 +64,42 @@ pub enum PaykitConnectionState {
     Blocked,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Response fields that carry internal identifiers, bearer secrets, or proof and entitlement
+/// material. Lifecycle and connection-state responses never carry them, so their presence fails
+/// the parse instead of being ignored like other unknown fields.
+const SECRET_BEARING_RESPONSE_FIELDS: &[&str] = &[
+    "task_id",
+    "credential",
+    "credential_issuance",
+    "submitted_proof_bundle",
+    "proofs",
+    "entitlement",
+    "verified_proof_bundle",
+    "entitlement_to_publish",
+];
+
+/// Secret-bearing fields that an access-credential response must not carry. The raw
+/// `credential` is its one documented secret.
+const ACCESS_CREDENTIAL_FORBIDDEN_FIELDS: &[&str] = &[
+    "task_id",
+    "credential_issuance",
+    "submitted_proof_bundle",
+    "proofs",
+    "entitlement",
+    "verified_proof_bundle",
+    "entitlement_to_publish",
+];
+
+/// Connection state moved to its own lookup; a lifecycle response that still carries it comes
+/// from the superseded submit contract.
+const LIFECYCLE_FOREIGN_FIELDS: &[&str] = &["connection_state"];
+
+/// Verification task lifecycle returned by submission, lookup, and dev completion.
+///
+/// Unknown fields are ignored so a newer Lock Server can add fields without breaking this
+/// release; secret-bearing fields are still rejected. Serializing a parsed response yields only
+/// the fields below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationTaskLifecycleResponse {
     pub creator: CreatorPubky,
     pub bundle_id: BundleId,
@@ -81,16 +115,32 @@ pub struct VerificationTaskLifecycleResponse {
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub admission_deadline_at: Option<time::OffsetDateTime>,
     pub terminal_reason: Option<VerificationTerminalReason>,
+    /// Present only for bundles submitted with a client reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_binding: Option<ClientBindingResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Relying-service binding echoed for a bundle submitted with a client reference.
+///
+/// A relying service accepts a completed task for one of its business objects only when
+/// `client_reference` equals the value it minted for that object and `pubky_lock_resource` and
+/// `criterion_ids` match the terms it expects. An absent binding never matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBindingResponse {
+    pub client_reference: ClientReference,
+    pub pubky_lock_resource: PubkyLockResource,
+    pub criterion_ids: Vec<String>,
+}
+
+/// Paykit connection state. Unknown fields are ignored; secret-bearing fields are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaykitConnectionStateResponse {
     pub state: PaykitConnectionState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Issued access credential. Unknown fields are ignored; proof and entitlement material is
+/// rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessCredentialResponse {
     pub credential: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -166,6 +216,8 @@ impl ViewerLocks {
     }
 
     pub fn parse_lifecycle_response(value: Value) -> Result<VerificationTaskLifecycleResponse> {
+        reject_fields(&value, SECRET_BEARING_RESPONSE_FIELDS)?;
+        reject_fields(&value, LIFECYCLE_FOREIGN_FIELDS)?;
         let response: VerificationTaskLifecycleResponse = serde_json::from_value(value)
             .map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))?;
         validate_lifecycle_response(&response)?;
@@ -181,10 +233,12 @@ impl ViewerLocks {
     pub fn parse_paykit_connection_state_response(
         value: Value,
     ) -> Result<PaykitConnectionStateResponse> {
+        reject_fields(&value, SECRET_BEARING_RESPONSE_FIELDS)?;
         serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
     }
 
     pub fn parse_access_credential_response(value: Value) -> Result<AccessCredentialResponse> {
+        reject_fields(&value, ACCESS_CREDENTIAL_FORBIDDEN_FIELDS)?;
         serde_json::from_value(value).map_err(|err| LocksSdkError::InvalidResponse(err.to_string()))
     }
 
@@ -204,7 +258,26 @@ impl Default for ViewerLocks {
     }
 }
 
+fn reject_fields(value: &Value, forbidden: &[&str]) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    match forbidden.iter().find(|field| object.contains_key(**field)) {
+        Some(field) => Err(LocksSdkError::InvalidResponse(format!(
+            "response carries forbidden field `{field}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn validate_lifecycle_response(response: &VerificationTaskLifecycleResponse) -> Result<()> {
+    if let Some(binding) = &response.client_binding
+        && binding.pubky_lock_resource.creator() != &response.creator
+    {
+        return Err(LocksSdkError::InvalidResponse(
+            "client binding names a lock of another creator".to_owned(),
+        ));
+    }
     let valid = match response.status {
         VerificationTaskStatus::Pending => {
             response.started_at.is_none()
@@ -580,6 +653,175 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_response_ignores_unknown_fields_from_newer_servers() {
+        let response = ViewerLocks::parse_lifecycle_response(json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null,
+            "future_object": { "nested": true },
+            "future_scalar": 7
+        }))
+        .unwrap();
+
+        assert_eq!(response.status, VerificationTaskStatus::Completed);
+        let reserialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            reserialized,
+            json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "completed",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": "2026-06-01T12:00:01Z",
+                "completed_at": "2026-06-01T12:00:02Z",
+                "failure_message": null,
+                "status_message": null,
+                "admission_deadline_at": null,
+                "terminal_reason": null
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_response_exposes_client_binding_only_when_present() {
+        let resource = format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json");
+        let mut body = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-06-01T12:00:00Z",
+            "started_at": "2026-06-01T12:00:01Z",
+            "completed_at": "2026-06-01T12:00:02Z",
+            "failure_message": null,
+            "status_message": null,
+            "admission_deadline_at": null,
+            "terminal_reason": null
+        });
+        let without = ViewerLocks::parse_lifecycle_response(body.clone()).unwrap();
+        assert_eq!(without.client_binding, None);
+        assert_eq!(serde_json::to_value(&without).unwrap(), body);
+
+        body["client_binding"] = json!({
+            "client_reference": "order-1",
+            "pubky_lock_resource": resource,
+            "criterion_ids": ["criterion-1"]
+        });
+        let with = ViewerLocks::parse_lifecycle_response(body.clone()).unwrap();
+        let binding = with.client_binding.clone().unwrap();
+        assert_eq!(binding.client_reference.as_str(), "order-1");
+        assert_eq!(binding.pubky_lock_resource.to_string(), resource);
+        assert_eq!(binding.criterion_ids, vec!["criterion-1".to_owned()]);
+        assert_eq!(serde_json::to_value(&with).unwrap(), body);
+    }
+
+    #[test]
+    fn lifecycle_response_rejects_malformed_or_foreign_client_binding() {
+        let other_creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+        for binding in [
+            json!({
+                "client_reference": "order-1",
+                "pubky_lock_resource": format!("{other_creator}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+            json!({
+                "client_reference": "",
+                "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+            json!({
+                "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }),
+        ] {
+            let body = json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null,
+                "terminal_reason": null,
+                "client_binding": binding
+            });
+            assert!(ViewerLocks::parse_lifecycle_response(body).is_err());
+        }
+    }
+
+    #[test]
+    fn connection_state_and_credential_responses_ignore_unknown_fields() {
+        let connection = ViewerLocks::parse_paykit_connection_state_response(json!({
+            "state": "connected",
+            "observed_generation": 3
+        }))
+        .unwrap();
+        assert_eq!(connection.state, PaykitConnectionState::Connected);
+        assert_eq!(
+            serde_json::to_value(&connection).unwrap(),
+            json!({ "state": "connected" })
+        );
+
+        let issued = ViewerLocks::parse_access_credential_response(json!({
+            "credential": "raw-access-credential",
+            "expires_at": "2026-06-01T12:15:00Z",
+            "credential_version": 2
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&issued).unwrap(),
+            json!({
+                "credential": "raw-access-credential",
+                "expires_at": "2026-06-01T12:15:00Z"
+            })
+        );
+    }
+
+    #[test]
+    fn every_secret_bearing_field_still_fails_lifecycle_and_connection_parses() {
+        for field in SECRET_BEARING_RESPONSE_FIELDS {
+            let mut lifecycle = json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "pending",
+                "submitted_at": "2026-06-01T12:00:00Z",
+                "started_at": null,
+                "completed_at": null,
+                "failure_message": null,
+                "terminal_reason": null
+            });
+            lifecycle[*field] = json!("leaked");
+            assert!(
+                ViewerLocks::parse_lifecycle_response(lifecycle).is_err(),
+                "{field} must fail the lifecycle parse"
+            );
+            let mut connection = json!({ "state": "connected" });
+            connection[*field] = json!("leaked");
+            assert!(
+                ViewerLocks::parse_paykit_connection_state_response(connection).is_err(),
+                "{field} must fail the connection-state parse"
+            );
+        }
+        for field in ACCESS_CREDENTIAL_FORBIDDEN_FIELDS {
+            let mut issued = json!({
+                "credential": "raw-access-credential",
+                "expires_at": "2026-06-01T12:15:00Z"
+            });
+            issued[*field] = json!("leaked");
+            assert!(
+                ViewerLocks::parse_access_credential_response(issued).is_err(),
+                "{field} must fail the access-credential parse"
+            );
+        }
+    }
+
+    #[test]
     fn access_credential_response_rejects_extra_entitlement_or_proof_material() {
         let result = ViewerLocks::parse_access_credential_response(json!({
             "credential": "raw-access-credential",
@@ -599,6 +841,7 @@ mod tests {
             ))
             .unwrap(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,

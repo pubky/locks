@@ -1,6 +1,7 @@
 use time::OffsetDateTime;
 
-use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource, TaskId};
+use locks_core::verification::SubmittedProofBundle;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -52,11 +53,46 @@ pub struct VerificationTaskLifecycleView {
     pub failure_message: Option<String>,
     /// Typed no-entitlement reason for expired Paykit attempts.
     pub terminal_reason: Option<VerificationTerminalReason>,
+    /// Relying-service binding, present only when the stored bundle carries a client reference.
+    pub client_binding: Option<ClientBindingView>,
+}
+
+/// What a relying service needs to tie a task to the business object it minted a client
+/// reference for: the reference itself and the lock terms the task verifies.
+///
+/// It never carries `reader_public_key`. The lifecycle lookup needs only the
+/// `{ creator, bundle_id }` handle, whose one secret is the bundle ID, so a leaked bundle ID must
+/// not also reveal who the reader is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBindingView {
+    /// Reference exactly as submitted.
+    pub client_reference: ClientReference,
+    /// Content lock the bundle was submitted against.
+    pub pubky_lock_resource: PubkyLockResource,
+    /// Criterion IDs of the submitted proofs, in submission order.
+    pub criterion_ids: Vec<String>,
+}
+
+impl ClientBindingView {
+    /// Builds the binding for a stored bundle, or `None` when it carries no client reference.
+    pub fn from_bundle(bundle: &SubmittedProofBundle) -> Option<Self> {
+        let client_reference = bundle.client_reference.clone()?;
+        Some(Self {
+            client_reference,
+            pubky_lock_resource: bundle.pubky_lock_resource.clone(),
+            criterion_ids: bundle
+                .proofs
+                .iter()
+                .map(|proof| proof.criterion_id.clone())
+                .collect(),
+        })
+    }
 }
 
 impl From<VerificationTaskRecord> for VerificationTaskLifecycleView {
     fn from(task: VerificationTaskRecord) -> Self {
         Self {
+            client_binding: ClientBindingView::from_bundle(&task.submitted_proof_bundle),
             creator: task.creator,
             bundle_id: task.submitted_proof_bundle.bundle_id,
             status: task.status,
@@ -355,6 +391,7 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

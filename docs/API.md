@@ -593,7 +593,9 @@ Success response returns lifecycle metadata only. It does not return connection 
 
 For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-payment`, `reader_public_key` is required as a top-level field on `submitted_proof_bundle`; the payment proof payload itself must be `{}`. Payment submissions are v1 single-proof only: a bundle with more than one `paykit-payment` proof, or a mix of `paykit-payment` and any other proof type, is rejected with `400 invalid_request`.
 
-Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent. The intent includes `payment_in` copied from the validated canonical `paykit-payment` criterion and is stored before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
+`client_reference` is an optional top-level field on `submitted_proof_bundle`: an opaque value a relying service mints for one of its own business objects (for example one payment) and asks the reader to carry. It is 1 to 64 bytes of UTF-8 without control characters; anything else is `400 invalid_request`. Locks stores it verbatim and never interprets it. Bundles without it behave as before. Fixtures: `locks-server/tests/fixtures/viewer_access/submit_proof_bundle_with_client_reference_request.json` and `submit_proof_bundle_with_client_reference_response_shape.json`.
+
+Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material, including a changed, added, or removed `client_reference`, returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent. The intent includes `payment_in` copied from the validated canonical `paykit-payment` criterion and is stored before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
 
 A claimed background worker sends the persisted body below to Paykit `POST /invoices`, using the task UUID as stable `X-Request-ID` for exact Paykit replay after an ambiguous response or process restart:
 
@@ -639,6 +641,20 @@ Looks up lifecycle metadata by public handle `{ creator, bundle_id }` using a JS
 Lifecycle responses include nullable `status_message` and `admission_deadline_at`. While invoice admission is pending, `admission_deadline_at` exposes the persisted DB-owned RFC 3339 cutoff; clients may use it to distinguish ordinary progress from an overdue/stalled worker, but must keep polling because only the worker may persist terminal failure. It becomes `null` after admission reaches ready or failed. Compare against a server-synchronized clock: DB time owns enforcement, so host/browser clock skew can make a local countdown approximate.
 
 While invoice admission is durably retrying `reader_setup_pending` or malformed/oversized Reader registry data, `status_message` is `"Reader wallet setup needed"`; clients should show that safe message and continue polling the existing task. Once observed, this reason remains sticky across unrelated transient retries until admission becomes ready or failed. Other states use `null`. Neither projection implies entitlement, invoice readiness, worker execution, or synthetic failure.
+
+When the stored bundle carries a `client_reference`, this response and the submission response add:
+
+```json
+{
+  "client_binding": {
+    "client_reference": "<as submitted>",
+    "pubky_lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
+    "criterion_ids": ["criterion-1"]
+  }
+}
+```
+
+`criterion_ids` lists the submitted proofs' `criterion_id` values in submission order. A relying service accepts a `completed` task for its object only when all three match what it expects; an absent `client_binding` never matches. Bundles without a reference return no `client_binding` key at all, so their responses keep the shape earlier SDK releases parse. The route has no authentication beyond the `{ creator, bundle_id }` handle, whose one secret is the bundle ID, so lifecycle responses never include `reader_public_key`: a leaked bundle ID must not also name the reader. The stored reference is write-once; task updates never rewrite it.
 
 Fixture: `locks-server/tests/fixtures/viewer_access/verification_task_handle_request.json`
 

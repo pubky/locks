@@ -455,6 +455,37 @@ const lifecycle = await viewer.submitProofBundle({
 
 `submitProofBundle` parses the submitted object through the Rust `SubmittedProofBundle` contract before sending it, so identifiers such as `bundle_id` are validated and serialized in canonical form. It does not generate verifier proofs for callers.
 
+### Relying-service client reference
+
+A relying service that sells access per business object (for example per order payment) mints an opaque `client_reference` for that object and has the reader include it in the submitted bundle:
+
+```ts
+const lifecycle = await viewer.submitProofBundle({
+  version: 1,
+  bundle_id: bundleId,
+  pubky_lock_resource: `${creator}/pub/app.locks/<lock_id>.json`,
+  reader_public_key: readerPubky,
+  client_reference: referenceFromRelyingService,
+  proofs: [{ criterion_id: "paykit", verifier_type: "paykit-payment", payload: {} }],
+});
+```
+
+The reference is 1 to 64 bytes of UTF-8 without control characters; Locks stores it verbatim. It is part of the bundle's replay identity, so resubmitting the bundle ID with a different reference, or without it, returns `409 task_state_conflict`.
+
+Lifecycle responses for such a bundle carry `client_binding`:
+
+```json
+{
+  "client_binding": {
+    "client_reference": "<as submitted>",
+    "pubky_lock_resource": "pubky<creator>/pub/app.locks/<lock_id>.json",
+    "criterion_ids": ["paykit"]
+  }
+}
+```
+
+Rust callers read it as `VerificationTaskLifecycleResponse::client_binding` (`ClientBindingResponse`). The relying service accepts a `completed` task for its object only when `client_reference` equals the value it minted for that object and `pubky_lock_resource` and `criterion_ids` match the terms it expects. A response without `client_binding` never matches. Bundles submitted without a reference return no `client_binding` key, so their responses keep the shape earlier SDK releases parse. Lifecycle responses never include `reader_public_key`.
+
 ```ts
 const handle = new VerificationTaskHandleOptions(creator, bundleId);
 const current = await viewer.lookupVerificationTask(handle);
@@ -496,7 +527,11 @@ let issued: AccessCredentialResponse =
     ViewerLocks::parse_access_credential_response(response_json)?;
 ```
 
-`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`. These parsers reject unknown fields so internal `task_id`, raw proof material, or entitlement evidence cannot silently become part of the public SDK response surface. JS/WASM viewer methods reuse matching Rust parsers internally before returning JSON to browser callers.
+`parse_submit_proof_bundle_response` and `parse_lifecycle_response` validate lifecycle-only responses. `parse_paykit_connection_state_response` accepts exactly `none`, `handshake`, `connected`, `recovery_required`, or `blocked`.
+
+These parsers ignore unknown response fields, so a Lock Server can add a response field before every consumer upgrades its SDK. Fields that would carry internal or secret material (`task_id`, `credential` outside the access-credential response, `credential_issuance`, `submitted_proof_bundle`, `proofs`, `entitlement`, `verified_proof_bundle`, `entitlement_to_publish`) still fail the parse, and a lifecycle response carrying `connection_state` fails as the superseded submit contract. Closed vocabularies stay closed: an unknown lifecycle `status`, `terminal_reason`, or connection `state` value is an error.
+
+JS/WASM viewer methods run the matching Rust parser and return the typed response re-serialized, not the raw server JSON. Browser callers therefore receive exactly the fields this SDK release knows; fields it ignores never reach them.
 
 ## Current verification commands
 

@@ -154,13 +154,14 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
     ) -> Result<(), ApplicationError> {
         let mut current_statuses = self.deletion_fence.current_statuses.write().await;
         let mut records = self.records.write().await;
-        if !records.contains_key(&task.task_id) {
+        let Some(stored) = records.get(&task.task_id) else {
             return Err(ApplicationError::MissingRecord {
                 record: "verification_task",
             });
-        }
-        current_statuses.insert(task.task_id, task.status);
-        records.insert(task.task_id, task);
+        };
+        let updated = stored.with_lifecycle_of(&task);
+        current_statuses.insert(updated.task_id, updated.status);
+        records.insert(updated.task_id, updated);
         Ok(())
     }
 
@@ -179,10 +180,14 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             });
         }
         for task in tasks {
-            if let Some(fence_record) = fence_records.get_mut(&task.task_id) {
-                fence_record.status = task.status;
+            let updated = records
+                .get(&task.task_id)
+                .expect("presence checked under the same write lock")
+                .with_lifecycle_of(&task);
+            if let Some(fence_record) = fence_records.get_mut(&updated.task_id) {
+                fence_record.status = updated.status;
             }
-            records.insert(task.task_id, task);
+            records.insert(updated.task_id, updated);
         }
         Ok(())
     }
@@ -517,7 +522,8 @@ impl InvoiceAdmissionRepository for InMemoryVerificationTaskRepository {
         state.claimed_by = None;
         state.claim_token = None;
         state.claim_expires_at = None;
-        records.insert(*task_id, state.record.task.clone());
+        let updated = task.with_lifecycle_of(&state.record.task);
+        records.insert(*task_id, updated);
         current_statuses.insert(*task_id, VerificationTaskStatus::Failed);
         if let Some(fence_record) = fence_records.get_mut(task_id) {
             fence_record.status = VerificationTaskStatus::Failed;
@@ -1268,6 +1274,213 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn single_and_atomic_updates_keep_the_stored_bundle_and_client_reference() {
+        let repo = InMemoryVerificationTaskRepository::new();
+        let stored = task_with_reference(TASK_ID, BUNDLE_ID, "order-1");
+        let other = task_with_reference(OTHER_TASK_ID, "000G40R40M30E209185GR38E1V", "order-9");
+        repo.insert_verification_task(stored.clone()).await.unwrap();
+        repo.insert_verification_task(other.clone()).await.unwrap();
+
+        let started = tampered(
+            stored
+                .transition_to(
+                    VerificationTaskStatus::InProgress,
+                    datetime!(2026-05-29 12:01:00 UTC),
+                    None,
+                )
+                .unwrap(),
+        );
+        repo.update_verification_task(started.clone())
+            .await
+            .unwrap();
+        let after_single = repo
+            .get_verification_task(&stored.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_single.status, VerificationTaskStatus::InProgress);
+        assert_eq!(after_single.started_at, started.started_at);
+        assert_eq!(
+            after_single.submitted_proof_bundle,
+            stored.submitted_proof_bundle
+        );
+        assert_eq!(after_single.submitted_at, stored.submitted_at);
+
+        let expired = |record: &VerificationTaskRecord| {
+            let in_progress = if record.status == VerificationTaskStatus::Pending {
+                record
+                    .transition_to(
+                        VerificationTaskStatus::InProgress,
+                        datetime!(2026-05-29 12:01:00 UTC),
+                        None,
+                    )
+                    .unwrap()
+            } else {
+                record.clone()
+            };
+            tampered(
+                in_progress
+                    .expire(
+                        crate::application::models::VerificationTerminalReason::ContentLockDeleted,
+                        datetime!(2026-05-29 12:02:00 UTC),
+                    )
+                    .unwrap(),
+            )
+        };
+        repo.update_verification_tasks_atomically(vec![expired(&after_single), expired(&other)])
+            .await
+            .unwrap();
+        for original in [&stored, &other] {
+            let reread = repo
+                .get_verification_task(&original.task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reread.status, VerificationTaskStatus::Expired);
+            assert_eq!(
+                reread.submitted_proof_bundle,
+                original.submitted_proof_bundle
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claimed_transition_keeps_the_stored_bundle_and_client_reference() {
+        let repo = Arc::new(InMemoryVerificationTaskRepository::new());
+        let stored = task_with_reference(TASK_ID, BUNDLE_ID, "order-1");
+        repo.insert_verification_task(stored.clone()).await.unwrap();
+        let claimer = InMemoryVerificationTaskClaimer::with_task_repository(
+            vec![stored.clone()],
+            repo.clone(),
+        );
+        let now = stored.submitted_at;
+        let claimed = claimer
+            .claim_next_verification_task("worker", now, now + time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let failed = tampered(
+            claimed
+                .task
+                .transition_to(
+                    VerificationTaskStatus::Failed,
+                    now + time::Duration::seconds(5),
+                    Some("verifier rejected proof".to_owned()),
+                )
+                .unwrap(),
+        );
+        let persisted = claimer
+            .persist_claimed_verification_task_transition(
+                failed,
+                "worker",
+                &claimed.claim_token,
+                now + time::Duration::seconds(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(persisted.status, VerificationTaskStatus::Failed);
+        assert_eq!(
+            persisted.submitted_proof_bundle,
+            stored.submitted_proof_bundle
+        );
+        let reread = repo
+            .get_verification_task(&stored.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.status, VerificationTaskStatus::Failed);
+        assert_eq!(reread.submitted_proof_bundle, stored.submitted_proof_bundle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_submissions_with_different_client_references_store_one() {
+        const RACERS: usize = 8;
+        let repo = Arc::new(InMemoryVerificationTaskRepository::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let mut racers = Vec::new();
+        for index in 0..RACERS {
+            let repo = Arc::clone(&repo);
+            let barrier = Arc::clone(&barrier);
+            let mut candidate = task_with_reference(
+                &format!("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2e{index:02}"),
+                BUNDLE_ID,
+                &format!("order-{index}"),
+            );
+            let invoice_path = index % 2 == 1;
+            if invoice_path {
+                candidate.submitted_proof_bundle.reader_public_key =
+                    Some(invoice_intent(&candidate).reader);
+            }
+            racers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = if invoice_path {
+                    repo.insert_invoice_pending_task(candidate.clone(), invoice_intent(&candidate))
+                        .await
+                        .map(|_| ())
+                } else {
+                    repo.insert_verification_task(candidate.clone()).await
+                };
+                (candidate, result)
+            }));
+        }
+        let mut winners = Vec::new();
+        for racer in racers {
+            let (candidate, result) = racer.await.unwrap();
+            match result {
+                Ok(()) => winners.push(candidate),
+                Err(ApplicationError::VerificationTaskConflict) => {}
+                other => panic!("unexpected concurrent insert result: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        let stored = repo
+            .get_verification_task_by_handle(
+                &winners[0].creator,
+                &winners[0].submitted_proof_bundle.bundle_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.submitted_proof_bundle,
+            winners[0].submitted_proof_bundle
+        );
+        assert_eq!(repo.records.read().await.len(), 1);
+    }
+
+    fn task_with_reference(
+        task_id: &str,
+        bundle_id: &str,
+        reference: &str,
+    ) -> VerificationTaskRecord {
+        let mut record = task_with(
+            task_id,
+            "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            bundle_id,
+            VerificationTaskStatus::Pending,
+        );
+        record.submitted_proof_bundle.client_reference =
+            Some(locks_core::ids::ClientReference::from_str(reference).unwrap());
+        record
+    }
+
+    /// The update a buggy or hostile caller could pass: same task, rewritten identity.
+    fn tampered(mut record: VerificationTaskRecord) -> VerificationTaskRecord {
+        record.submitted_proof_bundle.client_reference =
+            Some(locks_core::ids::ClientReference::from_str("order-rewritten").unwrap());
+        record.submitted_proof_bundle.reader_public_key = Some(
+            CreatorPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+                .unwrap(),
+        );
+        record.submitted_proof_bundle.proofs[0].payload = json!({ "rewritten": true });
+        record.submitted_at = datetime!(2026-06-01 00:00:00 UTC);
+        record
+    }
+
     fn task(status: VerificationTaskStatus) -> VerificationTaskRecord {
         task_with(
             TASK_ID,
@@ -1294,6 +1507,7 @@ mod tests {
                 ))
                 .unwrap(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,
