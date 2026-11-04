@@ -5836,6 +5836,7 @@ mod tests {
                 bundle_id,
                 pubky_lock_resource: lock_resource,
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,

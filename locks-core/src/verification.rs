@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ids::{BundleId, CreatorPubky, LockServerPubky, PubkyLockResource};
+use crate::ids::{BundleId, ClientReference, CreatorPubky, LockServerPubky, PubkyLockResource};
 use crate::lock_policy::VerifierType;
 
 /// Supported v0 submitted proof bundle payload version.
@@ -27,6 +27,12 @@ pub struct SubmittedProofBundle {
     /// Reader Pubky identity used by payment-backed invoice flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reader_public_key: Option<CreatorPubky>,
+    /// Opaque relying-service reference carried with the bundle and echoed on its lifecycle.
+    ///
+    /// Part of the bundle's replay identity: a changed or added reference under an existing
+    /// bundle ID conflicts. Never interpreted by Locks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_reference: Option<ClientReference>,
     /// Viewer-submitted proofs keyed to content lock criteria.
     pub proofs: Vec<Proof>,
 }
@@ -99,7 +105,7 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
 
-    use crate::ids::{BundleId, LockServerPubky, PubkyLockResource};
+    use crate::ids::{BundleId, ClientReference, LockServerPubky, PubkyLockResource};
     use crate::lock_policy::VerifierType;
     use crate::verification::{
         CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
@@ -128,6 +134,7 @@ mod tests {
             bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
             pubky_lock_resource: pubky_lock_resource_fixture(),
             reader_public_key: None,
+            client_reference: None,
             proofs: vec![Proof {
                 criterion_id: "criterion-1".to_owned(),
                 verifier_type: VerifierType::DevStatic,
@@ -156,6 +163,44 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn client_reference_is_optional_omitted_when_absent_and_round_trips_verbatim() {
+        let without = submitted_proof_bundle_fixture();
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("client_reference").is_none());
+        assert_eq!(
+            serde_json::from_value::<SubmittedProofBundle>(json).unwrap(),
+            without
+        );
+
+        let mut with = submitted_proof_bundle_fixture();
+        with.client_reference = Some(ClientReference::from_str(" Order-7 ").unwrap());
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["client_reference"], " Order-7 ");
+        let parsed = serde_json::from_value::<SubmittedProofBundle>(json).unwrap();
+        assert_eq!(parsed, with);
+        assert_ne!(parsed, without);
+    }
+
+    #[test]
+    fn submitted_proof_bundle_rejects_malformed_client_reference() {
+        for reference in [
+            json!(""),
+            json!("r".repeat(65)),
+            json!("a\u{1b}b"),
+            json!(null),
+        ] {
+            let mut json = serde_json::to_value(submitted_proof_bundle_fixture()).unwrap();
+            json["client_reference"] = reference.clone();
+            let parsed = serde_json::from_value::<SubmittedProofBundle>(json);
+            if reference.is_null() {
+                assert_eq!(parsed.unwrap().client_reference, None);
+            } else {
+                assert!(parsed.is_err(), "{reference}");
+            }
+        }
     }
 
     #[test]

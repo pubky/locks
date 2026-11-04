@@ -92,6 +92,7 @@ async fn retrieval_access_slice_submits_verifies_issues_validates_and_proxy_read
                 bundle_id: bundle_id(),
                 pubky_lock_resource: pubky_lock_resource.clone(),
                 reader_public_key: None,
+                client_reference: None,
                 proofs: vec![Proof {
                     criterion_id: "criterion-1".to_owned(),
                     verifier_type: VerifierType::DevStatic,
