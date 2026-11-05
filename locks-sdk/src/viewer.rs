@@ -65,6 +65,7 @@ pub enum VerificationTerminalReason {
     GraphConditionNotObservedByDeadline,
     VerificationUnavailableByDeadline,
     InvalidVerifierResponse,
+    VerificationConflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +81,7 @@ pub enum PaykitConnectionState {
 /// Response fields that carry internal identifiers, bearer secrets, or proof and entitlement
 /// material. Lifecycle and connection-state responses never carry them, so their presence fails
 /// the parse instead of being ignored like other unknown fields.
-const SECRET_BEARING_RESPONSE_FIELDS: &[&str] = &[
+pub(crate) const SECRET_BEARING_RESPONSE_FIELDS: &[&str] = &[
     "task_id",
     "credential",
     "credential_issuance",
@@ -189,11 +190,30 @@ impl ViewerLocks {
         )
     }
 
+    pub fn submit_payment_proof_bundle(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundleV2,
+    ) -> SdkViewerRequest {
+        self.post_json(
+            "/proof-bundles",
+            SubmitGraphProofBundleRequest {
+                submitted_proof_bundle,
+            },
+        )
+    }
+
     pub fn poll_folded_auth(&self, request: FoldedAuthStatusRequest) -> SdkViewerRequest {
         self.post_json("/proof-bundles/auth-status", request)
     }
 
     pub fn lookup_graph_verification_task(
+        &self,
+        request: VerificationTaskHandleRequest,
+    ) -> SdkViewerRequest {
+        self.lookup_verification_task(request)
+    }
+
+    pub fn lookup_payment_verification_task(
         &self,
         request: VerificationTaskHandleRequest,
     ) -> SdkViewerRequest {
@@ -280,6 +300,12 @@ impl ViewerLocks {
         crate::graph::parse_graph_lifecycle_response(value)
     }
 
+    pub fn parse_payment_lifecycle_response(
+        value: Value,
+    ) -> Result<crate::payment::PaymentVerificationTaskLifecycleResponse> {
+        crate::payment::parse_payment_lifecycle_response(value)
+    }
+
     pub fn parse_paykit_connection_state_response(
         value: Value,
     ) -> Result<PaykitConnectionStateResponse> {
@@ -308,11 +334,11 @@ impl Default for ViewerLocks {
     }
 }
 
-fn reject_fields(value: &Value, forbidden: &[&str]) -> Result<()> {
+pub(crate) fn reject_fields(value: &Value, fields: &[&str]) -> Result<()> {
     let Some(object) = value.as_object() else {
         return Ok(());
     };
-    match forbidden.iter().find(|field| object.contains_key(**field)) {
+    match fields.iter().find(|field| object.contains_key(**field)) {
         Some(field) => Err(LocksSdkError::InvalidResponse(format!(
             "response carries forbidden field `{field}`"
         ))),

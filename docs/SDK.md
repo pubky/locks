@@ -72,6 +72,8 @@ For a focused, copyable Paykit viewer flow plus exact request/response and termi
 
 For graph-only Content Lock v2, folded-auth polling, restart semantics, Nexus `app_spec_v0_7`, Rust/JS method names, browser secret handling, and deterministic Compose verification, see [`GRAPH_STAGE1.md`](GRAPH_STAGE1.md). Public JS uses `submitProofBundle`, `pollFoldedAuth`, and `lookupGraphVerificationTask`; Creator evidence uses `verificationEvidence`. These wrap canonical Rust planners and closed parsers rather than duplicating route shapes.
 
+For payment-only Content Lock v2 policy bounds, provider/deadline semantics, and explicit Rust/JS payment lifecycle methods, see [`PAYMENT_ONLY_V2.md`](PAYMENT_ONLY_V2.md).
+
 Run the static drift check:
 
 ```bash

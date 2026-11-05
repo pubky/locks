@@ -61,8 +61,10 @@ const requiredSnippets = [
   'static generate(): BundleId;',
   'toString(): string;',
   'submitProofBundle(submitted_proof_bundle: any): Promise<any>;',
+  'submitPaymentProofBundle(submitted_proof_bundle: any): Promise<any>;',
   'pollFoldedAuth(state: string): Promise<any>;',
   'lookupGraphVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
+  'lookupPaymentVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
   'lookupVerificationTask(options: VerificationTaskHandleOptions): Promise<any>;',
   'lookupPaykitConnectionState(options: VerificationTaskHandleOptions): Promise<any>;',
   'issueAccessCredential(options: VerificationTaskHandleOptions): Promise<any>;',
@@ -112,7 +114,12 @@ for (const forbidden of ['localStorage', 'sessionStorage', 'indexedDB', 'CacheSt
   }
 }
 
-for (const method of ['pollFoldedAuth', 'lookupGraphVerificationTask']) {
+for (const method of [
+  'pollFoldedAuth',
+  'lookupGraphVerificationTask',
+  'submitPaymentProofBundle',
+  'lookupPaymentVerificationTask',
+]) {
   if (typeof sdk.Viewer.prototype[method] !== 'function') {
     throw new Error(`generated Viewer missing ${method}`);
   }

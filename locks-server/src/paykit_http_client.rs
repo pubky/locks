@@ -5,9 +5,16 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::PaykitPaymentAsset;
+use locks_service::application::models::{
+    BitcoinOutpointV2 as PaymentProviderOutpoint, PaymentAssetV2, PaymentProviderCreateRequest,
+    PaymentProviderStatus, PaymentRequestStateV2 as PaymentProviderRequestState,
+    PaymentSampleStatusV2 as PaymentProviderSampleStatus, PaymentSampleV2 as PaymentProviderSample,
+    PaymentStateV2 as PaymentProviderPaymentState,
+};
 use locks_service::application::ports::{
     PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError, PaymentDrainStatus,
-    PaymentDrainSummary, PaymentObservation, PaymentRequestState, PaymentRequestStatus,
+    PaymentDrainSummary, PaymentObservation, PaymentProviderClient, PaymentProviderCreateResponse,
+    PaymentProviderError, PaymentProviderErrorKind, PaymentRequestState, PaymentRequestStatus,
     PaymentState,
 };
 use locks_service::infrastructure::verifiers::paykit_payment::{
@@ -36,6 +43,74 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 const CONNECTION_STATUS_BODY_LIMIT: usize = 1_024;
 const PAYMENT_STATUS_BODY_LIMIT: usize = 2_048;
 const PAYMENT_DRAIN_BODY_LIMIT: usize = 1_024;
+const PAYMENT_PROVIDER_V2_BODY_LIMIT: usize = 8_192;
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2PaymentRequest<'a> {
+    bundle_id: &'a str,
+    lock_resource: &'a str,
+    reader: &'a str,
+    payment: ProviderV2PaymentBody<'a>,
+    deadline: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2PaymentBody<'a> {
+    recipient_pubky: &'a str,
+    amount: &'a str,
+    asset: &'a str,
+    minimum_confirmations: u8,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2StatusRequest<'a> {
+    creator: &'a str,
+    bundle_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2CreateWireResponse {
+    invoice_created_at: String,
+    proposal_expires_at: String,
+    deadline: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2StatusWireResponse {
+    creator: String,
+    bundle_id: String,
+    request_state: PaymentProviderRequestState,
+    payment_state: PaymentProviderPaymentState,
+    invoice_created_at: String,
+    proposal_expires_at: String,
+    deadline: String,
+    asset: String,
+    minimum_confirmations: u8,
+    current_sample: Option<ProviderV2SampleWire>,
+    first_threshold_satisfied: Option<ProviderV2SampleWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2SampleWire {
+    observed_at: String,
+    status: PaymentProviderSampleStatus,
+    outpoint: Option<ProviderV2OutpointWire>,
+    confirmations: u8,
+    amount_matched: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2OutpointWire {
+    txid: String,
+    vout: u32,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaykitClientError {
@@ -564,6 +639,173 @@ impl PaykitInvoiceCreator for PaykitHttpClient {
 }
 
 #[async_trait]
+impl PaymentProviderClient for PaykitHttpClient {
+    async fn create_invoice(
+        &self,
+        request: &PaymentProviderCreateRequest,
+    ) -> Result<PaymentProviderCreateResponse, PaymentProviderError> {
+        let bundle_id = request.bundle_id.to_string();
+        let lock_resource = request.lock_resource.to_string();
+        let reader = request.reader.to_string();
+        let recipient = request.payment.recipient_pubky.to_string();
+        let deadline =
+            canonical_provider_time(request.deadline).map_err(|_| invalid_provider_response())?;
+        let body = ProviderV2PaymentRequest {
+            bundle_id: &bundle_id,
+            lock_resource: &lock_resource,
+            reader: &reader,
+            payment: ProviderV2PaymentBody {
+                recipient_pubky: &recipient,
+                amount: &request.payment.amount,
+                asset: "BTC",
+                minimum_confirmations: request.payment.minimum_confirmations,
+            },
+            deadline,
+        };
+        let response = self
+            .signed_post("v2/invoices", &body)
+            .await
+            .map_err(|_| retryable_provider(None))?;
+        if response.status() != StatusCode::OK {
+            return Err(classify_provider_status(&response));
+        }
+        let wire: ProviderV2CreateWireResponse =
+            read_bounded_json(response, PAYMENT_PROVIDER_V2_BODY_LIMIT)
+                .await
+                .map_err(map_provider_body_error)?;
+        let invoice_created_at = parse_canonical_provider_time(&wire.invoice_created_at)?;
+        let proposal_expires_at = parse_canonical_provider_time(&wire.proposal_expires_at)?;
+        let deadline = parse_canonical_provider_time(&wire.deadline)?;
+        if deadline != request.deadline
+            || invoice_created_at >= proposal_expires_at
+            || proposal_expires_at >= deadline
+        {
+            return Err(invalid_provider_response());
+        }
+        Ok(PaymentProviderCreateResponse {
+            invoice_created_at,
+            proposal_expires_at,
+            deadline,
+        })
+    }
+
+    async fn invoice_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<PaymentProviderStatus, PaymentProviderError> {
+        let creator_text = creator.to_string();
+        let bundle_text = bundle_id.to_string();
+        let response = self
+            .signed_post(
+                "v2/invoices/status",
+                &ProviderV2StatusRequest {
+                    creator: &creator_text,
+                    bundle_id: &bundle_text,
+                },
+            )
+            .await
+            .map_err(|_| retryable_provider(None))?;
+        if response.status() != StatusCode::OK {
+            return Err(classify_provider_status(&response));
+        }
+        let wire: ProviderV2StatusWireResponse =
+            read_bounded_json(response, PAYMENT_PROVIDER_V2_BODY_LIMIT)
+                .await
+                .map_err(map_provider_body_error)?;
+        if wire.creator != creator_text
+            || wire.bundle_id != bundle_text
+            || wire.asset != "BTC"
+            || wire.minimum_confirmations > 6
+        {
+            return Err(invalid_provider_response());
+        }
+        let status = PaymentProviderStatus {
+            creator: creator.clone(),
+            bundle_id: bundle_id.clone(),
+            request_state: wire.request_state,
+            payment_state: wire.payment_state,
+            invoice_created_at: parse_canonical_provider_time(&wire.invoice_created_at)?,
+            proposal_expires_at: parse_canonical_provider_time(&wire.proposal_expires_at)?,
+            deadline: parse_canonical_provider_time(&wire.deadline)?,
+            asset: PaymentAssetV2::Btc,
+            minimum_confirmations: wire.minimum_confirmations,
+            current_sample: wire
+                .current_sample
+                .map(provider_sample_from_wire)
+                .transpose()?,
+            first_threshold_satisfied: wire
+                .first_threshold_satisfied
+                .map(provider_sample_from_wire)
+                .transpose()?,
+        };
+        status.validate().map_err(|_| invalid_provider_response())?;
+        Ok(status)
+    }
+}
+
+fn canonical_provider_time(value: OffsetDateTime) -> Result<String, time::error::Format> {
+    value.format(&Rfc3339)
+}
+
+fn parse_canonical_provider_time(value: &str) -> Result<OffsetDateTime, PaymentProviderError> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid_provider_response())?;
+    if parsed.offset() != time::UtcOffset::UTC
+        || !parsed.nanosecond().is_multiple_of(1_000)
+        || canonical_provider_time(parsed).map_err(|_| invalid_provider_response())? != value
+    {
+        return Err(invalid_provider_response());
+    }
+    Ok(parsed)
+}
+
+fn provider_sample_from_wire(
+    wire: ProviderV2SampleWire,
+) -> Result<PaymentProviderSample, PaymentProviderError> {
+    let sample = PaymentProviderSample {
+        observed_at: parse_canonical_provider_time(&wire.observed_at)?,
+        status: wire.status,
+        outpoint: wire.outpoint.map(|outpoint| PaymentProviderOutpoint {
+            txid: outpoint.txid,
+            vout: outpoint.vout,
+        }),
+        confirmations: wire.confirmations,
+        amount_matched: wire.amount_matched,
+    };
+    sample.validate().map_err(|_| invalid_provider_response())?;
+    Ok(sample)
+}
+
+fn invalid_provider_response() -> PaymentProviderError {
+    PaymentProviderError {
+        kind: PaymentProviderErrorKind::InvalidResponse,
+        retry_after_seconds: None,
+    }
+}
+
+fn retryable_provider(retry_after_seconds: Option<u64>) -> PaymentProviderError {
+    PaymentProviderError {
+        kind: PaymentProviderErrorKind::Retryable,
+        retry_after_seconds,
+    }
+}
+
+fn classify_provider_status(response: &reqwest::Response) -> PaymentProviderError {
+    let status = response.status();
+    let retry_after =
+        safe_retry_after_seconds(response.headers().get(reqwest::header::RETRY_AFTER));
+    match status {
+        StatusCode::CONFLICT => PaymentProviderError {
+            kind: PaymentProviderErrorKind::Conflict,
+            retry_after_seconds: None,
+        },
+        StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS => retryable_provider(retry_after),
+        status if status.is_server_error() => retryable_provider(retry_after),
+        _ => invalid_provider_response(),
+    }
+}
+
+#[async_trait]
 impl PaymentDrainClient for PaykitHttpClient {
     async fn start_payment_drain(
         &self,
@@ -648,24 +890,41 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+#[derive(Debug)]
+enum BoundedJsonError {
+    Transport,
+    Invalid,
+}
+
+fn map_provider_body_error(error: BoundedJsonError) -> PaymentProviderError {
+    match error {
+        BoundedJsonError::Transport => retryable_provider(None),
+        BoundedJsonError::Invalid => invalid_provider_response(),
+    }
+}
+
 async fn read_bounded_json<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
     limit: usize,
-) -> Result<T, ()> {
+) -> Result<T, BoundedJsonError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(());
+        return Err(BoundedJsonError::Invalid);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BoundedJsonError::Transport)?
+    {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(());
+            return Err(BoundedJsonError::Invalid);
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).map_err(|_| ())
+    serde_json::from_slice(&body).map_err(|_| BoundedJsonError::Invalid)
 }
 
 fn map_payment_drain_status(status: StatusCode) -> Result<(), PaymentDrainClientError> {
@@ -970,6 +1229,18 @@ mod tests {
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn provider_body_transport_and_decode_failures_keep_distinct_retry_semantics() {
+        assert_eq!(
+            map_provider_body_error(BoundedJsonError::Transport).kind,
+            PaymentProviderErrorKind::Retryable
+        );
+        assert_eq!(
+            map_provider_body_error(BoundedJsonError::Invalid).kind,
+            PaymentProviderErrorKind::InvalidResponse
+        );
+    }
     const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/1111111111111111111111111111111111111111111111111111.json";
     const READER: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 

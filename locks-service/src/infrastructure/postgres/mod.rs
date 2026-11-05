@@ -18,6 +18,7 @@ pub mod frontend_sessions;
 pub mod graph_tasks;
 pub mod migrations;
 pub mod payment_drains;
+pub mod payment_tasks;
 mod proof_admission;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -36,5 +37,6 @@ pub use frontend_sessions::{PostgresFrontendSessionCodeStore, PostgresFrontendSe
 pub use graph_tasks::PostgresGraphTaskRepository;
 pub use migrations::run_migrations;
 pub use payment_drains::PostgresPaymentDrainRepository;
+pub use payment_tasks::PostgresPaymentTaskRepository;
 pub use verification_task_claims::PostgresVerificationTaskClaimer;
 pub use verification_tasks::PostgresVerificationTaskRepository;

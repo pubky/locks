@@ -64,7 +64,7 @@ const texts = Object.fromEntries(
 
 const required = {
   rootReadme: [
-    'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
+    'immutable Paykit Server revision `cf90f86734b616b48ce4d6c1582c0ebd37ef2080`',
     'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
     'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',
     'An absolute local `PAYKIT_SERVER_CONTEXT` override remains available',
@@ -72,14 +72,14 @@ const required = {
     'local-demo image/runtime stage',
   ],
   localOperatorDemo: [
-    'Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
+    'Paykit Server revision `cf90f86734b616b48ce4d6c1582c0ebd37ef2080`',
     'Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`',
     'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',
     'production Bitkit QR/deep-link path',
     'local-demo image/runtime stage',
   ],
   readme: [
-    'immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb`',
+    'immutable Paykit Server revision `cf90f86734b616b48ce4d6c1582c0ebd37ef2080`',
     'Paykit Server local-demo build uses Paykit Rust',
     '`v0.1.0-rc71`',
     'Locks workspace uses stable Paykit Rust `0.1.0` from crates.io',

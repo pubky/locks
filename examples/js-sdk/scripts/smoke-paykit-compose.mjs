@@ -31,10 +31,10 @@ const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
 const locksReleaseVersion = '0.1.0';
 const locksServerReleaseVersion = '0.1.1-rc1';
-assert.equal(PAYKIT_SERVER_REF, '4cc8e7b836dba28446a8d821f593ee40bb4acbeb');
+assert.equal(PAYKIT_SERVER_REF, 'cf90f86734b616b48ce4d6c1582c0ebd37ef2080');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
-  'https://github.com/pubky/paykit-server.git#4cc8e7b836dba28446a8d821f593ee40bb4acbeb',
+  'https://github.com/pubky/paykit-server.git#cf90f86734b616b48ce4d6c1582c0ebd37ef2080',
 );
 assert.doesNotThrow(() => validatePaykitSetupStatusSources({
   setupStatusSource: '.route("/setup/status", post(status))',

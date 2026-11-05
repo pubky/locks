@@ -6,6 +6,7 @@ pub mod folded_auth_cleanup;
 pub mod graph_worker;
 pub mod nexus_http_client;
 pub mod paykit_http_client;
+pub mod payment_worker;
 pub mod pkdns;
 pub mod rate_limit;
 pub mod runtime;

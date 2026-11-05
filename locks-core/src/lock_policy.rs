@@ -484,11 +484,15 @@ impl PaymentPolicyV2 {
         }
         if self.amount.is_empty()
             || !self.amount.bytes().all(|byte| byte.is_ascii_digit())
-            || !self.amount.bytes().any(|byte| byte != b'0')
+            || self
+                .amount
+                .parse::<u64>()
+                .ok()
+                .is_none_or(|amount| amount == 0)
         {
             return Err(ContentLockV2ValidationError::InvalidPaymentAmount);
         }
-        if self.asset.is_empty() || self.asset.chars().any(char::is_control) {
+        if self.asset != "BTC" {
             return Err(ContentLockV2ValidationError::InvalidPaymentAsset);
         }
         if self.minimum_confirmations > 6 {

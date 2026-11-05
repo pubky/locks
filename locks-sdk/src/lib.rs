@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod error;
 pub mod graph;
 pub mod paykit;
+pub mod payment;
 pub mod session;
 pub mod transport;
 pub mod viewer;
@@ -27,6 +28,7 @@ pub use graph::{
     GraphPredicateEvidenceState, GraphSubmitResponse, GraphVerificationTaskLifecycleResponse,
 };
 pub use paykit::has_paykit_data;
+pub use payment::PaymentVerificationTaskLifecycleResponse;
 pub use session::LocksSession;
 pub use viewer::{
     AccessCredentialResponse, ClientBindingResponse, PaykitConnectionState,

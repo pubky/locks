@@ -197,7 +197,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
                 entitlement_to_publish = $7,
                 updated_at = now()
             WHERE task_id = $1::uuid
-              AND evaluator_snapshot IS NULL
+              AND evaluator_mode IS NULL AND evaluator_snapshot IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
                   WHERE snapshot.verification_task_id = verification_tasks.task_id
@@ -230,7 +230,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE task_id = $1::uuid AND evaluator_snapshot IS NULL"
+            WHERE task_id = $1::uuid AND evaluator_mode IS NULL AND evaluator_snapshot IS NULL"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(task_id.to_string())
@@ -249,7 +249,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
         let sql = format!(
             "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
             FROM verification_tasks
-            WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NULL"
+            WHERE creator = $1 AND bundle_id = $2 AND evaluator_mode IS NULL AND evaluator_snapshot IS NULL"
         );
         let row = sqlx::query_as::<_, VerificationTaskRow>(&sql)
             .bind(creator.to_string())
@@ -264,7 +264,7 @@ impl VerificationTaskRepository for PostgresVerificationTaskRepository {
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {
         sqlx::query(
             "DELETE FROM verification_tasks
-             WHERE task_id = $1::uuid AND evaluator_snapshot IS NULL",
+             WHERE task_id = $1::uuid AND evaluator_mode IS NULL AND evaluator_snapshot IS NULL",
         )
         .bind(task_id.to_string())
         .execute(&self.pool)
@@ -915,7 +915,7 @@ async fn get_task_by_handle_in_transaction(
     let sql = format!(
         "SELECT {VERIFICATION_TASK_ROW_COLUMNS}
          FROM verification_tasks
-         WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NULL"
+         WHERE creator = $1 AND bundle_id = $2 AND evaluator_mode IS NULL AND evaluator_snapshot IS NULL"
     );
     sqlx::query_as::<_, VerificationTaskRow>(&sql)
         .bind(creator.to_string())
@@ -935,7 +935,7 @@ async fn graph_task_exists_by_handle(
     sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM verification_tasks
-            WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NOT NULL
+            WHERE creator = $1 AND bundle_id = $2 AND evaluator_mode IS NOT NULL
         )",
     )
     .bind(creator.to_string())

@@ -152,6 +152,25 @@ impl Viewer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = submitPaymentProofBundle)]
+    pub async fn submit_payment_proof_bundle(
+        &self,
+        submitted_proof_bundle: wasm_bindgen::JsValue,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let submitted_proof_bundle: Value = serde_wasm_bindgen::from_value(submitted_proof_bundle)
+            .map_err(|err| invalid_input(format!("invalid submitted proof bundle: {err}")))?;
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_submit_payment_proof_bundle_request(submitted_proof_bundle)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_payment_lifecycle_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = pollFoldedAuth)]
     pub async fn poll_folded_auth(&self, state: String) -> JsResult<wasm_bindgen::JsValue> {
         let resolver = BrowserPkarrResolver::new_with_options(&self.options)
@@ -179,6 +198,23 @@ impl Viewer {
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
         fetch_graph_lifecycle_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = lookupPaymentVerificationTask)]
+    pub async fn lookup_payment_verification_task(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_lookup_payment_verification_task_request(options)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_payment_lifecycle_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -328,6 +364,20 @@ impl Viewer {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_submit_payment_proof_bundle_request(
+        &self,
+        submitted_proof_bundle: Value,
+    ) -> Result<JsViewerRequestPlan, String> {
+        let bundle: locks_core::verification::SubmittedProofBundleV2 =
+            serde_json::from_value(submitted_proof_bundle)
+                .map_err(|err| format!("invalid payment proof bundle: {err}"))?;
+        if bundle.reader_pubky.is_none() {
+            return Err("payment proof bundle requires reader_pubky".to_owned());
+        }
+        Ok(self.request_plan(self.inner.submit_payment_proof_bundle(bundle)))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn build_poll_folded_auth_request(&self, state: &str) -> JsViewerRequestPlan {
         self.request_plan(
             self.inner
@@ -344,6 +394,17 @@ impl Viewer {
         Ok(self.request_plan(
             self.inner
                 .lookup_verification_task(parse_handle_options(options)?),
+        ))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_lookup_payment_verification_task_request(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> Result<JsViewerRequestPlan, String> {
+        Ok(self.request_plan(
+            self.inner
+                .lookup_payment_verification_task(parse_handle_options(options)?),
         ))
     }
 
@@ -506,6 +567,13 @@ fn validate_graph_lifecycle_response_for_tests(value: Value) -> Result<Value, St
     Ok(value)
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_payment_lifecycle_response_for_tests(value: Value) -> Result<Value, String> {
+    let response = locks_sdk::ViewerLocks::parse_payment_lifecycle_response(value)
+        .map_err(|err| err.to_string())?;
+    typed_response_json(&response)
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn fetch_viewer_lifecycle_json(
     request: &JsPreparedViewerRequest,
@@ -555,6 +623,16 @@ async fn fetch_graph_lifecycle_json(
     let validated = validate_graph_lifecycle_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode graph lifecycle: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_payment_lifecycle_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_payment_lifecycle_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode payment lifecycle: {err:?}")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -680,6 +758,7 @@ mod tests {
     use serde_json::json;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+    const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
@@ -718,6 +797,15 @@ mod tests {
             "version": 2,
             "bundle_id": BUNDLE_ID,
             "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json")
+        })
+    }
+
+    fn payment_proof_bundle() -> Value {
+        json!({
+            "version": 2,
+            "bundle_id": BUNDLE_ID,
+            "pubky_lock_resource": format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"),
+            "reader_pubky": READER
         })
     }
 
@@ -812,6 +900,39 @@ mod tests {
         assert_eq!(poll.path, "/proof-bundles/auth-status");
         assert_eq!(poll.authorization, None);
         assert_eq!(poll.body, json!({"state":"opaque-state"}));
+    }
+
+    #[test]
+    fn payment_submit_lookup_and_validation_use_explicit_payment_surface() {
+        let viewer = test_viewer();
+        let create = viewer
+            .build_submit_payment_proof_bundle_request(payment_proof_bundle())
+            .unwrap();
+        assert_eq!(create.path, "/proof-bundles");
+        assert!(
+            viewer
+                .build_submit_payment_proof_bundle_request(graph_proof_bundle())
+                .is_err()
+        );
+
+        let lookup = viewer
+            .build_lookup_payment_verification_task_request(&handle_options())
+            .unwrap();
+        assert_eq!(lookup.path, "/verification-task-lookups");
+
+        let response = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "failed",
+            "submitted_at": "2026-11-05T12:00:00Z",
+            "completed_at": "2026-11-05T12:01:00Z",
+            "admission_deadline_at": "2026-11-05T12:05:00Z",
+            "terminal_reason": "verification_conflict",
+            "future_diagnostic": "ignored"
+        });
+        let validated = validate_payment_lifecycle_response_for_tests(response).unwrap();
+        assert_eq!(validated["terminal_reason"], "verification_conflict");
+        assert!(validated.get("future_diagnostic").is_none());
     }
 
     #[test]

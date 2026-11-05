@@ -149,7 +149,8 @@ pub enum VerificationTaskStatus {
 }
 
 /// Canonical reason a verification attempt ended without entitlement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VerificationTerminalReason {
     PaymentRequestRejected,
     PaymentRequestCanceled,
@@ -159,6 +160,7 @@ pub enum VerificationTerminalReason {
     GraphConditionNotObservedByDeadline,
     VerificationUnavailableByDeadline,
     InvalidVerifierResponse,
+    VerificationConflict,
 }
 
 impl VerificationTerminalReason {
@@ -172,6 +174,7 @@ impl VerificationTerminalReason {
             Self::GraphConditionNotObservedByDeadline => "graph_condition_not_observed_by_deadline",
             Self::VerificationUnavailableByDeadline => "verification_unavailable_by_deadline",
             Self::InvalidVerifierResponse => "invalid_verifier_response",
+            Self::VerificationConflict => "verification_conflict",
         }
     }
 
@@ -187,6 +190,7 @@ impl VerificationTerminalReason {
             }
             "verification_unavailable_by_deadline" => Some(Self::VerificationUnavailableByDeadline),
             "invalid_verifier_response" => Some(Self::InvalidVerifierResponse),
+            "verification_conflict" => Some(Self::VerificationConflict),
             _ => None,
         }
     }

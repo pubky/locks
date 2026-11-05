@@ -50,6 +50,7 @@ impl GraphPublicationActionGuard for PostgresGraphPublicationActionGuard {
                  entitlement_publication_claim_token = NULL,
                  updated_at = clock_timestamp()
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'publishing_entitlement'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -99,6 +100,7 @@ struct GraphTaskRow {
     status: String,
     submitted_proof_bundle: serde_json::Value,
     submitted_at: time::OffsetDateTime,
+    evaluator_mode: String,
     evaluator_snapshot: serde_json::Value,
     evaluator_revision: i64,
     completed_at: Option<time::OffsetDateTime>,
@@ -108,7 +110,7 @@ struct GraphTaskRow {
 }
 
 const GRAPH_TASK_COLUMNS: &str = "task_id::text AS task_id, creator, bundle_id, status, \
-    submitted_proof_bundle, submitted_at, evaluator_snapshot, evaluator_revision, completed_at, \
+    submitted_proof_bundle, submitted_at, evaluator_mode, evaluator_snapshot, evaluator_revision, completed_at, \
     terminal_reason, \
     entitlement_to_publish, entitlement_publication_claim_token";
 
@@ -152,7 +154,7 @@ impl GraphTaskRepository for PostgresGraphTaskRepository {
         let existing = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
              WHERE creator = $1 AND bundle_id = $2
-               AND evaluator_snapshot IS NOT NULL
+               AND evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL
              FOR UPDATE"
         ))
         .bind(snapshot.creator.to_string())
@@ -183,9 +185,9 @@ impl GraphTaskRepository for PostgresGraphTaskRepository {
         let inserted = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "INSERT INTO verification_tasks (
                 task_id, creator, bundle_id, status, submitted_proof_bundle,
-                submitted_at, invoice_admission_phase, evaluator_snapshot,
+                submitted_at, invoice_admission_phase, evaluator_mode, evaluator_snapshot,
                 evaluator_revision
-             ) VALUES ($1::uuid, $2, $3, 'pending', $4, $5, 'ready', $6, 0)
+             ) VALUES ($1::uuid, $2, $3, 'pending', $4, $5, 'ready', 'graph', $6, 0)
              ON CONFLICT DO NOTHING
              RETURNING {GRAPH_TASK_COLUMNS}"
         ))
@@ -202,7 +204,7 @@ impl GraphTaskRepository for PostgresGraphTaskRepository {
             let winner = sqlx::query_as::<_, GraphTaskRow>(&format!(
                 "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
                  WHERE creator = $1 AND bundle_id = $2
-                   AND evaluator_snapshot IS NOT NULL
+                   AND evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL
                  FOR UPDATE"
             ))
             .bind(snapshot.creator.to_string())
@@ -249,7 +251,7 @@ impl GraphTaskRepository for PostgresGraphTaskRepository {
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
         let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
-             WHERE creator = $1 AND bundle_id = $2 AND evaluator_snapshot IS NOT NULL"
+             WHERE creator = $1 AND bundle_id = $2 AND evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL"
         ))
         .bind(creator.to_string())
         .bind(bundle_id.to_string())
@@ -277,7 +279,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         let row = sqlx::query_as::<_, GraphTaskRow>(
             "WITH candidate AS MATERIALIZED (
                 SELECT task_id FROM verification_tasks
-                WHERE evaluator_snapshot IS NOT NULL
+                WHERE evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL
                   AND deletion_job_id IS NULL
                   AND (
                     (
@@ -322,7 +324,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
              WHERE task.task_id = candidate.task_id
              RETURNING task.task_id::text AS task_id, task.creator, task.bundle_id,
                        task.status, task.submitted_proof_bundle, task.submitted_at,
-                       task.evaluator_snapshot, task.evaluator_revision, task.completed_at,
+                       task.evaluator_mode, task.evaluator_snapshot, task.evaluator_revision, task.completed_at,
                        task.terminal_reason,
                        task.entitlement_to_publish, task.entitlement_publication_claim_token",
         )
@@ -355,6 +357,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         let current = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'in_progress'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -483,6 +486,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  next_attempt_at = NULL,
                  updated_at = $4
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'in_progress'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -538,6 +542,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         let current = sqlx::query_as::<_, GraphTaskRow>(&format!(
             "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'in_progress'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -596,6 +601,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  claim_expires_at = NULL,
                  next_attempt_at = $6, updated_at = $4
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'in_progress'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -638,6 +644,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
                  updated_at = clock_timestamp()
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND claimed_by = $2 AND claim_token = $3",
         )
         .bind(task_id.to_string())
@@ -662,7 +669,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             Err(_) => return Ok(None),
         };
         let identity = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks WHERE task_id = $1::uuid"
+            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks WHERE task_id = $1::uuid AND evaluator_mode = 'graph'"
         ))
         .bind(task_id.to_string())
         .fetch_optional(&self.pool)
@@ -688,6 +695,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             "SELECT EXISTS (
                 SELECT 1 FROM verification_tasks
                 WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                   AND status = 'publishing_entitlement'
                   AND claimed_by = $2 AND claim_token = $3
                   AND claim_expires_at > clock_timestamp()
@@ -743,6 +751,7 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
                  entitlement_publication_claim_token = NULL,
                  updated_at = clock_timestamp()
              WHERE task_id = $1::uuid
+               AND evaluator_mode = 'graph'
                AND status = 'publishing_entitlement'
                AND claimed_by = $2 AND claim_token = $3
                AND claim_expires_at > clock_timestamp()
@@ -769,6 +778,11 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
 }
 
 fn row_to_task(row: GraphTaskRow) -> Result<GraphTaskRecord, ApplicationError> {
+    if row.evaluator_mode != "graph" {
+        return Err(ApplicationError::Storage {
+            message: "non-graph evaluator row reached graph decoder".to_owned(),
+        });
+    }
     let task_id = TaskId::from_str(&row.task_id).map_err(|error| ApplicationError::Storage {
         message: format!("invalid graph task id stored in Postgres: {error}"),
     })?;

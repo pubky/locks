@@ -4,10 +4,14 @@ import assert from 'node:assert/strict';
 import {
   connectionStateFromLookupResponse,
   connectionStateIndicator,
+  classifyPaymentLifecycle,
   createPaykitConnectionPoller,
   createPaykitConnectionObserverSlot,
   lookupPaykitConnectionState,
 } from '../reader-flow.js';
+
+assert.equal(classifyPaymentLifecycle({ status: 'publishing_entitlement' }), 'retry');
+assert.equal(classifyPaymentLifecycle({ status: 'completed' }), 'completed');
 
 assert.deepEqual(connectionStateIndicator(null), {
   label: 'Not reported yet',
