@@ -342,6 +342,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             return Err(invalid_state("payment retry delay must be positive"));
         }
         let now = self.now();
+        let mut fence = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
         let Some(stored) = records.iter_mut().find(|stored| {
             live(
@@ -355,6 +356,12 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         }) else {
             return Ok(None);
         };
+        if fence
+            .get(task_id)
+            .is_some_and(|record| record.deletion_job_id.is_some())
+        {
+            return Ok(None);
+        }
         snapshot
             .as_v1()
             .validate_progress_from(stored.task.snapshot.as_v1())
@@ -369,6 +376,9 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         stored.claim_token = None;
         stored.claim_expires_at = None;
         stored.next_attempt_at = Some((now + delay).min(stored.task.snapshot.as_v1().deadline_at));
+        if let Some(record) = fence.get_mut(task_id) {
+            record.status = stored.task.status;
+        }
         self.deletion_fence
             .current_statuses
             .write()
@@ -383,6 +393,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
     ) -> Result<bool, ApplicationError> {
+        let fence = self.deletion_fence.records.read().await;
         let mut records = self.records.write().await;
         let Some(stored) = records.iter_mut().find(|stored| {
             stored.task.task_id == *task_id
@@ -391,6 +402,12 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         }) else {
             return Ok(false);
         };
+        if fence
+            .get(task_id)
+            .is_some_and(|record| record.deletion_job_id.is_some())
+        {
+            return Ok(false);
+        }
         if stored.task.status == VerificationTaskStatus::InProgress
             && stored.task.snapshot.as_v1().root == PaymentRootState::Pending
         {
@@ -430,6 +447,13 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             .deletion_fence
             .acquire_lock_admission(&creator, &lock_id)
             .await;
+        let fence = self.deletion_fence.records.read().await;
+        if fence
+            .get(task_id)
+            .is_some_and(|record| record.deletion_job_id.is_some())
+        {
+            return Ok(None);
+        }
         let now = self.now();
         let live = self.records.read().await.iter().any(|stored| {
             live(
@@ -505,6 +529,7 @@ async fn complete_publication(
     publication_token: uuid::Uuid,
 ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
     let now = repository.now();
+    let mut fence = repository.deletion_fence.records.write().await;
     let mut records = repository.records.write().await;
     let Some(stored) = records.iter_mut().find(|stored| {
         live(
@@ -519,19 +544,19 @@ async fn complete_publication(
     }) else {
         return Ok(None);
     };
+    if fence
+        .get(task_id)
+        .is_some_and(|record| record.deletion_job_id.is_some())
+    {
+        return Ok(None);
+    }
     stored.task.status = VerificationTaskStatus::Completed;
     stored.task.completed_at = Some(now);
     stored.claimed_by = None;
     stored.claim_token = None;
     stored.claim_expires_at = None;
     stored.next_attempt_at = None;
-    if let Some(record) = repository
-        .deletion_fence
-        .records
-        .write()
-        .await
-        .get_mut(task_id)
-    {
+    if let Some(record) = fence.get_mut(task_id) {
         record.status = VerificationTaskStatus::Completed;
         record.entitlement_publication_claim_token = None;
     }
@@ -575,5 +600,184 @@ fn terminalize(
 fn invalid_state(message: impl Into<String>) -> ApplicationError {
     ApplicationError::InvalidVerificationTaskState {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use locks_core::ids::{LockHash, LockId, PubkyLockResource};
+    use locks_core::lock_policy::PaymentPolicyV2;
+    use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
+
+    use super::*;
+    use crate::application::models::{
+        BitcoinOutpointV2, PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2,
+        PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2,
+    };
+    use crate::application::payment_v2_reducer::reduce_payment_snapshot;
+
+    const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+    const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
+    const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+
+    fn request() -> AdmitPaymentTask {
+        let creator = CreatorPubky::from_str(CREATOR).unwrap();
+        let hash = LockHash::from_bytes([7; 32]);
+        let resource = PubkyLockResource::from_str(&format!(
+            "{CREATOR}/pub/app.locks/{}.json",
+            LockId::from_hash(hash)
+        ))
+        .unwrap();
+        AdmitPaymentTask {
+            task_id: TaskId::from_str("123e4567-e89b-42d3-a456-426614174021").unwrap(),
+            submitted_proof_bundle: SubmittedProofBundleV2 {
+                version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                bundle_id: BundleId::from_str(BUNDLE).unwrap(),
+                pubky_lock_resource: resource,
+                reader_pubky: Some(CreatorPubky::from_str(READER).unwrap()),
+            },
+            lock_hash: [7; 32],
+            payment: PaymentPolicyV2 {
+                recipient_pubky: creator,
+                amount: "50000".to_owned(),
+                asset: "BTC".to_owned(),
+                minimum_confirmations: 1,
+            },
+            verification_window_seconds: 300,
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_snapshot_fences_retry_before_it_can_mutate_frozen_state() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let repository = InMemoryPaymentTaskRepository::with_deletion_fence(fence.clone());
+        let admitted = repository.admit_payment_task(request()).await.unwrap();
+        let now = repository.now();
+        let claimed = repository
+            .claim_next_payment_task("worker", now, now + time::Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        fence
+            .records
+            .write()
+            .await
+            .get_mut(&admitted.task_id)
+            .unwrap()
+            .deletion_job_id = Some(uuid::Uuid::new_v4());
+
+        let mut progressed = claimed.task.snapshot;
+        progressed.as_v1_mut().next_due_at = Some(now + time::Duration::seconds(5));
+        assert!(
+            repository
+                .schedule_payment_task_retry(
+                    &admitted.task_id,
+                    "worker",
+                    &claimed.claim_token,
+                    now,
+                    0,
+                    progressed,
+                    now + time::Duration::seconds(5),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stored = repository
+            .get_payment_task_by_handle(
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, VerificationTaskStatus::InProgress);
+        assert_eq!(stored.evaluator_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_snapshot_fences_publication_before_external_action() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let repository = InMemoryPaymentTaskRepository::with_deletion_fence(fence.clone());
+        let admitted = repository.admit_payment_task(request()).await.unwrap();
+        let now = repository.now();
+        let claimed = repository
+            .claim_next_payment_task("worker", now, now + time::Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut snapshot = claimed.task.snapshot;
+        let state = snapshot.as_v1_mut();
+        let accepted = state.accepted_at;
+        let deadline = state.deadline_at;
+        state
+            .apply_create_response(
+                accepted + time::Duration::seconds(1),
+                accepted + time::Duration::seconds(60),
+                deadline,
+            )
+            .unwrap();
+        let sample = PaymentSampleV2 {
+            observed_at: accepted + time::Duration::seconds(2),
+            status: PaymentSampleStatusV2::Confirmed,
+            outpoint: Some(BitcoinOutpointV2 {
+                txid: "ab".repeat(32),
+                vout: 1,
+            }),
+            confirmations: 1,
+            amount_matched: true,
+        };
+        state
+            .apply_status(PaymentProviderStatus {
+                creator: state.creator.clone(),
+                bundle_id: state.bundle_id.clone(),
+                request_state: PaymentRequestStateV2::Accepted,
+                payment_state: PaymentStateV2::Detected,
+                invoice_created_at: accepted + time::Duration::seconds(1),
+                proposal_expires_at: accepted + time::Duration::seconds(60),
+                deadline,
+                asset: PaymentAssetV2::Btc,
+                minimum_confirmations: 1,
+                current_sample: Some(sample.clone()),
+                first_threshold_satisfied: Some(sample.clone()),
+            })
+            .unwrap();
+        reduce_payment_snapshot(state, sample.observed_at).unwrap();
+        let publishing = repository
+            .persist_claimed_payment_snapshot(
+                &admitted.task_id,
+                "worker",
+                &claimed.claim_token,
+                now,
+                0,
+                snapshot,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let publication_token = publishing.entitlement_publication_token.unwrap();
+        fence
+            .records
+            .write()
+            .await
+            .get_mut(&admitted.task_id)
+            .unwrap()
+            .deletion_job_id = Some(uuid::Uuid::new_v4());
+
+        assert!(
+            repository
+                .acquire_payment_publication_action(
+                    &admitted.task_id,
+                    "worker",
+                    &claimed.claim_token,
+                    1,
+                    publication_token,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -6,17 +6,17 @@ The deterministic payment-only-v2 verification surface is:
 ./scripts/test-payment-only-v2-compose.sh
 ```
 
-It starts the isolated `locks-payment-only-v2-e2e` Compose project with PostgreSQL 16, a deterministic fake provider-v2 HTTP service, and the `locks-e2e` Rust test container. The runner always removes the project and its disposable database volume before and after a run.
+It starts isolated `locks-payment-only-v2-e2e` Compose project with PostgreSQL 16, deterministic fake provider-v2 HTTP service, actual `locks-server` process, plus `locks-e2e` driver. Each of two fresh rounds removes disposable state, starts Lock Server, admits payment work into shared PostgreSQL, observes lifecycle through Lock Server HTTP API, restarts Lock Server, then verifies terminal state and provider call counts remain unchanged.
 
-The Rust E2E uses the production signed `PaykitHttpClient`, `PaymentVerificationWorker`, and `PostgresPaymentTaskRepository`. It verifies:
+Protocol-real server path verifies:
 
+- released Lock Server binary composes PostgreSQL migrations, signed provider client, durable payment worker, HTTP health, and lifecycle lookup;
 - provider-v2 `POST /v2/invoices` and `POST /v2/invoices/status` are each called once with signed requests;
-- the Locks-owned 60-second deadline is preserved by create and status responses;
-- the PostgreSQL repository and worker can be reconstructed between create and status;
-- threshold evidence observed exactly at the deadline remains timely when the HTTP response completes after the deadline;
-- a reorged current sample can return to `undetected` while immutable first-threshold evidence remains sticky and publishes a payment entitlement;
-- replay of the completed admission does not call the provider again; and
-- two fresh rounds produce the same terminal state, evaluator revision, and provider call counts.
+- provider rejection maps to durable `expired / payment_request_rejected` lifecycle;
+- actual service restart preserves terminal lifecycle and does not repeat provider calls; and
+- two clean rounds produce same terminal lifecycle and call counts.
+
+Separate Rust E2E in same target uses production signed `PaykitHttpClient`, `PaymentVerificationWorker`, and `PostgresPaymentTaskRepository` directly. It verifies exact-deadline response completion, repository/worker reconstruction, sticky first-threshold evidence across current-sample reorg, entitlement publication, replay, and deterministic repeated rounds.
 
 The fake provider is intentionally protocol-focused: it validates JSON framing, echoes immutable request bindings, records signature-header presence, and emits deterministic create/status evidence. It does not validate signature cryptography or emulate Bitcoin consensus. Signature implementation has separate client tests; this surface proves the production client actually signs both composed requests.
 

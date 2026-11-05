@@ -83,6 +83,96 @@ struct RoundSummary {
 }
 
 #[tokio::test]
+async fn payment_only_v2_server_compose_uses_http_and_persists_across_restart() {
+    let database_url =
+        std::env::var("TEST_DATABASE_URL").expect("Compose E2E requires TEST_DATABASE_URL");
+    let provider_url = std::env::var("PAYMENT_V2_FAKE_PROVIDER_URL")
+        .expect("Compose E2E requires PAYMENT_V2_FAKE_PROVIDER_URL");
+    let server_url = std::env::var("PAYMENT_V2_LOCKS_SERVER_URL")
+        .expect("Compose E2E requires PAYMENT_V2_LOCKS_SERVER_URL");
+    let phase = std::env::var("PAYMENT_V2_E2E_PHASE").expect("Compose E2E requires phase");
+    let http = reqwest::Client::new();
+    wait_for_server(&http, &server_url).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await
+        .unwrap();
+
+    if phase == "seed" {
+        sqlx::query("TRUNCATE verification_tasks CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        http.post(format!("{provider_url}/reset"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        PostgresPaymentTaskRepository::new(pool.clone())
+            .admit_payment_task(admission(TASK))
+            .await
+            .unwrap();
+    } else {
+        assert_eq!(phase, "verify");
+    }
+
+    let lifecycle = wait_for_terminal_lifecycle(&http, &server_url).await;
+    assert_eq!(lifecycle["status"], "expired");
+    assert_eq!(lifecycle["terminal_reason"], "payment_request_rejected");
+    let observations: Value = http
+        .get(format!("{provider_url}/observations"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(observations["create_calls"], 1);
+    assert_eq!(observations["status_calls"], 1);
+    assert_eq!(observations["signed_create"], true);
+    assert_eq!(observations["signed_status"], true);
+    pool.close().await;
+}
+
+async fn wait_for_server(http: &reqwest::Client, server_url: &str) {
+    for _ in 0..240 {
+        if http
+            .get(format!("{server_url}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("Lock Server did not become healthy");
+}
+
+async fn wait_for_terminal_lifecycle(http: &reqwest::Client, server_url: &str) -> Value {
+    for _ in 0..120 {
+        if let Ok(response) = http
+            .post(format!("{server_url}/verification-task-lookups"))
+            .json(&serde_json::json!({"creator": CREATOR, "bundle_id": BUNDLE}))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let body: Value = response.json().await.unwrap();
+            if body["status"] == "expired" {
+                return body;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("payment lifecycle did not terminalize through Lock Server");
+}
+
+#[tokio::test]
 async fn payment_only_v2_compose_is_deadline_exact_restart_safe_and_repeatable() {
     let database_url =
         std::env::var("TEST_DATABASE_URL").expect("Compose E2E requires TEST_DATABASE_URL");

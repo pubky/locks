@@ -291,12 +291,11 @@ impl PaymentVerificationWorker {
             }
             PaymentProviderErrorKind::Retryable => {
                 let state = snapshot_v1_mut(&mut snapshot);
+                let failure_at = observed_at.min(state.deadline_at);
                 state.operational_failure_count = state.operational_failure_count.saturating_add(1);
                 state.operational_failure_total = state.operational_failure_total.saturating_add(1);
-                state
-                    .operational_first_failure_at
-                    .get_or_insert(observed_at);
-                state.operational_last_failure_at = Some(observed_at);
+                state.operational_first_failure_at.get_or_insert(failure_at);
+                state.operational_last_failure_at = Some(failure_at);
                 state.operational_last_category = Some(PaymentOperationalErrorCategory::Transport);
                 if observed_at >= state.deadline_at {
                     reduce_payment_snapshot(state, observed_at).map_err(invalid_snapshot)?;
@@ -692,6 +691,48 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retryable_create_error_completing_after_deadline_terminalizes_durably() {
+        let complete_at = DEADLINE + time::Duration::milliseconds(1);
+        let clock = Arc::new(MutableClock(Mutex::new(ACCEPTED)));
+        let repository = repository_with_clock(clock.clone());
+        let admitted = admit(&repository).await;
+        let provider = Arc::new(CreateProvider {
+            response: Err(PaymentProviderError {
+                kind: PaymentProviderErrorKind::Retryable,
+                retry_after_seconds: None,
+            }),
+            clock: clock.clone(),
+            complete_at: Some(complete_at),
+            create_calls: AtomicUsize::new(0),
+        });
+
+        assert_eq!(
+            worker(repository.clone(), provider, clock)
+                .run_once()
+                .await
+                .unwrap(),
+            PaymentWorkerTick::Terminal(admitted.task_id)
+        );
+        let persisted = repository
+            .get_payment_task_by_handle(
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, VerificationTaskStatus::Failed);
+        assert_eq!(
+            persisted.snapshot.as_v1().root,
+            PaymentRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+        );
+        assert_eq!(
+            persisted.snapshot.as_v1().operational_last_failure_at,
+            Some(DEADLINE)
+        );
     }
 
     #[tokio::test]

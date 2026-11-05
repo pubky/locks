@@ -70,6 +70,9 @@ impl PaymentPublicationActionGuard for PostgresPaymentPublicationActionGuard {
                AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp()
                AND evaluator_revision=$4 AND entitlement_to_publish IS NOT NULL
                AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
                AND NOT EXISTS (SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id)
              RETURNING {COLUMNS}"
         )).bind(&self.task_id).bind(&self.worker_id).bind(self.claim_token).bind(self.expected_revision).bind(self.publication_token)
@@ -198,6 +201,9 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
             "WITH candidate AS MATERIALIZED (
                SELECT task_id FROM verification_tasks
                WHERE evaluator_mode='payment' AND evaluator_snapshot IS NOT NULL AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
                  AND (
                    (evaluator_snapshot->'root'->>'status'='pending' AND ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=clock_timestamp())) OR (status='in_progress' AND claim_expires_at<=clock_timestamp())))
                    OR (evaluator_snapshot->'root'->>'status'='satisfied' AND status='publishing_entitlement' AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) AND (next_attempt_at IS NULL OR next_attempt_at<=clock_timestamp()))
@@ -232,7 +238,10 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
         let current = sqlx::query_as::<_, PaymentTaskRow>(&format!(
-            "SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL FOR UPDATE"
+            "SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') FOR UPDATE"
         )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
         let Some(current) = current else {
             tx.rollback().await.map_err(storage_error)?;
@@ -289,6 +298,9 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         let row=sqlx::query_as::<_,PaymentTaskRow>(&format!(
             "UPDATE verification_tasks SET evaluator_snapshot=$5,evaluator_revision=evaluator_revision+1,status=$6,terminal_reason=$7,failure_message=NULL,completed_at=CASE WHEN $8 THEN NULL ELSE $4 END,entitlement_to_publish=$9,entitlement_publication_claim_token=$10,claimed_by=CASE WHEN $8 THEN claimed_by ELSE NULL END,claim_token=CASE WHEN $8 THEN claim_token ELSE NULL END,claim_expires_at=CASE WHEN $8 THEN claim_expires_at ELSE NULL END,next_attempt_at=NULL,updated_at=$4
              WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$11 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
              RETURNING {COLUMNS}"
         )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(database_now).bind(snapshot_json).bind(status).bind(reason).bind(retain).bind(entitlement).bind(token).bind(expected)
           .fetch_optional(&mut *tx).await.map_err(storage_error)?;
@@ -313,7 +325,10 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         let expected = i64::try_from(expected_revision)
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let current=sqlx::query_as::<_,PaymentTaskRow>(&format!("SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL FOR UPDATE"))
+        let current=sqlx::query_as::<_,PaymentTaskRow>(&format!("SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') FOR UPDATE"))
             .bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
         let Some(current) = current else {
             tx.rollback().await.map_err(storage_error)?;
@@ -333,7 +348,10 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
             .map_err(storage_error)?;
         let due = (now + delay).min(snapshot.as_v1().deadline_at);
         let value = snapshot.to_json().map_err(snapshot_error)?;
-        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET evaluator_snapshot=$5,evaluator_revision=evaluator_revision+1,status='pending',started_at=NULL,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=$6,updated_at=$4 WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$7 AND deletion_job_id IS NULL RETURNING {COLUMNS}"))
+        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET evaluator_snapshot=$5,evaluator_revision=evaluator_revision+1,status='pending',started_at=NULL,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=$6,updated_at=$4 WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$7 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') RETURNING {COLUMNS}"))
             .bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(now).bind(value).bind(due).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
         tx.commit().await.map_err(storage_error)?;
         row.map(row_to_task).transpose()
@@ -345,7 +363,7 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
     ) -> Result<bool, ApplicationError> {
-        let result=sqlx::query("UPDATE verification_tasks SET status=CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN 'pending' ELSE status END,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND claimed_by=$2 AND claim_token=$3").bind(task_id.to_string()).bind(worker_id).bind(claim_token).execute(&self.pool).await.map_err(storage_error)?;
+        let result=sqlx::query("UPDATE verification_tasks SET status=CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN 'pending' ELSE status END,started_at=CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN NULL ELSE started_at END,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND claimed_by=$2 AND claim_token=$3 AND deletion_job_id IS NULL AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r WHERE r.creator=verification_tasks.creator AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id)").bind(task_id.to_string()).bind(worker_id).bind(claim_token).execute(&self.pool).await.map_err(storage_error)?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -374,7 +392,10 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
             .await
             .map_err(storage_error)?;
         let mut connection = pooled.detach();
-        let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id))").bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).bind(publication_token).fetch_one(&mut connection).await.map_err(storage_error)?;
+        let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id))").bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).bind(publication_token).fetch_one(&mut connection).await.map_err(storage_error)?;
         if !live {
             connection.close().await.map_err(storage_error)?;
             return Ok(None);
@@ -400,7 +421,10 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
         let expected = i64::try_from(expected_revision)
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
-        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET status='completed',completed_at=clock_timestamp(),claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=NULL,entitlement_publication_claim_token=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND entitlement_to_publish IS NOT NULL AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id) RETURNING {COLUMNS}" )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).bind(publication_token).fetch_optional(&self.pool).await.map_err(storage_error)?;
+        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET status='completed',completed_at=clock_timestamp(),claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=NULL,entitlement_publication_claim_token=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND entitlement_to_publish IS NOT NULL AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
+                 WHERE r.creator=verification_tasks.creator
+                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id) RETURNING {COLUMNS}" )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).bind(publication_token).fetch_optional(&self.pool).await.map_err(storage_error)?;
         row.map(row_to_task).transpose()
     }
 }
@@ -499,7 +523,11 @@ mod tests {
     use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
 
     use super::*;
-    use crate::application::models::VerificationTaskStatus;
+    use crate::application::models::{
+        BitcoinOutpointV2, PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2,
+        PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2, VerificationTaskStatus,
+    };
+    use crate::application::payment_v2_reducer::reduce_payment_snapshot;
     use crate::application::ports::{PaymentTaskClaimer, PaymentTaskRepository};
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -579,6 +607,173 @@ mod tests {
             .unwrap();
         assert_eq!(progressed_replay.task_id, first.task_id);
         assert_eq!(progressed_replay.evaluator_revision, 1);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_force_receipt_fences_payment_claims_and_retry_transitions() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let admitted = repository
+            .admit_payment_task(request("123e4567-e89b-42d3-a456-426614174011"))
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let claimed = repository
+            .claim_next_payment_task("worker", now, now + time::Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = claimed.task.snapshot.as_v1();
+        sqlx::query(
+            "INSERT INTO content_lock_force_deletion_receipts(creator,lock_id,forced_at,completed_at) VALUES($1,$2,clock_timestamp(),clock_timestamp())",
+        )
+        .bind(snapshot.creator.to_string())
+        .bind(snapshot.pubky_lock_resource.lock_id().to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let mut progressed = claimed.task.snapshot.clone();
+        progressed.as_v1_mut().next_due_at = Some(now + time::Duration::seconds(5));
+        assert!(
+            repository
+                .schedule_payment_task_retry(
+                    &admitted.task_id,
+                    "worker",
+                    &claimed.claim_token,
+                    now,
+                    0,
+                    progressed,
+                    now + time::Duration::seconds(5),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        repository
+            .release_claimed_payment_task(&admitted.task_id, "worker", &claimed.claim_token)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .claim_next_payment_task("next-worker", now, now + time::Duration::seconds(30),)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_force_receipt_fences_payment_publication_acquire_and_completion() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let admitted = repository
+            .admit_payment_task(request("123e4567-e89b-42d3-a456-426614174012"))
+            .await
+            .unwrap();
+        let caller_now = time::OffsetDateTime::now_utc();
+        let claimed = repository
+            .claim_next_payment_task(
+                "worker",
+                caller_now,
+                caller_now + time::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut snapshot = claimed.task.snapshot;
+        let state = snapshot.as_v1_mut();
+        let accepted = state.accepted_at;
+        let deadline = state.deadline_at;
+        state
+            .apply_create_response(
+                accepted + time::Duration::seconds(1),
+                accepted + time::Duration::seconds(60),
+                deadline,
+            )
+            .unwrap();
+        let sample = PaymentSampleV2 {
+            observed_at: accepted + time::Duration::seconds(2),
+            status: PaymentSampleStatusV2::Detected,
+            outpoint: Some(BitcoinOutpointV2 {
+                txid: "ab".repeat(32),
+                vout: 1,
+            }),
+            confirmations: 0,
+            amount_matched: true,
+        };
+        state
+            .apply_status(PaymentProviderStatus {
+                creator: state.creator.clone(),
+                bundle_id: state.bundle_id.clone(),
+                request_state: PaymentRequestStateV2::Accepted,
+                payment_state: PaymentStateV2::Detected,
+                invoice_created_at: accepted + time::Duration::seconds(1),
+                proposal_expires_at: accepted + time::Duration::seconds(60),
+                deadline,
+                asset: PaymentAssetV2::Btc,
+                minimum_confirmations: 0,
+                current_sample: Some(sample.clone()),
+                first_threshold_satisfied: Some(sample.clone()),
+            })
+            .unwrap();
+        reduce_payment_snapshot(state, sample.observed_at).unwrap();
+        let publishing = repository
+            .persist_claimed_payment_snapshot(
+                &admitted.task_id,
+                "worker",
+                &claimed.claim_token,
+                caller_now,
+                0,
+                snapshot,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            publishing.status,
+            VerificationTaskStatus::PublishingEntitlement
+        );
+        let publication_token = publishing.entitlement_publication_token.unwrap();
+        let identity = publishing.snapshot.as_v1();
+        sqlx::query(
+            "INSERT INTO content_lock_force_deletion_receipts(creator,lock_id,forced_at,completed_at) VALUES($1,$2,clock_timestamp(),clock_timestamp())",
+        )
+        .bind(identity.creator.to_string())
+        .bind(identity.pubky_lock_resource.lock_id().to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            repository
+                .acquire_payment_publication_action(
+                    &admitted.task_id,
+                    "worker",
+                    &claimed.claim_token,
+                    1,
+                    publication_token,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .complete_claimed_payment_publication(
+                    &admitted.task_id,
+                    "worker",
+                    &claimed.claim_token,
+                    caller_now,
+                    1,
+                    publication_token,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         database.cleanup().await;
     }
 }

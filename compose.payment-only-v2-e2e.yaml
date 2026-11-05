@@ -1,6 +1,6 @@
 name: locks-payment-only-v2-e2e
 
-x-payment-only-v2-contract: payment-only-v2-e2e-contract-v1
+x-payment-only-v2-contract: payment-only-v2-e2e-contract-v2
 
 services:
   postgres:
@@ -22,6 +22,9 @@ services:
     working_dir: /workspace
     volumes:
       - ./scripts/payment-v2-e2e-fake-provider.py:/workspace/fake-provider.py:ro
+    environment:
+      PAYMENT_V2_FAKE_PORT: "3001"
+      PAYMENT_V2_FAKE_MODE: terminal-rejected
     command: ["python", "/workspace/fake-provider.py"]
     healthcheck:
       test:
@@ -29,11 +32,35 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18082/healthz', timeout=1)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3001/healthz', timeout=1)",
         ]
       interval: 1s
       timeout: 2s
       retries: 30
+
+  locks-server:
+    image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
+    working_dir: /workspace
+    network_mode: service:fake-provider-v2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fake-provider-v2:
+        condition: service_healthy
+    environment:
+      HOME: /locks-home
+      PUBKY_LOCK_DATABASE_URL: postgres://postgres:postgres@postgres:5432/locks_payment_v2_e2e
+      PUBKY_LOCK_RUNTIME_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      CARGO_HOME: /usr/local/cargo
+      CARGO_TARGET_DIR: /cargo-target
+      RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace:ro
+      - payment-v2-cargo-registry:/usr/local/cargo/registry
+      - payment-v2-cargo-target:/cargo-target
+      - payment-v2-locks-home:/locks-home
+    command: ["cargo", "run", "--locked", "-p", "locks-server", "--bin", "locks-server"]
 
   payment-v2-e2e:
     image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
@@ -44,9 +71,12 @@ services:
         condition: service_healthy
       fake-provider-v2:
         condition: service_healthy
+      locks-server:
+        condition: service_started
     environment:
       TEST_DATABASE_URL: postgres://postgres:postgres@postgres:5432/locks_payment_v2_e2e
-      PAYMENT_V2_FAKE_PROVIDER_URL: http://127.0.0.1:18082
+      PAYMENT_V2_FAKE_PROVIDER_URL: http://127.0.0.1:3001
+      PAYMENT_V2_LOCKS_SERVER_URL: http://127.0.0.1:3000
       CARGO_HOME: /usr/local/cargo
       CARGO_TARGET_DIR: /cargo-target
       RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
@@ -64,6 +94,7 @@ services:
         "locks-e2e",
         "--test",
         "payment_only_v2_compose",
+        "payment_only_v2_server_compose_uses_http_and_persists_across_restart",
         "--",
         "--nocapture",
       ]
@@ -71,3 +102,4 @@ services:
 volumes:
   payment-v2-cargo-registry:
   payment-v2-cargo-target:
+  payment-v2-locks-home:

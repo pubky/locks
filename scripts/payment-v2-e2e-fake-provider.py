@@ -2,6 +2,7 @@
 """Deterministic fake for the payment-only-v2 provider contract."""
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -110,6 +111,25 @@ class Handler(BaseHTTPRequestHandler):
             deadline = create["deadline"]
             created = canonical_time(parse_time(deadline) - timedelta(seconds=59))
             proposal_expires = canonical_time(parse_time(deadline) - timedelta(seconds=1))
+            if os.environ.get("PAYMENT_V2_FAKE_MODE") == "terminal-rejected":
+                reply(
+                    self,
+                    200,
+                    {
+                        "creator": create["payment"]["recipient_pubky"],
+                        "bundle_id": body["bundle_id"],
+                        "request_state": "rejected",
+                        "payment_state": "undetected",
+                        "invoice_created_at": created,
+                        "proposal_expires_at": proposal_expires,
+                        "deadline": deadline,
+                        "asset": "BTC",
+                        "minimum_confirmations": create["payment"]["minimum_confirmations"],
+                        "current_sample": None,
+                        "first_threshold_satisfied": None,
+                    },
+                )
+                return
             # Current chain state has reorged to undetected, while immutable first
             # threshold evidence was observed exactly at the Locks deadline.
             reply(
@@ -147,4 +167,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("0.0.0.0", 18082), Handler).serve_forever()
+    ThreadingHTTPServer(
+        ("0.0.0.0", int(os.environ.get("PAYMENT_V2_FAKE_PORT", "18082"))), Handler
+    ).serve_forever()
