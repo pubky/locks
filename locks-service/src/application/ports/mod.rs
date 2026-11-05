@@ -13,6 +13,7 @@ mod guarded_resources;
 mod lock_policy;
 mod payment_drain;
 mod payment_drain_repository;
+mod payment_tasks;
 mod runtime;
 mod verification;
 
@@ -29,6 +30,7 @@ pub use guarded_resources::*;
 pub use lock_policy::*;
 pub use payment_drain::*;
 pub use payment_drain_repository::*;
+pub use payment_tasks::*;
 pub use runtime::*;
 pub use verification::*;
 

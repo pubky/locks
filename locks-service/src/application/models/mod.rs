@@ -6,6 +6,7 @@ mod folded_auth;
 mod frontend_session;
 mod graph0conf;
 mod guarded_resource;
+mod payment_v2;
 mod verification;
 
 pub use access::*;
@@ -16,6 +17,7 @@ pub use folded_auth::*;
 pub use frontend_session::*;
 pub use graph0conf::*;
 pub use guarded_resource::*;
+pub use payment_v2::*;
 pub use verification::*;
 
 #[cfg(test)]

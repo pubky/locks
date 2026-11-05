@@ -16,6 +16,7 @@ use locks_service::application::models::{
     FoldedAuthStateHash, FoldedAuthStatus, GrantPopKeyId, GraphTaskRecord, InvoiceAdmissionPhase,
     InvoiceAdmissionRecord, InvoiceAdmissionRetryReason, StartFoldedAuthAttempt,
 };
+use locks_service::application::ports::{AdmitPaymentTask, VerificationTaskIdGenerator};
 use locks_service::application::use_cases::complete_verification_task::{
     CompleteVerificationTaskRequest, CompleteVerificationTaskUseCase,
 };
@@ -114,6 +115,21 @@ pub(super) async fn submit_proof_bundle(
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
+    if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
+        && let Some(existing) = state
+            .payment_tasks()
+            .get_payment_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+            .await?
+    {
+        if existing.snapshot.as_v1().submitted_proof_bundle != *bundle {
+            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(GraphVerificationTaskLifecycleHttpResponse::from(&existing)),
+        )
+            .into_response());
+    }
     let creator = match &request.submitted_proof_bundle {
         SubmittedProofBundlePayload::V1(bundle) => bundle.pubky_lock_resource.creator().clone(),
         SubmittedProofBundlePayload::V2(bundle) => bundle.pubky_lock_resource.creator().clone(),
@@ -143,30 +159,7 @@ pub(super) async fn submit_proof_bundle(
     let submitted_proof_bundle = match request.submitted_proof_bundle {
         SubmittedProofBundlePayload::V1(bundle) => bundle,
         SubmittedProofBundlePayload::V2(bundle) => {
-            if let Some(origin) = headers.get(header::ORIGIN) {
-                let allowed = origin.to_str().ok().is_some_and(|origin| {
-                    state
-                        .config()
-                        .creator_authority_acquisition
-                        .grant_connect
-                        .as_ref()
-                        .is_some_and(|grant| {
-                            crate::api::routes::auth_origin_allowed(
-                                &grant.allowed_return_origins,
-                                origin,
-                            )
-                        })
-                });
-                if !allowed {
-                    let mut response = StatusCode::FORBIDDEN.into_response();
-                    response.headers_mut().insert(
-                        "x-locks-folded-auth-origin-denied",
-                        header::HeaderValue::from_static("1"),
-                    );
-                    return Ok(response);
-                }
-            }
-            return start_folded_auth(&state, bundle).await;
+            return start_v2_verification(&state, &headers, bundle).await;
         }
     };
     let use_case = SubmitProofBundleUseCase::new(
@@ -199,6 +192,91 @@ pub(super) async fn submit_proof_bundle(
         .get_invoice_admission(&task.task_id)
         .await?;
     Ok(Json(project_lifecycle_response(submitted, admission.as_ref())).into_response())
+}
+
+async fn start_v2_verification(
+    state: &AppState,
+    headers: &HeaderMap,
+    submitted: locks_core::verification::SubmittedProofBundleV2,
+) -> Result<Response, ApiError> {
+    let resource = submitted.pubky_lock_resource.clone();
+    let payload = state
+        .content_locks()
+        .get_content_lock_payload(resource.creator(), resource.content_lock_path())
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(ApiErrorCode::ContentLockNotFound, "content lock not found")
+        })?;
+    validate_content_lock_submission(
+        &payload,
+        &SubmittedProofBundlePayload::V2(submitted.clone()),
+    )
+    .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
+    let ContentLockPayload::V2(lock) = payload else {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "invalid request",
+        ));
+    };
+    match (lock.graph.as_ref(), lock.payment.as_ref()) {
+        (None, Some(payment)) => {
+            if state.paykit_http_client().is_none() {
+                return Err(ApiError::new(
+                    ApiErrorCode::PaykitNotConfigured,
+                    "paykit is not configured",
+                ));
+            }
+            let lock_hash = *lock
+                .lock_hash()
+                .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?
+                .as_bytes();
+            let task = state
+                .payment_tasks()
+                .admit_payment_task(AdmitPaymentTask {
+                    task_id: state.task_ids().generate_task_id().await?,
+                    submitted_proof_bundle: submitted,
+                    lock_hash,
+                    payment: payment.clone(),
+                    verification_window_seconds: lock.verification_window_seconds,
+                })
+                .await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(GraphVerificationTaskLifecycleHttpResponse::from(&task)),
+            )
+                .into_response())
+        }
+        (Some(_), None) => {
+            if let Some(origin) = headers.get(header::ORIGIN) {
+                let allowed = origin.to_str().ok().is_some_and(|origin| {
+                    state
+                        .config()
+                        .creator_authority_acquisition
+                        .grant_connect
+                        .as_ref()
+                        .is_some_and(|grant| {
+                            crate::api::routes::auth_origin_allowed(
+                                &grant.allowed_return_origins,
+                                origin,
+                            )
+                        })
+                });
+                if !allowed {
+                    let mut response = StatusCode::FORBIDDEN.into_response();
+                    response.headers_mut().insert(
+                        "x-locks-folded-auth-origin-denied",
+                        header::HeaderValue::from_static("1"),
+                    );
+                    return Ok(response);
+                }
+            }
+            start_folded_auth(state, submitted).await
+        }
+        _ => Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "invalid request",
+        )),
+    }
 }
 
 async fn start_folded_auth(
@@ -382,11 +460,20 @@ pub(super) async fn lookup_verification_task(
         let graph = state
             .graph_tasks()
             .get_graph_task_by_handle(&request.creator, &request.bundle_id)
+            .await?;
+        if let Some(graph) = graph {
+            return Ok(Json(graph_lifecycle_response(&graph)).into_response());
+        }
+        let payment = state
+            .payment_tasks()
+            .get_payment_task_by_handle(&request.creator, &request.bundle_id)
             .await?
             .ok_or(ApplicationError::MissingRecord {
                 record: "verification_task",
             })?;
-        return Ok(Json(graph_lifecycle_response(&graph)).into_response());
+        return Ok(
+            Json(GraphVerificationTaskLifecycleHttpResponse::from(&payment)).into_response(),
+        );
     };
     let admission = state
         .invoice_admissions()

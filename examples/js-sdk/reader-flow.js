@@ -159,7 +159,9 @@ export async function refreshPaykitConnectionState({
 
 export function classifyPaymentLifecycle(lifecycle) {
   const status = getField(lifecycle, 'status');
-  if (status === 'pending' || status === 'in_progress') return 'retry';
+  if (status === 'pending' || status === 'in_progress' || status === 'publishing_entitlement') {
+    return 'retry';
+  }
   if (status === 'completed') return 'completed';
   if (status === 'failed' || status === 'expired') return 'failed';
   throw new Error(`unknown lifecycle status: ${String(status)}`);

@@ -641,8 +641,8 @@ async fn insert_graph_task_tx(
     let inserted = sqlx::query(
         "INSERT INTO verification_tasks (
             task_id, creator, bundle_id, status, submitted_proof_bundle,
-            submitted_at, invoice_admission_phase, evaluator_snapshot, evaluator_revision
-         ) VALUES ($1::uuid, $2, $3, 'pending', $4, $5, 'ready', $6, 0)
+            submitted_at, invoice_admission_phase, evaluator_mode, evaluator_snapshot, evaluator_revision
+         ) VALUES ($1::uuid, $2, $3, 'pending', $4, $5, 'ready', 'graph', $6, 0)
          ON CONFLICT DO NOTHING",
     )
     .bind(task.task_id.to_string())
@@ -1504,7 +1504,7 @@ mod tests {
                 .await
                 .unwrap();
             let ordinary_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM verification_tasks WHERE evaluator_snapshot IS NULL",
+                "SELECT COUNT(*) FROM verification_tasks WHERE evaluator_mode IS NULL AND evaluator_snapshot IS NULL",
             )
             .fetch_one(database.pool())
             .await
@@ -1587,7 +1587,7 @@ mod tests {
                 .await
                 .unwrap();
             let graph_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM verification_tasks WHERE evaluator_snapshot IS NOT NULL",
+                "SELECT COUNT(*) FROM verification_tasks WHERE evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL",
             )
             .fetch_one(database.pool())
             .await

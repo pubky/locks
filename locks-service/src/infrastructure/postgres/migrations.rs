@@ -169,6 +169,7 @@ mod tests {
             "entitlement_to_publish",
         )
         .await;
+        assert_column_exists(&mut connection, "verification_tasks", "evaluator_mode").await;
         assert_column_exists(&mut connection, "verification_tasks", "evaluator_snapshot").await;
         assert_column_exists(&mut connection, "verification_tasks", "evaluator_revision").await;
         assert_column_exists(
@@ -194,6 +195,12 @@ mod tests {
             &mut connection,
             "verification_tasks",
             "verification_tasks_due_graph_idx",
+        )
+        .await;
+        assert_index_exists(
+            &mut connection,
+            "verification_tasks",
+            "verification_tasks_due_payment_idx",
         )
         .await;
         assert_column_exists(&mut connection, "creator_authorities", "auth_kind").await;
@@ -529,7 +536,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=30).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=31).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -570,13 +577,145 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=30).collect::<Vec<_>>()
+            (1..=31).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],
             before.as_slice(),
             "published migration checksums changed"
         );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn exact_0030_prefix_backfills_graph_mode_without_changing_graph_snapshots() {
+        let database = TestDatabase::create_unmigrated().await;
+        let through_0030 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(30).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        through_0030.run(database.pool()).await.unwrap();
+
+        let applied_before: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(applied_before, (1..=30).collect::<Vec<_>>());
+
+        let pending_task_id = uuid::Uuid::new_v4();
+        let terminal_task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO verification_tasks (
+                task_id, status, submitted_proof_bundle, submitted_at, creator, bundle_id,
+                evaluator_snapshot, evaluator_revision
+             ) VALUES ($1, 'pending', '{}'::jsonb, clock_timestamp(), $2, $3, $4, 7)",
+        )
+        .bind(pending_task_id)
+        .bind("graph-backfill-pending-creator")
+        .bind("graph-backfill-pending-bundle")
+        .bind(serde_json::json!({
+            "version": 1,
+            "root": {"kind": "all", "children": [{"kind": "paid"}]},
+            "observations": []
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks (
+                task_id, status, submitted_proof_bundle, submitted_at, started_at,
+                completed_at, creator, bundle_id, terminal_reason, evaluator_snapshot,
+                evaluator_revision
+             ) VALUES (
+                $1, 'expired', '{}'::jsonb, clock_timestamp(), clock_timestamp(),
+                clock_timestamp(), $2, $3, 'graph_condition_not_observed_by_deadline', $4, 11
+             )",
+        )
+        .bind(terminal_task_id)
+        .bind("graph-backfill-terminal-creator")
+        .bind("graph-backfill-terminal-bundle")
+        .bind(serde_json::json!({
+            "version": 1,
+            "root": {"kind": "any", "children": [{"kind": "paid"}]},
+            "observations": [{"kind": "payment", "observed": false}]
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let pending_before: (Vec<u8>, String, Option<String>, i64) = sqlx::query_as(
+            "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,
+                    evaluator_revision
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(pending_task_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let terminal_before: (Vec<u8>, String, Option<String>, i64) = sqlx::query_as(
+            "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,
+                    evaluator_revision
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(terminal_task_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        let applied_after: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(applied_after, (1..=31).collect::<Vec<_>>());
+
+        let pending_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
+            "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,
+                    evaluator_revision, evaluator_mode
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(pending_task_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let terminal_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
+            "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,
+                    evaluator_revision, evaluator_mode
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(terminal_task_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (
+                pending_after.0,
+                pending_after.1,
+                pending_after.2,
+                pending_after.3
+            ),
+            pending_before,
+            "0031 changed pending graph snapshot bytes or lifecycle state"
+        );
+        assert_eq!(pending_after.4, "graph");
+        assert_eq!(
+            (
+                terminal_after.0,
+                terminal_after.1,
+                terminal_after.2,
+                terminal_after.3
+            ),
+            terminal_before,
+            "0031 changed terminal graph snapshot bytes or lifecycle state"
+        );
+        assert_eq!(terminal_after.4, "graph");
+
         database.cleanup().await;
     }
 

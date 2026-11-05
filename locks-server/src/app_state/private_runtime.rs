@@ -15,8 +15,8 @@ use locks_service::application::{
         ContentLockOwnershipRepository, CreatorAuthorityManager, CreatorAuthorityStore,
         CreatorConnectFlowStore, FrontendSessionCodeStore, FrontendSessionStore,
         GrantCreatorConnectFlowClient, GraphTaskClaimer, GraphTaskRepository,
-        InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient, VerificationTaskClaimer,
-        VerificationTaskRepository,
+        InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient, PaymentTaskClaimer,
+        PaymentTaskRepository, VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
 use time::OffsetDateTime;
@@ -32,6 +32,8 @@ pub(super) struct PrivateRuntimeAdapters {
     pub(super) verification_task_claimer: Arc<dyn VerificationTaskClaimer>,
     pub(super) graph_tasks: Arc<dyn GraphTaskRepository>,
     pub(super) graph_task_claimer: Arc<dyn GraphTaskClaimer>,
+    pub(super) payment_tasks: Arc<dyn PaymentTaskRepository>,
+    pub(super) payment_task_claimer: Arc<dyn PaymentTaskClaimer>,
     pub(super) access_credentials: Arc<dyn AccessCredentialStore>,
     pub(super) creator_authorities: Arc<dyn CreatorAuthorityStore>,
     pub(super) creator_connect_flows: Arc<dyn CreatorConnectFlowStore>,

@@ -19,7 +19,7 @@ use locks_core::ids::{
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
     GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
-    LockServerConfig, PaykitPaymentAsset, SecondaryGuardedResource, VerifierType,
+    LockServerConfig, PaykitPaymentAsset, PaymentPolicyV2, SecondaryGuardedResource, VerifierType,
 };
 use locks_core::verification::{
     Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
@@ -2704,6 +2704,194 @@ async fn post_proof_bundles_returns_public_lifecycle_handle_without_task_id() {
             "submitted_proof_bundle",
             "proofs",
         ],
+    );
+}
+
+#[tokio::test]
+async fn payment_only_v2_submission_returns_accepted_redacted_lifecycle_and_lookup() {
+    let (state, bundle) = payment_only_v2_test_state().await;
+    let app = router(state);
+
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    assert_eq!(submitted.headers()[header::CACHE_CONTROL], "no-store");
+    let submitted_body = response_json(submitted).await;
+    assert_eq!(submitted_body["creator"], creator().to_string());
+    assert_eq!(submitted_body["bundle_id"], BUNDLE_ID);
+    assert_eq!(submitted_body["status"], "pending");
+    assert_placeholder_string(&submitted_body["submitted_at"], "<submitted_at>");
+    assert_placeholder_string(
+        &submitted_body["admission_deadline_at"],
+        "<admission_deadline_at>",
+    );
+    assert_json_contains_no_null(&submitted_body);
+    assert_no_keys(
+        &submitted_body,
+        &[
+            "task_id",
+            "reader",
+            "reader_pubky",
+            "pubky_lock_resource",
+            "submitted_proof_bundle",
+            "payment",
+            "snapshot",
+            "lock_hash",
+            "evaluator_revision",
+            "entitlement_to_publish",
+            "claim_token",
+        ],
+    );
+
+    let lookup = app
+        .oneshot(json_request(
+            "POST",
+            "/verification-task-lookups",
+            json!({
+                "creator": creator(),
+                "bundle_id": bundle.bundle_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(lookup.status(), StatusCode::OK);
+    assert_eq!(response_json(lookup).await, submitted_body);
+}
+
+#[tokio::test]
+async fn payment_only_v2_exact_replay_survives_content_lock_removal() {
+    let (state, bundle) = payment_only_v2_test_state().await;
+    let app = router(state.clone());
+    let request = || {
+        json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        )
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = response_json(first).await;
+
+    assert!(
+        state
+            .content_locks()
+            .delete_content_lock(
+                bundle.pubky_lock_resource.creator(),
+                bundle.pubky_lock_resource.content_lock_path(),
+            )
+            .await
+            .unwrap()
+    );
+
+    let replay = app.oneshot(request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(replay).await, first_body);
+}
+
+#[tokio::test]
+async fn payment_only_v2_changed_same_handle_submission_conflicts() {
+    let (state, bundle) = payment_only_v2_test_state().await;
+    let app = router(state);
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let changed = SubmittedProofBundleV2 {
+        reader_pubky: Some(creator()),
+        ..bundle
+    };
+    let conflict = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": changed }),
+        ))
+        .await
+        .unwrap();
+
+    assert_error_response(conflict, StatusCode::CONFLICT, "task_state_conflict").await;
+}
+
+#[tokio::test]
+async fn graph_only_v2_submission_does_not_enter_payment_task_dispatch() {
+    let (state, bundle) = folded_auth_test_state().await;
+    let response = router(state.clone())
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(response).await["status"], "auth_pending");
+    assert!(
+        state
+            .payment_tasks()
+            .get_payment_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn paykit_payment_v1_submission_does_not_enter_v2_payment_task_dispatch() {
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let (content_lock, bundle) = paykit_content_lock_and_bundle();
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    seed_content_lock(&state, content_lock).await;
+
+    let response = router(state.clone())
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["status"], "pending");
+    assert!(
+        state
+            .verification_tasks()
+            .get_verification_task_by_handle(
+                bundle.pubky_lock_resource.creator(),
+                &bundle.bundle_id,
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        state
+            .payment_tasks()
+            .get_payment_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id,)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -6894,6 +7082,54 @@ async fn folded_auth_test_state_with_runtime(
     if let Some(clock) = clock {
         state = state.with_clock(clock);
     }
+    (state, bundle)
+}
+
+async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
+    let lock = ContentLockV2 {
+        version: 2,
+        creator: creator(),
+        primary_resource: Some(
+            GuardedResource::new(
+                "/priv/app.locks/content/payment.txt",
+                GuardedResourceHash::from_bytes([4; 32]),
+                "text/plain",
+                7,
+            )
+            .unwrap(),
+        ),
+        secondary_resources: BTreeMap::new(),
+        payment: Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
+        graph: None,
+        verification_window_seconds: 300,
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 300,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: datetime!(2026-10-30 11:00:00 UTC),
+    };
+    let path = ContentLockPath::from_lock_id(lock.lock_id().unwrap());
+    let bundle = SubmittedProofBundleV2 {
+        version: 2,
+        bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+        pubky_lock_resource: PubkyLockResource::new(creator(), path.clone()),
+        reader_pubky: Some(other_creator()),
+    };
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let state = test_state().with_paykit_http_client(Some(paykit));
+    state
+        .content_locks()
+        .upsert_content_lock_payload(creator(), path, ContentLockPayload::V2(lock))
+        .await
+        .unwrap();
     (state, bundle)
 }
 

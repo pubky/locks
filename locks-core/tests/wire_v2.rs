@@ -322,6 +322,36 @@ fn content_lock_v2_presence_modes_and_payment_bounds_are_closed() {
 }
 
 #[test]
+fn payment_v2_requires_exact_btc_and_u64_amount_without_normalizing_lexeme() {
+    for amount in ["1", "0001", "18446744073709551615"] {
+        let mut policy = payment(0);
+        policy.amount = amount.to_owned();
+        let lock = content_lock_v2(Some(policy), None);
+        let decoded = serde_json::from_value::<ContentLockV2>(serde_json::to_value(lock).unwrap())
+            .expect("valid bounded BTC amount");
+        assert_eq!(decoded.payment.unwrap().amount, amount);
+    }
+
+    for asset in ["btc", "USDT", ""] {
+        let mut policy = payment(0);
+        policy.asset = asset.to_owned();
+        let lock = content_lock_v2(Some(policy), None);
+        assert!(
+            serde_json::from_value::<ContentLockV2>(serde_json::to_value(lock).unwrap()).is_err()
+        );
+    }
+
+    for amount in ["0", "000", "1.0", "+1", "18446744073709551616"] {
+        let mut policy = payment(0);
+        policy.amount = amount.to_owned();
+        let lock = content_lock_v2(Some(policy), None);
+        assert!(
+            serde_json::from_value::<ContentLockV2>(serde_json::to_value(lock).unwrap()).is_err()
+        );
+    }
+}
+
+#[test]
 fn graph_v2_cardinality_operator_duplicates_and_order_are_closed() {
     let one = content_lock_v2(None, Some(graph(vec![follows()], None)));
     assert!(serde_json::from_value::<ContentLockV2>(serde_json::to_value(one).unwrap()).is_ok());

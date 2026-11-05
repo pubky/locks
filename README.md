@@ -71,7 +71,7 @@ docker compose --file compose.paykit-local-demo.yaml up -d --build
 
 3. In production, use the production Bitkit QR/deep-link path presented by Paykit. When using the local CLI authentication fallback, run `npm --prefix examples/js-sdk ...` commands from the repository host. Do not wrap `authenticate` or `authenticate-paykit` in `docker compose exec`; those wrappers load private role state on the host and bridge only the bounded native-helper request into the demo container. The helper is supplied only by the Paykit local-demo image/runtime stage, not the normal production package/runtime. Follow the manual bearer-URL log retrieval and retention guidance in the example README.
 
-The local demo selects immutable Paykit Server revision `4cc8e7b836dba28446a8d821f593ee40bb4acbeb` and the active Locks checkout. Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`; Locks workspace uses stable Paykit Rust `0.1.0` from crates.io. Contract checks derive server release ref from canonical Compose build context. No sibling Paykit or Pubky checkout is required for source resolution. An absolute local `PAYKIT_SERVER_CONTEXT` override remains available for coordinated development. Full Paykit demo adds Paykit Server at <http://127.0.0.1:3001> and keeps reader at <http://127.0.0.1:8088/reader/>. Payment remains manual operator action.
+The local demo selects immutable Paykit Server revision `cf90f86734b616b48ce4d6c1582c0ebd37ef2080` and the active Locks checkout. Paykit Server local-demo build uses Paykit Rust `v0.1.0-rc71`; Locks workspace uses stable Paykit Rust `0.1.0` from crates.io. Contract checks derive server release ref from canonical Compose build context. No sibling Paykit or Pubky checkout is required for source resolution. An absolute local `PAYKIT_SERVER_CONTEXT` override remains available for coordinated development. Full Paykit demo adds Paykit Server at <http://127.0.0.1:3001> and keeps reader at <http://127.0.0.1:8088/reader/>. Payment remains manual operator action.
 
 For the helper-free loopback browser demo against deployed staging Locks and Paykit services:
 
@@ -86,6 +86,8 @@ This staging-specific model uses fixed deployed origins, public Pubky SDK defaul
 - [Lock Server API](docs/API.md)
 - [Lock Server Runtime](docs/RUNTIME.md)
 - [Browser SDK](docs/SDK.md)
+- [Payment-only Content Lock v2](docs/PAYMENT_ONLY_V2.md)
+- [Payment-only v2 deterministic Compose E2E](docs/PAYMENT_ONLY_V2_COMPOSE_E2E.md)
 - [Domain model](docs/DOMAIN_MODEL.md)
 - [Terminology](docs/THESAURUS.md)
 - [Local operator demo](docs/LOCAL_OPERATOR_DEMO.md)

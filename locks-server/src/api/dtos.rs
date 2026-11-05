@@ -11,7 +11,8 @@ use locks_core::lock_service_pointer::LockServicePointer;
 use locks_core::verification::{SatisfiedByV2, SubmittedProofBundlePayload};
 use locks_service::application::models::{
     AccessCredential, FrontendSessionCode, GraphObservationOutcome, GraphOperationalErrorCategory,
-    GraphPredicateObservation, GraphTaskRecord, VerificationTaskStatus, VerificationTerminalReason,
+    GraphPredicateObservation, GraphTaskRecord, PaymentTaskRecord, VerificationTaskStatus,
+    VerificationTerminalReason,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::{
     ExchangeFrontendSessionCodeRequest, ExchangeFrontendSessionCodeResponse,
@@ -230,6 +231,24 @@ pub struct GraphVerificationTaskLifecycleHttpResponse {
 
 impl From<&GraphTaskRecord> for GraphVerificationTaskLifecycleHttpResponse {
     fn from(task: &GraphTaskRecord) -> Self {
+        let snapshot = task.snapshot.as_v1();
+        let terminal_reason = (snapshot.root.terminal_status() == Some(task.status))
+            .then(|| snapshot.root.terminal_reason())
+            .flatten();
+        Self {
+            creator: snapshot.creator.clone(),
+            bundle_id: snapshot.bundle_id.clone(),
+            status: task.status,
+            submitted_at: snapshot.accepted_at,
+            completed_at: task.completed_at,
+            admission_deadline_at: snapshot.deadline_at,
+            terminal_reason,
+        }
+    }
+}
+
+impl From<&PaymentTaskRecord> for GraphVerificationTaskLifecycleHttpResponse {
+    fn from(task: &PaymentTaskRecord) -> Self {
         let snapshot = task.snapshot.as_v1();
         let terminal_reason = (snapshot.root.terminal_status() == Some(task.status))
             .then(|| snapshot.root.terminal_reason())

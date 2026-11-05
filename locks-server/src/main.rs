@@ -8,6 +8,7 @@ use locks_server::deletion_worker::{
 use locks_server::folded_auth_cleanup::{FOLDED_AUTH_CLEANUP_INTERVAL, FoldedAuthCleanupWorker};
 use locks_server::graph_worker::{GraphVerificationWorker, OsGraphRetryJitter};
 use locks_server::nexus_http_client::NexusHttpClient;
+use locks_server::payment_worker::PaymentVerificationWorker;
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{
     InitialStartupOutcome, RuntimeTasks, ShutdownFuture, bind_listener_then_run_initial,
@@ -134,6 +135,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             paykit.as_ref(),
                             &invoice_jitter,
                         );
+                        let payment = PaymentVerificationWorker::new(
+                            worker_state.payment_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
+                            paykit.clone(),
+                            worker_state.clock().clone(),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
                         let graph = GraphVerificationWorker::new(
                             worker_state.graph_task_claimer().clone(),
                             worker_state.entitlements().clone(),
@@ -151,6 +162,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 worker_state.worker_readiness(),
                             ),
                             invoice.run_until_shutdown(context.shutdown()),
+                            payment.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms
+                                ),
+                            ),
                             graph.run_until_shutdown(
                                 context.shutdown(),
                                 Duration::from_millis(
@@ -168,12 +185,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             paykit.as_ref(),
                             &jitter,
                         );
+                        let payment = PaymentVerificationWorker::new(
+                            worker_state.payment_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
+                            paykit.clone(),
+                            worker_state.clock().clone(),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
                         tokio::try_join!(
                             verification.run_until_shutdown_with_readiness(
                                 context.shutdown(),
                                 worker_state.worker_readiness(),
                             ),
                             invoice.run_until_shutdown(context.shutdown()),
+                            payment.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms
+                                ),
+                            ),
                         )
                         .map(|_| ())
                         .map_err(anyhow::Error::from)
