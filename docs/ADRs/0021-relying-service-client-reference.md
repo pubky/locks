@@ -41,6 +41,8 @@ The relying service can only tell these cases apart with a value it mints itself
 
 A relying service accepts a `completed` task for one of its objects only when `client_reference` equals the value it minted for that object and `pubky_lock_resource` and `criterion_ids` equal the terms it expects. An absent `client_binding` never matches.
 
+The relying service mints each reference from a cryptographically secure random source with at least 128 bits of entropy, one per business object, never reused for another object, and free of personal data, credentials and meaningful business detail. Locks does not enforce this: it cannot tell a random value from a meaningful one. The lifecycle lookup echoes the reference to anyone holding `{ creator, bundle_id }`, so a predictable or reused reference weakens the binding, and a meaningful one leaks that detail if a bundle ID is exposed.
+
 ### SDK and rollout
 
 - SDK response parsers ignore unknown fields while still rejecting secret-bearing ones, and that release ships before any server that returns `client_binding`.

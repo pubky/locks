@@ -599,6 +599,15 @@ For non-payment verifier types, `reader_public_key` may be omitted. For `paykit-
 
 `client_reference` is an optional top-level field on `submitted_proof_bundle`: an opaque value a relying service mints for one of its own business objects (for example one payment) and asks the reader to carry. It is 1 to 64 bytes of UTF-8 without control characters; anything else is `400 invalid_request`. Locks stores it verbatim and never interprets it. Bundles without it behave as before. Fixtures: `locks-server/tests/fixtures/viewer_access/submit_proof_bundle_with_client_reference_request.json` and `submit_proof_bundle_with_client_reference_response_shape.json`.
 
+Locks does not check how a reference was made, so the relying service must:
+
+- mint each reference from a cryptographically secure random source, with at least 128 bits of entropy (for example 32 random bytes, base64url-encoded);
+- mint one reference per business object and never reuse it for another object;
+- keep it free of personal data, credentials and meaningful business detail (no order numbers, amounts, emails or names);
+- store it with the object it was minted for and compare it exactly.
+
+The lifecycle lookup echoes the reference to anyone holding `{ creator, bundle_id }`. A predictable or reused reference weakens the binding it exists for, and a meaningful one leaks that detail if a bundle ID is exposed.
+
 Submission processing applies rate limiting, then checks permanent lifecycle identity `{ creator, bundle_id }`. Changed submitted proof material, including a changed, added, or removed `client_reference`, returns `409 task_state_conflict`; exact persisted replays return the existing lifecycle without depending on mutable current lock state. New submissions validate proof shape, load the current canonical content lock referenced by `pubky_lock_resource`, verify its lock identity and payment policy (including recipient/creator equality), then atomically persist a pending verification task plus immutable invoice-admission intent. The intent includes `payment_in` copied from the validated canonical `paykit-payment` criterion and is stored before any Reader homeserver or Paykit I/O. The response returns that pending lifecycle immediately; browser clients poll it and must not resubmit to drive invoice creation.
 
 A claimed background worker sends the persisted body below to Paykit `POST /invoices`, using the task UUID as stable `X-Request-ID` for exact Paykit replay after an ambiguous response or process restart:
