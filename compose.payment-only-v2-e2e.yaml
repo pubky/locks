@@ -61,6 +61,11 @@ services:
       - payment-v2-cargo-target:/cargo-target
       - payment-v2-locks-home:/locks-home
     command: ["cargo", "run", "--locked", "-p", "locks-server", "--bin", "locks-server"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/healthz"]
+      interval: 1s
+      timeout: 2s
+      retries: 600
 
   payment-v2-e2e:
     image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
@@ -72,7 +77,7 @@ services:
       fake-provider-v2:
         condition: service_healthy
       locks-server:
-        condition: service_started
+        condition: service_healthy
     environment:
       TEST_DATABASE_URL: postgres://postgres:postgres@postgres:5432/locks_payment_v2_e2e
       PAYMENT_V2_FAKE_PROVIDER_URL: http://127.0.0.1:3001
