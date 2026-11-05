@@ -14,7 +14,8 @@ use crate::application::{
     models::{
         AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
         ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
-        ContentLockDeletionState, ForceDeletionReceipt, PrepareForceDeletionResult,
+        ContentLockDeletionState, ForceDeletionReceipt, PaymentRootState,
+        PrepareForceDeletionResult, VerificationTerminalReason,
     },
     ports::{
         ContentLockDeletionRepository, PublicationRecovery, publication_guarded_paths,
@@ -923,10 +924,26 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 "deletion drain cannot classify a frozen obligation",
             ));
         }
+        let deleted_payment_root = serde_json::to_value(PaymentRootState::Expired(
+            VerificationTerminalReason::ContentLockDeleted,
+        ))
+        .map_err(storage_display)?;
         sqlx::query(
             "UPDATE verification_tasks AS task
              SET status = 'expired', started_at = COALESCE(started_at, $2), completed_at = $2,
                  failure_message = NULL, terminal_reason = 'content_lock_deleted',
+                 evaluator_snapshot = CASE
+                     WHEN task.evaluator_mode = 'payment' THEN jsonb_set(
+                         task.evaluator_snapshot,
+                         '{root}',
+                         $3
+                     )
+                     ELSE task.evaluator_snapshot
+                 END,
+                 evaluator_revision = CASE
+                     WHEN task.evaluator_mode = 'payment' THEN task.evaluator_revision + 1
+                     ELSE task.evaluator_revision
+                 END,
                  claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
                  entitlement_publication_claim_token = NULL, next_attempt_at = NULL,
                  last_attempt_error = NULL, updated_at = $2
@@ -939,6 +956,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         )
         .bind(job_id)
         .bind(now)
+        .bind(deleted_payment_root)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -1868,11 +1886,13 @@ mod tests {
         },
         lock_policy::{
             AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
-            GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, VerifierType,
+            GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, PaymentPolicyV2,
+            VerifierType,
         },
         verification::{
             CriterionVerificationResult, EntitlementLifetime, Proof,
-            SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, VERIFIED_PROOF_BUNDLE_VERSION,
+            SUBMITTED_PROOF_BUNDLE_V2_VERSION, SUBMITTED_PROOF_BUNDLE_VERSION,
+            SubmittedProofBundle, SubmittedProofBundleV2, VERIFIED_PROOF_BUNDLE_VERSION,
             VerificationResult, VerifiedProofBundle,
         },
     };
@@ -1893,18 +1913,19 @@ mod tests {
                 ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
                 ContentLockOwnershipStatus, GraphRootState, GraphTaskRecord, GraphTaskSnapshot,
                 GraphTaskSnapshotV1, InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
-                PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
+                PaymentRootState, PrepareForceDeletionResult, VerificationTaskRecord,
+                VerificationTaskStatus, VerificationTerminalReason,
             },
             ports::{
-                AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
-                ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-                ContentLockDeletionRepository, ContentLockOwnershipRepository,
-                EntitlementRepository, GraphTaskClaimer, GraphTaskRepository,
-                InvoiceAdmissionRepository, PaymentDrainCleanupToken, PaymentDrainClient,
-                PaymentDrainClientError, PaymentDrainRepository, PaymentDrainStatus,
-                PaymentDrainSummary, PaymentDrainTerminalTransition, PaymentRequestState,
-                PaymentRequestStatus, PaymentState, VerificationTaskClaimer,
-                VerificationTaskRepository,
+                AccessCredentialStore, AdmitPaymentTask, Clock,
+                ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
+                ContentLockDeletionActionOwnership, ContentLockDeletionRepository,
+                ContentLockOwnershipRepository, EntitlementRepository, GraphTaskClaimer,
+                GraphTaskRepository, InvoiceAdmissionRepository, PaymentDrainCleanupToken,
+                PaymentDrainClient, PaymentDrainClientError, PaymentDrainRepository,
+                PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+                PaymentRequestState, PaymentRequestStatus, PaymentState, PaymentTaskRepository,
+                VerificationTaskClaimer, VerificationTaskRepository,
             },
             use_cases::drain_lock_payments::DrainLockPaymentsUseCase,
         },
@@ -1912,8 +1933,9 @@ mod tests {
         infrastructure::postgres::{
             PostgresAccessCredentialStore, PostgresContentLockDeletionActionOwnership,
             PostgresContentLockOwnershipRepository, PostgresGraphTaskRepository,
-            PostgresPaymentDrainRepository, PostgresVerificationTaskClaimer,
-            PostgresVerificationTaskRepository, testing::TestDatabase,
+            PostgresPaymentDrainRepository, PostgresPaymentTaskRepository,
+            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
+            testing::TestDatabase,
         },
     };
 
@@ -5154,6 +5176,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_paykit_drain_keeps_deleted_payment_task_readable_by_handle() {
+        let (database, payments, request, admitted) = deleted_pending_payment_task().await;
+
+        let stored = payments
+            .get_payment_task_by_handle(
+                admitted.snapshot.as_v1().pubky_lock_resource.creator(),
+                &admitted.snapshot.as_v1().bundle_id,
+            )
+            .await
+            .expect("deleted payment lifecycle remains readable")
+            .expect("deleted payment lifecycle remains present");
+
+        assert_eq!(stored.status, VerificationTaskStatus::Expired);
+        assert_eq!(
+            stored.snapshot.as_v1().root,
+            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
+        );
+        assert_eq!(stored.evaluator_revision, 1);
+        assert_eq!(stored.task_id, admitted.task_id);
+        assert_eq!(
+            request.submitted_proof_bundle,
+            stored.snapshot.as_v1().submitted_proof_bundle
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn no_paykit_drain_replays_exact_deleted_payment_submission() {
+        let (database, payments, request, admitted) = deleted_pending_payment_task().await;
+
+        let replay = payments
+            .admit_payment_task(request)
+            .await
+            .expect("exact deleted payment submission replays its lifecycle");
+
+        assert_eq!(replay.task_id, admitted.task_id);
+        assert_eq!(replay.status, VerificationTaskStatus::Expired);
+        assert_eq!(
+            replay.snapshot.as_v1().root,
+            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
+        );
+        assert_eq!(replay.evaluator_revision, 1);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn no_paykit_drain_expires_claimed_graph_task_and_preserves_readable_lifecycle() {
         let database = TestDatabase::create().await;
         let lock = content_lock();
@@ -6071,6 +6139,68 @@ mod tests {
             crate::infrastructure::final_credentials::FinalCredentialCipher::new([9; 32]),
         );
         (job, task, access, final_access_started_at)
+    }
+
+    async fn deleted_pending_payment_task() -> (
+        TestDatabase,
+        PostgresPaymentTaskRepository,
+        AdmitPaymentTask,
+        crate::application::models::PaymentTaskRecord,
+    ) {
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let payments = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let request = payment_task_request(&lock);
+        let admitted = payments.admit_payment_task(request.clone()).await.unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let deletions = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        deletions.insert_job(job.clone()).await.unwrap();
+        let claim_token = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE content_lock_deletion_jobs
+             SET phase = 'drain_payments', state = 'running', claimed_by = 'worker',
+                 claim_token = $2, claim_expires_at = $3
+             WHERE job_id = $1",
+        )
+        .bind(job.job_id)
+        .bind(claim_token)
+        .bind(database_now(&database).await + time::Duration::minutes(5))
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            deletions
+                .expire_unresolved_non_paykit_tasks(job.job_id, "worker", claim_token)
+                .await
+                .unwrap()
+        );
+        (database, payments, request, admitted)
+    }
+
+    fn payment_task_request(lock: &ContentLock) -> AdmitPaymentTask {
+        let lock_hash = lock.lock_hash().unwrap();
+        AdmitPaymentTask {
+            task_id: TaskId::from_str(&Uuid::new_v4().to_string()).unwrap(),
+            submitted_proof_bundle: SubmittedProofBundleV2 {
+                version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                bundle_id: BundleId::from_bytes([62; 16]),
+                pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                    "{}/pub/app.locks/{}.json",
+                    lock.creator,
+                    lock.lock_id().unwrap()
+                ))
+                .unwrap(),
+                reader_pubky: Some(lock.creator.clone()),
+            },
+            lock_hash: *lock_hash.as_bytes(),
+            payment: PaymentPolicyV2 {
+                recipient_pubky: lock.creator.clone(),
+                amount: "1".to_owned(),
+                asset: "BTC".to_owned(),
+                minimum_confirmations: 0,
+            },
+            verification_window_seconds: 300,
+        }
     }
 
     async fn database_now(database: &TestDatabase) -> time::OffsetDateTime {
