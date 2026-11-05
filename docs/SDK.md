@@ -476,6 +476,8 @@ const lifecycle = await viewer.submitProofBundle({
 
 The reference is 1 to 64 bytes of UTF-8 without control characters; Locks stores it verbatim. It is part of the bundle's replay identity, so resubmitting the bundle ID with a different reference, or without it, returns `409 task_state_conflict`.
 
+Mint each reference from a cryptographically secure random source with at least 128 bits of entropy (for example 32 random bytes, base64url-encoded), one per business object, never reused for another object, and free of personal data, credentials and meaningful business detail such as order numbers, amounts, emails or names. The lifecycle lookup echoes it to anyone holding `{ creator, bundle_id }`, so a predictable or reused reference weakens the binding and a meaningful one leaks that detail if a bundle ID is exposed. Locks does not check any of this.
+
 Lifecycle responses for such a bundle carry `client_binding`:
 
 ```json
