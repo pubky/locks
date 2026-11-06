@@ -1,0 +1,25 @@
+{
+  "accepted_at": "2026-10-01T12:00:00Z",
+  "bundle_id": "000G40R40M30E209185GR38E1W",
+  "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+  "deadline_at": "2026-10-01T12:05:00Z",
+  "lock_hash": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+  "operator": null,
+  "predicates": [{
+    "first_true_observation": null,
+    "latest_observation": null,
+    "next_due_at": null,
+    "operational_failure_count": 0,
+    "operational_failure_total": 0,
+    "operational_first_failure_at": null,
+    "operational_last_category": null,
+    "operational_last_failure_at": null,
+    "operational_last_http_status": null,
+    "predicate": {"followed": "creator", "follower": "reader", "type": "follows"},
+    "terminal_invalid": false
+  }],
+  "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G.json",
+  "reader": "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+  "root": {"status": "pending"},
+  "schema_version": 1
+}

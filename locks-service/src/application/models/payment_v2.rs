@@ -4,7 +4,10 @@ use locks_core::verification::{SubmittedProofBundleV2, VerifiedProofBundleV2};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::{VerificationTaskStatus, VerificationTerminalReason};
+use super::{
+    EvaluatorTaskIdentityV1, EvaluatorTaskSnapshotV1, VerificationTaskStatus,
+    VerificationTerminalReason,
+};
 
 pub const PAYMENT_TASK_SNAPSHOT_VERSION: u16 = 1;
 
@@ -73,6 +76,12 @@ impl PaymentTaskSnapshot {
     }
 }
 
+impl EvaluatorTaskSnapshotV1 for PaymentTaskSnapshot {
+    fn identity(&self) -> EvaluatorTaskIdentityV1 {
+        self.as_v1().identity()
+    }
+}
+
 fn json_error(message: impl Into<String>) -> serde_json::Error {
     serde_json::Error::io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -110,7 +119,52 @@ pub struct PaymentTaskSnapshotV1 {
     pub root: PaymentRootState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PaymentEvaluationV1<'a> {
+    pub submitted_proof_bundle: &'a SubmittedProofBundleV2,
+    pub payment: &'a PaymentTermsV2,
+    pub invoice: &'a PaymentInvoiceState,
+    pub provider_status: &'a Option<PaymentProviderStatus>,
+    pub operational_failure_count: u32,
+    pub operational_failure_total: u32,
+    pub operational_first_failure_at: Option<OffsetDateTime>,
+    pub operational_last_failure_at: Option<OffsetDateTime>,
+    pub operational_last_category: Option<PaymentOperationalErrorCategory>,
+    pub operational_last_http_status: Option<u16>,
+    pub next_due_at: Option<OffsetDateTime>,
+    pub root: &'a PaymentRootState,
+}
+
 impl PaymentTaskSnapshotV1 {
+    pub fn evaluation(&self) -> PaymentEvaluationV1<'_> {
+        PaymentEvaluationV1 {
+            submitted_proof_bundle: &self.submitted_proof_bundle,
+            payment: &self.payment,
+            invoice: &self.invoice,
+            provider_status: &self.provider_status,
+            operational_failure_count: self.operational_failure_count,
+            operational_failure_total: self.operational_failure_total,
+            operational_first_failure_at: self.operational_first_failure_at,
+            operational_last_failure_at: self.operational_last_failure_at,
+            operational_last_category: self.operational_last_category,
+            operational_last_http_status: self.operational_last_http_status,
+            next_due_at: self.next_due_at,
+            root: &self.root,
+        }
+    }
+
+    pub fn identity(&self) -> EvaluatorTaskIdentityV1 {
+        EvaluatorTaskIdentityV1 {
+            creator: self.creator.clone(),
+            bundle_id: self.bundle_id.clone(),
+            pubky_lock_resource: self.pubky_lock_resource.clone(),
+            lock_hash: self.lock_hash,
+            reader: self.reader.clone(),
+            accepted_at: self.accepted_at,
+            deadline_at: self.deadline_at,
+        }
+    }
+
     pub fn new(
         submitted: SubmittedProofBundleV2,
         lock_hash: [u8; 32],

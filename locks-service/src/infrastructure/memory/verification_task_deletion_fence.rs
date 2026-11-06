@@ -14,6 +14,8 @@ use crate::application::{
     ports::Clock,
 };
 
+use super::evaluator_tasks::StoredEvaluatorTask;
+
 type LockKey = (CreatorPubky, LockId);
 type HandleKey = (CreatorPubky, BundleId);
 
@@ -40,14 +42,7 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
     pub(crate) deletion_job_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct InMemoryStoredGraphTask {
-    pub(crate) task: GraphTaskRecord,
-    pub(crate) claimed_by: Option<String>,
-    pub(crate) claim_token: Option<Uuid>,
-    pub(crate) claim_expires_at: Option<OffsetDateTime>,
-    pub(crate) next_attempt_at: Option<OffsetDateTime>,
-}
+pub(crate) type InMemoryStoredGraphTask = StoredEvaluatorTask<GraphTaskRecord>;
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 pub struct InMemoryVerificationTaskDeletionFence {

@@ -2,10 +2,8 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
-use locks_core::verification::{
-    SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
-};
-use sqlx::{Connection, FromRow, PgConnection, PgPool};
+use locks_core::verification::{SatisfiedByV2, VerifiedProofBundleV2};
+use sqlx::{Connection, PgConnection, PgPool};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -13,9 +11,15 @@ use crate::application::models::{
     VerificationTerminalReason,
 };
 use crate::application::ports::{
-    GraphPublicationActionGuard, GraphTaskClaimer, GraphTaskRepository,
+    EvaluatorMode, EvaluatorTaskKernel, GraphPublicationActionGuard, GraphTaskClaimer,
+    GraphTaskRepository, build_evaluator_publication,
 };
 
+use super::evaluator_tasks::{
+    EVALUATOR_TASK_COLUMNS as GRAPH_TASK_COLUMNS, EvaluatorSnapshotTransition,
+    EvaluatorTaskRow as GraphTaskRow, claim_next, complete_publication_connection,
+    complete_publication_pool, persist_claimed_snapshot, release_claim, schedule_claimed_retry,
+};
 use super::proof_admission::{lock_proof_admission, proof_admission_lock_key};
 use super::verification_tasks::{reject_deletion_cutoff, status_from_database};
 
@@ -42,36 +46,16 @@ impl GraphPublicationActionGuard for PostgresGraphPublicationActionGuard {
             .ok_or_else(|| ApplicationError::Storage {
                 message: "graph publication action ownership was already released".to_owned(),
             })?;
-        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "UPDATE verification_tasks
-             SET status = 'completed', completed_at = clock_timestamp(),
-                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
-                 next_attempt_at = NULL,
-                 entitlement_publication_claim_token = NULL,
-                 updated_at = clock_timestamp()
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'publishing_entitlement'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $4
-               AND entitlement_to_publish IS NOT NULL
-               AND entitlement_publication_claim_token = $5
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
-                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
-               )
-             RETURNING {GRAPH_TASK_COLUMNS}"
-        ))
-        .bind(&self.task_id)
-        .bind(&self.worker_id)
-        .bind(self.claim_token)
-        .bind(self.expected_revision)
-        .bind(self.publication_token)
-        .fetch_optional(connection)
-        .await
-        .map_err(storage_error)?;
+        let row = complete_publication_connection(
+            connection,
+            EvaluatorMode::Graph,
+            &self.task_id,
+            &self.worker_id,
+            self.claim_token,
+            self.expected_revision,
+            self.publication_token,
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 
@@ -91,28 +75,6 @@ impl PostgresGraphTaskRepository {
         Self { pool }
     }
 }
-
-#[derive(Debug, FromRow)]
-struct GraphTaskRow {
-    task_id: String,
-    creator: String,
-    bundle_id: String,
-    status: String,
-    submitted_proof_bundle: serde_json::Value,
-    submitted_at: time::OffsetDateTime,
-    evaluator_mode: String,
-    evaluator_snapshot: serde_json::Value,
-    evaluator_revision: i64,
-    completed_at: Option<time::OffsetDateTime>,
-    terminal_reason: Option<String>,
-    entitlement_to_publish: Option<serde_json::Value>,
-    entitlement_publication_claim_token: Option<uuid::Uuid>,
-}
-
-const GRAPH_TASK_COLUMNS: &str = "task_id::text AS task_id, creator, bundle_id, status, \
-    submitted_proof_bundle, submitted_at, evaluator_mode, evaluator_snapshot, evaluator_revision, completed_at, \
-    terminal_reason, \
-    entitlement_to_publish, entitlement_publication_claim_token";
 
 #[async_trait]
 impl GraphTaskRepository for PostgresGraphTaskRepository {
@@ -270,74 +232,23 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         now: time::OffsetDateTime,
         claim_expires_at: time::OffsetDateTime,
     ) -> Result<Option<ClaimedGraphTask>, ApplicationError> {
-        if claim_expires_at <= now {
-            return Err(ApplicationError::InvalidVerificationTaskState {
+        EvaluatorTaskKernel::claim_ttl(now, claim_expires_at).map_err(|_| {
+            ApplicationError::InvalidVerificationTaskState {
                 message: "graph task claim expiry must follow claim time".to_owned(),
-            });
-        }
-        let claim_token = uuid::Uuid::new_v4();
-        let row = sqlx::query_as::<_, GraphTaskRow>(
-            "WITH candidate AS MATERIALIZED (
-                SELECT task_id FROM verification_tasks
-                WHERE evaluator_mode = 'graph' AND evaluator_snapshot IS NOT NULL
-                  AND deletion_job_id IS NULL
-                  AND (
-                    (
-                      evaluator_snapshot->'root'->>'status' = 'pending'
-                      AND (
-                        (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()))
-                        OR (status = 'in_progress' AND claim_expires_at <= clock_timestamp())
-                      )
-                    )
-                    OR (
-                      evaluator_snapshot->'root'->>'status' = 'satisfied'
-                      AND status = 'publishing_entitlement'
-                      AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
-                      AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())
-                    )
-                    OR (
-                      evaluator_snapshot->'root'->>'status' IN (
-                        'satisfied', 'expired', 'failed_invalid_response'
-                      )
-                      AND status = 'in_progress'
-                      AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
-                    )
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM content_lock_deletion_task_snapshot snapshot
-                    WHERE snapshot.verification_task_id = verification_tasks.task_id
-                  )
-                ORDER BY submitted_at, task_id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-             )
-             UPDATE verification_tasks task
-             SET status = CASE
-                     WHEN task.status = 'publishing_entitlement' THEN task.status
-                     ELSE 'in_progress'
-                 END,
-                 claimed_by = $1, claim_token = $2,
-                 claim_expires_at = clock_timestamp() + ($3 - $4),
-                 started_at = COALESCE(started_at, clock_timestamp()), next_attempt_at = NULL,
-                 attempt_count = attempt_count + 1, updated_at = clock_timestamp()
-             FROM candidate
-             WHERE task.task_id = candidate.task_id
-             RETURNING task.task_id::text AS task_id, task.creator, task.bundle_id,
-                       task.status, task.submitted_proof_bundle, task.submitted_at,
-                       task.evaluator_mode, task.evaluator_snapshot, task.evaluator_revision, task.completed_at,
-                       task.terminal_reason,
-                       task.entitlement_to_publish, task.entitlement_publication_claim_token",
+            }
+        })?;
+        let row = claim_next(
+            &self.pool,
+            EvaluatorMode::Graph,
+            worker_id,
+            now,
+            claim_expires_at,
         )
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(claim_expires_at)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        row.map(row_to_task)
-            .transpose()
-            .map(|task| task.map(|task| ClaimedGraphTask { task, claim_token }))
+        .await?;
+        row.map(|(row, claim_token)| {
+            row_to_task(row).map(|task| ClaimedGraphTask { task, claim_token })
+        })
+        .transpose()
     }
 
     async fn persist_claimed_graph_snapshot(
@@ -349,171 +260,100 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         expected_revision: u64,
         snapshot: GraphTaskSnapshot,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        EvaluatorTaskKernel::next_revision(expected_revision)?;
         let expected_revision = match i64::try_from(expected_revision) {
             Ok(revision) => revision,
             Err(_) => return Ok(None),
         };
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let current = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'in_progress'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $4
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot snapshot
-                 WHERE snapshot.verification_task_id = verification_tasks.task_id
-               )
-             FOR UPDATE"
-        ))
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(expected_revision)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        let Some(current) = current else {
-            transaction.rollback().await.map_err(storage_error)?;
-            return Ok(None);
-        };
-        let current = row_to_task(current)?;
-        let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        snapshot.as_v1().validate().map_err(invalid_snapshot)?;
-        snapshot
-            .as_v1()
-            .validate_observations_not_after(database_now)
-            .map_err(invalid_snapshot)?;
-        ensure_same_binding(&current.snapshot, &snapshot)?;
-        if current.snapshot != snapshot || current.snapshot.as_v1().root == GraphRootState::Pending
-        {
-            snapshot
-                .as_v1()
-                .validate_progress_from(current.snapshot.as_v1())
-                .map_err(invalid_snapshot)?;
-        }
-        if matches!(snapshot.as_v1().root, GraphRootState::Expired(_))
-            && database_now < snapshot.as_v1().deadline_at
-        {
-            return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "graph task cannot expire before its deadline".to_owned(),
-            });
-        }
-        expected_revision
-            .checked_add(1)
-            .ok_or_else(|| ApplicationError::Storage {
-                message: "graph evaluator revision overflow".to_owned(),
-            })?;
-        let snapshot_json = snapshot.to_json().map_err(snapshot_encode_error)?;
-        let root = snapshot.as_v1().root;
-        let (target_status, terminal_reason, failure_message, entitlement, publication_token): (
-            &str,
-            Option<&str>,
-            Option<&str>,
-            Option<serde_json::Value>,
-            Option<uuid::Uuid>,
-        ) = match root {
-            GraphRootState::Pending => ("in_progress", None, None, None, None),
-            GraphRootState::Satisfied => {
-                let identity = snapshot.as_v1();
-                let publication = VerifiedProofBundleV2 {
-                    version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
-                    creator: identity.creator.clone(),
-                    reader: identity.reader.clone(),
-                    bundle_id: identity.bundle_id.clone(),
-                    pubky_lock_resource: identity.pubky_lock_resource.clone(),
-                    verified_at: database_now,
-                    satisfied_by: vec![SatisfiedByV2::Graph],
+        let row = persist_claimed_snapshot(
+            &self.pool,
+            EvaluatorMode::Graph,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
+            expected_revision,
+            |current, database_now| {
+                let current = row_to_task(current.clone())?;
+                snapshot.as_v1().validate().map_err(invalid_snapshot)?;
+                snapshot
+                    .as_v1()
+                    .validate_observations_not_after(database_now)
+                    .map_err(invalid_snapshot)?;
+                ensure_same_binding(&current.snapshot, &snapshot)?;
+                if current.snapshot != snapshot
+                    || current.snapshot.as_v1().root == GraphRootState::Pending
+                {
+                    snapshot
+                        .as_v1()
+                        .validate_progress_from(current.snapshot.as_v1())
+                        .map_err(invalid_snapshot)?;
+                }
+                let root = snapshot.as_v1().root;
+                if matches!(root, GraphRootState::Expired(_))
+                    && database_now < snapshot.as_v1().deadline_at
+                {
+                    return Err(ApplicationError::InvalidVerificationTaskState {
+                        message: "graph task cannot expire before its deadline".to_owned(),
+                    });
+                }
+                let (status, reason, entitlement, publication_token) = match root {
+                    GraphRootState::Pending => ("in_progress", None, None, None),
+                    GraphRootState::Satisfied => {
+                        let publication = build_evaluator_publication(
+                            &snapshot.as_v1().identity(),
+                            EvaluatorMode::Graph,
+                            database_now,
+                        )
+                        .map_err(|error| ApplicationError::Storage {
+                            message: format!("invalid graph entitlement publication: {error}"),
+                        })?;
+                        (
+                            "publishing_entitlement",
+                            None,
+                            Some(serde_json::to_value(publication).map_err(snapshot_encode_error)?),
+                            Some(uuid::Uuid::new_v4()),
+                        )
+                    }
+                    GraphRootState::Expired(
+                        crate::application::models::GraphDeadlineResult::False,
+                    ) => (
+                        "expired",
+                        Some("graph_condition_not_observed_by_deadline".to_owned()),
+                        None,
+                        None,
+                    ),
+                    GraphRootState::Expired(
+                        crate::application::models::GraphDeadlineResult::DependencyUnavailable,
+                    ) => (
+                        "failed",
+                        Some("verification_unavailable_by_deadline".to_owned()),
+                        None,
+                        None,
+                    ),
+                    GraphRootState::FailedInvalidResponse => (
+                        "failed",
+                        Some("invalid_verifier_response".to_owned()),
+                        None,
+                        None,
+                    ),
                 };
-                publication
-                    .validate()
-                    .map_err(|error| ApplicationError::Storage {
-                        message: format!("invalid graph entitlement publication: {error}"),
-                    })?;
-                (
-                    "publishing_entitlement",
-                    None,
-                    None,
-                    Some(serde_json::to_value(publication).map_err(snapshot_encode_error)?),
-                    Some(uuid::Uuid::new_v4()),
-                )
-            }
-            GraphRootState::Expired(crate::application::models::GraphDeadlineResult::False) => (
-                "expired",
-                Some("graph_condition_not_observed_by_deadline"),
-                None,
-                None,
-                None,
-            ),
-            GraphRootState::Expired(
-                crate::application::models::GraphDeadlineResult::DependencyUnavailable,
-            ) => (
-                "failed",
-                Some("verification_unavailable_by_deadline"),
-                None,
-                None,
-                None,
-            ),
-            GraphRootState::FailedInvalidResponse => (
-                "failed",
-                Some("invalid_verifier_response"),
-                None,
-                None,
-                None,
-            ),
-        };
-        let retain_claim = matches!(root, GraphRootState::Pending | GraphRootState::Satisfied);
-
-        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "UPDATE verification_tasks
-             SET evaluator_snapshot = $5,
-                 evaluator_revision = evaluator_revision + 1,
-                 status = $7,
-                 terminal_reason = $8,
-                 failure_message = $9,
-                 completed_at = CASE WHEN $10 THEN NULL ELSE $4 END,
-                 entitlement_to_publish = $11,
-                 entitlement_publication_claim_token = $12,
-                 claimed_by = CASE WHEN $10 THEN claimed_by ELSE NULL END,
-                 claim_token = CASE WHEN $10 THEN claim_token ELSE NULL END,
-                 claim_expires_at = CASE WHEN $10 THEN claim_expires_at ELSE NULL END,
-                 next_attempt_at = NULL,
-                 updated_at = $4
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'in_progress'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $6
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot snapshot
-                 WHERE snapshot.verification_task_id = verification_tasks.task_id
-               )
-             RETURNING {GRAPH_TASK_COLUMNS}"
-        ))
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(database_now)
-        .bind(snapshot_json)
-        .bind(expected_revision)
-        .bind(target_status)
-        .bind(terminal_reason)
-        .bind(failure_message)
-        .bind(retain_claim)
-        .bind(entitlement)
-        .bind(publication_token)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
+                Ok((
+                    snapshot.to_json().map_err(snapshot_encode_error)?,
+                    EvaluatorSnapshotTransition {
+                        status,
+                        terminal_reason: reason,
+                        failure_message: None,
+                        entitlement,
+                        publication_token,
+                        retain_claim: matches!(
+                            root,
+                            GraphRootState::Pending | GraphRootState::Satisfied
+                        ),
+                    },
+                ))
+            },
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 
@@ -527,103 +367,45 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         snapshot: GraphTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
-        let retry_delay = next_attempt_at - now;
+        EvaluatorTaskKernel::next_revision(expected_revision)?;
         let expected_revision = match i64::try_from(expected_revision) {
             Ok(revision) => revision,
             Err(_) => return Ok(None),
         };
-        expected_revision
-            .checked_add(1)
-            .ok_or_else(|| ApplicationError::Storage {
-                message: "graph evaluator revision overflow".to_owned(),
-            })?;
 
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let current = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "SELECT {GRAPH_TASK_COLUMNS} FROM verification_tasks
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'in_progress'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $4
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
-                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
-               )
-             FOR UPDATE"
-        ))
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(expected_revision)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        let Some(current) = current else {
-            transaction.rollback().await.map_err(storage_error)?;
-            return Ok(None);
-        };
-        let current = row_to_task(current)?;
-        let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        let next_attempt_at = (database_now + retry_delay).min(snapshot.as_v1().deadline_at);
-        if !retry_delay.is_positive() {
-            return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "graph retry delay must be positive".to_owned(),
-            });
-        }
-        snapshot.as_v1().validate().map_err(invalid_snapshot)?;
-        snapshot
-            .as_v1()
-            .validate_observations_not_after(database_now)
-            .map_err(invalid_snapshot)?;
-        ensure_same_binding(&current.snapshot, &snapshot)?;
-        snapshot
-            .as_v1()
-            .validate_progress_from(current.snapshot.as_v1())
-            .map_err(invalid_snapshot)?;
-        if snapshot.as_v1().root != GraphRootState::Pending {
-            return Err(ApplicationError::InvalidVerificationTaskState {
-                message: "graph retry requires pending snapshot".to_owned(),
-            });
-        }
-        let snapshot_json = snapshot.to_json().map_err(snapshot_encode_error)?;
-        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "UPDATE verification_tasks
-             SET evaluator_snapshot = $5,
-                 evaluator_revision = evaluator_revision + 1,
-                 status = 'pending', started_at = NULL,
-                 claimed_by = NULL, claim_token = NULL,
-                 claim_expires_at = NULL,
-                 next_attempt_at = $6, updated_at = $4
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'in_progress'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $7
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
-                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
-               )
-             RETURNING {GRAPH_TASK_COLUMNS}"
-        ))
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(database_now)
-        .bind(snapshot_json)
-        .bind(next_attempt_at)
-        .bind(expected_revision)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
+        let row = schedule_claimed_retry(
+            &self.pool,
+            EvaluatorMode::Graph,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
+            now,
+            expected_revision,
+            next_attempt_at,
+            |current, database_now| {
+                let current = row_to_task(current.clone())?;
+                snapshot.as_v1().validate().map_err(invalid_snapshot)?;
+                snapshot
+                    .as_v1()
+                    .validate_observations_not_after(database_now)
+                    .map_err(invalid_snapshot)?;
+                ensure_same_binding(&current.snapshot, &snapshot)?;
+                snapshot
+                    .as_v1()
+                    .validate_progress_from(current.snapshot.as_v1())
+                    .map_err(invalid_snapshot)?;
+                if snapshot.as_v1().root != GraphRootState::Pending {
+                    return Err(ApplicationError::InvalidVerificationTaskState {
+                        message: "graph retry requires pending snapshot".to_owned(),
+                    });
+                }
+                Ok((
+                    snapshot.to_json().map_err(snapshot_encode_error)?,
+                    snapshot.as_v1().deadline_at,
+                ))
+            },
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 
@@ -633,27 +415,14 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
     ) -> Result<bool, ApplicationError> {
-        let result = sqlx::query(
-            "UPDATE verification_tasks
-             SET status = CASE
-                   WHEN status = 'in_progress'
-                    AND evaluator_snapshot->'root'->>'status' = 'pending'
-                   THEN 'pending'
-                   ELSE status
-                 END,
-                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
-                 updated_at = clock_timestamp()
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND claimed_by = $2 AND claim_token = $3",
+        release_claim(
+            &self.pool,
+            EvaluatorMode::Graph,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
         )
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .execute(&self.pool)
         .await
-        .map_err(storage_error)?;
-        Ok(result.rows_affected() == 1)
     }
 
     async fn acquire_graph_publication_action(
@@ -743,36 +512,16 @@ impl GraphTaskClaimer for PostgresGraphTaskRepository {
             Ok(revision) => revision,
             Err(_) => return Ok(None),
         };
-        let row = sqlx::query_as::<_, GraphTaskRow>(&format!(
-            "UPDATE verification_tasks
-             SET status = 'completed', completed_at = clock_timestamp(),
-                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
-                 next_attempt_at = NULL,
-                 entitlement_publication_claim_token = NULL,
-                 updated_at = clock_timestamp()
-             WHERE task_id = $1::uuid
-               AND evaluator_mode = 'graph'
-               AND status = 'publishing_entitlement'
-               AND claimed_by = $2 AND claim_token = $3
-               AND claim_expires_at > clock_timestamp()
-               AND evaluator_revision = $4
-               AND entitlement_to_publish IS NOT NULL
-               AND entitlement_publication_claim_token = $5
-               AND deletion_job_id IS NULL
-               AND NOT EXISTS (
-                 SELECT 1 FROM content_lock_deletion_task_snapshot deletion_snapshot
-                 WHERE deletion_snapshot.verification_task_id = verification_tasks.task_id
-               )
-             RETURNING {GRAPH_TASK_COLUMNS}"
-        ))
-        .bind(task_id.to_string())
-        .bind(worker_id)
-        .bind(claim_token)
-        .bind(expected_revision)
-        .bind(publication_token)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let row = complete_publication_pool(
+            &self.pool,
+            EvaluatorMode::Graph,
+            &task_id.to_string(),
+            worker_id,
+            *claim_token,
+            expected_revision,
+            publication_token,
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 }

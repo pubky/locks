@@ -2,10 +2,8 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
-use locks_core::verification::{
-    SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
-};
-use sqlx::{Connection, FromRow, PgConnection, PgPool};
+use locks_core::verification::{SatisfiedByV2, VerifiedProofBundleV2};
+use sqlx::{Connection, PgConnection, PgPool};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -13,9 +11,15 @@ use crate::application::models::{
     PaymentTaskSnapshotV1, VerificationTerminalReason,
 };
 use crate::application::ports::{
-    AdmitPaymentTask, PaymentPublicationActionGuard, PaymentTaskClaimer, PaymentTaskRepository,
+    AdmitPaymentTask, EvaluatorMode, EvaluatorTaskKernel, PaymentPublicationActionGuard,
+    PaymentTaskClaimer, PaymentTaskRepository, build_evaluator_publication,
 };
 
+use super::evaluator_tasks::{
+    EVALUATOR_TASK_COLUMNS as COLUMNS, EvaluatorSnapshotTransition,
+    EvaluatorTaskRow as PaymentTaskRow, claim_next, complete_publication_connection,
+    complete_publication_pool, persist_claimed_snapshot, release_claim, schedule_claimed_retry,
+};
 use super::proof_admission::{lock_proof_admission, proof_admission_lock_key};
 use super::verification_tasks::{reject_deletion_cutoff, status_from_database};
 
@@ -28,25 +32,6 @@ impl PostgresPaymentTaskRepository {
         Self { pool }
     }
 }
-
-#[derive(Debug, FromRow)]
-struct PaymentTaskRow {
-    task_id: String,
-    creator: String,
-    bundle_id: String,
-    status: String,
-    submitted_proof_bundle: serde_json::Value,
-    submitted_at: time::OffsetDateTime,
-    evaluator_mode: String,
-    evaluator_snapshot: serde_json::Value,
-    evaluator_revision: i64,
-    completed_at: Option<time::OffsetDateTime>,
-    terminal_reason: Option<String>,
-    entitlement_to_publish: Option<serde_json::Value>,
-    entitlement_publication_claim_token: Option<uuid::Uuid>,
-}
-
-const COLUMNS: &str = "task_id::text AS task_id, creator, bundle_id, status, submitted_proof_bundle, submitted_at, evaluator_mode, evaluator_snapshot, evaluator_revision, completed_at, terminal_reason, entitlement_to_publish, entitlement_publication_claim_token";
 
 struct PostgresPaymentPublicationActionGuard {
     connection: Option<PgConnection>,
@@ -64,19 +49,16 @@ impl PaymentPublicationActionGuard for PostgresPaymentPublicationActionGuard {
             .connection
             .as_mut()
             .ok_or_else(|| storage_message("payment publication guard released"))?;
-        let row = sqlx::query_as::<_, PaymentTaskRow>(&format!(
-            "UPDATE verification_tasks SET status='completed', completed_at=clock_timestamp(), claimed_by=NULL, claim_token=NULL, claim_expires_at=NULL, next_attempt_at=NULL, entitlement_publication_claim_token=NULL, updated_at=clock_timestamp()
-             WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement'
-               AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp()
-               AND evaluator_revision=$4 AND entitlement_to_publish IS NOT NULL
-               AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
-               AND NOT EXISTS (SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id)
-             RETURNING {COLUMNS}"
-        )).bind(&self.task_id).bind(&self.worker_id).bind(self.claim_token).bind(self.expected_revision).bind(self.publication_token)
-          .fetch_optional(connection).await.map_err(storage_error)?;
+        let row = complete_publication_connection(
+            connection,
+            EvaluatorMode::Payment,
+            &self.task_id,
+            &self.worker_id,
+            self.claim_token,
+            self.expected_revision,
+            self.publication_token,
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
     async fn release(mut self: Box<Self>) -> Result<(), ApplicationError> {
@@ -193,36 +175,20 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         now: time::OffsetDateTime,
         claim_expires_at: time::OffsetDateTime,
     ) -> Result<Option<ClaimedPaymentTask>, ApplicationError> {
-        if claim_expires_at <= now {
-            return Err(invalid_state("payment claim expiry must follow claim time"));
-        }
-        let token = uuid::Uuid::new_v4();
-        let row = sqlx::query_as::<_, PaymentTaskRow>(
-            "WITH candidate AS MATERIALIZED (
-               SELECT task_id FROM verification_tasks
-               WHERE evaluator_mode='payment' AND evaluator_snapshot IS NOT NULL AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
-                 AND (
-                   (evaluator_snapshot->'root'->>'status'='pending' AND ((status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=clock_timestamp())) OR (status='in_progress' AND claim_expires_at<=clock_timestamp())))
-                   OR (evaluator_snapshot->'root'->>'status'='satisfied' AND status='publishing_entitlement' AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) AND (next_attempt_at IS NULL OR next_attempt_at<=clock_timestamp()))
-                   OR (evaluator_snapshot->'root'->>'status' IN ('satisfied','expired','failed') AND status='in_progress' AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()))
-                 )
-                 AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id)
-               ORDER BY submitted_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1
-             )
-             UPDATE verification_tasks t SET status=CASE WHEN t.status='publishing_entitlement' THEN t.status ELSE 'in_progress' END,
-               claimed_by=$1,claim_token=$2,claim_expires_at=clock_timestamp()+($3-$4),started_at=COALESCE(started_at,clock_timestamp()),next_attempt_at=NULL,attempt_count=attempt_count+1,updated_at=clock_timestamp()
-             FROM candidate WHERE t.task_id=candidate.task_id
-             RETURNING t.task_id::text AS task_id,t.creator,t.bundle_id,t.status,t.submitted_proof_bundle,t.submitted_at,t.evaluator_mode,t.evaluator_snapshot,t.evaluator_revision,t.completed_at,t.terminal_reason,t.entitlement_to_publish,t.entitlement_publication_claim_token"
-        ).bind(worker_id).bind(token).bind(claim_expires_at).bind(now).fetch_optional(&self.pool).await.map_err(storage_error)?;
-        row.map(row_to_task).transpose().map(|task| {
-            task.map(|task| ClaimedPaymentTask {
-                task,
-                claim_token: token,
-            })
+        EvaluatorTaskKernel::claim_ttl(now, claim_expires_at)
+            .map_err(|_| invalid_state("payment claim expiry must follow claim time"))?;
+        let row = claim_next(
+            &self.pool,
+            EvaluatorMode::Payment,
+            worker_id,
+            now,
+            claim_expires_at,
+        )
+        .await?;
+        row.map(|(row, claim_token)| {
+            row_to_task(row).map(|task| ClaimedPaymentTask { task, claim_token })
         })
+        .transpose()
     }
 
     async fn persist_claimed_payment_snapshot(
@@ -234,77 +200,71 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         expected_revision: u64,
         snapshot: PaymentTaskSnapshot,
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
+        EvaluatorTaskKernel::next_revision(expected_revision)?;
         let expected = i64::try_from(expected_revision)
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let current = sqlx::query_as::<_, PaymentTaskRow>(&format!(
-            "SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') FOR UPDATE"
-        )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
-        let Some(current) = current else {
-            tx.rollback().await.map_err(storage_error)?;
-            return Ok(None);
-        };
-        let current = row_to_task(current)?;
-        let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        snapshot
-            .as_v1()
-            .validate_progress_from(current.snapshot.as_v1())
-            .map_err(invalid_state)?;
-        let root = snapshot.as_v1().root;
-        let (status, reason, entitlement, token, retain): (
-            &str,
-            Option<&str>,
-            Option<serde_json::Value>,
-            Option<uuid::Uuid>,
-            bool,
-        ) = match root {
-            PaymentRootState::Pending => ("in_progress", None, None, None, true),
-            PaymentRootState::Satisfied => {
-                let s = snapshot.as_v1();
-                let value = VerifiedProofBundleV2 {
-                    version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
-                    creator: s.creator.clone(),
-                    reader: s.reader.clone(),
-                    bundle_id: s.bundle_id.clone(),
-                    pubky_lock_resource: s.pubky_lock_resource.clone(),
-                    verified_at: database_now,
-                    satisfied_by: vec![SatisfiedByV2::Payment],
+        let row = persist_claimed_snapshot(
+            &self.pool,
+            EvaluatorMode::Payment,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
+            expected,
+            |current, database_now| {
+                let current = row_to_task(current.clone())?;
+                snapshot
+                    .as_v1()
+                    .validate_progress_from(current.snapshot.as_v1())
+                    .map_err(invalid_state)?;
+                let root = snapshot.as_v1().root;
+                let (status, reason, entitlement, token, retain_claim) = match root {
+                    PaymentRootState::Pending => ("in_progress", None, None, None, true),
+                    PaymentRootState::Satisfied => {
+                        let value = build_evaluator_publication(
+                            &snapshot.as_v1().identity(),
+                            EvaluatorMode::Payment,
+                            database_now,
+                        )
+                        .map_err(|error| {
+                            invalid_state(format!("invalid payment entitlement: {error}"))
+                        })?;
+                        (
+                            "publishing_entitlement",
+                            None,
+                            Some(serde_json::to_value(value).map_err(snapshot_error)?),
+                            Some(uuid::Uuid::new_v4()),
+                            true,
+                        )
+                    }
+                    PaymentRootState::Expired(reason) => (
+                        "expired",
+                        Some(reason.as_str().to_owned()),
+                        None,
+                        None,
+                        false,
+                    ),
+                    PaymentRootState::Failed(reason) => (
+                        "failed",
+                        Some(reason.as_str().to_owned()),
+                        None,
+                        None,
+                        false,
+                    ),
                 };
-                value
-                    .validate()
-                    .map_err(|e| invalid_state(format!("invalid payment entitlement: {e}")))?;
-                (
-                    "publishing_entitlement",
-                    None,
-                    Some(serde_json::to_value(value).map_err(snapshot_error)?),
-                    Some(uuid::Uuid::new_v4()),
-                    true,
-                )
-            }
-            PaymentRootState::Expired(reason) => {
-                ("expired", Some(reason.as_str()), None, None, false)
-            }
-            PaymentRootState::Failed(reason) => {
-                ("failed", Some(reason.as_str()), None, None, false)
-            }
-        };
-        let snapshot_json = snapshot.to_json().map_err(snapshot_error)?;
-        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!(
-            "UPDATE verification_tasks SET evaluator_snapshot=$5,evaluator_revision=evaluator_revision+1,status=$6,terminal_reason=$7,failure_message=NULL,completed_at=CASE WHEN $8 THEN NULL ELSE $4 END,entitlement_to_publish=$9,entitlement_publication_claim_token=$10,claimed_by=CASE WHEN $8 THEN claimed_by ELSE NULL END,claim_token=CASE WHEN $8 THEN claim_token ELSE NULL END,claim_expires_at=CASE WHEN $8 THEN claim_expires_at ELSE NULL END,next_attempt_at=NULL,updated_at=$4
-             WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$11 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json')
-             RETURNING {COLUMNS}"
-        )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(database_now).bind(snapshot_json).bind(status).bind(reason).bind(retain).bind(entitlement).bind(token).bind(expected)
-          .fetch_optional(&mut *tx).await.map_err(storage_error)?;
-        tx.commit().await.map_err(storage_error)?;
+                Ok((
+                    snapshot.to_json().map_err(snapshot_error)?,
+                    EvaluatorSnapshotTransition {
+                        status,
+                        terminal_reason: reason,
+                        failure_message: None,
+                        entitlement,
+                        publication_token: token,
+                        retain_claim,
+                    },
+                ))
+            },
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 
@@ -318,42 +278,34 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         snapshot: PaymentTaskSnapshot,
         next_attempt_at: time::OffsetDateTime,
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
-        let delay = next_attempt_at - caller_now;
-        if !delay.is_positive() {
-            return Err(invalid_state("payment retry delay must be positive"));
-        }
+        EvaluatorTaskKernel::next_revision(expected_revision)?;
         let expected = i64::try_from(expected_revision)
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let current=sqlx::query_as::<_,PaymentTaskRow>(&format!("SELECT {COLUMNS} FROM verification_tasks WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') FOR UPDATE"))
-            .bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
-        let Some(current) = current else {
-            tx.rollback().await.map_err(storage_error)?;
-            return Ok(None);
-        };
-        let current = row_to_task(current)?;
-        snapshot
-            .as_v1()
-            .validate_progress_from(current.snapshot.as_v1())
-            .map_err(invalid_state)?;
-        if snapshot.as_v1().root != PaymentRootState::Pending {
-            return Err(invalid_state("payment retry requires pending root"));
-        }
-        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        let due = (now + delay).min(snapshot.as_v1().deadline_at);
-        let value = snapshot.to_json().map_err(snapshot_error)?;
-        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET evaluator_snapshot=$5,evaluator_revision=evaluator_revision+1,status='pending',started_at=NULL,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=$6,updated_at=$4 WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='in_progress' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$7 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') RETURNING {COLUMNS}"))
-            .bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(now).bind(value).bind(due).bind(expected).fetch_optional(&mut *tx).await.map_err(storage_error)?;
-        tx.commit().await.map_err(storage_error)?;
+        let row = schedule_claimed_retry(
+            &self.pool,
+            EvaluatorMode::Payment,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
+            caller_now,
+            expected,
+            next_attempt_at,
+            |current, _database_now| {
+                let current = row_to_task(current.clone())?;
+                snapshot
+                    .as_v1()
+                    .validate_progress_from(current.snapshot.as_v1())
+                    .map_err(invalid_state)?;
+                if snapshot.as_v1().root != PaymentRootState::Pending {
+                    return Err(invalid_state("payment retry requires pending root"));
+                }
+                Ok((
+                    snapshot.to_json().map_err(snapshot_error)?,
+                    snapshot.as_v1().deadline_at,
+                ))
+            },
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 
@@ -363,8 +315,14 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
         worker_id: &str,
         claim_token: &uuid::Uuid,
     ) -> Result<bool, ApplicationError> {
-        let result=sqlx::query("UPDATE verification_tasks SET status=CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN 'pending' ELSE status END,started_at=CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN NULL ELSE started_at END,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND claimed_by=$2 AND claim_token=$3 AND deletion_job_id IS NULL AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r WHERE r.creator=verification_tasks.creator AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id)").bind(task_id.to_string()).bind(worker_id).bind(claim_token).execute(&self.pool).await.map_err(storage_error)?;
-        Ok(result.rows_affected() == 1)
+        release_claim(
+            &self.pool,
+            EvaluatorMode::Payment,
+            &task_id.to_string(),
+            worker_id,
+            claim_token,
+        )
+        .await
     }
 
     async fn acquire_payment_publication_action(
@@ -421,10 +379,16 @@ impl PaymentTaskClaimer for PostgresPaymentTaskRepository {
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
         let expected = i64::try_from(expected_revision)
             .map_err(|_| invalid_state("payment revision exceeds storage"))?;
-        let row=sqlx::query_as::<_,PaymentTaskRow>(&format!("UPDATE verification_tasks SET status='completed',completed_at=clock_timestamp(),claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL,next_attempt_at=NULL,entitlement_publication_claim_token=NULL,updated_at=clock_timestamp() WHERE task_id=$1::uuid AND evaluator_mode='payment' AND status='publishing_entitlement' AND claimed_by=$2 AND claim_token=$3 AND claim_expires_at>clock_timestamp() AND evaluator_revision=$4 AND entitlement_to_publish IS NOT NULL AND entitlement_publication_claim_token=$5 AND deletion_job_id IS NULL
-               AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r
-                 WHERE r.creator=verification_tasks.creator
-                   AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'=r.creator||'/pub/app.locks/'||r.lock_id||'.json') AND NOT EXISTS(SELECT 1 FROM content_lock_deletion_task_snapshot s WHERE s.verification_task_id=verification_tasks.task_id) RETURNING {COLUMNS}" )).bind(task_id.to_string()).bind(worker_id).bind(claim_token).bind(expected).bind(publication_token).fetch_optional(&self.pool).await.map_err(storage_error)?;
+        let row = complete_publication_pool(
+            &self.pool,
+            EvaluatorMode::Payment,
+            &task_id.to_string(),
+            worker_id,
+            *claim_token,
+            expected,
+            publication_token,
+        )
+        .await?;
         row.map(row_to_task).transpose()
     }
 }
