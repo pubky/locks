@@ -129,7 +129,7 @@ Handle lifecycle states as closed vocabulary:
 
 All five outcomes are terminal: stop browser/Rust polling, issue no access credential, and grant no entitlement. Payment retries require a fresh Bundle ID and payment request; replaying same Bundle ID returns same terminal lifecycle. A deleted content lock must be recreated before any new attempt.
 
-JS/WASM methods reject unknown statuses, unknown terminal reasons, secret-bearing fields, and invalid tuples. Other unknown fields are dropped: the methods return only the fields this SDK release knows. Keep application handling closed too:
+JS/WASM methods reject unknown statuses, unknown terminal reasons, secret-bearing fields, the superseded `connection_state` field on lifecycle responses, and invalid tuples. Other unknown fields are dropped: the methods return only the fields this SDK release knows. Keep application handling closed too:
 
 ```js
 function nextAction(lifecycle) {
