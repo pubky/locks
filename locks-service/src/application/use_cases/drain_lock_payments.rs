@@ -1182,13 +1182,6 @@ fn provider_v2_status_is_terminal(
             | PaymentRequestStateV2::ProofSubmitted
             | PaymentRequestStateV2::ActiveRecurring
     );
-    if status.first_threshold_satisfied.is_some() && !accepted_lifecycle {
-        return Err(ApplicationError::InvalidContentLockDeletionState {
-            message:
-                "provider-v2 threshold evidence conflicts with request lifecycle during deletion"
-                    .to_owned(),
-        });
-    }
     let satisfied_without_publication =
         accepted_lifecycle && status.first_threshold_satisfied.is_some();
     Ok(satisfied_without_publication
@@ -1623,8 +1616,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_v2_reconciliation_rejects_threshold_evidence_outside_accepted_lifecycle() {
-        let value = PaymentProviderStatus {
+    fn provider_v2_reconciliation_accepts_rc3_lifecycle_with_retained_threshold_evidence() {
+        let mut value = PaymentProviderStatus {
             creator: CreatorPubky::from_str(
                 "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
             )
@@ -1649,7 +1642,21 @@ mod tests {
                 amount_matched: true,
             }),
         };
-        assert!(provider_v2_status_is_terminal(&value).is_err());
+
+        assert_eq!(provider_v2_status_is_terminal(&value), Ok(false));
+
+        for request_state in [
+            PaymentRequestStateV2::Rejected,
+            PaymentRequestStateV2::Canceled,
+            PaymentRequestStateV2::ProposalExpired,
+        ] {
+            value.request_state = request_state;
+            assert_eq!(provider_v2_status_is_terminal(&value), Ok(true));
+        }
+
+        value.request_state = PaymentRequestStateV2::Proposed;
+        value.payment_state = PaymentStateV2::Expired;
+        assert_eq!(provider_v2_status_is_terminal(&value), Ok(true));
     }
 
     #[test]
@@ -1672,7 +1679,16 @@ mod tests {
                 asset: PaymentAssetV2::Btc,
                 minimum_confirmations: 0,
                 current_sample: None,
-                first_threshold_satisfied: None,
+                first_threshold_satisfied: Some(PaymentSampleV2 {
+                    observed_at: datetime!(2026-08-12 12:00:00 UTC),
+                    status: PaymentSampleStatusV2::Detected,
+                    outpoint: Some(BitcoinOutpointV2 {
+                        txid: "00".repeat(32),
+                        vout: 0,
+                    }),
+                    confirmations: 0,
+                    amount_matched: true,
+                }),
             };
             assert!(provider_v2_status_is_terminal(&value).is_err());
         }
