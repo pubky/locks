@@ -11,7 +11,7 @@ BEGIN
           AND deletion.state IN ('queued', 'running', 'failed')
           AND deletion.force_requested_at IS NULL
           AND (snapshot.resolved_status IS NOT NULL
-               OR deletion.phase NOT IN ('withdraw', 'start_payment_drain', 'drain_payments'))
+               OR deletion.phase NOT IN ('withdraw', 'start_payment_drain'))
     ) THEN
         RAISE EXCEPTION USING
             MESSAGE = 'migration 0032 found an active provider-v2 deletion that may have crossed payment drain without a persisted rc3 fence',

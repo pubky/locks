@@ -1507,8 +1507,10 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         let Some(drain) = deletion.payment_drain.as_ref() else {
             return Ok(PaymentDrainCleanupPreparation::NotRequired);
         };
-        if drain.lock_resource.as_ref() != Some(lock_resource)
-            || drain.authority.as_ref() != Some(authority)
+        let has_frozen_authority = drain.lock_resource.is_some() || drain.authority.is_some();
+        if has_frozen_authority
+            && (drain.lock_resource.as_ref() != Some(lock_resource)
+                || drain.authority.as_ref() != Some(authority))
         {
             return Err(invalid_deletion_state(
                 "Paykit authority or lock resource changed before deletion cleanup",
@@ -3011,6 +3013,106 @@ mod tests {
             .unwrap()
             .reads["/priv/app.locks/content/post.json"];
         assert!(read.consumed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_paykit_v1_cleanup_does_not_require_provider_v2_authority() {
+        let store = InMemoryAccessCredentialStore::new();
+        let job_id = Uuid::from_u128(41);
+        let claim_token = Uuid::from_u128(42);
+        let creator = record().creator;
+        let lock_id =
+            LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+        let lock_resource =
+            PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{lock_id}.json"))
+                .unwrap();
+        let authority = PaykitAuthority {
+            scheme: "https".to_owned(),
+            host: "paykit.example".to_owned(),
+            port: 443,
+            base_path: "/".to_owned(),
+        };
+        let cleanup_token =
+            PaymentDrainCleanupToken::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        store.state.write().await.deletions.insert(
+            job_id,
+            DeletionAccessState {
+                creator,
+                lock_id,
+                frozen_content_lock: test_content_lock().into(),
+                state: ContentLockDeletionState::Running,
+                phase: ContentLockDeletionPhase::PurgeOperationalState,
+                force_requested: false,
+                claimed_by: Some("worker".to_owned()),
+                claim_token: Some(claim_token),
+                claim_expires_at: Some(datetime!(2100-01-01 00:00:00 UTC)),
+                issuance_started_at: None,
+                issuance_deadline: None,
+                read_deadline: None,
+                payment_aggregate: Some(DeletionPaymentAggregate {
+                    completed: true,
+                    accepted_count: 0,
+                }),
+                payment_drain: Some(InMemoryPaymentDrain {
+                    summary: PaymentDrainSummary {
+                        status: PaymentDrainStatus::Completed,
+                        accepted_count: 0,
+                        terminal_count: 1,
+                        cancellation_enqueued_count: 0,
+                        cleanup_token: cleanup_token.clone(),
+                    },
+                    lock_resource: None,
+                    authority: None,
+                    fence_acknowledged: false,
+                    cleanup_completed: false,
+                }),
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
+                bundle_snapshots: HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            store
+                .prepare_payment_drain_cleanup(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .unwrap(),
+            PaymentDrainCleanupPreparation::Pending(cleanup_token)
+        );
+
+        {
+            let mut state = store.state.write().await;
+            let drain = state
+                .deletions
+                .get_mut(&job_id)
+                .unwrap()
+                .payment_drain
+                .as_mut()
+                .unwrap();
+            drain.lock_resource = Some(lock_resource.clone());
+            drain.authority = Some(PaykitAuthority {
+                host: "other.example".to_owned(),
+                ..authority.clone()
+            });
+        }
+        assert!(
+            store
+                .prepare_payment_drain_cleanup(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

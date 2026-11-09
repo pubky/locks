@@ -589,7 +589,12 @@ mod tests {
 
     #[tokio::test]
     async fn populated_0031_upgrade_classifies_safe_provider_v2_and_refuses_post_drain_state() {
-        for (phase, should_succeed) in [("withdraw", true), ("drain_existing_credentials", false)] {
+        for (phase, should_succeed) in [
+            ("withdraw", true),
+            ("start_payment_drain", true),
+            ("drain_payments", false),
+            ("drain_existing_credentials", false),
+        ] {
             let database = TestDatabase::create_unmigrated().await;
             let through_0031 = Migrator {
                 migrations: Cow::Owned(super::MIGRATOR.iter().take(31).cloned().collect()),

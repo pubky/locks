@@ -1164,6 +1164,9 @@ fn validate_aggregate_progress(
 fn provider_v2_status_is_terminal(
     status: &crate::application::models::PaymentProviderStatus,
 ) -> Result<bool, ApplicationError> {
+    status
+        .validate()
+        .map_err(|message| ApplicationError::InvalidContentLockDeletionState { message })?;
     if matches!(
         status.request_state,
         PaymentRequestStateV2::InvalidConflict | PaymentRequestStateV2::RecoveryRequired
@@ -1173,12 +1176,29 @@ fn provider_v2_status_is_terminal(
                 .to_owned(),
         });
     }
-    Ok(matches!(
+    let accepted_lifecycle = matches!(
         status.request_state,
-        PaymentRequestStateV2::ProposalExpired
-            | PaymentRequestStateV2::Rejected
-            | PaymentRequestStateV2::Canceled
-    ) || status.payment_state == PaymentStateV2::Expired)
+        PaymentRequestStateV2::Accepted
+            | PaymentRequestStateV2::ProofSubmitted
+            | PaymentRequestStateV2::ActiveRecurring
+    );
+    if status.first_threshold_satisfied.is_some() && !accepted_lifecycle {
+        return Err(ApplicationError::InvalidContentLockDeletionState {
+            message:
+                "provider-v2 threshold evidence conflicts with request lifecycle during deletion"
+                    .to_owned(),
+        });
+    }
+    let satisfied_without_publication =
+        accepted_lifecycle && status.first_threshold_satisfied.is_some();
+    Ok(satisfied_without_publication
+        || matches!(
+            status.request_state,
+            PaymentRequestStateV2::ProposalExpired
+                | PaymentRequestStateV2::Rejected
+                | PaymentRequestStateV2::Canceled
+        )
+        || status.payment_state == PaymentStateV2::Expired)
 }
 
 pub(crate) fn classify_payment_task(
@@ -1244,8 +1264,9 @@ mod tests {
 
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2, PaymentStateV2,
-        VerificationTaskStatus, VerificationTerminalReason,
+        BitcoinOutpointV2, PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2,
+        PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2, VerificationTaskStatus,
+        VerificationTerminalReason,
     };
     use crate::application::ports::{
         EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary,
@@ -1548,6 +1569,87 @@ mod tests {
             };
             assert_eq!(provider_v2_status_is_terminal(&value), Ok(terminal));
         }
+    }
+
+    #[test]
+    fn provider_v2_reconciliation_terminalizes_accepted_like_timely_threshold_evidence() {
+        for request_state in [
+            PaymentRequestStateV2::Accepted,
+            PaymentRequestStateV2::ProofSubmitted,
+            PaymentRequestStateV2::ActiveRecurring,
+        ] {
+            let mut value = PaymentProviderStatus {
+                creator: CreatorPubky::from_str(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                )
+                .unwrap(),
+                bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                request_state,
+                payment_state: PaymentStateV2::Detected,
+                invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
+                proposal_expires_at: datetime!(2026-08-12 11:00:00 UTC),
+                deadline: datetime!(2026-08-13 10:00:00 UTC),
+                asset: PaymentAssetV2::Btc,
+                minimum_confirmations: 0,
+                current_sample: None,
+                first_threshold_satisfied: Some(PaymentSampleV2 {
+                    observed_at: datetime!(2026-08-12 12:00:00 UTC),
+                    status: PaymentSampleStatusV2::Detected,
+                    outpoint: Some(BitcoinOutpointV2 {
+                        txid: "00".repeat(32),
+                        vout: 0,
+                    }),
+                    confirmations: 0,
+                    amount_matched: true,
+                }),
+            };
+            assert_eq!(provider_v2_status_is_terminal(&value), Ok(true));
+
+            value.first_threshold_satisfied = None;
+            assert_eq!(provider_v2_status_is_terminal(&value), Ok(false));
+
+            value.first_threshold_satisfied = Some(PaymentSampleV2 {
+                observed_at: datetime!(2026-08-13 10:00:01 UTC),
+                status: PaymentSampleStatusV2::Detected,
+                outpoint: Some(BitcoinOutpointV2 {
+                    txid: "00".repeat(32),
+                    vout: 0,
+                }),
+                confirmations: 0,
+                amount_matched: true,
+            });
+            assert!(provider_v2_status_is_terminal(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_v2_reconciliation_rejects_threshold_evidence_outside_accepted_lifecycle() {
+        let value = PaymentProviderStatus {
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+            request_state: PaymentRequestStateV2::Proposed,
+            payment_state: PaymentStateV2::Detected,
+            invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
+            proposal_expires_at: datetime!(2026-08-12 11:00:00 UTC),
+            deadline: datetime!(2026-08-13 10:00:00 UTC),
+            asset: PaymentAssetV2::Btc,
+            minimum_confirmations: 0,
+            current_sample: None,
+            first_threshold_satisfied: Some(PaymentSampleV2 {
+                observed_at: datetime!(2026-08-12 12:00:00 UTC),
+                status: PaymentSampleStatusV2::Detected,
+                outpoint: Some(BitcoinOutpointV2 {
+                    txid: "00".repeat(32),
+                    vout: 0,
+                }),
+                confirmations: 0,
+                amount_matched: true,
+            }),
+        };
+        assert!(provider_v2_status_is_terminal(&value).is_err());
     }
 
     #[test]
