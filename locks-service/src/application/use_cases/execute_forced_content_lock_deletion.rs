@@ -217,11 +217,11 @@ fn frozen_resource_paths(claim: &ClaimedContentLockDeletionJob) -> BTreeSet<Stri
     let mut paths = claim
         .job
         .frozen_content_lock
-        .secondary_resources
+        .secondary_resources()
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if let Some(primary) = &claim.job.frozen_content_lock.primary_resource {
+    if let Some(primary) = claim.job.frozen_content_lock.primary_resource() {
         paths.insert(primary.path.clone());
     }
     paths

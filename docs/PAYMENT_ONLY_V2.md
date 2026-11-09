@@ -66,6 +66,16 @@ HTTP `400`, `401`, `403`, or malformed success data terminalize as `invalid_veri
 
 Payment task claims, retries, snapshot writes, and publication use revision/lease fencing. Satisfied entitlement publication is durable and restart-safe. Graph-only v2 and payment v1 stay in separate evaluator lanes.
 
+## Provider-v2 deletion
+
+Graceful deletion requires Paykit Server `v0.1.1-rc3` or newer. Locks freezes exact payment evaluator facts, posts/replays `/payment-request-drains`, then reconciles provider-v2 invoices only after drain acknowledgment and completion. Reconciliation uses exact `/v2/invoices` replay plus `/v2/invoices/status`; it never creates a fresh invoice or uses legacy payment status. Live provider status defers deletion. Conflict plus status `404` proves absence; conflict plus a found invoice, changed binding/timestamps, malformed success, or changed Paykit authority fails closed.
+
+Deletion cutoff blocks unpublished entitlement effects. Completed published entitlement payloads remain unchanged. Graceful purge replays `/payment-request-drain-cleanups` with durable cleanup token under live deletion claim before operational state is removed; lost responses are safe to replay. Force deletion makes no provider call, abandons provider obligation, terminalizes unpublished task as `expired/content_lock_deleted`, preserves completed task, and leaves permanent same-resource task/publication fences. External invoice may remain active after force.
+
+Paykit Server rc3 also keeps its provider-v2 creation fence permanently after graceful cleanup.
+The same canonical lock resource may replay its exact old invoice, but cannot create a fresh invoice.
+Publish under a new Lock ID instead; Locks has no provider-fence reset.
+
 ## Runtime and verification
 
 Payment-only v2 reuses existing `[paykit]` server URL and Lock Server signing key. V2 threshold comes from immutable lock policy; existing `[paykit].minimum_confirmations` remains v1-only.

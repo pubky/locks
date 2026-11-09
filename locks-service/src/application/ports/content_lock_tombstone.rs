@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::ContentLockPayload;
 
 use crate::application::errors::ApplicationError;
 
@@ -30,7 +30,7 @@ pub trait ContentLockTombstoneRepository: Send + Sync {
         &self,
         creator: CreatorPubky,
         content_lock_path: ContentLockPath,
-        frozen_original: &ContentLock,
+        frozen_original: &ContentLockPayload,
         tombstone: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, ApplicationError>;
 

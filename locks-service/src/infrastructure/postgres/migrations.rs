@@ -536,7 +536,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=31).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=32).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -577,7 +577,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=31).collect::<Vec<_>>()
+            (1..=32).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],
@@ -585,6 +585,89 @@ mod tests {
             "published migration checksums changed"
         );
         database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn populated_0031_upgrade_classifies_safe_provider_v2_and_refuses_post_drain_state() {
+        for (phase, should_succeed) in [("withdraw", true), ("drain_existing_credentials", false)] {
+            let database = TestDatabase::create_unmigrated().await;
+            let through_0031 = Migrator {
+                migrations: Cow::Owned(super::MIGRATOR.iter().take(31).cloned().collect()),
+                ignore_missing: false,
+                locking: false,
+                no_tx: false,
+            };
+            through_0031.run(database.pool()).await.unwrap();
+            let job_id = uuid::Uuid::new_v4();
+            let task_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO content_lock_deletion_jobs
+                     (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                      state, phase)
+                 VALUES ($1, 'upgrade-creator', 'upgrade-lock', '{}'::jsonb,
+                         clock_timestamp(), 'queued', $2)",
+            )
+            .bind(job_id)
+            .bind(phase)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO verification_tasks
+                     (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                      submitted_at, invoice_admission_phase, evaluator_mode,
+                      evaluator_snapshot, evaluator_revision, deletion_job_id)
+                 VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'pending',
+                         '{\"proofs\":[]}'::jsonb, clock_timestamp(), 'ready', 'payment',
+                         '{\"schema_version\":1}'::jsonb, 0, $2)",
+            )
+            .bind(task_id)
+            .bind(job_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO content_lock_deletion_task_snapshot
+                     (deletion_job_id, verification_task_id, creator, bundle_id,
+                      pubky_lock_resource, status_at_cutoff, paykit_admission_required)
+                 VALUES ($1, $2, 'upgrade-creator', 'upgrade-bundle',
+                         'upgrade-creator/pub/app.locks/upgrade-lock.json', 'pending', TRUE)",
+            )
+            .bind(job_id)
+            .bind(task_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+            let migration = super::MIGRATOR
+                .iter()
+                .find(|migration| migration.version == 32)
+                .unwrap();
+            let result = sqlx::raw_sql(migration.sql.as_ref())
+                .execute(database.pool())
+                .await;
+            if should_succeed {
+                result.unwrap();
+                let kind: String = sqlx::query_scalar(
+                    "SELECT obligation_kind FROM content_lock_deletion_task_snapshot
+                     WHERE deletion_job_id = $1",
+                )
+                .bind(job_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+                assert_eq!(kind, "provider_v2");
+            } else {
+                let error = result.expect_err("post-drain provider-v2 upgrade must refuse closed");
+                assert!(
+                    error.to_string().contains(
+                        "active provider-v2 deletion that may have crossed payment drain"
+                    ),
+                    "unexpected 0032 refusal: {error}"
+                );
+            }
+            database.cleanup().await;
+        }
     }
 
     #[tokio::test]
@@ -672,7 +755,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_after, (1..=31).collect::<Vec<_>>());
+        assert_eq!(applied_after, (1..=32).collect::<Vec<_>>());
 
         let pending_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
             "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,

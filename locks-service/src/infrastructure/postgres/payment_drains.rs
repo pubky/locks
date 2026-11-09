@@ -8,10 +8,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
-use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
+use crate::application::models::{
+    PaymentTaskSnapshot, VerificationTaskStatus, VerificationTerminalReason,
+};
 use crate::application::ports::{
-    PaymentDrainCleanupToken, PaymentDrainObligation, PaymentDrainRepository, PaymentDrainStatus,
-    PaymentDrainSummary, PaymentDrainTerminalTransition,
+    PaykitAuthority, PaymentDrainCleanupPreparation, PaymentDrainCleanupToken,
+    PaymentDrainObligation, PaymentDrainObligationKind, PaymentDrainRepository, PaymentDrainStatus,
+    PaymentDrainSummary, PaymentDrainTerminalTransition, ProviderV2DeletionReconciliation,
 };
 
 #[derive(Debug, Clone)]
@@ -31,9 +34,13 @@ struct ObligationRow {
     creator: String,
     bundle_id: String,
     pubky_lock_resource: String,
-    criterion_id: String,
-    invoice_created_at: OffsetDateTime,
-    payment_deadline: OffsetDateTime,
+    obligation_kind: String,
+    criterion_id: Option<String>,
+    invoice_created_at: Option<OffsetDateTime>,
+    payment_deadline: Option<OffsetDateTime>,
+    evaluator_revision_at_cutoff: Option<i64>,
+    evaluator_snapshot_at_cutoff: Option<serde_json::Value>,
+    provider_reconciliation_state: Option<String>,
     status: String,
     entitlement_to_publish: Option<serde_json::Value>,
 }
@@ -45,6 +52,19 @@ struct DrainRow {
     terminal_count: i64,
     cancellation_enqueued_count: i64,
     cleanup_token: String,
+}
+
+#[derive(FromRow)]
+struct CleanupRow {
+    status: String,
+    accepted_count: i64,
+    cleanup_token: String,
+    cleanup_state: String,
+    pubky_lock_resource: Option<String>,
+    paykit_authority_scheme: Option<String>,
+    paykit_authority_host: Option<String>,
+    paykit_authority_port: Option<i32>,
+    paykit_authority_base_path: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -200,6 +220,161 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         Ok(updated.rows_affected() == 1)
     }
 
+    async fn prepare_provider_v2_fence(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "start_payment_drain",
+        ) && !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let port = i32::from(authority.port);
+        let existing: Option<(String, String, String, i32, String)> = sqlx::query_as(
+            "SELECT pubky_lock_resource, paykit_authority_scheme, paykit_authority_host,
+                    paykit_authority_port, paykit_authority_base_path
+             FROM content_lock_provider_v2_drain_fences
+             WHERE deletion_job_id = $1 FOR UPDATE",
+        )
+        .bind(deletion_job_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    lock_resource.to_string(),
+                    authority.scheme.clone(),
+                    authority.host.clone(),
+                    port,
+                    authority.base_path.clone(),
+                )
+            {
+                return Err(invalid_deletion(
+                    "Paykit authority or lock resource changed before provider-v2 drain replay",
+                ));
+            }
+        } else {
+            let inserted = sqlx::query(
+                "INSERT INTO content_lock_provider_v2_drain_fences
+                     (deletion_job_id, pubky_lock_resource, paykit_authority_scheme,
+                      paykit_authority_host, paykit_authority_port,
+                      paykit_authority_base_path, prepared_at)
+                 SELECT $1, $2, $3, $4, $5, $6, $7
+                 WHERE EXISTS (
+                     SELECT 1 FROM content_lock_deletion_task_snapshot
+                     WHERE deletion_job_id = $1 AND obligation_kind = 'provider_v2'
+                 )",
+            )
+            .bind(deletion_job_id)
+            .bind(lock_resource.to_string())
+            .bind(&authority.scheme)
+            .bind(&authority.host)
+            .bind(port)
+            .bind(&authority.base_path)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if inserted.rows_affected() != 1 {
+                return Err(invalid_deletion(
+                    "provider-v2 drain preparation is missing its frozen obligation",
+                ));
+            }
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(true)
+    }
+
+    async fn store_provider_v2_fence(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "start_payment_drain",
+        ) && !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let port = i32::from(authority.port);
+        let updated = sqlx::query(
+            "UPDATE content_lock_payment_drains AS drain
+             SET pubky_lock_resource = COALESCE(drain.pubky_lock_resource, $2),
+                 paykit_authority_scheme = COALESCE(drain.paykit_authority_scheme, $3),
+                 paykit_authority_host = COALESCE(drain.paykit_authority_host, $4),
+                 paykit_authority_port = COALESCE(drain.paykit_authority_port, $5),
+                 paykit_authority_base_path = COALESCE(drain.paykit_authority_base_path, $6),
+                 provider_v2_fence_acknowledged_at =
+                     COALESCE(drain.provider_v2_fence_acknowledged_at, $7),
+                 updated_at = $7
+             WHERE drain.deletion_job_id = $1
+               AND EXISTS (
+                   SELECT 1 FROM content_lock_provider_v2_drain_fences AS prepared
+                   WHERE prepared.deletion_job_id = drain.deletion_job_id
+                     AND prepared.pubky_lock_resource = $2
+                     AND prepared.paykit_authority_scheme = $3
+                     AND prepared.paykit_authority_host = $4
+                     AND prepared.paykit_authority_port = $5
+                     AND prepared.paykit_authority_base_path = $6
+               )
+               AND EXISTS (
+                   SELECT 1 FROM content_lock_deletion_task_snapshot AS snapshot
+                   WHERE snapshot.deletion_job_id = drain.deletion_job_id
+                     AND snapshot.obligation_kind = 'provider_v2'
+               )
+               AND (drain.pubky_lock_resource IS NULL OR drain.pubky_lock_resource = $2)
+               AND (drain.paykit_authority_scheme IS NULL OR drain.paykit_authority_scheme = $3)
+               AND (drain.paykit_authority_host IS NULL OR drain.paykit_authority_host = $4)
+               AND (drain.paykit_authority_port IS NULL OR drain.paykit_authority_port = $5)
+               AND (drain.paykit_authority_base_path IS NULL OR drain.paykit_authority_base_path = $6)",
+        )
+        .bind(deletion_job_id)
+        .bind(lock_resource.to_string())
+        .bind(&authority.scheme)
+        .bind(&authority.host)
+        .bind(port)
+        .bind(&authority.base_path)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn list_obligations(
         &self,
         deletion_job_id: Uuid,
@@ -207,15 +382,19 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         let rows = sqlx::query_as::<_, ObligationRow>(
             "SELECT snapshot.verification_task_id AS task_id, snapshot.creator,
                     snapshot.bundle_id, snapshot.pubky_lock_resource,
-                    snapshot.criterion_id,
+                    snapshot.obligation_kind, snapshot.criterion_id,
                     snapshot.invoice_created_at, snapshot.payment_deadline,
+                    snapshot.evaluator_revision_at_cutoff,
+                    snapshot.evaluator_snapshot_at_cutoff,
+                    snapshot.provider_reconciliation_state,
                     task.status, task.entitlement_to_publish
              FROM content_lock_deletion_task_snapshot AS snapshot
              JOIN verification_tasks AS task
                ON task.task_id = snapshot.verification_task_id
              WHERE snapshot.deletion_job_id = $1
-               AND snapshot.paykit_admission_required IS DISTINCT FROM FALSE
-               AND task.invoice_admission_phase <> 'failed'
+               AND snapshot.obligation_kind IN ('paykit_v1', 'provider_v2')
+               AND (snapshot.obligation_kind = 'provider_v2'
+                    OR task.invoice_admission_phase <> 'failed')
              ORDER BY snapshot.verification_task_id",
         )
         .bind(deletion_job_id)
@@ -422,6 +601,257 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         Ok(true)
     }
 
+    async fn persist_provider_v2_terminal(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        reconciliation: &ProviderV2DeletionReconciliation,
+    ) -> Result<bool, ApplicationError> {
+        let valid_shape = (reconciliation.create_conflict
+            && reconciliation.create_response.is_none()
+            && reconciliation.status.is_none())
+            || (!reconciliation.create_conflict
+                && reconciliation.create_response.is_some()
+                && reconciliation.status.is_some());
+        if !valid_shape {
+            return Err(invalid_deletion(
+                "provider-v2 deletion reconciliation has an invalid closed shape",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let response = reconciliation.create_response;
+        let status = reconciliation
+            .status
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(storage_display)?;
+        let terminal_snapshot = reconciliation
+            .terminal_snapshot
+            .to_json()
+            .map_err(storage_display)?;
+        let task_updated = sqlx::query(
+            "UPDATE verification_tasks AS task
+             SET status = CASE WHEN task.status = 'completed' THEN task.status ELSE 'expired' END,
+                 started_at = CASE WHEN task.status = 'completed' THEN task.started_at
+                                   ELSE COALESCE(task.started_at, $3) END,
+                 completed_at = CASE WHEN task.status = 'completed' THEN task.completed_at ELSE $3 END,
+                 failure_message = CASE WHEN task.status = 'completed' THEN task.failure_message ELSE NULL END,
+                 terminal_reason = CASE WHEN task.status = 'completed' THEN task.terminal_reason
+                                        ELSE 'content_lock_deleted' END,
+                 evaluator_snapshot = CASE WHEN task.status = 'completed' THEN task.evaluator_snapshot
+                     ELSE $4 END,
+                 evaluator_revision = CASE WHEN task.status = 'completed' THEN task.evaluator_revision
+                                           ELSE snapshot.evaluator_revision_at_cutoff + 1 END,
+                 entitlement_to_publish = CASE WHEN task.status = 'completed'
+                     THEN task.entitlement_to_publish ELSE NULL END,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 next_attempt_at = NULL, last_attempt_error = NULL,
+                 entitlement_publication_claim_token = NULL, updated_at = $3
+             FROM content_lock_deletion_task_snapshot AS snapshot
+             WHERE snapshot.deletion_job_id = $1
+               AND snapshot.verification_task_id = task.task_id
+               AND snapshot.verification_task_id = $2::uuid
+               AND snapshot.obligation_kind = 'provider_v2'
+               AND snapshot.resolved_status IS NULL
+               AND task.deletion_job_id = $1
+               AND (
+                    task.status = 'completed'
+                    OR (task.status IN ('pending', 'in_progress')
+                        AND task.evaluator_revision = snapshot.evaluator_revision_at_cutoff
+                        AND task.evaluator_snapshot = snapshot.evaluator_snapshot_at_cutoff
+                        AND task.entitlement_to_publish IS NOT DISTINCT FROM snapshot.entitlement_payload_at_cutoff
+                        AND task.entitlement_publication_claim_token IS NOT DISTINCT FROM snapshot.publication_token_at_cutoff)
+               )",
+        )
+        .bind(deletion_job_id)
+        .bind(task_id.to_string())
+        .bind(now)
+        .bind(terminal_snapshot)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if task_updated.rows_affected() != 1 {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let resolved = sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET resolved_status = CASE WHEN status_at_cutoff = 'completed' THEN 'completed' ELSE 'expired' END,
+                 resolved_at = $3,
+                 provider_reconciliation_state = 'terminal',
+                 provider_create_replay_result = $4,
+                 provider_create_invoice_created_at = $5,
+                 provider_create_proposal_expires_at = $6,
+                 provider_create_deadline = $7,
+                 provider_status_snapshot = $8,
+                 provider_reconciled_at = $3,
+                 final_credential_eligible_at = CASE
+                     WHEN status_at_cutoff = 'completed'
+                      AND NOT had_active_credential_at_cutoff
+                     THEN $3
+                     ELSE final_credential_eligible_at
+                 END
+             WHERE deletion_job_id = $1 AND verification_task_id = $2::uuid
+               AND obligation_kind = 'provider_v2' AND resolved_status IS NULL
+               AND provider_create_replay_result = $4
+               AND provider_create_invoice_created_at IS NOT DISTINCT FROM $5
+               AND provider_create_proposal_expires_at IS NOT DISTINCT FROM $6
+               AND provider_create_deadline IS NOT DISTINCT FROM $7
+               AND provider_status_snapshot IS NOT DISTINCT FROM $8
+               AND ((provider_reconciliation_state = 'not_found_after_fence'
+                     AND $4 = 'conflict' AND $8::jsonb IS NULL)
+                    OR (provider_reconciliation_state = 'found'
+                        AND $4 = 'exact_replay' AND $8::jsonb IS NOT NULL))",
+        )
+        .bind(deletion_job_id)
+        .bind(task_id.to_string())
+        .bind(now)
+        .bind(if reconciliation.create_conflict {
+            "conflict"
+        } else {
+            "exact_replay"
+        })
+        .bind(response.map(|value| value.invoice_created_at))
+        .bind(response.map(|value| value.proposal_expires_at))
+        .bind(response.map(|value| value.deadline))
+        .bind(status)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if resolved.rows_affected() != 1 {
+            return Err(invalid_deletion(
+                "provider-v2 deletion reconciliation lost its snapshot fence",
+            ));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(true)
+    }
+
+    async fn persist_provider_v2_binding(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        create_conflict: bool,
+        response: Option<crate::application::ports::PaymentProviderCreateResponse>,
+    ) -> Result<bool, ApplicationError> {
+        if create_conflict == response.is_some() {
+            return Err(invalid_deletion(
+                "provider-v2 binding checkpoint has an invalid closed shape",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let replay_result = if create_conflict {
+            "conflict"
+        } else {
+            "exact_replay"
+        };
+        let updated = sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET provider_reconciliation_state = CASE
+                     WHEN provider_create_replay_result IS NULL AND $3 = 'exact_replay'
+                         THEN 'binding_replayed'
+                     WHEN provider_create_replay_result IS NULL THEN 'pending'
+                     ELSE provider_reconciliation_state END,
+                 provider_create_replay_result = COALESCE(provider_create_replay_result, $3),
+                 provider_create_invoice_created_at = COALESCE(provider_create_invoice_created_at, $4),
+                 provider_create_proposal_expires_at = COALESCE(provider_create_proposal_expires_at, $5),
+                 provider_create_deadline = COALESCE(provider_create_deadline, $6)
+             WHERE deletion_job_id = $1 AND verification_task_id = $2::uuid
+               AND obligation_kind = 'provider_v2' AND resolved_status IS NULL
+               AND (provider_create_replay_result IS NULL
+                    OR (provider_create_replay_result = $3
+                        AND provider_create_invoice_created_at IS NOT DISTINCT FROM $4
+                        AND provider_create_proposal_expires_at IS NOT DISTINCT FROM $5
+                        AND provider_create_deadline IS NOT DISTINCT FROM $6))",
+        )
+        .bind(deletion_job_id)
+        .bind(task_id.to_string())
+        .bind(replay_result)
+        .bind(response.map(|value| value.invoice_created_at))
+        .bind(response.map(|value| value.proposal_expires_at))
+        .bind(response.map(|value| value.deadline))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn persist_provider_v2_status(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        status: Option<&crate::application::models::PaymentProviderStatus>,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "drain_payments",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let status_json = status
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(storage_display)?;
+        let updated = sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET provider_reconciliation_state = CASE
+                     WHEN $4::jsonb IS NULL THEN 'not_found_after_fence'
+                     ELSE 'found' END,
+                 provider_status_snapshot = $4,
+                 provider_reconciled_at = $3
+             WHERE deletion_job_id = $1 AND verification_task_id = $2::uuid
+               AND obligation_kind = 'provider_v2' AND resolved_status IS NULL
+               AND provider_create_replay_result IS NOT NULL
+               AND (($4::jsonb IS NULL AND provider_create_replay_result = 'conflict')
+                    OR $4::jsonb IS NOT NULL)",
+        )
+        .bind(deletion_job_id)
+        .bind(task_id.to_string())
+        .bind(now)
+        .bind(status_json)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     async fn all_obligations_terminal(
         &self,
         deletion_job_id: Uuid,
@@ -431,14 +861,127 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                 SELECT 1 FROM content_lock_deletion_task_snapshot
                 WHERE deletion_job_id = $1
                   AND paykit_admission_required = TRUE
-                  AND COALESCE(resolved_status, status_at_cutoff)
-                      NOT IN ('completed', 'failed', 'expired')
+                  AND (
+                      COALESCE(resolved_status, status_at_cutoff)
+                          NOT IN ('completed', 'failed', 'expired')
+                      OR (obligation_kind = 'provider_v2'
+                          AND provider_reconciliation_state <> 'terminal')
+                  )
             )",
         )
         .bind(deletion_job_id)
         .fetch_one(&self.pool)
         .await
         .map_err(storage_error)
+    }
+
+    async fn prepare_payment_drain_cleanup(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<PaymentDrainCleanupPreparation, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "purge_operational_state",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(PaymentDrainCleanupPreparation::ClaimLost);
+        }
+        let row = sqlx::query_as::<_, CleanupRow>(
+            "SELECT status, accepted_count, cleanup_token, cleanup_state,
+                    pubky_lock_resource, paykit_authority_scheme, paykit_authority_host,
+                    paykit_authority_port, paykit_authority_base_path
+             FROM content_lock_payment_drains
+             WHERE deletion_job_id = $1 FOR UPDATE",
+        )
+        .bind(deletion_job_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(row) = row else {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(PaymentDrainCleanupPreparation::NotRequired);
+        };
+        if row.status != "completed" || row.accepted_count != 0 {
+            return Err(invalid_deletion(
+                "payment drain cleanup requires a completed zero-accepted aggregate",
+            ));
+        }
+        let has_frozen_authority = row.paykit_authority_scheme.is_some()
+            || row.paykit_authority_host.is_some()
+            || row.paykit_authority_port.is_some()
+            || row.paykit_authority_base_path.is_some()
+            || row.pubky_lock_resource.is_some();
+        if has_frozen_authority
+            && (row.pubky_lock_resource.as_deref() != Some(&lock_resource.to_string())
+                || row.paykit_authority_scheme.as_deref() != Some(authority.scheme.as_str())
+                || row.paykit_authority_host.as_deref() != Some(authority.host.as_str())
+                || row.paykit_authority_port != Some(i32::from(authority.port))
+                || row.paykit_authority_base_path.as_deref() != Some(authority.base_path.as_str()))
+        {
+            return Err(invalid_deletion(
+                "Paykit authority or lock resource changed before payment drain cleanup",
+            ));
+        }
+        let result = match row.cleanup_state.as_str() {
+            "completed" => PaymentDrainCleanupPreparation::Completed,
+            "pending" => PaymentDrainCleanupPreparation::Pending(
+                PaymentDrainCleanupToken::parse(&row.cleanup_token)
+                    .ok_or_else(|| invalid_deletion("persisted Paykit cleanup token is invalid"))?,
+            ),
+            _ => {
+                return Err(invalid_deletion(
+                    "persisted payment drain cleanup state is invalid",
+                ));
+            }
+        };
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result)
+    }
+
+    async fn persist_payment_drain_cleanup(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        cleanup_token: &PaymentDrainCleanupToken,
+    ) -> Result<bool, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let (ownership, now) = lock_deletion_ownership(&mut transaction, deletion_job_id).await?;
+        if !owns_live_drain_claim(
+            ownership.as_ref(),
+            worker_id,
+            claim_token,
+            now,
+            "purge_operational_state",
+        ) {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "UPDATE content_lock_payment_drains
+             SET cleanup_state = 'completed', cleanup_completed_at = COALESCE(cleanup_completed_at, $2),
+                 updated_at = $2
+             WHERE deletion_job_id = $1 AND cleanup_token = $3
+               AND status = 'completed' AND accepted_count = 0
+               AND cleanup_state IN ('pending', 'completed')",
+        )
+        .bind(deletion_job_id)
+        .bind(now)
+        .bind(cleanup_token.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(updated.rows_affected() == 1)
     }
 }
 
@@ -483,15 +1026,57 @@ fn owns_live_drain_claim(
 }
 
 fn row_to_obligation(row: ObligationRow) -> Result<PaymentDrainObligation, ApplicationError> {
+    let creator = CreatorPubky::from_str(&row.creator).map_err(storage_display)?;
+    let bundle_id = BundleId::from_str(&row.bundle_id).map_err(storage_display)?;
+    let lock_resource =
+        PubkyLockResource::from_str(&row.pubky_lock_resource).map_err(storage_display)?;
+    let kind = match row.obligation_kind.as_str() {
+        "paykit_v1" => PaymentDrainObligationKind::PaykitV1 {
+            criterion_id: row
+                .criterion_id
+                .ok_or_else(|| invalid_deletion("paykit-v1 obligation is missing criterion_id"))?,
+            invoice_created_at: row.invoice_created_at.ok_or_else(|| {
+                invalid_deletion("paykit-v1 obligation is missing invoice_created_at")
+            })?,
+            payment_deadline: row.payment_deadline.ok_or_else(|| {
+                invalid_deletion("paykit-v1 obligation is missing payment_deadline")
+            })?,
+        },
+        "provider_v2" => {
+            let evaluator_revision =
+                u64::try_from(row.evaluator_revision_at_cutoff.ok_or_else(|| {
+                    invalid_deletion("provider-v2 obligation is missing evaluator revision")
+                })?)
+                .map_err(storage_display)?;
+            let snapshot =
+                PaymentTaskSnapshot::from_json(row.evaluator_snapshot_at_cutoff.ok_or_else(
+                    || invalid_deletion("provider-v2 obligation is missing evaluator snapshot"),
+                )?)
+                .map_err(storage_display)?;
+            let frozen = snapshot.as_v1();
+            if frozen.creator != creator
+                || frozen.bundle_id != bundle_id
+                || frozen.pubky_lock_resource != lock_resource
+            {
+                return Err(invalid_deletion(
+                    "provider-v2 frozen evaluator identity diverges from deletion snapshot",
+                ));
+            }
+            PaymentDrainObligationKind::ProviderV2 {
+                evaluator_revision,
+                snapshot: Box::new(snapshot),
+                reconciliation_terminal: row.provider_reconciliation_state.as_deref()
+                    == Some("terminal"),
+            }
+        }
+        _ => return Err(invalid_deletion("unknown deletion payment obligation kind")),
+    };
     Ok(PaymentDrainObligation {
         task_id: TaskId::from_str(&row.task_id.to_string()).map_err(storage_display)?,
-        creator: CreatorPubky::from_str(&row.creator).map_err(storage_display)?,
-        bundle_id: BundleId::from_str(&row.bundle_id).map_err(storage_display)?,
-        lock_resource: PubkyLockResource::from_str(&row.pubky_lock_resource)
-            .map_err(storage_display)?,
-        criterion_id: row.criterion_id,
-        invoice_created_at: row.invoice_created_at,
-        payment_deadline: row.payment_deadline,
+        creator,
+        bundle_id,
+        lock_resource,
+        kind,
         status: status_from_database(&row.status)?,
         entitlement_to_publish: row
             .entitlement_to_publish
@@ -593,17 +1178,23 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locks_core::ids::{BundleId, PubkyLockResource, TaskId};
+    use locks_core::ids::{BundleId, CreatorPubky, LockHash, LockId, PubkyLockResource, TaskId};
+    use locks_core::lock_policy::PaymentPolicyV2;
     use locks_core::verification::{
-        EntitlementLifetime, VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
+        EntitlementLifetime, SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2,
+        VERIFIED_PROOF_BUNDLE_VERSION, VerificationResult, VerifiedProofBundle,
     };
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
+    use crate::application::models::{
+        PaymentRootState, PaymentTaskSnapshot, PaymentTaskSnapshotV1, VerificationTaskStatus,
+        VerificationTerminalReason,
+    };
     use crate::application::ports::{
-        PaymentDrainCleanupToken, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
-        PaymentDrainTerminalTransition,
+        PaykitAuthority, PaymentDrainCleanupToken, PaymentDrainObligationKind,
+        PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
+        PaymentDrainTerminalTransition, ProviderV2DeletionReconciliation,
     };
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -623,6 +1214,200 @@ mod tests {
         .await
         .unwrap();
         assert!(exists);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn provider_v2_absence_after_fence_terminalizes_frozen_task_without_entitlement() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let job_id = Uuid::new_v4();
+        let task_uuid = Uuid::new_v4();
+        let task_id = TaskId::from_str(&task_uuid.to_string()).unwrap();
+        let claim_token = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let creator =
+            CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap();
+        let reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let lock_hash = LockHash::from_bytes([7; 32]);
+        let lock_resource = PubkyLockResource::from_str(&format!(
+            "{creator}/pub/app.locks/{}.json",
+            LockId::from_hash(lock_hash)
+        ))
+        .unwrap();
+        let snapshot = PaymentTaskSnapshotV1::new(
+            SubmittedProofBundleV2 {
+                version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                bundle_id: bundle_id.clone(),
+                pubky_lock_resource: lock_resource.clone(),
+                reader_pubky: Some(reader),
+            },
+            [7; 32],
+            PaymentPolicyV2 {
+                recipient_pubky: creator.clone(),
+                amount: "1".to_owned(),
+                asset: "BTC".to_owned(),
+                minimum_confirmations: 0,
+            },
+            now,
+            300,
+        )
+        .unwrap();
+        let snapshot_json = PaymentTaskSnapshot::V1(snapshot.clone()).to_json().unwrap();
+        insert_drain_job(
+            database.pool(),
+            job_id,
+            claim_token,
+            now,
+            &URL_SAFE_NO_PAD.encode([11_u8; 32]),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, creator, bundle_id, status, submitted_proof_bundle, submitted_at,
+                  invoice_admission_phase, evaluator_mode, evaluator_snapshot,
+                  evaluator_revision, deletion_job_id)
+             VALUES ($1, $2, $3, 'pending', $4, $5, 'ready', 'payment', $6, 0, $7)",
+        )
+        .bind(task_uuid)
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .bind(serde_json::to_value(&snapshot.submitted_proof_bundle).unwrap())
+        .bind(now)
+        .bind(&snapshot_json)
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, status_at_cutoff, paykit_admission_required,
+                  obligation_kind, evaluator_mode_at_cutoff, evaluator_revision_at_cutoff,
+                  evaluator_snapshot_at_cutoff, provider_reconciliation_state)
+             VALUES ($1, $2, $3, $4, $5, 'pending', TRUE, 'provider_v2',
+                     'payment', 0, $6, 'pending')",
+        )
+        .bind(job_id)
+        .bind(task_uuid)
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .bind(lock_resource.to_string())
+        .bind(&snapshot_json)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let obligations = repository.list_obligations(job_id).await.unwrap();
+        assert!(matches!(
+            obligations.as_slice(),
+            [obligation]
+                if matches!(obligation.kind, PaymentDrainObligationKind::ProviderV2 { .. })
+        ));
+        let authority = PaykitAuthority {
+            scheme: "http".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            base_path: "/".to_owned(),
+        };
+        assert!(
+            repository
+                .prepare_provider_v2_fence(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .unwrap()
+        );
+        let mismatched_authority = PaykitAuthority {
+            port: 8081,
+            ..authority.clone()
+        };
+        assert!(
+            repository
+                .prepare_provider_v2_fence(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &mismatched_authority,
+                )
+                .await
+                .is_err(),
+            "restart authority mismatch must fail before another provider call"
+        );
+        assert!(
+            repository
+                .store_provider_v2_fence(job_id, "worker", claim_token, &lock_resource, &authority,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .persist_provider_v2_binding(job_id, "worker", claim_token, &task_id, true, None,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .persist_provider_v2_status(job_id, "worker", claim_token, &task_id, None,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .persist_provider_v2_binding(job_id, "worker", claim_token, &task_id, true, None,)
+                .await
+                .unwrap(),
+            "replay after durable status checkpoint must preserve reconciliation state"
+        );
+        let mut terminal_snapshot = PaymentTaskSnapshot::V1(snapshot.clone());
+        terminal_snapshot.as_v1_mut().root =
+            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted);
+        assert!(
+            repository
+                .persist_provider_v2_terminal(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &task_id,
+                    &ProviderV2DeletionReconciliation {
+                        create_conflict: true,
+                        create_response: None,
+                        status: None,
+                        terminal_snapshot,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        let (status, reason, evaluator): (String, Option<String>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT status, terminal_reason, evaluator_snapshot
+                 FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(task_uuid)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(reason.as_deref(), Some("content_lock_deleted"));
+        assert_eq!(
+            evaluator.get("root"),
+            Some(
+                &serde_json::to_value(PaymentRootState::Expired(
+                    VerificationTerminalReason::ContentLockDeleted,
+                ))
+                .unwrap()
+            )
+        );
         database.cleanup().await;
     }
 
@@ -1252,12 +2037,13 @@ mod tests {
             "INSERT INTO content_lock_deletion_task_snapshot
                  (deletion_job_id, verification_task_id, creator, bundle_id,
                   pubky_lock_resource, criterion_id, status_at_cutoff,
-                  paykit_admission_required, invoice_created_at, payment_deadline)
+                  paykit_admission_required, obligation_kind,
+                  invoice_created_at, payment_deadline)
              VALUES ($1, $2,
                      'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
                      '000G40R40M30E209185GR38E1W',
                      'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json',
-                     'payment', 'pending', TRUE, $3, $4)",
+                     'payment', 'pending', TRUE, 'paykit_v1', $3, $4)",
         )
         .bind(job_id)
         .bind(task_id)

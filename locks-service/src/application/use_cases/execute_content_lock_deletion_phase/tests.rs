@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use locks_core::{
     content_lock_deletion::ContentLockDeletionTombstone,
     ids::{ContentLockPath, CreatorPubky, GuardedResourceHash, LockId},
-    lock_policy::ContentLock,
+    lock_policy::{ContentLock, ContentLockPayload},
 };
 use time::{Duration, OffsetDateTime, macros::datetime};
 use uuid::Uuid;
@@ -542,7 +542,7 @@ async fn repository_none_is_claim_lost_and_guard_is_released() {
 }
 
 #[tokio::test]
-async fn purge_is_deferred_task_ten_handoff() {
+async fn purge_cleans_payment_drain_before_finishing_job() {
     let h = Harness::new();
     let outcome = h
         .executor()
@@ -551,13 +551,14 @@ async fn purge_is_deferred_task_ten_handoff() {
             "worker",
         )
         .await;
-    assert_eq!(outcome, DeletionPhaseExecutionOutcome::Deferred);
+    assert_eq!(outcome, DeletionPhaseExecutionOutcome::Progressed);
+    assert_eq!(h.payments.cleanup_calls.load(Ordering::SeqCst), 1);
     assert!(h.deletions.advances().is_empty());
     assert!(h.actions.released.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
-async fn operation_evidence_does_not_infer_phase_health_from_purge_or_claim_loss() {
+async fn operation_evidence_does_not_infer_phase_health_from_purge_progress_or_claim_loss() {
     let h = Harness::new();
     let purge = h
         .executor()
@@ -566,7 +567,7 @@ async fn operation_evidence_does_not_infer_phase_health_from_purge_or_claim_loss
             "worker",
         )
         .await;
-    assert_eq!(purge.outcome, DeletionPhaseExecutionOutcome::Deferred);
+    assert_eq!(purge.outcome, DeletionPhaseExecutionOutcome::Progressed);
     assert_eq!(
         purge
             .evidence
@@ -656,7 +657,7 @@ struct FakeDeletions {
     obligations_pending: AtomicBool,
     issuance_deadline_missed: AtomicBool,
     advances: Mutex<Vec<ContentLockDeletionPhase>>,
-    finishes: Mutex<Vec<ContentLockDeletionFailureCode>>,
+    finishes: Mutex<Vec<Option<ContentLockDeletionFailureCode>>>,
     advance_error: Mutex<Option<ApplicationError>>,
 }
 impl FakeDeletions {
@@ -670,7 +671,13 @@ impl FakeDeletions {
         self.advances.lock().unwrap().clone()
     }
     fn finishes(&self) -> Vec<ContentLockDeletionFailureCode> {
-        self.finishes.lock().unwrap().clone()
+        self.finishes
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .flatten()
+            .collect()
     }
     fn result(&self) -> Option<ContentLockDeletionJob> {
         self.claim_live
@@ -807,7 +814,7 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: Uuid,
         code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
-        self.finishes.lock().unwrap().push(code.unwrap());
+        self.finishes.lock().unwrap().push(code);
         Ok(self.result())
     }
     async fn resume_failed_job(
@@ -938,7 +945,7 @@ impl ContentLockTombstoneRepository for FakeTombstones {
         &self,
         _: CreatorPubky,
         _: ContentLockPath,
-        _: &ContentLock,
+        _: &ContentLockPayload,
         _: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, ApplicationError> {
         if let Some(error) = self.withdraw_error.lock().unwrap().take() {
@@ -1092,6 +1099,7 @@ impl Clock for FixedClock {
 #[derive(Default)]
 struct FakePayments {
     error: Mutex<Option<ApplicationError>>,
+    cleanup_calls: AtomicUsize,
 }
 #[async_trait]
 impl ContentLockPaymentDrainExecutor for FakePayments {
@@ -1106,6 +1114,15 @@ impl ContentLockPaymentDrainExecutor for FakePayments {
         DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Deferred).with_evidence(
             DeletionDependencyEvidence::healthy(DeletionDependencySource::PaymentProvider),
         )
+    }
+
+    async fn cleanup_claimed(
+        &self,
+        _: ClaimedContentLockDeletionJob,
+        _: &str,
+    ) -> DeletionPhaseExecution {
+        self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Progressed)
     }
 }
 #[derive(Default)]

@@ -20,6 +20,7 @@ pub struct PaymentProviderCreateResponse {
 pub enum PaymentProviderErrorKind {
     InvalidResponse,
     Conflict,
+    NotFound,
     Retryable,
 }
 

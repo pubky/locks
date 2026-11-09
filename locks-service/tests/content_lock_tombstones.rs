@@ -50,7 +50,12 @@ async fn memory_content_lock_and_tombstone_adapters_share_one_canonical_public_p
     let tombstone = tombstone_at_five();
     assert_eq!(
         tombstones
-            .withdraw_content_lock(creator.clone(), path.clone(), &original, &tombstone)
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original.clone().into(),
+                &tombstone
+            )
             .await
             .unwrap(),
         TombstoneReadback::Exact
@@ -96,7 +101,12 @@ async fn memory_withdrawal_is_exact_and_replacement_is_classified_without_parsin
     );
     assert_eq!(
         repository
-            .withdraw_content_lock(creator.clone(), path.clone(), &original, &expected)
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original.clone().into(),
+                &expected
+            )
             .await
             .unwrap(),
         TombstoneReadback::Missing
@@ -108,7 +118,12 @@ async fn memory_withdrawal_is_exact_and_replacement_is_classified_without_parsin
         .unwrap();
     assert_eq!(
         repository
-            .withdraw_content_lock(creator.clone(), path.clone(), &original, &expected)
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original.clone().into(),
+                &expected
+            )
             .await
             .unwrap(),
         TombstoneReadback::Exact
@@ -151,7 +166,12 @@ async fn memory_force_delete_removes_tombstone_and_missing_retry_succeeds() {
         .await
         .unwrap();
     repository
-        .withdraw_content_lock(creator.clone(), path.clone(), &original, &expected)
+        .withdraw_content_lock(
+            creator.clone(),
+            path.clone(),
+            &original.clone().into(),
+            &expected,
+        )
         .await
         .unwrap();
 
@@ -185,7 +205,12 @@ async fn pubky_withdrawal_writes_canonical_bytes_to_exact_path_and_reads_them_ba
 
     assert_eq!(
         repository
-            .withdraw_content_lock(creator.clone(), path.clone(), &original, &expected)
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original.clone().into(),
+                &expected
+            )
             .await
             .unwrap(),
         TombstoneReadback::Exact
@@ -205,7 +230,12 @@ async fn pubky_withdrawal_writes_canonical_bytes_to_exact_path_and_reads_them_ba
 
     assert_eq!(
         repository
-            .withdraw_content_lock(creator.clone(), path.clone(), &original, &expected)
+            .withdraw_content_lock(
+                creator.clone(),
+                path.clone(),
+                &original.clone().into(),
+                &expected
+            )
             .await
             .unwrap(),
         TombstoneReadback::Exact
@@ -252,7 +282,7 @@ async fn pubky_withdrawal_accepts_legacy_json_number_spelling_but_rejects_change
             .withdraw_content_lock(
                 creator.clone(),
                 path.clone(),
-                &original,
+                &original.clone().into(),
                 &tombstone_at_five(),
             )
             .await
@@ -275,7 +305,12 @@ async fn pubky_withdrawal_accepts_legacy_json_number_spelling_but_rejects_change
     repository.client().replace_bytes(replacement_bytes.clone());
     assert_eq!(
         repository
-            .withdraw_content_lock(creator, path, &original, &tombstone_at_five())
+            .withdraw_content_lock(
+                creator,
+                path,
+                &original.clone().into(),
+                &tombstone_at_five()
+            )
             .await
             .unwrap(),
         TombstoneReadback::Replaced
@@ -324,7 +359,7 @@ async fn pubky_readback_classifies_missing_and_non_tombstone_replacement_as_raw_
             .withdraw_content_lock(
                 creator.clone(),
                 path.clone(),
-                &original_content_lock(),
+                &original_content_lock().into(),
                 &expected,
             )
             .await

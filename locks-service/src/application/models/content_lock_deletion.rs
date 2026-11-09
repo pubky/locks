@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use locks_core::{
     ids::{CreatorPubky, LockId},
-    lock_policy::ContentLock,
+    lock_policy::ContentLockPayload,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -95,7 +95,7 @@ pub struct ContentLockDeletionJob {
     pub job_id: Uuid,
     pub creator: CreatorPubky,
     pub lock_id: LockId,
-    pub frozen_content_lock: ContentLock,
+    pub frozen_content_lock: ContentLockPayload,
     pub deletion_started_at: OffsetDateTime,
     pub state: ContentLockDeletionState,
     pub phase: ContentLockDeletionPhase,
@@ -117,7 +117,7 @@ pub struct ClaimedContentLockDeletionJob {
 pub struct ForceDeletionReceipt {
     pub creator: CreatorPubky,
     pub lock_id: LockId,
-    pub frozen_content_lock: Option<ContentLock>,
+    pub frozen_content_lock: Option<ContentLockPayload>,
     pub forced_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,
 }
@@ -159,9 +159,10 @@ impl ContentLockDeletionJob {
     /// Creates a queued deletion job from a canonical frozen content lock.
     pub fn new(
         job_id: Uuid,
-        frozen_content_lock: ContentLock,
+        frozen_content_lock: impl Into<ContentLockPayload>,
         deletion_started_at: OffsetDateTime,
     ) -> Result<Self, ApplicationError> {
+        let frozen_content_lock = frozen_content_lock.into();
         let lock_id = frozen_content_lock.lock_id().map_err(|error| {
             ApplicationError::ContentLockCanonicalization {
                 message: error.to_string(),
@@ -169,7 +170,7 @@ impl ContentLockDeletionJob {
         })?;
         Ok(Self {
             job_id,
-            creator: frozen_content_lock.creator.clone(),
+            creator: frozen_content_lock.creator().clone(),
             lock_id,
             frozen_content_lock,
             deletion_started_at,
@@ -189,7 +190,7 @@ impl ContentLockDeletionJob {
                 message: error.to_string(),
             }
         })?;
-        if actual != self.lock_id || self.frozen_content_lock.creator != self.creator {
+        if actual != self.lock_id || self.frozen_content_lock.creator() != &self.creator {
             return Err(ApplicationError::InvalidContentLockDeletionState {
                 message: "frozen content lock identity does not match deletion job".to_owned(),
             });

@@ -289,7 +289,7 @@ impl PaymentVerificationWorker {
                 )
                 .await
             }
-            PaymentProviderErrorKind::Retryable => {
+            PaymentProviderErrorKind::NotFound | PaymentProviderErrorKind::Retryable => {
                 let state = snapshot_v1_mut(&mut snapshot);
                 let failure_at = observed_at.min(state.deadline_at);
                 state.operational_failure_count = state.operational_failure_count.saturating_add(1);

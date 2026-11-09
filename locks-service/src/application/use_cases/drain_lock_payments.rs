@@ -8,13 +8,15 @@ use locks_core::verification::{
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob, ContentLockDeletionPhase,
-    VerificationTaskStatus, VerificationTerminalReason,
+    PaymentInvoiceState, PaymentProviderCreateRequest, PaymentRequestStateV2, PaymentRootState,
+    PaymentStateV2, PaymentTaskSnapshot, VerificationTaskStatus, VerificationTerminalReason,
 };
 use crate::application::ports::{
-    Clock, ContentLockDeletionRepository, EntitlementRepository, PaymentDrainClient,
-    PaymentDrainClientError, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
+    Clock, ContentLockDeletionRepository, EntitlementRepository, PaymentDrainCleanupPreparation,
+    PaymentDrainClient, PaymentDrainClientError, PaymentDrainObligation,
+    PaymentDrainObligationKind, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
     PaymentDrainTerminalTransition, PaymentRequestState, PaymentRequestStatus, PaymentState,
-    same_entitlement_decision,
+    ProviderV2DeletionReconciliation, same_entitlement_decision,
 };
 
 use super::execute_content_lock_deletion_phase::{
@@ -130,6 +132,114 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         }
     }
 
+    pub async fn cleanup_claimed_with_evidence(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> DeletionPhaseExecution {
+        if claim.job.phase != ContentLockDeletionPhase::PurgeOperationalState {
+            return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::FatalFailure);
+        }
+        let authority = match self.paykit.authority() {
+            Some(authority) => authority,
+            None => {
+                return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::FatalFailure);
+            }
+        };
+        let lock_resource = lock_resource(&claim);
+        let preparation = match self
+            .drains
+            .prepare_payment_drain_cleanup(
+                claim.job.job_id,
+                worker_id,
+                claim.claim_token,
+                &lock_resource,
+                &authority,
+            )
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                return deletion_error_execution(
+                    &error,
+                    DeletionDependencySource::PaymentDrainRepository,
+                );
+            }
+        };
+        let mut evidence =
+            DeletionDependencyEvidence::healthy(DeletionDependencySource::PaymentDrainRepository);
+        match preparation {
+            PaymentDrainCleanupPreparation::ClaimLost => {
+                return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::ClaimLost);
+            }
+            PaymentDrainCleanupPreparation::NotRequired
+            | PaymentDrainCleanupPreparation::Completed => {}
+            PaymentDrainCleanupPreparation::Pending(cleanup_token) => {
+                if let Err(error) = self
+                    .paykit
+                    .cleanup_payment_drain(&lock_resource, &cleanup_token)
+                    .await
+                {
+                    return DeletionPhaseExecution::new(match error {
+                        PaymentDrainClientError::Transport | PaymentDrainClientError::Server => {
+                            DeletionPhaseExecutionOutcome::TransientDependencyFailure
+                        }
+                        _ => DeletionPhaseExecutionOutcome::FatalFailure,
+                    })
+                    .with_evidence(DeletionDependencyEvidence::unavailable(
+                        DeletionDependencySource::PaymentProvider,
+                    ));
+                }
+                evidence = evidence.merge(DeletionDependencyEvidence::healthy(
+                    DeletionDependencySource::PaymentProvider,
+                ));
+                match self
+                    .drains
+                    .persist_payment_drain_cleanup(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &cleanup_token,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return DeletionPhaseExecution::new(
+                            DeletionPhaseExecutionOutcome::ClaimLost,
+                        )
+                        .with_evidence(evidence);
+                    }
+                    Err(error) => {
+                        return deletion_error_execution(
+                            &error,
+                            DeletionDependencySource::PaymentDrainRepository,
+                        )
+                        .with_evidence(evidence);
+                    }
+                }
+            }
+        }
+        match self
+            .deletions
+            .finish(claim.job.job_id, worker_id, claim.claim_token, None)
+            .await
+        {
+            Ok(Some(_)) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Progressed)
+                .with_evidence(evidence)
+                .with_evidence(DeletionDependencyEvidence::healthy(
+                    DeletionDependencySource::RepositoryTerminalMutation,
+                )),
+            Ok(None) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::ClaimLost)
+                .with_evidence(evidence),
+            Err(error) => deletion_error_execution(
+                &error,
+                DeletionDependencySource::RepositoryTerminalMutation,
+            )
+            .with_evidence(evidence),
+        }
+    }
+
     async fn execute_claimed_observed(
         &self,
         claim: ClaimedContentLockDeletionJob,
@@ -177,6 +287,35 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 .await;
         }
         let lock_resource = lock_resource(&claim);
+        let obligations = self.drains.list_obligations(claim.job.job_id).await?;
+        let has_provider_v2 = obligations.iter().any(|obligation| {
+            matches!(
+                obligation.kind,
+                PaymentDrainObligationKind::ProviderV2 { .. }
+            )
+        });
+        if has_provider_v2 {
+            let authority = self.paykit.authority().ok_or_else(|| {
+                ApplicationError::InvalidContentLockDeletionState {
+                    message: "provider-v2 deletion requires a normalized Paykit authority"
+                        .to_owned(),
+                }
+            })?;
+            if !self
+                .drains
+                .prepare_provider_v2_fence(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+        }
         let summary = match self.paykit.start_payment_drain(&lock_resource).await {
             Ok(summary) => {
                 observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
@@ -220,6 +359,27 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Err(error);
             }
         }
+        if has_provider_v2 {
+            let authority = self.paykit.authority().ok_or_else(|| {
+                ApplicationError::InvalidContentLockDeletionState {
+                    message: "provider-v2 deletion requires a normalized Paykit authority"
+                        .to_owned(),
+                }
+            })?;
+            if !self
+                .drains
+                .store_provider_v2_fence(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
         self.advance_to(
             &claim,
             worker_id,
@@ -253,6 +413,36 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 return Err(error);
             }
         };
+        let has_provider_v2 = obligations.iter().any(|obligation| {
+            matches!(
+                obligation.kind,
+                PaymentDrainObligationKind::ProviderV2 { .. }
+            )
+        });
+        if has_provider_v2 {
+            let authority = self.paykit.authority().ok_or_else(|| {
+                ApplicationError::InvalidContentLockDeletionState {
+                    message: "provider-v2 deletion requires the frozen Paykit authority".to_owned(),
+                }
+            })?;
+            let lock_resource = lock_resource(&claim);
+            if !self
+                .drains
+                .store_provider_v2_fence(
+                    claim.job.job_id,
+                    worker_id,
+                    claim.claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await?
+            {
+                return Err(ApplicationError::InvalidContentLockDeletionState {
+                    message: "provider-v2 Paykit authority or drain fence changed after restart"
+                        .to_owned(),
+                });
+            }
+        }
         if obligations.is_empty() {
             let persisted = match self.drains.get_payment_drain(claim.job.job_id).await {
                 Ok(Some(persisted)) => {
@@ -332,10 +522,10 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             }
         };
         let mut replayed_publication = false;
-        for obligation in obligations
-            .iter()
-            .filter(|obligation| obligation.status == VerificationTaskStatus::PublishingEntitlement)
-        {
+        for obligation in obligations.iter().filter(|obligation| {
+            obligation.status == VerificationTaskStatus::PublishingEntitlement
+                && matches!(obligation.kind, PaymentDrainObligationKind::PaykitV1 { .. })
+        }) {
             replayed_publication = true;
             let entitlement = obligation.entitlement_to_publish.clone().ok_or_else(|| {
                 ApplicationError::InvalidVerificationTaskState {
@@ -435,6 +625,27 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         }
 
         for obligation in obligations {
+            let (criterion_id, invoice_created_at, payment_deadline) = match &obligation.kind {
+                PaymentDrainObligationKind::ProviderV2 {
+                    reconciliation_terminal,
+                    ..
+                } => {
+                    if *reconciliation_terminal {
+                        continue;
+                    }
+                    if summary.status != PaymentDrainStatus::Completed {
+                        continue;
+                    }
+                    self.reconcile_provider_v2(&claim, worker_id, &obligation, evidence)
+                        .await?;
+                    continue;
+                }
+                PaymentDrainObligationKind::PaykitV1 {
+                    criterion_id,
+                    invoice_created_at,
+                    payment_deadline,
+                } => (criterion_id, *invoice_created_at, *payment_deadline),
+            };
             if matches!(
                 obligation.status,
                 VerificationTaskStatus::Completed
@@ -463,8 +674,8 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     return Err(map_client_error(error));
                 }
             };
-            if status.invoice_created_at != obligation.invoice_created_at
-                || status.payment_deadline != obligation.payment_deadline
+            if status.invoice_created_at != invoice_created_at
+                || status.payment_deadline != payment_deadline
             {
                 return Err(ApplicationError::InvalidVerificationTaskState {
                     message: "Paykit payment window changed during deletion".to_owned(),
@@ -487,7 +698,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                             pubky_lock_resource: obligation.lock_resource.clone(),
                             verification_result: VerificationResult {
                                 criteria: vec![CriterionVerificationResult {
-                                    criterion_id: obligation.criterion_id.clone(),
+                                    criterion_id: criterion_id.clone(),
                                     satisfied: true,
                                     verified_at: now,
                                     verified_by: self.verified_by.clone(),
@@ -554,6 +765,206 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         }
         self.finish_completed_drain(claim, worker_id, evidence)
             .await
+    }
+
+    async fn reconcile_provider_v2(
+        &self,
+        claim: &ClaimedContentLockDeletionJob,
+        worker_id: &str,
+        obligation: &PaymentDrainObligation,
+        evidence: &mut DeletionDependencyEvidence,
+    ) -> Result<bool, ApplicationError> {
+        let PaymentDrainObligationKind::ProviderV2 { snapshot, .. } = &obligation.kind else {
+            unreachable!("provider-v2 reconciliation requires a provider-v2 obligation");
+        };
+        let frozen = snapshot.as_v1();
+        let request = PaymentProviderCreateRequest {
+            bundle_id: frozen.bundle_id.clone(),
+            lock_resource: frozen.pubky_lock_resource.clone(),
+            reader: frozen.reader.clone(),
+            payment: frozen.payment.clone(),
+            deadline: frozen.deadline_at,
+        };
+        let reconciliation = match self.paykit.replay_provider_v2_invoice(&request).await {
+            Ok(response) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                let mut expected = frozen.clone();
+                match expected.invoice {
+                    PaymentInvoiceState::Pending => expected
+                        .apply_create_response(
+                            response.invoice_created_at,
+                            response.proposal_expires_at,
+                            response.deadline,
+                        )
+                        .map_err(
+                            |message| ApplicationError::InvalidContentLockDeletionState { message },
+                        )?,
+                    PaymentInvoiceState::Created {
+                        invoice_created_at,
+                        proposal_expires_at,
+                    } if invoice_created_at == response.invoice_created_at
+                        && proposal_expires_at == response.proposal_expires_at
+                        && frozen.deadline_at == response.deadline => {}
+                    PaymentInvoiceState::Created { .. } => {
+                        return Err(ApplicationError::InvalidContentLockDeletionState {
+                            message: "provider-v2 replay changed immutable create timestamps"
+                                .to_owned(),
+                        });
+                    }
+                }
+                if !self
+                    .drains
+                    .persist_provider_v2_binding(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &obligation.task_id,
+                        false,
+                        Some(response),
+                    )
+                    .await?
+                {
+                    return Err(ApplicationError::InvalidContentLockDeletionState {
+                        message: "provider-v2 binding checkpoint lost its frozen task fence"
+                            .to_owned(),
+                    });
+                }
+                observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+                let status = self
+                    .paykit
+                    .provider_v2_invoice_status(&obligation.creator, &obligation.bundle_id)
+                    .await
+                    .map_err(|error| {
+                        observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                        map_client_error(error)
+                    })?
+                    .ok_or_else(|| ApplicationError::InvalidContentLockDeletionState {
+                        message: "provider-v2 exact replay was followed by invoice absence"
+                            .to_owned(),
+                    })?;
+                status.validate_against(&expected).map_err(|message| {
+                    ApplicationError::InvalidContentLockDeletionState { message }
+                })?;
+                if !self
+                    .drains
+                    .persist_provider_v2_status(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &obligation.task_id,
+                        Some(&status),
+                    )
+                    .await?
+                {
+                    return Err(ApplicationError::InvalidContentLockDeletionState {
+                        message: "provider-v2 status checkpoint lost its frozen task fence"
+                            .to_owned(),
+                    });
+                }
+                if !provider_v2_status_is_terminal(&status)? {
+                    return Ok(false);
+                }
+                expected.apply_status(status.clone()).map_err(|message| {
+                    ApplicationError::InvalidContentLockDeletionState { message }
+                })?;
+                expected.root =
+                    PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted);
+                ProviderV2DeletionReconciliation {
+                    create_conflict: false,
+                    create_response: Some(response),
+                    status: Some(status),
+                    terminal_snapshot: PaymentTaskSnapshot::V1(expected),
+                }
+            }
+            Err(PaymentDrainClientError::Conflict) => {
+                observe_healthy(evidence, DeletionDependencySource::PaymentProvider);
+                if !self
+                    .drains
+                    .persist_provider_v2_binding(
+                        claim.job.job_id,
+                        worker_id,
+                        claim.claim_token,
+                        &obligation.task_id,
+                        true,
+                        None,
+                    )
+                    .await?
+                {
+                    return Err(ApplicationError::InvalidContentLockDeletionState {
+                        message: "provider-v2 conflict checkpoint lost its frozen task fence"
+                            .to_owned(),
+                    });
+                }
+                match self
+                    .paykit
+                    .provider_v2_invoice_status(&obligation.creator, &obligation.bundle_id)
+                    .await
+                {
+                    Ok(None) => {
+                        if !self
+                            .drains
+                            .persist_provider_v2_status(
+                                claim.job.job_id,
+                                worker_id,
+                                claim.claim_token,
+                                &obligation.task_id,
+                                None,
+                            )
+                            .await?
+                        {
+                            return Err(ApplicationError::InvalidContentLockDeletionState {
+                                message:
+                                    "provider-v2 absence checkpoint lost its frozen task fence"
+                                        .to_owned(),
+                            });
+                        }
+                        let mut terminal_snapshot = (**snapshot).clone();
+                        terminal_snapshot.as_v1_mut().root = PaymentRootState::Expired(
+                            VerificationTerminalReason::ContentLockDeleted,
+                        );
+                        ProviderV2DeletionReconciliation {
+                            create_conflict: true,
+                            create_response: None,
+                            status: None,
+                            terminal_snapshot,
+                        }
+                    }
+                    Ok(Some(status)) => {
+                        return Err(ApplicationError::InvalidContentLockDeletionState {
+                            message: format!(
+                                "provider-v2 replay conflict resolved to an existing {:?} invoice",
+                                status.request_state
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                        return Err(map_client_error(error));
+                    }
+                }
+            }
+            Err(error) => {
+                observe_unavailable(evidence, DeletionDependencySource::PaymentProvider);
+                return Err(map_client_error(error));
+            }
+        };
+        if !self
+            .drains
+            .persist_provider_v2_terminal(
+                claim.job.job_id,
+                worker_id,
+                claim.claim_token,
+                &obligation.task_id,
+                &reconciliation,
+            )
+            .await?
+        {
+            return Err(ApplicationError::InvalidContentLockDeletionState {
+                message: "provider-v2 reconciliation lost its frozen task fence".to_owned(),
+            });
+        }
+        observe_healthy(evidence, DeletionDependencySource::PaymentDrainRepository);
+        Ok(true)
     }
 
     async fn finish_completed_drain(
@@ -690,6 +1101,20 @@ fn observe_healthy(evidence: &mut DeletionDependencyEvidence, source: DeletionDe
     *evidence = evidence.merge(DeletionDependencyEvidence::healthy(source));
 }
 
+fn deletion_error_execution(
+    error: &ApplicationError,
+    source: DeletionDependencySource,
+) -> DeletionPhaseExecution {
+    let outcome = match classify_deletion_execution_error(error) {
+        DeletionExecutionErrorClass::TransientDependency => {
+            DeletionPhaseExecutionOutcome::TransientDependencyFailure
+        }
+        DeletionExecutionErrorClass::Fatal => DeletionPhaseExecutionOutcome::FatalFailure,
+    };
+    DeletionPhaseExecution::new(outcome)
+        .with_evidence(DeletionDependencyEvidence::unavailable(source))
+}
+
 fn observe_unavailable(
     evidence: &mut DeletionDependencyEvidence,
     source: DeletionDependencySource,
@@ -734,6 +1159,26 @@ fn validate_aggregate_progress(
         });
     }
     Ok(())
+}
+
+fn provider_v2_status_is_terminal(
+    status: &crate::application::models::PaymentProviderStatus,
+) -> Result<bool, ApplicationError> {
+    if matches!(
+        status.request_state,
+        PaymentRequestStateV2::InvalidConflict | PaymentRequestStateV2::RecoveryRequired
+    ) {
+        return Err(ApplicationError::InvalidContentLockDeletionState {
+            message: "provider-v2 invoice entered a conflicting recovery state during deletion"
+                .to_owned(),
+        });
+    }
+    Ok(matches!(
+        status.request_state,
+        PaymentRequestStateV2::ProposalExpired
+            | PaymentRequestStateV2::Rejected
+            | PaymentRequestStateV2::Canceled
+    ) || status.payment_state == PaymentStateV2::Expired)
 }
 
 pub(crate) fn classify_payment_task(
@@ -798,7 +1243,10 @@ mod tests {
     };
 
     use crate::application::errors::ApplicationError;
-    use crate::application::models::{VerificationTaskStatus, VerificationTerminalReason};
+    use crate::application::models::{
+        PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2, PaymentStateV2,
+        VerificationTaskStatus, VerificationTerminalReason,
+    };
     use crate::application::ports::{
         EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary,
         PaymentRequestState, PaymentRequestStatus, PaymentState,
@@ -808,7 +1256,7 @@ mod tests {
 
     use super::{
         DeletionDependencyEvidence, DeletionDependencySource, classify_payment_task,
-        persist_entitlement, validate_aggregate_progress,
+        persist_entitlement, provider_v2_status_is_terminal, validate_aggregate_progress,
     };
 
     #[tokio::test]
@@ -1045,6 +1493,86 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn provider_v2_reconciliation_waits_for_closed_provider_lifecycle() {
+        for (request_state, payment_state, terminal) in [
+            (
+                PaymentRequestStateV2::Proposed,
+                PaymentStateV2::Undetected,
+                false,
+            ),
+            (
+                PaymentRequestStateV2::Accepted,
+                PaymentStateV2::Detected,
+                false,
+            ),
+            (
+                PaymentRequestStateV2::Rejected,
+                PaymentStateV2::Undetected,
+                true,
+            ),
+            (
+                PaymentRequestStateV2::Canceled,
+                PaymentStateV2::Undetected,
+                true,
+            ),
+            (
+                PaymentRequestStateV2::ProposalExpired,
+                PaymentStateV2::Undetected,
+                true,
+            ),
+            (
+                PaymentRequestStateV2::Accepted,
+                PaymentStateV2::Expired,
+                true,
+            ),
+        ] {
+            let value = PaymentProviderStatus {
+                creator: CreatorPubky::from_str(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                )
+                .unwrap(),
+                bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                request_state,
+                payment_state,
+                invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
+                proposal_expires_at: datetime!(2026-08-12 11:00:00 UTC),
+                deadline: datetime!(2026-08-13 10:00:00 UTC),
+                asset: PaymentAssetV2::Btc,
+                minimum_confirmations: 0,
+                current_sample: None,
+                first_threshold_satisfied: None,
+            };
+            assert_eq!(provider_v2_status_is_terminal(&value), Ok(terminal));
+        }
+    }
+
+    #[test]
+    fn provider_v2_reconciliation_rejects_conflict_and_recovery_even_when_payment_expired() {
+        for request_state in [
+            PaymentRequestStateV2::InvalidConflict,
+            PaymentRequestStateV2::RecoveryRequired,
+        ] {
+            let value = PaymentProviderStatus {
+                creator: CreatorPubky::from_str(
+                    "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                )
+                .unwrap(),
+                bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+                request_state,
+                payment_state: PaymentStateV2::Expired,
+                invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
+                proposal_expires_at: datetime!(2026-08-12 11:00:00 UTC),
+                deadline: datetime!(2026-08-13 10:00:00 UTC),
+                asset: PaymentAssetV2::Btc,
+                minimum_confirmations: 0,
+                current_sample: None,
+                first_threshold_satisfied: None,
+            };
+            assert!(provider_v2_status_is_terminal(&value).is_err());
         }
     }
 

@@ -246,6 +246,18 @@ pub enum ContentLockPayload {
     V2(ContentLockV2),
 }
 
+impl From<ContentLock> for ContentLockPayload {
+    fn from(value: ContentLock) -> Self {
+        Self::V1(value)
+    }
+}
+
+impl PartialEq<ContentLock> for ContentLockPayload {
+    fn eq(&self, other: &ContentLock) -> bool {
+        matches!(self, Self::V1(value) if value == other)
+    }
+}
+
 impl<'de> Deserialize<'de> for ContentLockPayload {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -274,6 +286,13 @@ impl<'de> Deserialize<'de> for ContentLockPayload {
 }
 
 impl ContentLockPayload {
+    pub fn as_v1(&self) -> Option<&ContentLock> {
+        match self {
+            Self::V1(content_lock) => Some(content_lock),
+            Self::V2(_) => None,
+        }
+    }
+
     /// Returns the creator that owns this content lock.
     pub fn creator(&self) -> &CreatorPubky {
         match self {
@@ -288,6 +307,65 @@ impl ContentLockPayload {
             Self::V1(lock) => lock.lock_id(),
             Self::V2(lock) => lock.lock_id(),
         }
+    }
+
+    /// Validates guarded-resource invariants for either supported version.
+    pub fn validate_resource_set(&self) -> Result<(), ContentLockValidationError> {
+        match self {
+            Self::V1(lock) => lock.validate_resource_set(),
+            Self::V2(lock) => lock.validate_resource_set(),
+        }
+    }
+
+    /// Serializes either supported version to canonical JSON bytes.
+    pub fn canonical_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        match self {
+            Self::V1(lock) => lock.canonical_json_bytes(),
+            Self::V2(lock) => lock.canonical_json_bytes(),
+        }
+    }
+
+    /// Computes canonical lock hash for either supported version.
+    pub fn lock_hash(&self) -> serde_json::Result<LockHash> {
+        match self {
+            Self::V1(lock) => lock.lock_hash(),
+            Self::V2(lock) => lock.lock_hash(),
+        }
+    }
+
+    pub fn primary_resource(&self) -> Option<&GuardedResource> {
+        match self {
+            Self::V1(lock) => lock.primary_resource.as_ref(),
+            Self::V2(lock) => lock.primary_resource.as_ref(),
+        }
+    }
+
+    pub fn secondary_resources(&self) -> &BTreeMap<String, SecondaryGuardedResource> {
+        match self {
+            Self::V1(lock) => &lock.secondary_resources,
+            Self::V2(lock) => &lock.secondary_resources,
+        }
+    }
+
+    pub fn resource_count(&self) -> usize {
+        usize::from(self.primary_resource().is_some()) + self.secondary_resources().len()
+    }
+
+    pub fn resource_for_path(&self, path: &str) -> Option<GuardedResource> {
+        if let Some(primary) = self
+            .primary_resource()
+            .filter(|resource| resource.path == path)
+        {
+            return Some(primary.clone());
+        }
+        self.secondary_resources()
+            .get(path)
+            .map(|resource| GuardedResource {
+                path: path.to_owned(),
+                hash: resource.hash,
+                content_type: resource.content_type.clone(),
+                size: resource.size,
+            })
     }
 }
 

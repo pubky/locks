@@ -143,7 +143,7 @@ pub(super) async fn delete_content_lock_for_authenticated_creator(
     let path = ContentLockPath::from_lock_id(lock_id.clone());
     let Some(content_lock) = state
         .content_locks()
-        .get_content_lock(&creator, &path)
+        .get_content_lock_payload(&creator, &path)
         .await?
     else {
         if state
@@ -399,7 +399,7 @@ async fn force_delete_content_lock(
     let published_content_lock = if existing_receipt.is_none() && existing_job.is_none() {
         state
             .content_locks()
-            .get_content_lock(&creator, &path)
+            .get_content_lock_payload(&creator, &path)
             .await?
     } else {
         None
@@ -519,7 +519,7 @@ async fn execute_synchronous_force_cleanup(
     creator: &CreatorPubky,
     lock_id: &LockId,
     path: &ContentLockPath,
-    content_lock: Option<locks_core::lock_policy::ContentLock>,
+    content_lock: Option<locks_core::lock_policy::ContentLockPayload>,
 ) -> Result<Vec<String>, ApiError> {
     state
         .content_locks()
@@ -527,7 +527,7 @@ async fn execute_synchronous_force_cleanup(
         .await?;
     if state
         .content_locks()
-        .get_content_lock(creator, path)
+        .get_content_lock_payload(creator, path)
         .await?
         .is_some()
     {
@@ -540,12 +540,12 @@ async fn execute_synchronous_force_cleanup(
     let mut failed_resource_paths = Vec::new();
     if let Some(content_lock) = content_lock {
         let mut resource_paths = content_lock
-            .secondary_resources
+            .secondary_resources()
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(primary) = content_lock.primary_resource {
-            resource_paths.push(primary.path);
+        if let Some(primary) = content_lock.primary_resource() {
+            resource_paths.push(primary.path.clone());
         }
         resource_paths.sort();
         resource_paths.dedup();
@@ -576,14 +576,14 @@ async fn execute_synchronous_force_cleanup(
 }
 
 fn validate_content_lock_identity(
-    content_lock: &locks_core::lock_policy::ContentLock,
+    content_lock: &locks_core::lock_policy::ContentLockPayload,
     creator: &CreatorPubky,
     expected_lock_id: &LockId,
 ) -> Result<(), ApiError> {
     let actual_lock_id = content_lock
         .lock_id()
         .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "content lock unavailable"))?;
-    if &content_lock.creator != creator || &actual_lock_id != expected_lock_id {
+    if content_lock.creator() != creator || &actual_lock_id != expected_lock_id {
         return Err(ApiError::new(
             ApiErrorCode::InternalError,
             "content lock unavailable",
@@ -593,7 +593,7 @@ fn validate_content_lock_identity(
 }
 
 fn validate_frozen_content_lock_identity(
-    content_lock: &locks_core::lock_policy::ContentLock,
+    content_lock: &locks_core::lock_policy::ContentLockPayload,
     creator: &CreatorPubky,
     expected_lock_id: &LockId,
 ) -> Result<(), ApiError> {
@@ -603,7 +603,7 @@ fn validate_frozen_content_lock_identity(
     let actual_lock_id = content_lock
         .lock_id()
         .map_err(|_| ApiError::new(ApiErrorCode::InternalError, "state_corrupt"))?;
-    if &content_lock.creator != creator || &actual_lock_id != expected_lock_id {
+    if content_lock.creator() != creator || &actual_lock_id != expected_lock_id {
         return Err(ApiError::new(ApiErrorCode::InternalError, "state_corrupt"));
     }
     Ok(())
@@ -858,7 +858,7 @@ fn validate_content_lock_limits(
 }
 
 fn validate_persisted_content_lock_limits(
-    content_lock: &locks_core::lock_policy::ContentLock,
+    content_lock: &locks_core::lock_policy::ContentLockPayload,
     limits: crate::config::ContentLocksConfig,
 ) -> Result<(), ApiError> {
     if content_lock.resource_count() > limits.max_resources {
@@ -872,11 +872,11 @@ fn validate_persisted_content_lock_limits(
     }
 
     let mut total_size = 0_u64;
-    if let Some(primary_resource) = &content_lock.primary_resource {
+    if let Some(primary_resource) = content_lock.primary_resource() {
         validate_descriptor_size(primary_resource.size, &limits)?;
         total_size = total_size.saturating_add(primary_resource.size);
     }
-    for secondary_resource in content_lock.secondary_resources.values() {
+    for secondary_resource in content_lock.secondary_resources().values() {
         validate_descriptor_size(secondary_resource.size, &limits)?;
         total_size = total_size.saturating_add(secondary_resource.size);
     }

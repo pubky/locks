@@ -5,8 +5,9 @@ use locks_core::{
         BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
     },
     lock_policy::{
-        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
-        GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, VerifierType,
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, GraphParticipantV2,
+        GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig,
+        PaymentPolicyV2, VerifierType,
     },
     verification::{
         CriterionVerificationResult, EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION,
@@ -23,15 +24,16 @@ use locks_service::{
             ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
             FinalAccessWindows, GraphObservationOutcome, GraphTaskRecord, GraphTaskSnapshot,
             GraphTaskSnapshotV1, INVOICE_ADMISSION_INTENT_VERSION,
-            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1,
+            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1, PaymentRootState,
             PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
             VerificationTerminalReason,
         },
         ports::{
-            AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
+            AccessCredentialStore, AdmitPaymentTask, Clock, ContentLockDeletionActionAcquireResult,
             ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, GraphTaskClaimer, GraphTaskRepository,
-            InvoiceAdmissionRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            InvoiceAdmissionRepository, PaymentDrainObligationKind, PaymentDrainRepository,
+            PaymentTaskRepository, VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -39,7 +41,7 @@ use locks_service::{
         access_credentials::InMemoryAccessCredentialStore,
         content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
         content_lock_deletions::InMemoryContentLockDeletionRepository,
-        graph_tasks::InMemoryGraphTaskRepository,
+        graph_tasks::InMemoryGraphTaskRepository, payment_tasks::InMemoryPaymentTaskRepository,
         verification_task_claims::InMemoryVerificationTaskClaimer,
         verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
         verification_tasks::InMemoryVerificationTaskRepository,
@@ -136,6 +138,73 @@ impl Clock for MutableClock {
     fn now(&self) -> time::OffsetDateTime {
         *self.0.lock().unwrap()
     }
+}
+
+#[tokio::test]
+async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_replay() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
+    let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
+    let lock = content_lock();
+    let lock_hash = lock.lock_hash().unwrap();
+    let request = AdmitPaymentTask {
+        task_id: TaskId::from_str(&Uuid::new_v4().to_string()).unwrap(),
+        submitted_proof_bundle: locks_core::verification::SubmittedProofBundleV2 {
+            version: locks_core::verification::SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+            bundle_id: BundleId::from_bytes([62; 16]),
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{}/pub/app.locks/{}.json",
+                lock.creator,
+                lock.lock_id().unwrap()
+            ))
+            .unwrap(),
+            reader_pubky: Some(lock.creator.clone()),
+        },
+        lock_hash: *lock_hash.as_bytes(),
+        payment: PaymentPolicyV2 {
+            recipient_pubky: lock.creator.clone(),
+            amount: "1".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 0,
+        },
+        verification_window_seconds: 300,
+    };
+    let admitted = payments.admit_payment_task(request.clone()).await.unwrap();
+
+    assert!(matches!(
+        deletions
+            .prepare_force_deletion(&lock.creator, &lock.lock_id().unwrap())
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::Synchronous(None)
+    ));
+
+    let terminal = payments
+        .get_payment_task_by_handle(&lock.creator, &request.submitted_proof_bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.task_id, admitted.task_id);
+    assert_eq!(terminal.status, VerificationTaskStatus::Expired);
+    assert_eq!(
+        terminal.snapshot.as_v1().root,
+        PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
+    );
+    assert_eq!(
+        payments.admit_payment_task(request.clone()).await,
+        Ok(terminal),
+        "exact replay stays readable without reopening publication"
+    );
+    let mut fresh_bundle = request;
+    fresh_bundle.task_id = TaskId::from_str(&Uuid::new_v4().to_string()).unwrap();
+    fresh_bundle.submitted_proof_bundle.bundle_id = BundleId::from_bytes([63; 16]);
+    assert_eq!(
+        payments.admit_payment_task(fresh_bundle).await,
+        Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress),
+        "force receipt permanently fences every later bundle for the deleted lock"
+    );
 }
 
 #[tokio::test]
@@ -356,10 +425,12 @@ async fn frozen_manifest_identity_is_immutable_and_creator_lock_unique() {
 
     assert!(job.validate_frozen_identity().is_ok());
     let mut corrupted = job;
-    corrupted
-        .frozen_content_lock
-        .access_policy
-        .requested_credential_ttl_seconds += 1;
+    match &mut corrupted.frozen_content_lock {
+        ContentLockPayload::V1(lock) => {
+            lock.access_policy.requested_credential_ttl_seconds += 1;
+        }
+        ContentLockPayload::V2(_) => unreachable!(),
+    }
     assert!(corrupted.validate_frozen_identity().is_err());
 
     let mut malformed = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
@@ -781,7 +852,7 @@ async fn in_memory_active_force_completion_is_exactly_fenced_and_permanently_blo
                 &job.creator,
                 &job.lock_id,
                 Uuid::new_v4(),
-                &job.frozen_content_lock,
+                job.frozen_content_lock.as_v1().unwrap(),
             )
             .await,
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
@@ -982,7 +1053,7 @@ async fn in_memory_cutoff_is_captured_under_the_shared_fence_not_from_the_caller
         Arc::clone(&fence),
     ));
     let access = Arc::new(
-        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+        InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
             verification_tasks.clone(),
             Arc::clone(&fence),
         ),
@@ -1038,7 +1109,7 @@ async fn failed_access_registration_leaves_no_job_or_task_ownership() {
         Arc::clone(&first_fence),
     ));
     let access = Arc::new(
-        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+        InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
             first_tasks,
             Arc::clone(&first_fence),
         ),
@@ -2025,6 +2096,69 @@ async fn no_paykit_drain_preserves_paykit_snapshot_for_later_paykit_recovery() {
 }
 
 #[tokio::test]
+async fn in_memory_paykit_v1_deletion_freezes_invoice_window_and_legacy_obligation() {
+    let (verification_tasks, access, deletions) = in_memory_access_stack();
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let mut task = verification_task(&job, VerificationTaskStatus::Pending);
+    let reader =
+        CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+            .unwrap();
+    task.submitted_proof_bundle.reader_public_key = Some(reader.clone());
+    verification_tasks
+        .insert_invoice_pending_task(
+            task.clone(),
+            InvoiceAdmissionIntentV1 {
+                version: INVOICE_ADMISSION_INTENT_VERSION,
+                creator: task.creator.clone(),
+                bundle_id: task.submitted_proof_bundle.bundle_id.clone(),
+                lock_resource: task.submitted_proof_bundle.pubky_lock_resource.clone(),
+                reader,
+                payment_in: 24,
+            },
+        )
+        .await
+        .unwrap();
+    let admission = verification_tasks
+        .claim_next_invoice_admission("invoice-worker", NOW, time::Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let invoice_created_at = NOW + time::Duration::seconds(1);
+    let payment_deadline = NOW + time::Duration::hours(24);
+    verification_tasks
+        .mark_invoice_admission_ready(
+            &task.task_id,
+            "invoice-worker",
+            &admission.claim_token,
+            NOW,
+            invoice_created_at,
+            payment_deadline,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    deletions.insert_job(job.clone()).await.unwrap();
+    let obligations = access.list_obligations(job.job_id).await.unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].task_id, task.task_id);
+    assert_eq!(
+        obligations[0].lock_resource,
+        task.submitted_proof_bundle.pubky_lock_resource
+    );
+    assert!(matches!(
+        &obligations[0].kind,
+        PaymentDrainObligationKind::PaykitV1 {
+            criterion_id,
+            invoice_created_at: stored_created_at,
+            payment_deadline: stored_deadline,
+        } if criterion_id == "criterion-1"
+            && *stored_created_at == invoice_created_at
+            && *stored_deadline == payment_deadline
+    ));
+}
+
+#[tokio::test]
 async fn in_memory_payment_drain_waits_for_pending_paykit_snapshot() {
     let (verification_tasks, access, deletions) = in_memory_access_stack();
     let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
@@ -2380,7 +2514,7 @@ fn in_memory_access_stack_with_clock(
         Arc::clone(&fence),
     ));
     let access = Arc::new(
-        InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+        InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
             verification_tasks.clone(),
             Arc::clone(&fence),
         ),

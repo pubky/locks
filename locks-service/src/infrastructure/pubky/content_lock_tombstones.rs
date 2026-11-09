@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::ContentLockPayload;
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::content_lock_tombstone::{
@@ -15,7 +15,7 @@ fn matches_frozen_content_lock(actual: &[u8], expected_canonical: &[u8]) -> bool
         return true;
     }
 
-    serde_json::from_slice::<ContentLock>(actual)
+    serde_json::from_slice::<ContentLockPayload>(actual)
         .ok()
         .and_then(|content_lock| content_lock.canonical_json_bytes().ok())
         .is_some_and(|canonical| canonical == expected_canonical)
@@ -51,7 +51,7 @@ where
         &self,
         creator: CreatorPubky,
         content_lock_path: ContentLockPath,
-        frozen_original: &ContentLock,
+        frozen_original: &ContentLockPayload,
         tombstone: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, ApplicationError> {
         let tombstone_bytes = canonical_tombstone_bytes(tombstone)?;

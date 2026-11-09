@@ -234,6 +234,13 @@ pub trait ContentLockPaymentDrainExecutor: Send + Sync {
         claim: ClaimedContentLockDeletionJob,
         worker_id: &str,
     ) -> DeletionPhaseExecution;
+
+    /// Cleans any durable provider drain, then terminalizes the graceful job.
+    async fn cleanup_claimed(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> DeletionPhaseExecution;
 }
 
 #[async_trait]
@@ -244,6 +251,14 @@ impl ContentLockPaymentDrainExecutor for DrainLockPaymentsUseCase<'_> {
         worker_id: &str,
     ) -> DeletionPhaseExecution {
         DrainLockPaymentsUseCase::execute_claimed_with_evidence(self, claim, worker_id).await
+    }
+
+    async fn cleanup_claimed(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> DeletionPhaseExecution {
+        DrainLockPaymentsUseCase::cleanup_claimed_with_evidence(self, claim, worker_id).await
     }
 }
 
@@ -390,7 +405,10 @@ impl<'a> ContentLockDeletionPhaseExecutor<'a> {
                     .await
             }
             ContentLockDeletionPhase::PurgeOperationalState => {
-                DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::Deferred)
+                self.dependencies
+                    .payments
+                    .cleanup_claimed(claim, worker_id)
+                    .await
             }
         }
     }
@@ -536,10 +554,10 @@ impl<'a> ContentLockDeletionPhaseExecutor<'a> {
         let tombstone = tombstone(claim);
         let content_lock_path = ContentLockPath::from_lock_id(claim.job.lock_id.clone());
         let mut resources = BTreeMap::<String, GuardedResourceHash>::new();
-        for (path, resource) in &claim.job.frozen_content_lock.secondary_resources {
+        for (path, resource) in claim.job.frozen_content_lock.secondary_resources() {
             resources.insert(path.clone(), resource.hash);
         }
-        if let Some(primary) = &claim.job.frozen_content_lock.primary_resource {
+        if let Some(primary) = claim.job.frozen_content_lock.primary_resource() {
             resources.insert(primary.path.clone(), primary.hash);
         }
 

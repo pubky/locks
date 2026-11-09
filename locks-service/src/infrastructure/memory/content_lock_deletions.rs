@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, LockId};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::{ContentLock, ContentLockPayload};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -797,7 +797,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        frozen_content_lock: Option<&ContentLock>,
+        frozen_content_lock: Option<&ContentLockPayload>,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let _claim_transition = self.claim_transition_gate.lock().await;
         let forced_at = self.verification_task_fence.authoritative_cutoff();
@@ -858,6 +858,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
             }
             let job = stored.job.clone();
+            self.verification_task_fence
+                .abandon_provider_v2_tasks(creator, lock_id, forced_at)
+                .await;
             self.access_credentials
                 .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
                 .await;
@@ -873,6 +876,14 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             );
             return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
         }
+        self.verification_task_fence
+            .deletion_cutoffs
+            .write()
+            .await
+            .insert(key.clone());
+        self.verification_task_fence
+            .abandon_provider_v2_tasks(creator, lock_id, forced_at)
+            .await;
         self.access_credentials
             .block_key_and_disable_job(creator, lock_id, None)
             .await;
@@ -948,6 +959,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let Some(forced_at) = stored.job.force_requested_at else {
             return Ok(false);
         };
+        self.verification_task_fence
+            .abandon_provider_v2_tasks(&key.0, &key.1, forced_at)
+            .await;
         self.access_credentials
             .block_key_and_disable_job(&key.0, &key.1, Some(job_id))
             .await;

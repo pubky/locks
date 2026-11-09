@@ -1801,7 +1801,7 @@ mod tests {
             job_id: Uuid::from_u128(1),
             creator: frozen_content_lock.creator.clone(),
             lock_id: frozen_content_lock.lock_id().unwrap(),
-            frozen_content_lock,
+            frozen_content_lock: frozen_content_lock.into(),
             deletion_started_at: NOW,
             state: ContentLockDeletionState::Running,
             phase: ContentLockDeletionPhase::Withdraw,
