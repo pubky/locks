@@ -473,7 +473,6 @@ impl GraphTaskClaimer for InMemoryGraphTaskRepository {
             expected_revision,
             now,
             next_attempt_at,
-            snapshot.as_v1().deadline_at,
             snapshot,
             |id| {
                 fence

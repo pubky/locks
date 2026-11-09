@@ -276,8 +276,7 @@ pub(crate) fn retry_claimed<T, F>(
     claim_token: &uuid::Uuid,
     expected_revision: u64,
     now: OffsetDateTime,
-    requested_due: OffsetDateTime,
-    deadline: OffsetDateTime,
+    due: OffsetDateTime,
     snapshot: T::Snapshot,
     deletion_fenced: F,
 ) -> Result<Option<T>, ApplicationError>
@@ -296,7 +295,6 @@ where
     ) else {
         return Ok(None);
     };
-    let due = EvaluatorTaskKernel::retry_due(now, requested_due, now, deadline)?;
     let stored = &mut records[index];
     if stored.task.status() != VerificationTaskStatus::InProgress {
         return Ok(None);
@@ -507,7 +505,6 @@ mod tests {
                 0,
                 now,
                 now + Duration::seconds(5),
-                now + Duration::minutes(1),
                 (true, false),
                 |_| false,
             )

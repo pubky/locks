@@ -363,7 +363,6 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             expected_revision,
             now,
             due,
-            snapshot.as_v1().deadline_at,
             snapshot,
             |id| {
                 fence
@@ -558,11 +557,15 @@ fn invalid_state(message: impl Into<String>) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
 
     use locks_core::ids::{LockHash, LockId, PubkyLockResource};
     use locks_core::lock_policy::PaymentPolicyV2;
     use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
+    use time::macros::datetime;
 
     use super::*;
     use crate::application::models::{
@@ -570,10 +573,27 @@ mod tests {
         PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2,
     };
     use crate::application::payment_v2_reducer::reduce_payment_snapshot;
+    use crate::application::ports::Clock;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
     const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+    const NOW: time::OffsetDateTime = datetime!(2026-10-01 12:00:00 UTC);
+
+    #[derive(Debug)]
+    struct MutableClock(Mutex<time::OffsetDateTime>);
+
+    impl MutableClock {
+        fn set(&self, now: time::OffsetDateTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> time::OffsetDateTime {
+            *self.0.lock().unwrap()
+        }
+    }
 
     fn request() -> AdmitPaymentTask {
         let creator = CreatorPubky::from_str(CREATOR).unwrap();
@@ -600,6 +620,54 @@ mod tests {
             },
             verification_window_seconds: 300,
         }
+    }
+
+    #[tokio::test]
+    async fn retry_clamped_to_reached_deadline_releases_claim() {
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = InMemoryPaymentTaskRepository::with_deletion_fence(fence);
+        let admitted = repository.admit_payment_task(request()).await.unwrap();
+        let deadline = admitted.snapshot.as_v1().deadline_at;
+        let claimed = repository
+            .claim_next_payment_task("worker", NOW, deadline + time::Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut snapshot = claimed.task.snapshot;
+        snapshot.as_v1_mut().next_due_at = Some(NOW + time::Duration::seconds(5));
+
+        clock.set(deadline);
+        let scheduled = repository
+            .schedule_payment_task_retry(
+                &admitted.task_id,
+                "worker",
+                &claimed.claim_token,
+                NOW,
+                0,
+                snapshot,
+                NOW + time::Duration::seconds(5),
+            )
+            .await
+            .unwrap()
+            .expect("deadline-clamped retry remains schedulable");
+
+        assert_eq!(scheduled.status, VerificationTaskStatus::Pending);
+        assert_eq!(scheduled.evaluator_revision, 1);
+        assert!(
+            repository
+                .claim_next_payment_task(
+                    "next-worker",
+                    deadline,
+                    deadline + time::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "retry at the reached deadline must be immediately claimable"
+        );
     }
 
     #[tokio::test]
