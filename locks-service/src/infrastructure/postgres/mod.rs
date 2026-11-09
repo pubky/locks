@@ -13,6 +13,7 @@ pub mod content_lock_ownership;
 pub mod creator_authority;
 pub mod creator_connect_flows;
 pub mod errors;
+mod evaluator_tasks;
 pub mod folded_auth;
 pub mod frontend_sessions;
 pub mod graph_tasks;

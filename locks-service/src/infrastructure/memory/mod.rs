@@ -5,6 +5,7 @@ pub mod content_lock_ownership;
 pub mod content_lock_tombstones;
 pub mod content_locks;
 pub mod entitlements;
+pub(crate) mod evaluator_tasks;
 pub mod folded_auth;
 pub mod graph_tasks;
 pub mod guarded_resources;

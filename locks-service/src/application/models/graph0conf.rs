@@ -5,6 +5,8 @@ use locks_core::lock_policy::{GraphOperatorV2, GraphPolicyV2, GraphPredicateV2};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use super::{EvaluatorTaskIdentityV1, EvaluatorTaskSnapshotV1};
+
 pub const GRAPH_TASK_SNAPSHOT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,12 @@ impl GraphTaskSnapshot {
         match self {
             Self::V1(snapshot) => snapshot,
         }
+    }
+}
+
+impl EvaluatorTaskSnapshotV1 for GraphTaskSnapshot {
+    fn identity(&self) -> EvaluatorTaskIdentityV1 {
+        self.as_v1().identity()
     }
 }
 
@@ -119,7 +127,34 @@ pub struct GraphTaskSnapshotV1 {
     pub root: GraphRootState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GraphEvaluationV1<'a> {
+    pub operator: &'a Option<GraphOperatorV2>,
+    pub predicates: &'a [GraphPredicateState],
+    pub root: &'a GraphRootState,
+}
+
 impl GraphTaskSnapshotV1 {
+    pub fn evaluation(&self) -> GraphEvaluationV1<'_> {
+        GraphEvaluationV1 {
+            operator: &self.operator,
+            predicates: &self.predicates,
+            root: &self.root,
+        }
+    }
+
+    pub fn identity(&self) -> EvaluatorTaskIdentityV1 {
+        EvaluatorTaskIdentityV1 {
+            creator: self.creator.clone(),
+            bundle_id: self.bundle_id.clone(),
+            pubky_lock_resource: self.pubky_lock_resource.clone(),
+            lock_hash: self.lock_hash,
+            reader: self.reader.clone(),
+            accepted_at: self.accepted_at,
+            deadline_at: self.deadline_at,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         creator: CreatorPubky,

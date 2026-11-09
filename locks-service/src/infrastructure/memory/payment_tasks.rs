@@ -2,9 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
-use locks_core::verification::{
-    SatisfiedByV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
-};
 use tokio::sync::{OwnedMutexGuard, RwLock};
 
 use crate::application::errors::ApplicationError;
@@ -13,21 +10,20 @@ use crate::application::models::{
     PaymentTaskSnapshotV1, VerificationTaskStatus,
 };
 use crate::application::ports::{
-    AdmitPaymentTask, PaymentPublicationActionGuard, PaymentTaskClaimer, PaymentTaskRepository,
+    AdmitPaymentTask, EvaluatorMode, EvaluatorTaskKernel, PaymentPublicationActionGuard,
+    PaymentTaskClaimer, PaymentTaskRepository, build_evaluator_publication,
 };
 
+use super::evaluator_tasks::{
+    MemoryEvaluatorTransition, StoredEvaluatorTask, claim_next, claimed_task_index,
+    complete_publication as complete_evaluator_publication, persist_claimed, publication_is_live,
+    release_claim, retry_claimed,
+};
 use super::verification_task_deletion_fence::{
     InMemoryVerificationTaskDeletionFence, InMemoryVerificationTaskFenceRecord,
 };
 
-#[derive(Debug, Clone)]
-struct StoredPaymentTask {
-    task: PaymentTaskRecord,
-    claimed_by: Option<String>,
-    claim_token: Option<uuid::Uuid>,
-    claim_expires_at: Option<time::OffsetDateTime>,
-    next_attempt_at: Option<time::OffsetDateTime>,
-}
+type StoredPaymentTask = StoredEvaluatorTask<PaymentTaskRecord>;
 
 #[derive(Debug, Clone)]
 pub struct InMemoryPaymentTaskRepository {
@@ -170,13 +166,10 @@ impl PaymentTaskRepository for InMemoryPaymentTaskRepository {
             .write()
             .await
             .insert(task.task_id, task.status);
-        self.records.write().await.push(StoredPaymentTask {
-            task: task.clone(),
-            claimed_by: None,
-            claim_token: None,
-            claim_expires_at: None,
-            next_attempt_at: None,
-        });
+        self.records
+            .write()
+            .await
+            .push(StoredEvaluatorTask::new(task.clone()));
         Ok(task)
     }
 
@@ -206,39 +199,19 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         caller_now: time::OffsetDateTime,
         requested_claim_expires_at: time::OffsetDateTime,
     ) -> Result<Option<ClaimedPaymentTask>, ApplicationError> {
-        let ttl = requested_claim_expires_at - caller_now;
-        if !ttl.is_positive() {
-            return Err(invalid_state("payment claim expiry must follow claim time"));
-        }
+        let ttl = EvaluatorTaskKernel::claim_ttl(caller_now, requested_claim_expires_at)
+            .map_err(|_| invalid_state("payment claim expiry must follow claim time"))?;
         let now = self.now();
         let fence = self.deletion_fence.records.read().await;
         let mut records = self.records.write().await;
-        let Some(stored) = records.iter_mut().find(|stored| {
-            ((matches!(
-                stored.task.status,
-                VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
-            ) && stored.task.snapshot.as_v1().root == PaymentRootState::Pending)
-                || (stored.task.status == VerificationTaskStatus::PublishingEntitlement
-                    && stored.task.snapshot.as_v1().root == PaymentRootState::Satisfied))
-                && stored.next_attempt_at.is_none_or(|due| due <= now)
-                && stored.claim_expires_at.is_none_or(|expiry| expiry <= now)
-                && fence
-                    .get(&stored.task.task_id)
-                    .is_none_or(|record| record.deletion_job_id.is_none())
-        }) else {
-            return Ok(None);
-        };
-        if stored.task.status != VerificationTaskStatus::PublishingEntitlement {
-            stored.task.status = VerificationTaskStatus::InProgress;
-        }
-        let token = uuid::Uuid::new_v4();
-        stored.claimed_by = Some(worker_id.to_owned());
-        stored.claim_token = Some(token);
-        stored.claim_expires_at = Some(now + ttl);
-        stored.next_attempt_at = None;
-        Ok(Some(ClaimedPaymentTask {
-            task: stored.task.clone(),
-            claim_token: token,
+        let stored = claim_next(&mut records, worker_id, now, ttl, |task_id| {
+            fence
+                .get(&task_id)
+                .is_some_and(|record| record.deletion_job_id.is_some())
+        });
+        Ok(stored.map(|stored| ClaimedPaymentTask {
+            task: stored.task,
+            claim_token: stored.claim_token.expect("shared claim kernel sets token"),
         }))
     }
 
@@ -254,77 +227,90 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         let now = self.now();
         let mut fence = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
-        let Some(stored) = records.iter_mut().find(|stored| {
-            live(
-                stored,
-                task_id,
-                worker_id,
-                claim_token,
-                expected_revision,
-                now,
-            )
-        }) else {
+        let Some(index) = claimed_task_index(
+            &records,
+            task_id,
+            worker_id,
+            claim_token,
+            expected_revision,
+            now,
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        ) else {
             return Ok(None);
         };
-        if fence
-            .get(task_id)
-            .is_some_and(|record| record.deletion_job_id.is_some())
-        {
-            return Ok(None);
-        }
+        let current = &records[index].task;
         snapshot
             .as_v1()
-            .validate_progress_from(stored.task.snapshot.as_v1())
+            .validate_progress_from(current.snapshot.as_v1())
             .map_err(invalid_state)?;
         let root = snapshot.as_v1().root;
-        stored.task.snapshot = snapshot;
-        stored.task.evaluator_revision = stored
-            .task
-            .evaluator_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid_state("payment evaluator revision overflow"))?;
-        match root {
-            PaymentRootState::Pending => {}
+        let (status, publication, publication_token, completed_at, retain_claim) = match root {
+            PaymentRootState::Pending => {
+                (VerificationTaskStatus::InProgress, None, None, None, true)
+            }
             PaymentRootState::Satisfied => {
-                let identity = stored.task.snapshot.as_v1();
-                let entitlement = VerifiedProofBundleV2 {
-                    version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
-                    creator: identity.creator.clone(),
-                    reader: identity.reader.clone(),
-                    bundle_id: identity.bundle_id.clone(),
-                    pubky_lock_resource: identity.pubky_lock_resource.clone(),
-                    verified_at: now,
-                    satisfied_by: vec![SatisfiedByV2::Payment],
-                };
-                entitlement.validate().map_err(|error| {
-                    invalid_state(format!("invalid payment entitlement: {error}"))
-                })?;
-                stored.task.status = VerificationTaskStatus::PublishingEntitlement;
-                stored.task.entitlement_to_publish = Some(entitlement);
-                let publication_token = uuid::Uuid::new_v4();
-                stored.task.entitlement_publication_token = Some(publication_token);
-                if let Some(record) = fence.get_mut(task_id) {
-                    record.status = stored.task.status;
-                    record.entitlement_publication_claim_token = Some(publication_token);
-                }
+                let publication = build_evaluator_publication(
+                    &snapshot.as_v1().identity(),
+                    EvaluatorMode::Payment,
+                    now,
+                )
+                .map_err(|error| invalid_state(format!("invalid payment entitlement: {error}")))?;
+                (
+                    VerificationTaskStatus::PublishingEntitlement,
+                    Some(publication),
+                    Some(uuid::Uuid::new_v4()),
+                    None,
+                    true,
+                )
             }
-            PaymentRootState::Expired(_) => {
-                terminalize(stored, VerificationTaskStatus::Expired, now)
+            PaymentRootState::Expired(_) => (
+                VerificationTaskStatus::Expired,
+                None,
+                None,
+                Some(now),
+                false,
+            ),
+            PaymentRootState::Failed(_) => {
+                (VerificationTaskStatus::Failed, None, None, Some(now), false)
             }
-            PaymentRootState::Failed(_) => terminalize(stored, VerificationTaskStatus::Failed, now),
+        };
+        let updated = persist_claimed(
+            &mut records,
+            task_id,
+            worker_id,
+            claim_token,
+            expected_revision,
+            now,
+            snapshot,
+            MemoryEvaluatorTransition {
+                status,
+                publication,
+                publication_token,
+                completed_at,
+                retain_claim,
+            },
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        )?;
+        if let Some(updated) = &updated {
+            if let Some(record) = fence.get_mut(task_id) {
+                record.status = updated.status;
+                record.entitlement_publication_claim_token = updated.entitlement_publication_token;
+            }
+            self.deletion_fence
+                .current_statuses
+                .write()
+                .await
+                .insert(*task_id, updated.status);
         }
-        if let Some(record) = fence.get_mut(task_id) {
-            record.status = stored.task.status;
-            if stored.task.status != VerificationTaskStatus::PublishingEntitlement {
-                record.entitlement_publication_claim_token = None;
-            }
-        }
-        self.deletion_fence
-            .current_statuses
-            .write()
-            .await
-            .insert(*task_id, stored.task.status);
-        Ok(Some(stored.task.clone()))
+        Ok(updated)
     }
 
     async fn schedule_payment_task_retry(
@@ -337,54 +323,64 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         snapshot: PaymentTaskSnapshot,
         requested_next: time::OffsetDateTime,
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
-        let delay = requested_next - caller_now;
-        if !delay.is_positive() {
-            return Err(invalid_state("payment retry delay must be positive"));
-        }
         let now = self.now();
         let mut fence = self.deletion_fence.records.write().await;
         let mut records = self.records.write().await;
-        let Some(stored) = records.iter_mut().find(|stored| {
-            live(
-                stored,
-                task_id,
-                worker_id,
-                claim_token,
-                expected_revision,
-                now,
-            )
-        }) else {
+        let Some(index) = claimed_task_index(
+            &records,
+            task_id,
+            worker_id,
+            claim_token,
+            expected_revision,
+            now,
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        ) else {
             return Ok(None);
         };
-        if fence
-            .get(task_id)
-            .is_some_and(|record| record.deletion_job_id.is_some())
-        {
-            return Ok(None);
-        }
+        let current = &records[index].task;
         snapshot
             .as_v1()
-            .validate_progress_from(stored.task.snapshot.as_v1())
+            .validate_progress_from(current.snapshot.as_v1())
             .map_err(invalid_state)?;
         if snapshot.as_v1().root != PaymentRootState::Pending {
             return Err(invalid_state("payment retry requires pending root"));
         }
-        stored.task.snapshot = snapshot;
-        stored.task.evaluator_revision += 1;
-        stored.task.status = VerificationTaskStatus::Pending;
-        stored.claimed_by = None;
-        stored.claim_token = None;
-        stored.claim_expires_at = None;
-        stored.next_attempt_at = Some((now + delay).min(stored.task.snapshot.as_v1().deadline_at));
-        if let Some(record) = fence.get_mut(task_id) {
-            record.status = stored.task.status;
+        let due = EvaluatorTaskKernel::retry_due(
+            caller_now,
+            requested_next,
+            now,
+            snapshot.as_v1().deadline_at,
+        )?;
+        let updated = retry_claimed(
+            &mut records,
+            task_id,
+            worker_id,
+            claim_token,
+            expected_revision,
+            now,
+            due,
+            snapshot,
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        )?;
+        if updated.is_some() {
+            if let Some(record) = fence.get_mut(task_id) {
+                record.status = VerificationTaskStatus::Pending;
+            }
+            self.deletion_fence
+                .current_statuses
+                .write()
+                .await
+                .insert(*task_id, VerificationTaskStatus::Pending);
         }
-        self.deletion_fence
-            .current_statuses
-            .write()
-            .await
-            .insert(*task_id, stored.task.status);
-        Ok(Some(stored.task.clone()))
+        Ok(updated)
     }
 
     async fn release_claimed_payment_task(
@@ -395,28 +391,17 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
     ) -> Result<bool, ApplicationError> {
         let fence = self.deletion_fence.records.read().await;
         let mut records = self.records.write().await;
-        let Some(stored) = records.iter_mut().find(|stored| {
-            stored.task.task_id == *task_id
-                && stored.claimed_by.as_deref() == Some(worker_id)
-                && stored.claim_token.as_ref() == Some(claim_token)
-        }) else {
-            return Ok(false);
-        };
-        if fence
-            .get(task_id)
-            .is_some_and(|record| record.deletion_job_id.is_some())
-        {
-            return Ok(false);
-        }
-        if stored.task.status == VerificationTaskStatus::InProgress
-            && stored.task.snapshot.as_v1().root == PaymentRootState::Pending
-        {
-            stored.task.status = VerificationTaskStatus::Pending;
-        }
-        stored.claimed_by = None;
-        stored.claim_token = None;
-        stored.claim_expires_at = None;
-        Ok(true)
+        Ok(release_claim(
+            &mut records,
+            task_id,
+            worker_id,
+            claim_token,
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        ))
     }
 
     async fn acquire_payment_publication_action(
@@ -455,17 +440,21 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             return Ok(None);
         }
         let now = self.now();
-        let live = self.records.read().await.iter().any(|stored| {
-            live(
-                stored,
-                task_id,
-                worker_id,
-                claim_token,
-                expected_revision,
-                now,
-            ) && stored.task.status == VerificationTaskStatus::PublishingEntitlement
-                && stored.task.entitlement_publication_token == Some(publication_token)
-        });
+        let records = self.records.read().await;
+        let live = publication_is_live(
+            &records,
+            task_id,
+            worker_id,
+            claim_token,
+            expected_revision,
+            publication_token,
+            now,
+            |id| {
+                fence
+                    .get(&id)
+                    .is_some_and(|record| record.deletion_job_id.is_some())
+            },
+        );
         if !live {
             return Ok(None);
         }
@@ -531,70 +520,33 @@ async fn complete_publication(
     let now = repository.now();
     let mut fence = repository.deletion_fence.records.write().await;
     let mut records = repository.records.write().await;
-    let Some(stored) = records.iter_mut().find(|stored| {
-        live(
-            stored,
-            task_id,
-            worker_id,
-            claim_token,
-            expected_revision,
-            now,
-        ) && stored.task.status == VerificationTaskStatus::PublishingEntitlement
-            && stored.task.entitlement_publication_token == Some(publication_token)
-    }) else {
-        return Ok(None);
-    };
-    if fence
-        .get(task_id)
-        .is_some_and(|record| record.deletion_job_id.is_some())
-    {
-        return Ok(None);
+    let updated = complete_evaluator_publication(
+        &mut records,
+        task_id,
+        worker_id,
+        claim_token,
+        expected_revision,
+        publication_token,
+        now,
+        |id| {
+            fence
+                .get(&id)
+                .is_some_and(|record| record.deletion_job_id.is_some())
+        },
+    );
+    if updated.is_some() {
+        if let Some(record) = fence.get_mut(task_id) {
+            record.status = VerificationTaskStatus::Completed;
+            record.entitlement_publication_claim_token = None;
+        }
+        repository
+            .deletion_fence
+            .current_statuses
+            .write()
+            .await
+            .insert(*task_id, VerificationTaskStatus::Completed);
     }
-    stored.task.status = VerificationTaskStatus::Completed;
-    stored.task.completed_at = Some(now);
-    stored.claimed_by = None;
-    stored.claim_token = None;
-    stored.claim_expires_at = None;
-    stored.next_attempt_at = None;
-    if let Some(record) = fence.get_mut(task_id) {
-        record.status = VerificationTaskStatus::Completed;
-        record.entitlement_publication_claim_token = None;
-    }
-    repository
-        .deletion_fence
-        .current_statuses
-        .write()
-        .await
-        .insert(*task_id, VerificationTaskStatus::Completed);
-    Ok(Some(stored.task.clone()))
-}
-
-fn live(
-    stored: &StoredPaymentTask,
-    task_id: &TaskId,
-    worker_id: &str,
-    claim_token: &uuid::Uuid,
-    revision: u64,
-    now: time::OffsetDateTime,
-) -> bool {
-    stored.task.task_id == *task_id
-        && stored.task.evaluator_revision == revision
-        && stored.claimed_by.as_deref() == Some(worker_id)
-        && stored.claim_token.as_ref() == Some(claim_token)
-        && stored.claim_expires_at.is_some_and(|expiry| expiry > now)
-}
-
-fn terminalize(
-    stored: &mut StoredPaymentTask,
-    status: VerificationTaskStatus,
-    now: time::OffsetDateTime,
-) {
-    stored.task.status = status;
-    stored.task.completed_at = Some(now);
-    stored.claimed_by = None;
-    stored.claim_token = None;
-    stored.claim_expires_at = None;
-    stored.next_attempt_at = None;
+    Ok(updated)
 }
 
 fn invalid_state(message: impl Into<String>) -> ApplicationError {
@@ -605,11 +557,15 @@ fn invalid_state(message: impl Into<String>) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
 
     use locks_core::ids::{LockHash, LockId, PubkyLockResource};
     use locks_core::lock_policy::PaymentPolicyV2;
     use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
+    use time::macros::datetime;
 
     use super::*;
     use crate::application::models::{
@@ -617,10 +573,27 @@ mod tests {
         PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2,
     };
     use crate::application::payment_v2_reducer::reduce_payment_snapshot;
+    use crate::application::ports::Clock;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
     const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+    const NOW: time::OffsetDateTime = datetime!(2026-10-01 12:00:00 UTC);
+
+    #[derive(Debug)]
+    struct MutableClock(Mutex<time::OffsetDateTime>);
+
+    impl MutableClock {
+        fn set(&self, now: time::OffsetDateTime) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> time::OffsetDateTime {
+            *self.0.lock().unwrap()
+        }
+    }
 
     fn request() -> AdmitPaymentTask {
         let creator = CreatorPubky::from_str(CREATOR).unwrap();
@@ -647,6 +620,54 @@ mod tests {
             },
             verification_window_seconds: 300,
         }
+    }
+
+    #[tokio::test]
+    async fn retry_clamped_to_reached_deadline_releases_claim() {
+        let clock = Arc::new(MutableClock(Mutex::new(NOW)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = InMemoryPaymentTaskRepository::with_deletion_fence(fence);
+        let admitted = repository.admit_payment_task(request()).await.unwrap();
+        let deadline = admitted.snapshot.as_v1().deadline_at;
+        let claimed = repository
+            .claim_next_payment_task("worker", NOW, deadline + time::Duration::seconds(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut snapshot = claimed.task.snapshot;
+        snapshot.as_v1_mut().next_due_at = Some(NOW + time::Duration::seconds(5));
+
+        clock.set(deadline);
+        let scheduled = repository
+            .schedule_payment_task_retry(
+                &admitted.task_id,
+                "worker",
+                &claimed.claim_token,
+                NOW,
+                0,
+                snapshot,
+                NOW + time::Duration::seconds(5),
+            )
+            .await
+            .unwrap()
+            .expect("deadline-clamped retry remains schedulable");
+
+        assert_eq!(scheduled.status, VerificationTaskStatus::Pending);
+        assert_eq!(scheduled.evaluator_revision, 1);
+        assert!(
+            repository
+                .claim_next_payment_task(
+                    "next-worker",
+                    deadline,
+                    deadline + time::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "retry at the reached deadline must be immediately claimable"
+        );
     }
 
     #[tokio::test]
