@@ -2,4 +2,11 @@
 # `rsa 0.9.10` is retained through SQLx's optional MySQL dependency closure.
 # This workspace enables PostgreSQL only. Verify the exception remains unreachable with:
 # cargo tree --workspace --all-features --target all -i rsa@0.9.10
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0459 affects inactive, unbundled SQLite lockfile metadata; Locks enables
+# PostgreSQL only, and no compatible published SQLx release permits libsqlite3-sys >=0.39.0.
+# Upstream fix: https://github.com/transact-rs/sqlx/pull/4502
+# Commit: 10462fa4414c6c7f1ed1d39bb31678e3b726878c
+# Review no later than 2027-02-07. Remove this exception when the first compatible
+# published SQLx release containing that commit is available.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459"]
