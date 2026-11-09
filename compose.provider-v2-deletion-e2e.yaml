@@ -1,0 +1,90 @@
+name: locks-provider-v2-deletion-e2e
+
+x-provider-contract: &provider-contract "paykit-server-v0.1.1-rc3-725a4cd6578cdc149b4f38c8577bb9937a81bbb6-tree-460e541fa10c8da8c761f71177407cd0959ca17d"
+
+services:
+  locks-postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: locks
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d locks"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    tmpfs: [/var/lib/postgresql/data]
+
+  paykit-postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    tmpfs: [/var/lib/postgresql/data]
+
+  paykit:
+    build:
+      context: .
+      dockerfile: docker/provider-v2-deletion-paykit.Dockerfile
+      args:
+        PAYKIT_REV: 725a4cd6578cdc149b4f38c8577bb9937a81bbb6
+    depends_on:
+      paykit-postgres: {condition: service_healthy}
+    environment:
+      TEST_DATABASE_URL: postgres://postgres:postgres@paykit-postgres:5432/postgres
+      LOCKS_PAYKIT_COORD_DIR: /coord
+      PROVIDER_V2_DELETION_SCENARIO: ${PROVIDER_V2_DELETION_SCENARIO:?scenario required}
+      PAYKIT_CONTRACT: *provider-contract
+    volumes:
+      - coordination:/coord
+
+  paykit-relay:
+    image: python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
+    depends_on: [paykit]
+    environment:
+      PAYKIT_UPSTREAM_HOST: paykit
+      PAYKIT_UPSTREAM_PORT: "3001"
+    volumes:
+      - ./scripts/provider-v2-deletion-paykit-proxy.py:/proxy.py:ro
+    command: ["python", "/proxy.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3002/healthz', timeout=1)"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  provider-v2-deletion-e2e:
+    image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
+    working_dir: /locks
+    depends_on:
+      locks-postgres: {condition: service_healthy}
+      paykit-relay: {condition: service_healthy}
+    environment:
+      TEST_DATABASE_URL: postgres://postgres:postgres@locks-postgres:5432/locks
+      LOCKS_PAYKIT_COORD_DIR: /coord
+      PAYKIT_SERVER_URL: http://paykit-relay:3002
+      PROVIDER_V2_DELETION_SCENARIO: ${PROVIDER_V2_DELETION_SCENARIO:?scenario required}
+      CARGO_HOME: /cargo
+      CARGO_TARGET_DIR: /target
+      RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
+      CARGO_INCREMENTAL: "0"
+    volumes:
+      - .:/locks:ro
+      - coordination:/coord
+      - locks-private:/private
+      - cargo-cache:/cargo
+      - target-cache:/target
+    command: ["cargo", "test", "--locked", "-p", "locks-e2e", "--test", "provider_v2_deletion_compose", "provider_v2_deletion_compose_exercises_real_locks_http_and_paykit_rc3", "--", "--exact", "--nocapture"]
+
+volumes:
+  coordination:
+  locks-private:
+  cargo-cache:
+  target-cache:
