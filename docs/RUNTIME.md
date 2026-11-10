@@ -243,7 +243,7 @@ WHERE state IN ('queued', 'running', 'failed');
 
 If rows are returned, resume/retry them on the pre-0021 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
 
-Migration `0032_provider_v2_deletion` upgrades ordinary graceful payment deletions that already reached `completed` on `v0.1.1-rc3`; it retains their frozen evaluator snapshot, terminal resolution, and final-credential evidence. It still fails closed if a completed payment deletion has an unresolved snapshot, because that contradicts graceful completion and cannot be repaired by replaying a completed job. Before upgrading from rc3, stop writes and run:
+Migration `0032_provider_v2_deletion` upgrades ordinary graceful payment deletions that already reached `completed` on `v0.1.1-rc3`; it retains their frozen evaluator snapshot, terminal resolution, and final-credential evidence. Only those rows already stored before `0032` may retain the rc3 terminal shape without provider replay/status evidence; PostgreSQL rejects that shape for every later insert or update. It still fails closed if a completed payment deletion has an unresolved snapshot, because that contradicts graceful completion and cannot be repaired by replaying a completed job. Before upgrading from rc3, stop writes and run:
 
 ```sql
 SELECT deletion.job_id,

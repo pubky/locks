@@ -720,17 +720,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 .acquire_lock_admission(&key.0, &key.1)
                 .await;
             let _claim_transition = self.claim_transition_gate.lock().await;
-            let now = self.verification_task_fence.authoritative_cutoff();
-            let phase = {
-                let jobs = self.jobs.read().await;
-                let Some(stored) = jobs
-                    .values()
-                    .find(|stored| owns_claim(stored, job_id, worker_id, claim_token, now))
-                else {
-                    return Ok(None);
-                };
-                stored.job.phase
-            };
             let mut folded_auth_reservations = self
                 .verification_task_fence
                 .folded_auth_reservations
@@ -758,6 +747,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             let mut intents = self.publication_intents.write().await;
             let mut ownership = self.ownership_records.write().await;
             let mut jobs = self.jobs.write().await;
+            let now = self.verification_task_fence.authoritative_cutoff();
             let Some(stored) = jobs
                 .values()
                 .find(|stored| owns_claim(stored, job_id, worker_id, claim_token, now))
@@ -765,7 +755,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 return Ok(None);
             };
             self.access_credentials
-                .check_successful_finish(job_id, phase, now)
+                .check_successful_finish(job_id, stored.job.phase, now)
                 .await?;
             if let Some(verification_tasks) = self.access_credentials.verification_task_repository()
             {
@@ -1032,7 +1022,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         worker_id: &str,
         claim_token: Uuid,
     ) -> Result<bool, ApplicationError> {
-        let now = self.verification_task_fence.authoritative_cutoff();
         let key = self
             .jobs
             .read()
@@ -1056,6 +1045,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
+        let now = self.verification_task_fence.authoritative_cutoff();
         let Some(stored) = jobs.get(&key) else {
             return Ok(false);
         };
@@ -1071,7 +1061,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             &mut current_statuses,
             &key.0,
             &key.1,
-            forced_at,
+            now,
             &preserve_terminal,
         );
         self.access_credentials
@@ -1159,7 +1149,17 @@ fn clear_claim(stored: &mut StoredJob) {
 
 #[cfg(test)]
 mod lock_order_tests {
-    use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration as StdDuration};
+    use std::{
+        collections::BTreeMap,
+        future::{Future, poll_fn},
+        str::FromStr,
+        sync::{
+            Arc,
+            atomic::{AtomicI64, Ordering},
+        },
+        task::Poll,
+        time::Duration as StdDuration,
+    };
 
     use locks_core::{
         ids::{BundleId, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId},
@@ -1189,6 +1189,115 @@ mod lock_order_tests {
         fn now(&self) -> OffsetDateTime {
             NOW
         }
+    }
+
+    #[derive(Debug)]
+    struct MutableClock(AtomicI64);
+
+    impl MutableClock {
+        fn new(now: OffsetDateTime) -> Self {
+            Self(AtomicI64::new(now.unix_timestamp()))
+        }
+
+        fn set(&self, now: OffsetDateTime) {
+            self.0.store(now.unix_timestamp(), Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for MutableClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(self.0.load(Ordering::SeqCst)).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_finish_rejects_claim_that_expires_while_waiting_for_fence_locks() {
+        let clock = Arc::new(MutableClock::new(NOW));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = Arc::new(
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence)),
+        );
+        let claim = ready_to_finish(&repository, content_lock(0)).await;
+        let claim_key = (claim.job.creator.clone(), claim.job.lock_id.clone());
+
+        let records_guard = fence.records.write().await;
+        let finishing = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move {
+                repository
+                    .finish(claim.job.job_id, "finish-worker", claim.claim_token, None)
+                    .await
+            })
+        };
+        wait_until_locked(|| fence.folded_auth_reservations.try_read().is_err()).await;
+        clock.set(NOW + time::Duration::minutes(2));
+        drop(records_guard);
+
+        assert!(
+            finishing.await.unwrap().unwrap().is_none(),
+            "finish must revalidate the exact live claim at post-fence authoritative time"
+        );
+        assert!(
+            repository
+                .get_job(&claim_key.0, &claim_key.1)
+                .await
+                .unwrap()
+                .is_some(),
+            "expired finisher must not purge the deletion job"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_completion_rejects_claim_that_expires_while_waiting_for_fence_locks() {
+        let clock = Arc::new(MutableClock::new(NOW));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = Arc::new(
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence)),
+        );
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(1), NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&job.creator, &job.lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Active(_)
+        ));
+        let claim = repository
+            .claim_next("force-worker", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let claim_key = (claim.job.creator.clone(), claim.job.lock_id.clone());
+
+        let records_guard = fence.records.write().await;
+        let completing = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move {
+                repository
+                    .complete_force_deletion(job.job_id, "force-worker", claim.claim_token)
+                    .await
+            })
+        };
+        wait_until_locked(|| repository.claim_transition_gate.try_lock().is_err()).await;
+        clock.set(NOW + time::Duration::minutes(2));
+        drop(records_guard);
+
+        assert!(
+            !completing.await.unwrap().unwrap(),
+            "force completion must revalidate the exact live claim at post-fence authoritative time"
+        );
+        assert!(
+            !repository
+                .has_force_receipt(&claim_key.0, &claim_key.1)
+                .await
+                .unwrap(),
+            "expired force worker must not create a completion receipt"
+        );
     }
 
     #[tokio::test]
@@ -1225,21 +1334,24 @@ mod lock_order_tests {
                     .await
             })
         };
-        tokio::task::yield_now().await;
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-        let inserting = {
-            let repository = Arc::clone(&repository);
-            tokio::spawn(async move { repository.insert_job(other_job.clone()).await })
-        };
-        tokio::task::yield_now().await;
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
-        drop(receipts_guard);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        wait_until_locked(|| repository.claim_transition_gate.try_lock().is_err()).await;
         drop(records_guard);
+        wait_until_locked(|| fence.records.try_read().is_err()).await;
+
+        let mut inserting = Box::pin(repository.insert_job(other_job));
+        poll_fn(|context| match inserting.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!(
+                    "intake unexpectedly completed before force receipt lock release: {result:?}"
+                )
+            }
+        })
+        .await;
+        drop(receipts_guard);
 
         let (completed, inserted) = tokio::time::timeout(StdDuration::from_secs(1), async {
-            (completing.await.unwrap(), inserting.await.unwrap())
+            (completing.await.unwrap(), inserting.await)
         })
         .await
         .expect("force completion and admission lock cycle must not deadlock");

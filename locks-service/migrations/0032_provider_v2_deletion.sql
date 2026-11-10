@@ -246,6 +246,18 @@ ALTER TABLE content_lock_deletion_task_snapshot
              AND provider_status_snapshot IS NULL)
         );
 
+-- Existing v0.1.1-rc3 completed graceful rows predate provider replay
+-- evidence. Keep those already-stored rows readable, but enforce full terminal
+-- evidence on every row inserted or updated after this migration. PostgreSQL
+-- enforces a NOT VALID CHECK for new writes without scanning legacy rows.
+ALTER TABLE content_lock_deletion_task_snapshot
+    ADD CONSTRAINT content_lock_snapshot_provider_terminal_evidence_post_0032
+        CHECK (
+            obligation_kind <> 'provider_v2'
+            OR provider_reconciliation_state <> 'terminal'
+            OR provider_create_replay_result IS NOT NULL
+        ) NOT VALID;
+
 ALTER TABLE content_lock_payment_drains
     ADD COLUMN pubky_lock_resource TEXT,
     ADD COLUMN paykit_authority_scheme TEXT,
