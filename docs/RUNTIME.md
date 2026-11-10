@@ -243,6 +243,29 @@ WHERE state IN ('queued', 'running', 'failed');
 
 If rows are returned, resume/retry them on the pre-0021 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
 
+Migration `0032_provider_v2_deletion` upgrades ordinary graceful payment deletions that already reached `completed` on `v0.1.1-rc3`; it retains their frozen evaluator snapshot, terminal resolution, and final-credential evidence. It still fails closed if a completed payment deletion has an unresolved snapshot, because that contradicts graceful completion and cannot be repaired by replaying a completed job. Before upgrading from rc3, stop writes and run:
+
+```sql
+SELECT deletion.job_id,
+       deletion.creator,
+       deletion.lock_id,
+       snapshot.verification_task_id,
+       snapshot.status_at_cutoff,
+       snapshot.resolved_status,
+       task.status AS current_task_status
+FROM content_lock_deletion_jobs AS deletion
+JOIN content_lock_deletion_task_snapshot AS snapshot
+  ON snapshot.deletion_job_id = deletion.job_id
+JOIN verification_tasks AS task
+  ON task.task_id = snapshot.verification_task_id
+WHERE deletion.state = 'completed'
+  AND deletion.force_requested_at IS NULL
+  AND task.evaluator_mode = 'payment'
+  AND snapshot.resolved_status IS NULL;
+```
+
+No rows means completed rc3 payment deletions are safe to migrate. If rows exist, keep rc3 data and public state unchanged, retain a database backup, and escalate the listed IDs for evidence-specific reconciliation before retrying. Do not delete the job or snapshot, rewrite it to a retryable phase, or invent terminal/provider evidence: completed jobs cannot be resumed and those edits can erase the only retained cutoff record.
+
 The runtime-master-key cutover intentionally cannot decrypt creator-authority rows written with the retired Compose `creator-authority-encryption-key`. An existing Compose volume containing that file fails startup instead of silently stranding encrypted authority. To upgrade a local stack:
 
 1. Stop the stack and back up any data that must be retained.

@@ -23,10 +23,11 @@ BEGIN
         WHERE task.evaluator_mode = 'payment'
           AND deletion.state = 'completed'
           AND deletion.force_requested_at IS NULL
+          AND snapshot.resolved_status IS NULL
     ) THEN
         RAISE EXCEPTION USING
             MESSAGE = 'migration 0032 found a completed provider-v2 deletion without a persisted rc3 fence',
-            HINT = 'restore the deletion to a retryable state at a pre-drain phase for rc3 reconciliation, or explicitly record force abandonment, before retrying the migration';
+            HINT = 'follow the migration 0032 incident query in docs/RUNTIME.md; do not delete or hand-edit the completed job';
     END IF;
 
     IF EXISTS (
@@ -77,9 +78,25 @@ SET obligation_kind = CASE
     evaluator_snapshot_at_cutoff = CASE WHEN task.evaluator_mode = 'payment' THEN task.evaluator_snapshot END,
     entitlement_payload_at_cutoff = CASE WHEN task.evaluator_mode = 'payment' THEN task.entitlement_to_publish END,
     publication_token_at_cutoff = CASE WHEN task.evaluator_mode = 'payment' THEN task.entitlement_publication_claim_token END,
-    provider_reconciliation_state = CASE WHEN task.evaluator_mode = 'payment' THEN 'pending' END
-FROM verification_tasks AS task
-WHERE task.task_id = snapshot.verification_task_id;
+    provider_reconciliation_state = CASE
+        WHEN task.evaluator_mode = 'payment'
+             AND deletion.state = 'completed'
+             AND deletion.force_requested_at IS NULL
+             AND snapshot.resolved_status IS NOT NULL
+            THEN 'terminal'
+        WHEN task.evaluator_mode = 'payment' THEN 'pending'
+    END,
+    provider_reconciled_at = CASE
+        WHEN task.evaluator_mode = 'payment'
+             AND deletion.state = 'completed'
+             AND deletion.force_requested_at IS NULL
+             AND snapshot.resolved_status IS NOT NULL
+            THEN snapshot.resolved_at
+    END
+FROM verification_tasks AS task,
+     content_lock_deletion_jobs AS deletion
+WHERE task.task_id = snapshot.verification_task_id
+  AND deletion.job_id = snapshot.deletion_job_id;
 
 UPDATE content_lock_deletion_task_snapshot
 SET obligation_kind = COALESCE(obligation_kind, 'local'),
@@ -199,6 +216,14 @@ ALTER TABLE content_lock_deletion_task_snapshot
              AND resolved_status IS NOT NULL
              AND provider_reconciled_at IS NOT NULL
              AND (
+                 -- v0.1.1-rc3 completed graceful deletions retain terminal
+                 -- evidence in the frozen evaluator snapshot and resolution fields.
+                 (provider_create_replay_result IS NULL
+                  AND provider_create_invoice_created_at IS NULL
+                  AND provider_create_proposal_expires_at IS NULL
+                  AND provider_create_deadline IS NULL
+                  AND provider_status_snapshot IS NULL)
+                 OR
                  (provider_create_replay_result = 'conflict'
                   AND provider_create_invoice_created_at IS NULL
                   AND provider_create_proposal_expires_at IS NULL

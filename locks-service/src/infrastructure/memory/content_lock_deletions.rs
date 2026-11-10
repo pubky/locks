@@ -731,6 +731,11 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 };
                 stored.job.phase
             };
+            let mut folded_auth_reservations = self
+                .verification_task_fence
+                .folded_auth_reservations
+                .write()
+                .await;
             let mut fence_records = self.verification_task_fence.records.write().await;
             let task_ids = fence_records
                 .iter()
@@ -746,14 +751,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                         .then_some((record.creator.clone(), record.bundle_id.clone()))
                 })
                 .collect::<HashSet<_>>();
-            let mut graph_records = self.verification_task_fence.graph_records.write().await;
             let mut payment_records = self.verification_task_fence.payment_records.write().await;
             let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
-            let mut folded_auth_reservations = self
-                .verification_task_fence
-                .folded_auth_reservations
-                .write()
-                .await;
+            let mut graph_records = self.verification_task_fence.graph_records.write().await;
             let mut deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.write().await;
             let mut intents = self.publication_intents.write().await;
             let mut ownership = self.ownership_records.write().await;
@@ -1047,6 +1047,13 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .acquire_lock_admission(&key.0, &key.1)
             .await;
         let _claim_transition = self.claim_transition_gate.lock().await;
+        let preserve_terminal = self
+            .access_credentials
+            .reconciled_provider_v2_terminal_task_ids(job_id)
+            .await;
+        let mut fence_records = self.verification_task_fence.records.write().await;
+        let mut payment_records = self.verification_task_fence.payment_records.write().await;
+        let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         let Some(stored) = jobs.get(&key) else {
@@ -1058,13 +1065,15 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let Some(forced_at) = stored.job.force_requested_at else {
             return Ok(false);
         };
-        let preserve_terminal = self
-            .access_credentials
-            .reconciled_provider_v2_terminal_task_ids(job_id)
-            .await;
-        self.verification_task_fence
-            .abandon_provider_v2_tasks(&key.0, &key.1, forced_at, &preserve_terminal)
-            .await;
+        InMemoryVerificationTaskDeletionFence::abandon_provider_v2_tasks_under_locks(
+            &mut fence_records,
+            &mut payment_records,
+            &mut current_statuses,
+            &key.0,
+            &key.1,
+            forced_at,
+            &preserve_terminal,
+        );
         self.access_credentials
             .block_key_and_disable_job(&key.0, &key.1, Some(job_id))
             .await;
@@ -1146,4 +1155,330 @@ fn clear_claim(stored: &mut StoredJob) {
     stored.claimed_by = None;
     stored.claim_token = None;
     stored.claim_expires_at = None;
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration as StdDuration};
+
+    use locks_core::{
+        ids::{BundleId, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId},
+        lock_policy::{
+            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
+            GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig,
+        },
+    };
+    use time::macros::datetime;
+
+    use super::*;
+    use crate::{
+        application::{
+            models::{GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1},
+            ports::{Clock, GraphTaskClaimer, GraphTaskRepository},
+        },
+        infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository,
+    };
+
+    const NOW: OffsetDateTime = datetime!(2026-11-10 12:00:00 UTC);
+    const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[derive(Debug)]
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            NOW
+        }
+    }
+
+    #[tokio::test]
+    async fn force_completion_does_not_deadlock_with_other_lock_admission() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock,
+        )));
+        let repository = Arc::new(
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence)),
+        );
+        let force_job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(1), NOW).unwrap();
+        repository.insert_job(force_job.clone()).await.unwrap();
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&force_job.creator, &force_job.lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Active(_)
+        ));
+        let claim = repository
+            .claim_next("force-worker", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let other_job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(2), NOW).unwrap();
+
+        let records_guard = fence.records.write().await;
+        let receipts_guard = repository.force_receipts.write().await;
+        let completing = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move {
+                repository
+                    .complete_force_deletion(force_job.job_id, "force-worker", claim.claim_token)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        let inserting = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move { repository.insert_job(other_job.clone()).await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        drop(receipts_guard);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        drop(records_guard);
+
+        let (completed, inserted) = tokio::time::timeout(StdDuration::from_secs(1), async {
+            (completing.await.unwrap(), inserting.await.unwrap())
+        })
+        .await
+        .expect("force completion and admission lock cycle must not deadlock");
+        assert!(completed.unwrap());
+        inserted.unwrap();
+        assert!(
+            repository
+                .has_force_receipt(&claim.job.creator, &claim.job.lock_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repository
+                .get_job(&claim.job.creator, &claim.job.lock_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_finish_does_not_deadlock_with_graph_claim_release() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock,
+        )));
+        let repository = Arc::new(
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence)),
+        );
+        let finish_claim = ready_to_finish(&repository, content_lock(3)).await;
+        let graph_repository = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let graph_task = graph_task(&content_lock(4));
+        graph_repository
+            .insert_graph_task(graph_task.clone())
+            .await
+            .unwrap();
+        let graph_claim = graph_repository
+            .claim_next_graph_task("graph-worker", NOW, NOW + time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let graph_guard = fence.graph_records.write().await;
+        let finishing = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move {
+                repository
+                    .finish(
+                        finish_claim.job.job_id,
+                        "finish-worker",
+                        finish_claim.claim_token,
+                        None,
+                    )
+                    .await
+            })
+        };
+        wait_until_locked(|| fence.records.try_read().is_err()).await;
+        let releasing = {
+            let graph_repository = Arc::clone(&graph_repository);
+            let task_id = graph_task.task_id;
+            tokio::spawn(async move {
+                graph_repository
+                    .release_claimed_graph_task(&task_id, "graph-worker", &graph_claim.claim_token)
+                    .await
+            })
+        };
+        wait_until_locked(|| fence.current_statuses.try_read().is_err()).await;
+        drop(graph_guard);
+
+        let (finished, released) = tokio::time::timeout(StdDuration::from_secs(1), async {
+            (finishing.await.unwrap(), releasing.await.unwrap())
+        })
+        .await
+        .expect("finish and graph release lock cycle must not deadlock");
+        assert!(finished.unwrap().is_some());
+        assert!(released.unwrap());
+        let reclaimed = graph_repository
+            .claim_next_graph_task("next-graph-worker", NOW, NOW + time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .expect("released graph task remains claimable");
+        assert_eq!(reclaimed.task.task_id, graph_task.task_id);
+        assert_ne!(reclaimed.claim_token, graph_claim.claim_token);
+    }
+
+    #[tokio::test]
+    async fn successful_finish_does_not_deadlock_with_graph_admission() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock,
+        )));
+        let repository = Arc::new(
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence)),
+        );
+        let finish_claim = ready_to_finish(&repository, content_lock(5)).await;
+        let graph_repository = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let graph_task = graph_task(&content_lock(6));
+
+        let records_guard = fence.records.write().await;
+        let finishing = {
+            let repository = Arc::clone(&repository);
+            tokio::spawn(async move {
+                repository
+                    .finish(
+                        finish_claim.job.job_id,
+                        "finish-worker",
+                        finish_claim.claim_token,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let inserting = {
+            let graph_repository = Arc::clone(&graph_repository);
+            tokio::spawn(async move { graph_repository.insert_graph_task(graph_task).await })
+        };
+        wait_until_locked(|| fence.folded_auth_reservations.try_read().is_err()).await;
+        drop(records_guard);
+
+        let (finished, inserted) = tokio::time::timeout(StdDuration::from_secs(1), async {
+            (finishing.await.unwrap(), inserting.await.unwrap())
+        })
+        .await
+        .expect("finish and graph admission lock cycle must not deadlock");
+        assert!(finished.unwrap().is_some());
+        inserted.unwrap();
+        assert!(
+            graph_repository
+                .claim_next_graph_task("graph-worker", NOW, NOW + time::Duration::minutes(1),)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn ready_to_finish(
+        repository: &InMemoryContentLockDeletionRepository,
+        lock: ContentLock,
+    ) -> ClaimedContentLockDeletionJob {
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        repository.insert_job(job.clone()).await.unwrap();
+        for phase in [
+            ContentLockDeletionPhase::StartPaymentDrain,
+            ContentLockDeletionPhase::DrainPayments,
+            ContentLockDeletionPhase::DrainExistingCredentials,
+            ContentLockDeletionPhase::IssueFinalCredentials,
+            ContentLockDeletionPhase::DrainFinalReads,
+            ContentLockDeletionPhase::DeleteContent,
+            ContentLockDeletionPhase::DeleteTombstone,
+            ContentLockDeletionPhase::PurgeOperationalState,
+        ] {
+            let claim = repository
+                .claim_next("finish-worker", time::Duration::minutes(1))
+                .await
+                .unwrap()
+                .unwrap();
+            repository
+                .advance_phase(job.job_id, "finish-worker", claim.claim_token, phase)
+                .await
+                .unwrap()
+                .advanced()
+                .expect("test deletion phase advances");
+        }
+        repository
+            .claim_next("finish-worker", time::Duration::minutes(1))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn wait_until_locked(mut predicate: impl FnMut() -> bool) {
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while !predicate() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contender reached decisive lock");
+    }
+
+    fn graph_task(lock: &ContentLock) -> GraphTaskRecord {
+        let lock_id = lock.lock_id().unwrap();
+        GraphTaskRecord {
+            task_id: TaskId::from_str(&Uuid::new_v4().to_string()).unwrap(),
+            snapshot: GraphTaskSnapshot::V1(
+                GraphTaskSnapshotV1::new(
+                    lock.creator.clone(),
+                    BundleId::new_random(),
+                    PubkyLockResource::from_str(&format!(
+                        "{}/pub/app.locks/{lock_id}.json",
+                        lock.creator
+                    ))
+                    .unwrap(),
+                    *lock.lock_hash().unwrap().as_bytes(),
+                    lock.creator.clone(),
+                    NOW,
+                    60,
+                    GraphPolicyV2 {
+                        predicates: vec![GraphPredicateV2::Follows {
+                            follower: GraphParticipantV2::Reader,
+                            followed: GraphParticipantV2::Creator,
+                        }],
+                        operator: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        }
+    }
+
+    fn content_lock(seed: u8) -> ContentLock {
+        ContentLock {
+            version: CONTENT_LOCK_VERSION,
+            creator: CreatorPubky::from_str(CREATOR).unwrap(),
+            primary_resource: Some(
+                GuardedResource::new(
+                    format!("/priv/app.locks/content/{seed}.json"),
+                    GuardedResourceHash::from_bytes([seed; 32]),
+                    "application/json".to_owned(),
+                    42,
+                )
+                .unwrap(),
+            ),
+            secondary_resources: BTreeMap::new(),
+            criteria: vec![],
+            lock_logic: LockLogic::All { criteria: vec![] },
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig { override_: None },
+            created_at: NOW - time::Duration::hours(i64::from(seed)),
+        }
+    }
 }
