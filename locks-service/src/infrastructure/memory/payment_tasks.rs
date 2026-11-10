@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, TaskId};
-use tokio::sync::{OwnedMutexGuard, RwLock};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
@@ -23,12 +23,9 @@ use super::verification_task_deletion_fence::{
     InMemoryVerificationTaskDeletionFence, InMemoryVerificationTaskFenceRecord,
 };
 
-type StoredPaymentTask = StoredEvaluatorTask<PaymentTaskRecord>;
-
 #[derive(Debug, Clone)]
 pub struct InMemoryPaymentTaskRepository {
     deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
-    records: Arc<RwLock<Vec<StoredPaymentTask>>>,
 }
 
 struct InMemoryPaymentPublicationActionGuard {
@@ -52,10 +49,7 @@ impl InMemoryPaymentTaskRepository {
         Self::default()
     }
     pub fn with_deletion_fence(deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>) -> Self {
-        Self {
-            deletion_fence,
-            records: Arc::new(RwLock::new(Vec::new())),
-        }
+        Self { deletion_fence }
     }
     fn now(&self) -> time::OffsetDateTime {
         self.deletion_fence.authoritative_cutoff()
@@ -88,10 +82,17 @@ impl PaymentTaskRepository for InMemoryPaymentTaskRepository {
             .acquire_lock_admission(&creator, &lock_id)
             .await;
 
-        if let Some(existing) = self.records.read().await.iter().find(|stored| {
-            let snapshot = stored.task.snapshot.as_v1();
-            snapshot.creator == creator && snapshot.bundle_id == bundle_id
-        }) {
+        if let Some(existing) = self
+            .deletion_fence
+            .payment_records
+            .read()
+            .await
+            .iter()
+            .find(|stored| {
+                let snapshot = stored.task.snapshot.as_v1();
+                snapshot.creator == creator && snapshot.bundle_id == bundle_id
+            })
+        {
             let candidate = PaymentTaskSnapshotV1::new(
                 request.submitted_proof_bundle,
                 request.lock_hash,
@@ -166,7 +167,8 @@ impl PaymentTaskRepository for InMemoryPaymentTaskRepository {
             .write()
             .await
             .insert(task.task_id, task.status);
-        self.records
+        self.deletion_fence
+            .payment_records
             .write()
             .await
             .push(StoredEvaluatorTask::new(task.clone()));
@@ -179,7 +181,8 @@ impl PaymentTaskRepository for InMemoryPaymentTaskRepository {
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
         Ok(self
-            .records
+            .deletion_fence
+            .payment_records
             .read()
             .await
             .iter()
@@ -203,7 +206,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             .map_err(|_| invalid_state("payment claim expiry must follow claim time"))?;
         let now = self.now();
         let fence = self.deletion_fence.records.read().await;
-        let mut records = self.records.write().await;
+        let mut records = self.deletion_fence.payment_records.write().await;
         let stored = claim_next(&mut records, worker_id, now, ttl, |task_id| {
             fence
                 .get(&task_id)
@@ -226,7 +229,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
         let now = self.now();
         let mut fence = self.deletion_fence.records.write().await;
-        let mut records = self.records.write().await;
+        let mut records = self.deletion_fence.payment_records.write().await;
         let Some(index) = claimed_task_index(
             &records,
             task_id,
@@ -325,7 +328,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
     ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
         let now = self.now();
         let mut fence = self.deletion_fence.records.write().await;
-        let mut records = self.records.write().await;
+        let mut records = self.deletion_fence.payment_records.write().await;
         let Some(index) = claimed_task_index(
             &records,
             task_id,
@@ -390,7 +393,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         claim_token: &uuid::Uuid,
     ) -> Result<bool, ApplicationError> {
         let fence = self.deletion_fence.records.read().await;
-        let mut records = self.records.write().await;
+        let mut records = self.deletion_fence.payment_records.write().await;
         Ok(release_claim(
             &mut records,
             task_id,
@@ -413,7 +416,8 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
         publication_token: uuid::Uuid,
     ) -> Result<Option<Box<dyn PaymentPublicationActionGuard>>, ApplicationError> {
         let identity = self
-            .records
+            .deletion_fence
+            .payment_records
             .read()
             .await
             .iter()
@@ -440,7 +444,7 @@ impl PaymentTaskClaimer for InMemoryPaymentTaskRepository {
             return Ok(None);
         }
         let now = self.now();
-        let records = self.records.read().await;
+        let records = self.deletion_fence.payment_records.read().await;
         let live = publication_is_live(
             &records,
             task_id,
@@ -519,7 +523,7 @@ async fn complete_publication(
 ) -> Result<Option<PaymentTaskRecord>, ApplicationError> {
     let now = repository.now();
     let mut fence = repository.deletion_fence.records.write().await;
-    let mut records = repository.records.write().await;
+    let mut records = repository.deletion_fence.payment_records.write().await;
     let updated = complete_evaluator_publication(
         &mut records,
         task_id,

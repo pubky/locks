@@ -1730,6 +1730,92 @@ async fn graceful_delete_of_existing_lock_queues_one_frozen_job_and_replays() {
 }
 
 #[tokio::test]
+async fn graceful_delete_of_payment_v2_lock_freezes_versioned_manifest_and_replays() {
+    let (state, _) = payment_only_v2_test_state().await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = payment_only_v2_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = ContentLockPath::from_lock_id(lock_id.clone());
+    assert_eq!(
+        state
+            .content_locks()
+            .get_content_lock_payload(&creator(), &path)
+            .await
+            .unwrap(),
+        Some(ContentLockPayload::V2(content_lock.clone()))
+    );
+    let app = router(state.clone());
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(authenticated_json_request(
+                "DELETE",
+                &format!("/creator/content-locks/{lock_id}"),
+                json!(null),
+                "creator-session",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "lock_id": lock_id, "status": "queued" })
+        );
+    }
+
+    let job = state
+        .content_lock_deletions()
+        .get_job(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        job.frozen_content_lock,
+        ContentLockPayload::V2(content_lock)
+    );
+    assert_eq!(job.state, ContentLockDeletionState::Queued);
+}
+
+#[tokio::test]
+async fn force_delete_of_payment_v2_lock_records_versioned_receipt_without_provider_io() {
+    let (state, _) = payment_only_v2_test_state().await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = payment_only_v2_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}?force=true"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+    let receipt = state
+        .content_lock_deletions()
+        .get_force_receipt(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.frozen_content_lock,
+        Some(ContentLockPayload::V2(content_lock))
+    );
+}
+
+#[tokio::test]
 async fn force_delete_removes_resources_and_lock_records_receipt_and_replays() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -2191,6 +2277,35 @@ async fn assert_terminal_job_force_defers_until_stale_worker_releases_action_lan
     let app = router(state.clone());
 
     let deferred = force_delete_request(&app, &lock_id).await;
+    if failure_code.is_none() {
+        assert_eq!(deferred.status(), StatusCode::OK);
+        stale_guard.release().await.unwrap();
+        assert!(
+            state
+                .content_locks()
+                .get_content_lock(&creator(), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .guarded_resources()
+                .get_current_guarded_resource(&creator(), &resource.path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .content_lock_deletions()
+                .get_force_receipt(&creator(), &lock_id)
+                .await
+                .unwrap()
+                .is_some_and(|receipt| receipt.completed_at.is_some())
+        );
+        return;
+    }
     assert_eq!(deferred.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response_json(deferred).await,
@@ -7085,8 +7200,8 @@ async fn folded_auth_test_state_with_runtime(
     (state, bundle)
 }
 
-async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
-    let lock = ContentLockV2 {
+fn payment_only_v2_lock() -> ContentLockV2 {
+    ContentLockV2 {
         version: 2,
         creator: creator(),
         primary_resource: Some(
@@ -7112,7 +7227,11 @@ async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
         },
         lock_server: LockServerConfig { override_: None },
         created_at: datetime!(2026-10-30 11:00:00 UTC),
-    };
+    }
+}
+
+async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
+    let lock = payment_only_v2_lock();
     let path = ContentLockPath::from_lock_id(lock.lock_id().unwrap());
     let bundle = SubmittedProofBundleV2 {
         version: 2,
@@ -8430,7 +8549,11 @@ async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .prepare_force_deletion_with_manifest(
+                &creator(),
+                &lock_id,
+                Some(&ContentLockPayload::V1(content_lock.clone())),
+            )
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)
@@ -8534,7 +8657,11 @@ async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_r
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .prepare_force_deletion_with_manifest(
+                &creator(),
+                &lock_id,
+                Some(&ContentLockPayload::V1(content_lock.clone())),
+            )
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)

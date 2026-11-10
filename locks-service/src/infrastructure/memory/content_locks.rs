@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 
+use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
 use locks_core::lock_policy::{ContentLock, ContentLockPayload};
+use serde::de::DeserializeOwned;
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::ContentLockRepository;
@@ -22,6 +24,32 @@ impl InMemoryContentLockRepository {
     /// Creates a typed adapter over shared canonical public-path storage.
     pub fn with_public_store(public_store: InMemoryPublicContentLockStore) -> Self {
         Self { public_store }
+    }
+}
+
+fn deserialize_content_lock_or_tombstone<T>(
+    bytes: &[u8],
+    content_lock_path: &ContentLockPath,
+) -> Result<Option<T>, ApplicationError>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_slice(bytes) {
+        Ok(content_lock) => Ok(Some(content_lock)),
+        Err(content_lock_error) => {
+            let is_canonical_tombstone =
+                serde_json::from_slice::<ContentLockDeletionTombstone>(bytes)
+                    .is_ok_and(|tombstone| tombstone.lock_id == *content_lock_path.lock_id());
+            if is_canonical_tombstone {
+                Ok(None)
+            } else {
+                Err(ApplicationError::Storage {
+                    message: format!(
+                        "failed to deserialize in-memory content lock: {content_lock_error}"
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -69,12 +97,9 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         self.public_store
             .get(creator, content_lock_path)
             .await
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| ApplicationError::Storage {
-                    message: format!("failed to deserialize in-memory content lock: {error}"),
-                })
-            })
+            .map(|bytes| deserialize_content_lock_or_tombstone(&bytes, content_lock_path))
             .transpose()
+            .map(Option::flatten)
     }
 
     async fn get_content_lock_payload(
@@ -85,12 +110,9 @@ impl ContentLockRepository for InMemoryContentLockRepository {
         self.public_store
             .get(creator, content_lock_path)
             .await
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| ApplicationError::Storage {
-                    message: format!("failed to deserialize in-memory content lock: {error}"),
-                })
-            })
+            .map(|bytes| deserialize_content_lock_or_tombstone(&bytes, content_lock_path))
             .transpose()
+            .map(Option::flatten)
     }
 
     async fn delete_content_lock(
@@ -113,7 +135,7 @@ mod tests {
     use serde_json::json;
     use time::macros::datetime;
 
-    use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockServerPubky};
+    use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockHash, LockId, LockServerPubky};
     use locks_core::lock_policy::{
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
         LockServerConfig, VerifierType,
@@ -144,6 +166,30 @@ mod tests {
         assert_eq!(
             repo.get_content_lock(&creator, &first_path).await.unwrap(),
             Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_content_lock_payload_treats_canonical_deletion_tombstone_as_absent() {
+        let repo = InMemoryContentLockRepository::new();
+        let creator = creator();
+        let lock_id = LockId::from_hash(LockHash::from_bytes([9; 32]));
+        let path = ContentLockPath::from_lock_id(lock_id.clone());
+        let tombstone =
+            ContentLockDeletionTombstone::new(lock_id, datetime!(2026-08-12 05:00:00 UTC));
+        repo.public_store
+            .put(
+                creator.clone(),
+                path.clone(),
+                serde_json::to_vec(&tombstone).unwrap(),
+            )
+            .await;
+
+        assert_eq!(
+            repo.get_content_lock_payload(&creator, &path)
+                .await
+                .unwrap(),
+            None
         );
     }
 

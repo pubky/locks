@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::{
-    ids::{CreatorPubky, LockId},
-    lock_policy::ContentLock,
+    ids::{ContentLockPath, CreatorPubky, LockId, PubkyLockResource},
+    lock_policy::{ContentLock, ContentLockPayload},
 };
 use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
 use time::OffsetDateTime;
@@ -452,19 +452,42 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "INSERT INTO content_lock_deletion_task_snapshot
                  (deletion_job_id, verification_task_id, creator, bundle_id,
                   pubky_lock_resource, criterion_id, status_at_cutoff,
-                  paykit_admission_required)
+                  paykit_admission_required, obligation_kind,
+                  evaluator_mode_at_cutoff, evaluator_revision_at_cutoff,
+                  evaluator_snapshot_at_cutoff, entitlement_payload_at_cutoff,
+                  publication_token_at_cutoff, provider_reconciliation_state)
              SELECT $1, task_id, creator, bundle_id,
                     submitted_proof_bundle->>'pubky_lock_resource',
-                    (SELECT proof->>'criterion_id'
-                     FROM jsonb_array_elements(submitted_proof_bundle->'proofs') AS proof
-                     WHERE proof->>'verifier_type' = 'paykit-payment'
-                     LIMIT 1),
+                    CASE WHEN evaluator_mode = 'payment' THEN NULL ELSE
+                        (SELECT proof->>'criterion_id'
+                         FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
+                         WHERE proof->>'verifier_type' = 'paykit-payment'
+                         LIMIT 1)
+                    END,
                     status,
-                    EXISTS (
-                        SELECT 1
-                        FROM jsonb_array_elements(submitted_proof_bundle->'proofs') AS proof
-                        WHERE proof->>'verifier_type' = 'paykit-payment'
-                    )
+                    CASE
+                        WHEN evaluator_mode = 'payment' THEN TRUE
+                        ELSE EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
+                            WHERE proof->>'verifier_type' = 'paykit-payment'
+                        )
+                    END,
+                    CASE
+                        WHEN evaluator_mode = 'payment' THEN 'provider_v2'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
+                            WHERE proof->>'verifier_type' = 'paykit-payment'
+                        ) THEN 'paykit_v1'
+                        ELSE 'local'
+                    END,
+                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_mode END,
+                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_revision END,
+                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_snapshot END,
+                    CASE WHEN evaluator_mode = 'payment' THEN entitlement_to_publish END,
+                    CASE WHEN evaluator_mode = 'payment' THEN entitlement_publication_claim_token END,
+                    CASE WHEN evaluator_mode = 'payment' THEN 'pending' END
              FROM verification_tasks
              WHERE creator = $2
                AND submitted_proof_bundle->>'pubky_lock_resource' = $3",
@@ -502,6 +525,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                      ELSE NULL
                  END
              WHERE deletion_job_id = $1
+               AND obligation_kind <> 'provider_v2'
                AND status_at_cutoff IN ('completed', 'failed', 'expired')",
         )
         .bind(job.job_id)
@@ -797,7 +821,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                     JOIN verification_tasks AS task
                       ON task.task_id = snapshot.verification_task_id
                     WHERE snapshot.deletion_job_id = $1
-                      AND snapshot.paykit_admission_required = TRUE
+                      AND snapshot.obligation_kind = 'paykit_v1'
                       AND task.invoice_admission_phase = 'ready'
                       AND (task.invoice_created_at IS NULL
                            OR task.payment_deadline IS NULL
@@ -821,7 +845,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                     JOIN verification_tasks AS task
                       ON task.task_id = snapshot.verification_task_id
                     WHERE snapshot.deletion_job_id = $1
-                      AND snapshot.paykit_admission_required = TRUE
+                      AND snapshot.obligation_kind = 'paykit_v1'
                       AND task.invoice_admission_phase = 'invoice_pending'
                 )",
             )
@@ -855,7 +879,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                      )
                  FROM verification_tasks AS task
                  WHERE snapshot.deletion_job_id = $1
-                   AND snapshot.paykit_admission_required = TRUE
+                   AND snapshot.obligation_kind = 'paykit_v1'
                    AND task.task_id = snapshot.verification_task_id",
             )
             .bind(job_id)
@@ -912,7 +936,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "SELECT EXISTS (
                  SELECT 1 FROM content_lock_deletion_task_snapshot
                  WHERE deletion_job_id = $1
-                   AND paykit_admission_required IS NULL
+                   AND obligation_kind IS NULL
              )",
         )
         .bind(job_id)
@@ -950,7 +974,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
              FROM content_lock_deletion_task_snapshot AS snapshot
              WHERE snapshot.deletion_job_id = $1
                AND snapshot.verification_task_id = task.task_id
-               AND snapshot.paykit_admission_required = FALSE
+               AND snapshot.obligation_kind = 'local'
                AND snapshot.resolved_status IS NULL
                AND task.status IN ('pending', 'in_progress')",
         )
@@ -964,7 +988,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "UPDATE content_lock_deletion_task_snapshot
              SET resolved_status = 'expired', resolved_at = $2
              WHERE deletion_job_id = $1
-               AND paykit_admission_required = FALSE
+               AND obligation_kind = 'local'
                AND resolved_status IS NULL",
         )
         .bind(job_id)
@@ -981,7 +1005,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             "SELECT EXISTS (
                  SELECT 1 FROM content_lock_deletion_task_snapshot
                  WHERE deletion_job_id = $1
-                   AND paykit_admission_required IS DISTINCT FROM FALSE
+                   AND obligation_kind IN ('paykit_v1', 'provider_v2')
              )",
         )
         .bind(job_id)
@@ -1011,6 +1035,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             }
             ensure_all_frozen_snapshots_terminal(&mut transaction, job_id).await?;
             ensure_payment_drain_completed(&mut transaction, job_id).await?;
+            ensure_payment_drain_cleaned(&mut transaction, job_id).await?;
             ensure_no_live_access_obligations(&mut transaction, job_id, now).await?;
             let issuance_incomplete: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
@@ -1030,6 +1055,48 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                     "successful completion cannot bypass final credential issuance",
                 ));
             }
+            let task_ids = sqlx::query_scalar::<_, Uuid>(
+                "SELECT verification_task_id
+                 FROM content_lock_deletion_task_snapshot
+                 WHERE deletion_job_id = $1",
+            )
+            .bind(job_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            sqlx::query("DELETE FROM folded_auth_attempts WHERE task_id = ANY($1)")
+                .bind(&task_ids)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            sqlx::query(
+                "DELETE FROM content_lock_ownership
+                 WHERE creator = $1 AND lock_id = $2",
+            )
+            .bind(current.creator.to_string())
+            .bind(current.lock_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            let deleted = sqlx::query("DELETE FROM content_lock_deletion_jobs WHERE job_id = $1")
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            if deleted.rows_affected() != 1 {
+                return Err(invalid_state("graceful purge lost its locked deletion job"));
+            }
+            sqlx::query("DELETE FROM verification_tasks WHERE task_id = ANY($1)")
+                .bind(&task_ids)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            transaction.commit().await.map_err(storage_error)?;
+            let mut completed = current;
+            completed.state = ContentLockDeletionState::Completed;
+            completed.failure_code = None;
+            completed.next_attempt_at = None;
+            return Ok(Some(completed));
         }
         revoke_read_claims(&mut transaction, job_id).await?;
         let state = if failure_code.is_some() {
@@ -1149,7 +1216,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        frozen_content_lock: Option<&ContentLock>,
+        frozen_content_lock: Option<&ContentLockPayload>,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
@@ -1157,10 +1224,25 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        let publication_in_progress = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2)",
+        let lock_resource = PubkyLockResource::new(
+            creator.clone(),
+            ContentLockPath::from_lock_id(lock_id.clone()),
         )
-        .bind(creator.to_string()).bind(lock_id.to_string())
+        .to_string();
+        let publication_in_progress = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM content_lock_publication_intents WHERE creator = $1 AND lock_id = $2)
+                 OR EXISTS (
+                     SELECT 1 FROM verification_tasks
+                     WHERE creator = $1
+                       AND submitted_proof_bundle->>'pubky_lock_resource' = $3
+                       AND evaluator_mode = 'payment'
+                       AND (status = 'publishing_entitlement'
+                            OR entitlement_publication_claim_token IS NOT NULL)
+                 )",
+        )
+        .bind(creator.to_string())
+        .bind(lock_id.to_string())
+        .bind(&lock_resource)
         .fetch_one(&mut *transaction).await.map_err(storage_error)?;
         if publication_in_progress {
             transaction.commit().await.map_err(storage_error)?;
@@ -1294,6 +1376,26 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                 .execute(&mut *transaction)
                 .await
                 .map_err(storage_error)?;
+                if abandon_provider_v2_tasks_for_force(
+                    &mut transaction,
+                    creator,
+                    &lock_resource,
+                    forced_at,
+                )
+                .await?
+                {
+                    sqlx::query(
+                        "UPDATE content_lock_force_deletion_receipts
+                         SET provider_v2_abandoned_at = COALESCE(provider_v2_abandoned_at, $3)
+                         WHERE creator = $1 AND lock_id = $2",
+                    )
+                    .bind(creator.to_string())
+                    .bind(lock_id.to_string())
+                    .bind(forced_at)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                }
                 transaction.commit().await.map_err(storage_error)?;
                 return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
             }
@@ -1314,6 +1416,21 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        if abandon_provider_v2_tasks_for_force(&mut transaction, creator, &lock_resource, forced_at)
+            .await?
+        {
+            sqlx::query(
+                "UPDATE content_lock_force_deletion_receipts
+                 SET provider_v2_abandoned_at = COALESCE(provider_v2_abandoned_at, $3)
+                 WHERE creator = $1 AND lock_id = $2",
+            )
+            .bind(creator.to_string())
+            .bind(lock_id.to_string())
+            .bind(forced_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
         transaction.commit().await.map_err(storage_error)?;
         Ok(PrepareForceDeletionResult::Synchronous(None))
     }
@@ -1400,10 +1517,88 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        let deleted_payment_root = serde_json::to_value(PaymentRootState::Expired(
+            VerificationTerminalReason::ContentLockDeleted,
+        ))
+        .map_err(storage_display)?;
         sqlx::query(
-            "UPDATE verification_tasks SET deletion_job_id = NULL WHERE deletion_job_id = $1",
+            "UPDATE verification_tasks AS task
+             SET status = CASE
+                     WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                     THEN task.status ELSE 'expired' END,
+                 started_at = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                                   THEN task.started_at
+                                   ELSE COALESCE(task.started_at, $2) END,
+                 completed_at = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                                   THEN task.completed_at ELSE $2 END,
+                 failure_message = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                                        THEN task.failure_message ELSE NULL END,
+                 terminal_reason = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                                        THEN task.terminal_reason
+                                        ELSE 'content_lock_deleted' END,
+                 evaluator_snapshot = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                     THEN task.evaluator_snapshot
+                     WHEN snapshot.obligation_kind = 'provider_v2'
+                     THEN jsonb_set(snapshot.evaluator_snapshot_at_cutoff, '{root}', $3)
+                     ELSE task.evaluator_snapshot END,
+                 evaluator_revision = CASE
+                     WHEN task.status <> 'completed'
+                      AND NOT (snapshot.obligation_kind = 'provider_v2'
+                               AND snapshot.provider_reconciliation_state = 'terminal'
+                               AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                      AND snapshot.obligation_kind = 'provider_v2'
+                     THEN snapshot.evaluator_revision_at_cutoff + 1
+                     ELSE task.evaluator_revision END,
+                 entitlement_to_publish = CASE WHEN task.status = 'completed'
+                       OR (snapshot.obligation_kind = 'provider_v2'
+                           AND snapshot.provider_reconciliation_state = 'terminal'
+                           AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
+                     THEN task.entitlement_to_publish ELSE NULL END,
+                 claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+                 next_attempt_at = NULL, last_attempt_error = NULL,
+                 entitlement_publication_claim_token = NULL, deletion_job_id = NULL,
+                 updated_at = $2
+             FROM content_lock_deletion_task_snapshot AS snapshot
+             WHERE snapshot.deletion_job_id = $1
+               AND snapshot.verification_task_id = task.task_id",
         )
         .bind(job_id)
+        .bind(now)
+        .bind(deleted_payment_root)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE content_lock_force_deletion_receipts
+             SET provider_v2_abandoned_at = $2
+             WHERE creator = $3 AND lock_id = $4
+               AND EXISTS (
+                   SELECT 1 FROM content_lock_deletion_task_snapshot
+                   WHERE deletion_job_id = $1 AND obligation_kind = 'provider_v2'
+               )",
+        )
+        .bind(job_id)
+        .bind(now)
+        .bind(current.creator.to_string())
+        .bind(current.lock_id.to_string())
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -1650,6 +1845,80 @@ async fn ensure_payment_drain_completed(
     Ok(())
 }
 
+async fn ensure_payment_drain_cleaned(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+) -> Result<(), ApplicationError> {
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM content_lock_payment_drains
+             WHERE deletion_job_id = $1 AND cleanup_state <> 'completed'
+         )",
+    )
+    .bind(job_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if pending {
+        return Err(invalid_state(
+            "payment drain cleanup must be durably completed before job purge",
+        ));
+    }
+    Ok(())
+}
+
+async fn abandon_provider_v2_tasks_for_force(
+    transaction: &mut Transaction<'_, Postgres>,
+    creator: &CreatorPubky,
+    lock_resource: &str,
+    forced_at: OffsetDateTime,
+) -> Result<bool, ApplicationError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM verification_tasks
+             WHERE creator = $1
+               AND submitted_proof_bundle->>'pubky_lock_resource' = $2
+               AND evaluator_mode = 'payment'
+         )",
+    )
+    .bind(creator.to_string())
+    .bind(lock_resource)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if !exists {
+        return Ok(false);
+    }
+    let deleted_root = serde_json::to_value(PaymentRootState::Expired(
+        VerificationTerminalReason::ContentLockDeleted,
+    ))
+    .map_err(storage_display)?;
+    sqlx::query(
+        "UPDATE verification_tasks
+         SET status = 'expired', started_at = COALESCE(started_at, $3), completed_at = $3,
+             failure_message = NULL, terminal_reason = 'content_lock_deleted',
+             evaluator_snapshot = jsonb_set(evaluator_snapshot, '{root}', $4),
+             evaluator_revision = evaluator_revision + 1,
+             entitlement_to_publish = NULL, claimed_by = NULL, claim_token = NULL,
+             claim_expires_at = NULL, next_attempt_at = NULL, last_attempt_error = NULL,
+             entitlement_publication_claim_token = NULL, deletion_job_id = NULL,
+             updated_at = $3
+         WHERE creator = $1
+           AND submitted_proof_bundle->>'pubky_lock_resource' = $2
+           AND evaluator_mode = 'payment'
+           AND status <> 'completed'
+           AND entitlement_publication_claim_token IS NULL",
+    )
+    .bind(creator.to_string())
+    .bind(lock_resource)
+    .bind(forced_at)
+    .bind(deleted_root)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(true)
+}
+
 async fn revoke_read_claims(
     transaction: &mut Transaction<'_, Postgres>,
     job_id: Uuid,
@@ -1744,7 +2013,7 @@ fn row_to_force_receipt(
         None
     } else {
         row.frozen_content_lock
-            .map(serde_json::from_value::<ContentLock>)
+            .map(serde_json::from_value::<ContentLockPayload>)
             .transpose()
             .map_err(|_| ApplicationError::CorruptContentLockDeletionManifest {
                 message: "force deletion manifest cannot be decoded".to_owned(),
@@ -1773,7 +2042,7 @@ fn row_to_job(row: DeletionJobRow) -> Result<ContentLockDeletionJob, Application
         job_id: row.job_id,
         creator: CreatorPubky::from_str(&row.creator).map_err(storage_display)?,
         lock_id: LockId::from_str(&row.lock_id).map_err(storage_display)?,
-        frozen_content_lock: serde_json::from_value::<ContentLock>(row.frozen_content_lock)
+        frozen_content_lock: serde_json::from_value::<ContentLockPayload>(row.frozen_content_lock)
             .map_err(storage_display)?,
         deletion_started_at: row.deletion_started_at,
         state: state_from_database(&row.state)?,
@@ -1882,7 +2151,8 @@ mod tests {
     use async_trait::async_trait;
     use locks_core::{
         ids::{
-            BundleId, CreatorPubky, GuardedResourceHash, LockServerPubky, PubkyLockResource, TaskId,
+            BundleId, CreatorPubky, GuardedResourceHash, LockHash, LockId, LockServerPubky,
+            PubkyLockResource, TaskId,
         },
         lock_policy::{
             AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
@@ -1921,11 +2191,12 @@ mod tests {
                 ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
                 ContentLockDeletionActionOwnership, ContentLockDeletionRepository,
                 ContentLockOwnershipRepository, EntitlementRepository, GraphTaskClaimer,
-                GraphTaskRepository, InvoiceAdmissionRepository, PaymentDrainCleanupToken,
-                PaymentDrainClient, PaymentDrainClientError, PaymentDrainRepository,
-                PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
-                PaymentRequestState, PaymentRequestStatus, PaymentState, PaymentTaskRepository,
-                VerificationTaskClaimer, VerificationTaskRepository,
+                GraphTaskRepository, InvoiceAdmissionRepository, PaykitAuthority,
+                PaymentDrainCleanupPreparation, PaymentDrainCleanupToken, PaymentDrainClient,
+                PaymentDrainClientError, PaymentDrainRepository, PaymentDrainStatus,
+                PaymentDrainSummary, PaymentDrainTerminalTransition, PaymentRequestState,
+                PaymentRequestStatus, PaymentState, PaymentTaskRepository, VerificationTaskClaimer,
+                VerificationTaskRepository,
             },
             use_cases::drain_lock_payments::DrainLockPaymentsUseCase,
         },
@@ -2211,7 +2482,7 @@ mod tests {
                     &job.creator,
                     &job.lock_id,
                     Uuid::new_v4(),
-                    &job.frozen_content_lock,
+                    job.frozen_content_lock.as_v1().unwrap(),
                 )
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
@@ -3087,6 +3358,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_terminalizes_unpublished_provider_v2_task_and_persists_abandonment() {
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let lock_id = lock.lock_id().unwrap();
+        let payments = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let admitted = payments
+            .admit_payment_task(payment_task_request(&lock))
+            .await
+            .unwrap();
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&lock.creator, &lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(None)
+        ));
+
+        let (status, terminal_reason, root, abandoned_at): (
+            String,
+            Option<String>,
+            serde_json::Value,
+            Option<time::OffsetDateTime>,
+        ) = sqlx::query_as(
+            "SELECT task.status, task.terminal_reason, task.evaluator_snapshot->'root',
+                    receipt.provider_v2_abandoned_at
+             FROM verification_tasks task
+             JOIN content_lock_force_deletion_receipts receipt
+               ON receipt.creator = task.creator
+              AND receipt.lock_id = $2
+             WHERE task.task_id = $1",
+        )
+        .bind(admitted.task_id.as_uuid())
+        .bind(lock_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(terminal_reason.as_deref(), Some("content_lock_deleted"));
+        assert_eq!(
+            root,
+            serde_json::json!({"status":"expired","reason":"content_lock_deleted"})
+        );
+        assert!(abandoned_at.is_some());
+        let replay = payments
+            .admit_payment_task(payment_task_request(&lock))
+            .await
+            .expect("exact replay remains readable without reopening provider work");
+        assert_eq!(replay.task_id, admitted.task_id);
+        assert_eq!(replay.status, VerificationTaskStatus::Expired);
+        assert_eq!(
+            replay.snapshot.as_v1().root,
+            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_force_reterminalizes_unreconciled_failed_provider_v2_task() {
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let lock_id = lock.lock_id().unwrap();
+        let payments = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let admitted = payments
+            .admit_payment_task(payment_task_request(&lock))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET status = 'failed', started_at = clock_timestamp(),
+                 failure_message = 'provider conflict', terminal_reason = NULL,
+                 completed_at = clock_timestamp()
+             WHERE task_id = $1",
+        )
+        .bind(admitted.task_id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&lock.creator, &lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(None)
+        ));
+
+        let (status, reason, failure, revision_after): (
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT status, terminal_reason, failure_message, evaluator_revision
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(admitted.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(reason.as_deref(), Some("content_lock_deleted"));
+        assert_eq!(failure, None);
+        assert_eq!(revision_after, admitted.evaluator_revision as i64 + 1);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn deletion_preserves_live_invoice_admission_claim_until_window_is_persisted() {
         let database = TestDatabase::create().await;
         let lock = content_lock();
@@ -3440,6 +3821,96 @@ mod tests {
         let paykit_calls = complete_payment_drain(&deletions, &drains, &job).await;
         assert_eq!(paykit_calls, 1);
 
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn force_preserves_provider_v2_terminal_reconciliation_evidence() {
+        let database = TestDatabase::create().await;
+        let pool = database.pool().clone();
+        let payments = PostgresPaymentTaskRepository::new(pool.clone());
+        let deletions = PostgresContentLockDeletionRepository::new(pool.clone());
+        let lock = content_lock();
+        let terminal = payments
+            .admit_payment_task(payment_task_request(&lock))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET status = 'failed', started_at = clock_timestamp(),
+                 completed_at = clock_timestamp(),
+                 failure_message = 'reconciled provider failure', terminal_reason = NULL,
+                 entitlement_to_publish = NULL
+             WHERE task_id = $1",
+        )
+        .bind(terminal.task_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        deletions.insert_job(job.clone()).await.unwrap();
+        sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET resolved_status = 'failed', resolved_at = clock_timestamp(),
+                 provider_reconciliation_state = 'terminal',
+                 provider_create_replay_result = 'conflict',
+                 provider_reconciled_at = clock_timestamp()
+             WHERE deletion_job_id = $1 AND verification_task_id = $2",
+        )
+        .bind(job.job_id)
+        .bind(terminal.task_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before: (
+            String,
+            Option<String>,
+            i64,
+            serde_json::Value,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT task.status, task.failure_message, task.evaluator_revision,
+                        task.evaluator_snapshot, snapshot.provider_reconciliation_state,
+                        snapshot.resolved_status
+                 FROM verification_tasks task
+                 JOIN content_lock_deletion_task_snapshot snapshot
+                   ON snapshot.verification_task_id = task.task_id
+                 WHERE task.task_id = $1",
+        )
+        .bind(terminal.task_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before.4, "terminal");
+        assert_eq!(before.5.as_deref(), Some("failed"));
+        assert!(matches!(
+            deletions
+                .prepare_force_deletion(&job.creator, &job.lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Active(_)
+        ));
+        let force_claim = deletions
+            .claim_next("force-worker", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            deletions
+                .complete_force_deletion(job.job_id, "force-worker", force_claim.claim_token)
+                .await
+                .unwrap()
+        );
+        let after: (String, Option<String>, i64, serde_json::Value) = sqlx::query_as(
+            "SELECT status, failure_message, evaluator_revision, evaluator_snapshot
+             FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(terminal.task_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, (before.0, before.1, before.2, before.3));
         database.cleanup().await;
     }
 
@@ -3959,8 +4430,14 @@ mod tests {
         let obligations = drains.list_obligations(job.job_id).await.unwrap();
         assert_eq!(obligations.len(), 1);
         assert_eq!(obligations[0].task_id, task.task_id);
-        assert_eq!(obligations[0].invoice_created_at, invoice_created_at);
-        assert_eq!(obligations[0].payment_deadline, payment_deadline);
+        assert!(matches!(
+            &obligations[0].kind,
+            crate::application::ports::PaymentDrainObligationKind::PaykitV1 {
+                invoice_created_at: actual_created,
+                payment_deadline: actual_deadline,
+                ..
+            } if *actual_created == invoice_created_at && *actual_deadline == payment_deadline
+        ));
         assert!(!drains.all_obligations_terminal(job.job_id).await.unwrap());
 
         deletions
@@ -4680,13 +5157,19 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
+        let crate::application::ports::PaymentDrainObligationKind::PaykitV1 {
+            criterion_id, ..
+        } = obligation.kind
+        else {
+            panic!("expected paykit-v1 obligation");
+        };
         let entitlement = VerifiedProofBundle {
             version: VERIFIED_PROOF_BUNDLE_VERSION,
             bundle_id: obligation.bundle_id,
             pubky_lock_resource: obligation.lock_resource,
             verification_result: VerificationResult {
                 criteria: vec![CriterionVerificationResult {
-                    criterion_id: obligation.criterion_id,
+                    criterion_id,
                     satisfied: true,
                     verified_at: NOW,
                     verified_by: LockServerPubky::from_str(
@@ -4896,7 +5379,7 @@ mod tests {
         let lookup = AccessCredentialLookupKey::derive(&issued.credential);
         let path = job
             .frozen_content_lock
-            .primary_resource
+            .primary_resource()
             .as_ref()
             .unwrap()
             .path
@@ -5063,7 +5546,7 @@ mod tests {
         let lookup = AccessCredentialLookupKey::derive(&issued.credential);
         let path = job
             .frozen_content_lock
-            .primary_resource
+            .primary_resource()
             .as_ref()
             .unwrap()
             .path
@@ -5176,7 +5659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_paykit_drain_keeps_deleted_payment_task_readable_by_handle() {
+    async fn provider_v2_cutoff_keeps_payment_task_pending_for_rc3_reconciliation() {
         let (database, payments, request, admitted) = deleted_pending_payment_task().await;
 
         let stored = payments
@@ -5188,12 +5671,9 @@ mod tests {
             .expect("deleted payment lifecycle remains readable")
             .expect("deleted payment lifecycle remains present");
 
-        assert_eq!(stored.status, VerificationTaskStatus::Expired);
-        assert_eq!(
-            stored.snapshot.as_v1().root,
-            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
-        );
-        assert_eq!(stored.evaluator_revision, 1);
+        assert_eq!(stored.status, VerificationTaskStatus::Pending);
+        assert_eq!(stored.snapshot.as_v1().root, PaymentRootState::Pending);
+        assert_eq!(stored.evaluator_revision, 0);
         assert_eq!(stored.task_id, admitted.task_id);
         assert_eq!(
             request.submitted_proof_bundle,
@@ -5203,7 +5683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_paykit_drain_replays_exact_deleted_payment_submission() {
+    async fn provider_v2_cutoff_replays_exact_submission_without_local_terminalization() {
         let (database, payments, request, admitted) = deleted_pending_payment_task().await;
 
         let replay = payments
@@ -5212,12 +5692,9 @@ mod tests {
             .expect("exact deleted payment submission replays its lifecycle");
 
         assert_eq!(replay.task_id, admitted.task_id);
-        assert_eq!(replay.status, VerificationTaskStatus::Expired);
-        assert_eq!(
-            replay.snapshot.as_v1().root,
-            PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
-        );
-        assert_eq!(replay.evaluator_revision, 1);
+        assert_eq!(replay.status, VerificationTaskStatus::Pending);
+        assert_eq!(replay.snapshot.as_v1().root, PaymentRootState::Pending);
+        assert_eq!(replay.evaluator_revision, 0);
         database.cleanup().await;
     }
 
@@ -5611,7 +6088,7 @@ mod tests {
         let lookup = AccessCredentialLookupKey::derive(&issued.credential);
         let path = job
             .frozen_content_lock
-            .primary_resource
+            .primary_resource()
             .as_ref()
             .unwrap()
             .path
@@ -5758,14 +6235,39 @@ mod tests {
         let mut paykit = verification_task(&lock, BundleId::from_bytes([64; 16]));
         paykit.submitted_proof_bundle.proofs[0].verifier_type = VerifierType::PaykitPayment;
         let local = verification_task(&lock, BundleId::from_bytes([65; 16]));
+        let local_task_id = local.task_id;
         tasks
             .insert_verification_task(paykit.clone())
             .await
             .unwrap();
         tasks.insert_verification_task(local).await.unwrap();
+        let owned_paths = guarded_paths(&lock);
+        let ownership = PostgresContentLockOwnershipRepository::new(database.pool().clone());
+        ownership
+            .reserve_paths(&lock.creator, &owned_paths, &lock.lock_id().unwrap())
+            .await
+            .unwrap();
         let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
         let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
         repository.insert_job(job.clone()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO folded_auth_attempts
+                 (creator, bundle_id, generation, state_hash, status,
+                  submitted_proof_bundle, pubky_lock_resource, lock_hash,
+                  verification_window_seconds, graph_policy, created_at, expires_at,
+                  terminal_at, purge_after, task_id)
+             VALUES ($1, 'purge-folded-auth', 1, $2, 'accepted', '{}'::jsonb,
+                     'purge-resource', $3, 60, '{}'::jsonb, $4,
+                     $4 + INTERVAL '10 minutes', $4, $4 + INTERVAL '1 hour', $5)",
+        )
+        .bind(job.creator.to_string())
+        .bind(vec![17_u8; 32])
+        .bind(vec![18_u8; 32])
+        .bind(NOW)
+        .bind(local_task_id.as_uuid())
+        .execute(database.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE content_lock_deletion_task_snapshot
              SET resolved_status = 'expired', resolved_at = $3
@@ -5784,7 +6286,7 @@ mod tests {
              ) VALUES ($1, 'completed', 0, 1, 0, $2, $3, $3)",
         )
         .bind(job.job_id)
-        .bind("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+        .bind("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         .bind(NOW)
         .execute(database.pool())
         .await
@@ -5846,10 +6348,131 @@ mod tests {
         .execute(database.pool())
         .await
         .unwrap();
+        assert!(matches!(
+            repository
+                .finish(job.job_id, "worker", claim_token, None)
+                .await,
+            Err(ApplicationError::InvalidContentLockDeletionState { message })
+                if message == "payment drain cleanup must be durably completed before job purge"
+        ));
+        let payment_drains = PostgresPaymentDrainRepository::new(database.pool().clone());
+        let lock_resource = PubkyLockResource::from_str(&format!(
+            "{}/pub/app.locks/{}.json",
+            job.creator, job.lock_id
+        ))
+        .unwrap();
+        let authority = PaykitAuthority {
+            scheme: "http".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 8080,
+            base_path: "/".to_owned(),
+        };
+        let cleanup_token = match payment_drains
+            .prepare_payment_drain_cleanup(
+                job.job_id,
+                "worker",
+                claim_token,
+                &lock_resource,
+                &authority,
+            )
+            .await
+            .unwrap()
+        {
+            PaymentDrainCleanupPreparation::Pending(token) => token,
+            other => panic!("expected pending cleanup after restart boundary, got {other:?}"),
+        };
+        assert!(
+            !payment_drains
+                .persist_payment_drain_cleanup(
+                    job.job_id,
+                    "worker",
+                    Uuid::new_v4(),
+                    &cleanup_token,
+                )
+                .await
+                .unwrap()
+        );
+        let restarted_drains = PostgresPaymentDrainRepository::new(database.pool().clone());
+        assert!(
+            restarted_drains
+                .persist_payment_drain_cleanup(job.job_id, "worker", claim_token, &cleanup_token,)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            restarted_drains
+                .prepare_payment_drain_cleanup(
+                    job.job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .unwrap(),
+            PaymentDrainCleanupPreparation::Completed
+        );
+        assert!(
+            repository
+                .finish(job.job_id, "worker", Uuid::new_v4(), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retained_after_stale_finish: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM content_lock_deletion_jobs WHERE job_id = $1),
+                 (SELECT COUNT(*) FROM verification_tasks WHERE task_id = ANY($2))",
+        )
+        .bind(job.job_id)
+        .bind([paykit.task_id.as_uuid(), local_task_id.as_uuid()])
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_after_stale_finish, (1, 2));
         repository
             .finish(job.job_id, "worker", claim_token, None)
             .await
             .unwrap();
+        let remaining_job: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM content_lock_deletion_jobs WHERE job_id = $1")
+                .bind(job.job_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let remaining_tasks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM verification_tasks WHERE task_id = ANY($1)")
+                .bind([paykit.task_id.as_uuid(), local_task_id.as_uuid()])
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let remaining_drains: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM content_lock_payment_drains WHERE deletion_job_id = $1",
+        )
+        .bind(job.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let remaining_folded_auth: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM folded_auth_attempts WHERE task_id = $1")
+                .bind(local_task_id.as_uuid())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (
+                remaining_job,
+                remaining_tasks,
+                remaining_drains,
+                remaining_folded_auth,
+            ),
+            (0, 0, 0, 0)
+        );
+        let replacement_lock = LockId::from_hash(LockHash::from_bytes([99; 32]));
+        ownership
+            .reserve_paths(&job.creator, &owned_paths, &replacement_lock)
+            .await
+            .expect("purge must release ownership for a different lock");
 
         database.cleanup().await;
     }
@@ -5993,7 +6616,7 @@ mod tests {
         let lookup = AccessCredentialLookupKey::derive(&issued.credential);
         let path = job
             .frozen_content_lock
-            .primary_resource
+            .primary_resource()
             .as_ref()
             .unwrap()
             .path

@@ -18,6 +18,7 @@ mod tests {
 
     use sqlx::Row;
     use sqlx::migrate::Migrator;
+    use time::macros::datetime;
 
     use super::super::testing::TestDatabase;
 
@@ -49,6 +50,7 @@ mod tests {
         "969587bd999941575899dac2fb322dee6bba266ee74d7b20c4b1053e58355eca4498913aedccb175d347f2b8e2293297",
         "3b4c9a739458b5da0391d8a6ebd159584f229d66f039dac52ff3ee2eae0fbc03d40d723fd6502c20d1e699c21c13602a",
     ];
+    const EXACT_RC3_0031_SHA384: &str = "83eb133c159a5e577a0e5244e18f0b58c6f057c80db5502f0cf50a38c64e1308e210d1d35fc1a0a9b2e68b7347fed2e4";
 
     fn checksum_hex(checksum: &[u8]) -> String {
         checksum.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -536,7 +538,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=31).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=32).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -577,12 +579,282 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=31).collect::<Vec<_>>()
+            (1..=32).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],
             before.as_slice(),
             "published migration checksums changed"
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn populated_0031_upgrade_classifies_safe_provider_v2_and_refuses_post_drain_state() {
+        for (phase, should_succeed) in [
+            ("withdraw", true),
+            ("start_payment_drain", true),
+            ("drain_payments", false),
+            ("drain_existing_credentials", false),
+        ] {
+            let database = TestDatabase::create_unmigrated().await;
+            let through_0031 = Migrator {
+                migrations: Cow::Owned(super::MIGRATOR.iter().take(31).cloned().collect()),
+                ignore_missing: false,
+                locking: false,
+                no_tx: false,
+            };
+            through_0031.run(database.pool()).await.unwrap();
+            let job_id = uuid::Uuid::new_v4();
+            let task_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO content_lock_deletion_jobs
+                     (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                      state, phase)
+                 VALUES ($1, 'upgrade-creator', 'upgrade-lock', '{}'::jsonb,
+                         clock_timestamp(), 'queued', $2)",
+            )
+            .bind(job_id)
+            .bind(phase)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO verification_tasks
+                     (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                      submitted_at, started_at, completed_at, entitlement_to_publish,
+                      invoice_admission_phase, evaluator_mode, evaluator_snapshot,
+                      evaluator_revision, deletion_job_id)
+                 VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'completed',
+                         '{\"proofs\":[]}'::jsonb, clock_timestamp(), clock_timestamp(),
+                         clock_timestamp(), '{}'::jsonb, 'ready', 'payment',
+                         '{\"schema_version\":1}'::jsonb, 7, $2)",
+            )
+            .bind(task_id)
+            .bind(job_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO content_lock_deletion_task_snapshot
+                     (deletion_job_id, verification_task_id, creator, bundle_id,
+                      pubky_lock_resource, status_at_cutoff, paykit_admission_required,
+                      resolved_status, resolved_at, final_credential_eligible_at)
+                 VALUES ($1, $2, 'upgrade-creator', 'upgrade-bundle',
+                         'upgrade-creator/pub/app.locks/upgrade-lock.json', 'completed', TRUE,
+                         'completed', clock_timestamp(), clock_timestamp())",
+            )
+            .bind(job_id)
+            .bind(task_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+            let result = super::run_migrations(database.pool()).await;
+            if should_succeed {
+                result.unwrap();
+                let row: (
+                    String,
+                    String,
+                    Option<String>,
+                    Option<time::OffsetDateTime>,
+                    Option<time::OffsetDateTime>,
+                ) = sqlx::query_as(
+                    "SELECT obligation_kind, provider_reconciliation_state,
+                            resolved_status, resolved_at, final_credential_eligible_at
+                     FROM content_lock_deletion_task_snapshot
+                     WHERE deletion_job_id = $1",
+                )
+                .bind(job_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+                assert_eq!(row.0, "provider_v2");
+                assert_eq!(row.1, "pending");
+                assert_eq!((row.2, row.3, row.4), (None, None, None));
+            } else {
+                let error = result.expect_err("post-drain provider-v2 upgrade must refuse closed");
+                assert!(
+                    error.to_string().contains(
+                        "active provider-v2 deletion that may have crossed payment drain"
+                    ),
+                    "unexpected 0032 refusal: {error}"
+                );
+            }
+            database.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn populated_0031_upgrade_preserves_completed_graceful_provider_v2_evidence() {
+        let migration_0031 = super::MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 31)
+            .expect("migration 0031 exists");
+        assert_eq!(
+            checksum_hex(migration_0031.checksum.as_ref()),
+            EXACT_RC3_0031_SHA384,
+            "0031 fixture must use the exact v0.1.1-rc3 migration"
+        );
+        let database = TestDatabase::create_unmigrated().await;
+        let through_0031 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(31).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        through_0031.run(database.pool()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase)
+             VALUES ($1, 'upgrade-creator', 'upgrade-lock', '{}'::jsonb,
+                     clock_timestamp(), 'completed', 'purge_operational_state')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                  submitted_at, started_at, completed_at, entitlement_to_publish,
+                  invoice_admission_phase, evaluator_mode, evaluator_snapshot,
+                  evaluator_revision, deletion_job_id)
+             VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'completed',
+                     '{\"proofs\":[]}'::jsonb, clock_timestamp(), clock_timestamp(),
+                     clock_timestamp(), '{}'::jsonb, 'ready', 'payment',
+                     '{\"schema_version\":1,\"root\":\"satisfied\"}'::jsonb, 7, $2)",
+        )
+        .bind(task_id)
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, status_at_cutoff, paykit_admission_required,
+                  resolved_status, resolved_at, final_credential_eligible_at)
+             VALUES ($1, $2, 'upgrade-creator', 'upgrade-bundle',
+                     'upgrade-creator/pub/app.locks/upgrade-lock.json', 'completed', TRUE,
+                     'completed', '2026-11-01 12:00:00+00', '2026-11-01 12:05:00+00')",
+        )
+        .bind(job_id)
+        .bind(task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET resolved_status = NULL
+             WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let unresolved_error = super::run_migrations(database.pool())
+            .await
+            .expect_err("completed rc3 deletion without terminal resolution must fail closed");
+        assert!(
+            unresolved_error
+                .to_string()
+                .contains("completed provider-v2 deletion without a persisted rc3 fence"),
+            "unexpected unresolved completed-deletion error: {unresolved_error}"
+        );
+        sqlx::query(
+            "UPDATE content_lock_deletion_task_snapshot
+             SET resolved_status = 'completed'
+             WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        super::run_migrations(database.pool())
+            .await
+            .expect("completed ordinary rc3 deletion must upgrade without operator repair");
+
+        type MigratedProviderV2Row = (
+            String,
+            String,
+            i64,
+            serde_json::Value,
+            Option<String>,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+            Option<String>,
+            Option<serde_json::Value>,
+        );
+        let row: MigratedProviderV2Row = sqlx::query_as(
+            "SELECT obligation_kind, provider_reconciliation_state,
+                    evaluator_revision_at_cutoff, evaluator_snapshot_at_cutoff,
+                    resolved_status, resolved_at, final_credential_eligible_at,
+                    provider_reconciled_at, provider_create_replay_result,
+                    provider_status_snapshot
+             FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, "provider_v2");
+        assert_eq!(row.1, "terminal");
+        assert_eq!(row.2, 7);
+        assert_eq!(
+            row.3,
+            serde_json::json!({"schema_version": 1, "root": "satisfied"})
+        );
+        assert_eq!(row.4.as_deref(), Some("completed"));
+        assert_eq!(row.5, Some(datetime!(2026-11-01 12:00:00 UTC)));
+        assert_eq!(row.6, Some(datetime!(2026-11-01 12:05:00 UTC)));
+        assert_eq!(row.7, row.5);
+        assert_eq!(row.8, None);
+        assert_eq!(row.9, None);
+
+        let applied_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(applied_versions, (1..=32).collect::<Vec<_>>());
+
+        sqlx::query(
+            "CREATE TEMP TABLE migrated_legacy_snapshot AS
+             SELECT * FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM content_lock_deletion_task_snapshot
+             WHERE deletion_job_id = $1",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let synthesized = sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+             SELECT * FROM migrated_legacy_snapshot",
+        )
+        .execute(database.pool())
+        .await;
+        let synthesis_error = synthesized
+            .expect_err("post-0032 rows must not synthesize the rc3 terminal-evidence exemption")
+            .to_string();
+        assert!(
+            synthesis_error.contains("content_lock_snapshot_provider_terminal_evidence_post_0032"),
+            "unexpected synthesized legacy-shape error: {synthesis_error}"
         );
         database.cleanup().await;
     }
@@ -672,7 +944,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_after, (1..=31).collect::<Vec<_>>());
+        assert_eq!(applied_after, (1..=32).collect::<Vec<_>>());
 
         let pending_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
             "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,

@@ -182,15 +182,21 @@ async fn in_memory_state_exposes_callable_deletion_action_and_tombstone_adapters
         .unwrap();
     state
         .content_lock_tombstones()
-        .withdraw_content_lock(creator.clone(), path.clone(), &content_lock, &tombstone)
+        .withdraw_content_lock(
+            creator.clone(),
+            path.clone(),
+            &locks_core::lock_policy::ContentLockPayload::V1(content_lock.clone()),
+            &tombstone,
+        )
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         state
             .content_locks()
             .get_content_lock(&creator, &path)
             .await
-            .is_err()
+            .unwrap(),
+        None
     );
     assert_eq!(
         state

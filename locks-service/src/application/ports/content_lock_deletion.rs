@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use locks_core::{
     ids::{CreatorPubky, LockId},
-    lock_policy::ContentLock,
+    lock_policy::{ContentLock, ContentLockPayload},
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -208,7 +208,7 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        frozen_content_lock: Option<&ContentLock>,
+        frozen_content_lock: Option<&ContentLockPayload>,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
         let _ = frozen_content_lock;
         self.prepare_force_deletion(creator, lock_id).await

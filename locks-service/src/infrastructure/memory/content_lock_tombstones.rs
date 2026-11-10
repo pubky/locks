@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
-use locks_core::lock_policy::ContentLock;
+use locks_core::lock_policy::ContentLockPayload;
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::content_lock_tombstone::{
@@ -9,6 +9,14 @@ use crate::application::ports::content_lock_tombstone::{
 };
 use crate::application::ports::{ContentLockTombstoneRepository, TombstoneReadback};
 use crate::infrastructure::memory::public_content_locks::InMemoryPublicContentLockStore;
+
+fn matches_frozen_content_lock(actual: &[u8], expected_canonical: &[u8]) -> bool {
+    actual == expected_canonical
+        || serde_json::from_slice::<ContentLockPayload>(actual)
+            .ok()
+            .and_then(|content_lock| content_lock.canonical_json_bytes().ok())
+            .is_some_and(|canonical| canonical == expected_canonical)
+}
 
 /// In-memory exact-byte public tombstone adapter.
 #[derive(Debug, Default)]
@@ -33,7 +41,7 @@ impl ContentLockTombstoneRepository for InMemoryContentLockTombstoneRepository {
         &self,
         creator: CreatorPubky,
         content_lock_path: ContentLockPath,
-        frozen_original: &ContentLock,
+        frozen_original: &ContentLockPayload,
         tombstone: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, ApplicationError> {
         let expected = canonical_tombstone_bytes(tombstone)?;
@@ -50,7 +58,7 @@ impl ContentLockTombstoneRepository for InMemoryContentLockTombstoneRepository {
             .as_deref()
         {
             Some(actual) if actual == expected => return Ok(TombstoneReadback::Exact),
-            Some(actual) if actual == original => {}
+            Some(actual) if matches_frozen_content_lock(actual, &original) => {}
             None => return Ok(TombstoneReadback::Missing),
             Some(_) => return Ok(TombstoneReadback::Replaced),
         }

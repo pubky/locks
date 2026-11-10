@@ -16,8 +16,8 @@ use locks_core::ids::{
     PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, Criterion,
+    GuardedResource, LockLogic, LockServerConfig, VerifierType,
 };
 use locks_core::verification::{
     EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
@@ -1430,7 +1430,7 @@ impl ContentLockTombstoneRepository for CrashExternalRepository {
         &self,
         _creator: CreatorPubky,
         _content_lock_path: ContentLockPath,
-        _frozen_original: &ContentLock,
+        _frozen_original: &ContentLockPayload,
         _tombstone: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, locks_service::application::errors::ApplicationError> {
         self.withdraw_calls.fetch_add(1, Ordering::SeqCst);

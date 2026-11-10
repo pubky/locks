@@ -378,11 +378,12 @@ impl AppState {
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(
-            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
                 verification_tasks.clone(),
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
+        let payment_drains = access_credentials.clone() as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -427,6 +428,7 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            payment_drains,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -475,11 +477,12 @@ impl AppState {
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(
-            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
                 verification_tasks.clone(),
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
+        let payment_drains = access_credentials.clone() as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -513,6 +516,7 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            payment_drains,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -560,11 +564,12 @@ impl AppState {
         verification_tasks
             .attach_verification_task_claimer(Arc::downgrade(&verification_task_claimer));
         let access_credentials = Arc::new(
-            InMemoryAccessCredentialStore::with_verification_task_repository_and_deletion_fence(
+            InMemoryAccessCredentialStore::with_verification_and_invoice_repositories_and_deletion_fence(
                 verification_tasks.clone(),
                 Arc::clone(&verification_task_deletion_fence),
             ),
         );
+        let payment_drains = access_credentials.clone() as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store = InMemoryCreatorAuthorityStore::new();
         let creator_authorities = Arc::new(creator_authority_store.clone());
         let creator_authority_manager = Arc::new(LegacyCookieCreatorAuthorityManager::new(
@@ -612,6 +617,7 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            payment_drains,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(InMemoryCreatorConnectFlowStore::new()),
@@ -647,6 +653,8 @@ impl AppState {
                 pool.clone(),
                 final_credential_cipher,
             ));
+        let payment_drains = Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
+            as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -680,6 +688,7 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            payment_drains,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(PostgresCreatorConnectFlowStore::new(pool.clone())),
@@ -763,6 +772,8 @@ impl AppState {
                 pool.clone(),
                 ciphers.final_credential,
             ));
+        let payment_drains = Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
+            as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), ciphers.creator_authority);
         let creator_authorities = Arc::new(creator_authority_store.clone());
@@ -797,6 +808,7 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            payment_drains,
             access_credentials,
             creator_authorities,
             creator_connect_flows: Arc::new(PostgresCreatorConnectFlowStore::new(pool.clone())),
@@ -859,10 +871,7 @@ impl AppState {
                 ))
             })
         });
-        let payment_drains = postgres_pool.as_ref().map(|pool| {
-            Arc::new(PostgresPaymentDrainRepository::new(pool.clone()))
-                as Arc<dyn PaymentDrainRepository>
-        });
+        let payment_drains = Some(private_runtime.payment_drains.clone());
         let payment_drain_client = paykit_http_client
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaymentDrainClient>);

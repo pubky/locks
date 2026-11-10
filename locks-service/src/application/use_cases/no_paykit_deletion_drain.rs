@@ -168,6 +168,34 @@ impl ContentLockPaymentDrainExecutor for NoPaykitDeletionDrainUseCase<'_> {
             ),
         }
     }
+
+    async fn cleanup_claimed(
+        &self,
+        claim: ClaimedContentLockDeletionJob,
+        worker_id: &str,
+    ) -> DeletionPhaseExecution {
+        if claim.job.phase != ContentLockDeletionPhase::PurgeOperationalState {
+            return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::FatalFailure);
+        }
+        match self
+            .deletions
+            .finish(claim.job.job_id, worker_id, claim.claim_token, None)
+            .await
+        {
+            Ok(Some(_)) => observed_phase(
+                DeletionPhaseExecutionOutcome::Progressed,
+                DeletionDependencyEvidence::healthy(
+                    DeletionDependencySource::PaymentDrainRepository,
+                ),
+            ),
+            Ok(None) => DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::ClaimLost),
+            Err(error) => observed_error(
+                &error,
+                DeletionDependencySource::PaymentDrainRepository,
+                DeletionDependencyEvidence::none(),
+            ),
+        }
+    }
 }
 
 fn observed_phase(

@@ -154,7 +154,7 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, `POST /proof-bundles` durably persists the pending verification task and immutable invoice-admission intent before any Reader homeserver or Paykit I/O, then returns that pending lifecycle. The intent contains `payment_in` copied from the validated canonical `paykit-payment` criterion. Task insertion and deletion start serialize on the same per-lock database fence: a committed task is included in the deletion snapshot, while a committed deletion cutoff rejects a genuinely new task. Exact persisted replay returns the same lifecycle. A claimed invoice-admission worker calls Paykit `POST /invoices` with persisted `bundle_id`, `lock_resource`, `reader`, and `payment_in`, plus the stable task UUID in `X-Request-ID`; Paykit independently reads the canonical lock and rejects a `payment_in` mismatch before side effects. Browser clients poll the existing task and never resubmit to drive admission. A deletion job cannot start Paykit draining while a snapshotted admission remains `invoice_pending`. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Verification workers call `POST /payment-requests/status` only after invoice admission is ready. Every Paykit request body is canonical JSON. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body` with the existing Lock Server keypair; body-only signatures are not supported. Therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Provider-v2 graceful deletion requires Paykit Server `v0.1.1-rc3` or newer because it uses signed drain create/lookup/cleanup plus v2 invoice replay/status. Locks persists normalized authority from this existing URL with deletion state; changing origin during restart fails closed before provider status, absence, or cleanup. No separate deletion-provider config exists. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, `POST /proof-bundles` durably persists the pending verification task and immutable invoice-admission intent before any Reader homeserver or Paykit I/O, then returns that pending lifecycle. The intent contains `payment_in` copied from the validated canonical `paykit-payment` criterion. Task insertion and deletion start serialize on the same per-lock database fence: a committed task is included in the deletion snapshot, while a committed deletion cutoff rejects a genuinely new task. Exact persisted replay returns the same lifecycle. A claimed invoice-admission worker calls Paykit `POST /invoices` with persisted `bundle_id`, `lock_resource`, `reader`, and `payment_in`, plus the stable task UUID in `X-Request-ID`; Paykit independently reads the canonical lock and rejects a `payment_in` mismatch before side effects. Browser clients poll the existing task and never resubmit to drive admission. A deletion job cannot start Paykit draining while a snapshotted admission remains `invoice_pending`. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Verification workers call `POST /payment-requests/status` only after invoice admission is ready. Every Paykit request body is canonical JSON. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body` with the existing Lock Server keypair; body-only signatures are not supported. Therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
 Public connection-state lookups have independent process-local admission control. Defaults are 60 requests per 60-second window for each `(client IP, creator, bundle_id)`, a process-wide token bucket of 50 requests per second with burst 50, 16 concurrent outbound Paykit status requests, and at most 10,000 retained windows across the process:
 
@@ -242,6 +242,29 @@ WHERE state IN ('queued', 'running', 'failed');
 ```
 
 If rows are returned, resume/retry them on the pre-0021 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
+
+Migration `0032_provider_v2_deletion` upgrades ordinary graceful payment deletions that already reached `completed` on `v0.1.1-rc3`; it retains their frozen evaluator snapshot, terminal resolution, and final-credential evidence. Only those rows already stored before `0032` may retain the rc3 terminal shape without provider replay/status evidence; PostgreSQL rejects that shape for every later insert or update. It still fails closed if a completed payment deletion has an unresolved snapshot, because that contradicts graceful completion and cannot be repaired by replaying a completed job. Before upgrading from rc3, stop writes and run:
+
+```sql
+SELECT deletion.job_id,
+       deletion.creator,
+       deletion.lock_id,
+       snapshot.verification_task_id,
+       snapshot.status_at_cutoff,
+       snapshot.resolved_status,
+       task.status AS current_task_status
+FROM content_lock_deletion_jobs AS deletion
+JOIN content_lock_deletion_task_snapshot AS snapshot
+  ON snapshot.deletion_job_id = deletion.job_id
+JOIN verification_tasks AS task
+  ON task.task_id = snapshot.verification_task_id
+WHERE deletion.state = 'completed'
+  AND deletion.force_requested_at IS NULL
+  AND task.evaluator_mode = 'payment'
+  AND snapshot.resolved_status IS NULL;
+```
+
+No rows means completed rc3 payment deletions are safe to migrate. If rows exist, keep rc3 data and public state unchanged, retain a database backup, and escalate the listed IDs for evidence-specific reconciliation before retrying. Do not delete the job or snapshot, rewrite it to a retryable phase, or invent terminal/provider evidence: completed jobs cannot be resumed and those edits can erase the only retained cutoff record.
 
 The runtime-master-key cutover intentionally cannot decrypt creator-authority rows written with the retired Compose `creator-authority-encryption-key`. An existing Compose volume containing that file fails startup instead of silently stranding encrypted authority. To upgrade a local stack:
 

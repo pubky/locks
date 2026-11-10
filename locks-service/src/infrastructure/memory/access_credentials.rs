@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use locks_core::{
     ids::{BundleId, CreatorPubky, LockId, TaskId},
-    lock_policy::ContentLock,
+    lock_policy::{ContentLockPayload, VerifierType},
 };
 use rand::{RngCore, rngs::OsRng};
 use time::{Duration, OffsetDateTime};
@@ -21,10 +21,17 @@ use crate::application::{
         ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
         DeletionReadAuthorization, EncryptedFinalCredential, FinalAccessWindows,
         FinalCredentialContext, FinalCredentialMaterialization, InitializeFinalAccessWindowsResult,
-        IssuedDeletionCredential, OrdinaryCredentialLookupResult, VerificationTaskStatus,
-        VerificationTerminalReason,
+        IssuedDeletionCredential, OrdinaryCredentialLookupResult, PaymentTaskSnapshot,
+        VerificationTaskStatus, VerificationTerminalReason,
     },
-    ports::{AccessCredentialStore, FinalCredentialWorkerIssueRequest, VerificationTaskRepository},
+    ports::{
+        AccessCredentialStore, FinalCredentialWorkerIssueRequest, InvoiceAdmissionRepository,
+        PaykitAuthority, PaymentDrainCleanupPreparation, PaymentDrainCleanupToken,
+        PaymentDrainObligation, PaymentDrainObligationKind, PaymentDrainRepository,
+        PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
+        PaymentProviderCreateResponse, ProviderV2DeletionReconciliation,
+        VerificationTaskRepository,
+    },
 };
 use crate::infrastructure::{
     final_credentials::FinalCredentialCipher,
@@ -57,7 +64,7 @@ struct StoredCredential {
 struct DeletionAccessState {
     creator: CreatorPubky,
     lock_id: LockId,
-    frozen_content_lock: ContentLock,
+    frozen_content_lock: ContentLockPayload,
     state: ContentLockDeletionState,
     phase: ContentLockDeletionPhase,
     force_requested: bool,
@@ -68,7 +75,19 @@ struct DeletionAccessState {
     issuance_deadline: Option<OffsetDateTime>,
     read_deadline: Option<OffsetDateTime>,
     payment_aggregate: Option<DeletionPaymentAggregate>,
+    payment_drain: Option<InMemoryPaymentDrain>,
+    prepared_provider_v2_lock_resource: Option<locks_core::ids::PubkyLockResource>,
+    prepared_provider_v2_authority: Option<PaykitAuthority>,
     bundle_snapshots: HashMap<BundleId, DeletionBundleSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct InMemoryPaymentDrain {
+    summary: PaymentDrainSummary,
+    lock_resource: Option<locks_core::ids::PubkyLockResource>,
+    authority: Option<PaykitAuthority>,
+    fence_acknowledged: bool,
+    cleanup_completed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,7 +96,7 @@ struct DeletionPaymentAggregate {
     accepted_count: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeletionBundleSnapshot {
     task_id: TaskId,
     paykit_admission_required: bool,
@@ -87,10 +106,30 @@ struct DeletionBundleSnapshot {
     resolved_at: Option<OffsetDateTime>,
     final_credential_eligible_at: Option<OffsetDateTime>,
     final_credential_issued: bool,
+    paykit_v1: Option<FrozenPaykitV1Deletion>,
+    provider_v2: Option<FrozenProviderV2Deletion>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenPaykitV1Deletion {
+    criterion_id: String,
+    lock_resource: locks_core::ids::PubkyLockResource,
+    entitlement_to_publish: Option<locks_core::verification::VerifiedProofBundle>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenProviderV2Deletion {
+    evaluator_revision: u64,
+    snapshot: PaymentTaskSnapshot,
+    create_conflict: Option<bool>,
+    create_response: Option<PaymentProviderCreateResponse>,
+    provider_status: Option<crate::application::models::PaymentProviderStatus>,
+    status_checkpointed: bool,
+    reconciliation_terminal: bool,
 }
 
 impl DeletionBundleSnapshot {
-    fn permits_final_credential(self) -> bool {
+    fn permits_final_credential(&self) -> bool {
         self.paykit_admission_required
             && !self.had_active_credential_at_cutoff
             && self.resolved_status.unwrap_or(self.status_at_cutoff)
@@ -128,6 +167,7 @@ pub struct InMemoryAccessCredentialStore {
     state: RwLock<StoreState>,
     final_credential_cipher: FinalCredentialCipher,
     verification_tasks: Option<Arc<dyn VerificationTaskRepository>>,
+    invoice_admissions: Option<Arc<dyn InvoiceAdmissionRepository>>,
     verification_task_deletion_fence: Option<Arc<InMemoryVerificationTaskDeletionFence>>,
 }
 
@@ -158,10 +198,32 @@ impl Default for InMemoryAccessCredentialStore {
 }
 
 impl InMemoryAccessCredentialStore {
+    pub(crate) async fn reconciled_provider_v2_terminal_task_ids(
+        &self,
+        job_id: Uuid,
+    ) -> HashSet<TaskId> {
+        self.state
+            .read()
+            .await
+            .deletions
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|deletion| deletion.bundle_snapshots.values())
+            .filter(|snapshot| {
+                snapshot.resolved_status.is_some()
+                    && snapshot
+                        .provider_v2
+                        .as_ref()
+                        .is_some_and(|provider| provider.reconciliation_terminal)
+            })
+            .map(|snapshot| snapshot.task_id)
+            .collect()
+    }
+
     /// Creates an empty standalone store. Final credentials are unavailable until
     /// verification dependencies are supplied.
     pub fn new() -> Self {
-        Self::build(None, None)
+        Self::build(None, None, None)
     }
 
     pub fn with_verification_task_repository_and_deletion_fence(
@@ -170,6 +232,21 @@ impl InMemoryAccessCredentialStore {
     ) -> Self {
         Self::build(
             Some(verification_tasks),
+            None,
+            Some(verification_task_deletion_fence),
+        )
+    }
+
+    pub fn with_verification_and_invoice_repositories_and_deletion_fence<T>(
+        verification_tasks: Arc<T>,
+        verification_task_deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
+    ) -> Self
+    where
+        T: VerificationTaskRepository + InvoiceAdmissionRepository + 'static,
+    {
+        Self::build(
+            Some(verification_tasks.clone()),
+            Some(verification_tasks),
             Some(verification_task_deletion_fence),
         )
     }
@@ -177,11 +254,12 @@ impl InMemoryAccessCredentialStore {
     pub fn with_deletion_fence(
         verification_task_deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     ) -> Self {
-        Self::build(None, Some(verification_task_deletion_fence))
+        Self::build(None, None, Some(verification_task_deletion_fence))
     }
 
     fn build(
         verification_tasks: Option<Arc<dyn VerificationTaskRepository>>,
+        invoice_admissions: Option<Arc<dyn InvoiceAdmissionRepository>>,
         verification_task_deletion_fence: Option<Arc<InMemoryVerificationTaskDeletionFence>>,
     ) -> Self {
         let mut key = [0_u8; 32];
@@ -190,6 +268,7 @@ impl InMemoryAccessCredentialStore {
             state: RwLock::new(StoreState::default()),
             final_credential_cipher: FinalCredentialCipher::new(key),
             verification_tasks,
+            invoice_admissions,
             verification_task_deletion_fence,
         }
     }
@@ -208,6 +287,68 @@ impl InMemoryAccessCredentialStore {
         snapshot_bundles: &HashMap<BundleId, (TaskId, bool, VerificationTaskStatus)>,
     ) -> Result<(), ApplicationError> {
         let key = (job.creator.clone(), job.lock_id.clone());
+        {
+            let state = self.state.read().await;
+            if state.blocked_keys.contains(&key) || state.deletion_jobs_by_key.contains_key(&key) {
+                return Err(ApplicationError::ContentLockDeletionInProgress);
+            }
+        }
+        let provider_v2 = if let Some(fence) = &self.verification_task_deletion_fence {
+            fence
+                .payment_records
+                .read()
+                .await
+                .iter()
+                .map(|stored| {
+                    (
+                        stored.task.task_id,
+                        FrozenProviderV2Deletion {
+                            evaluator_revision: stored.task.evaluator_revision,
+                            snapshot: stored.task.snapshot.clone(),
+                            create_conflict: None,
+                            create_response: None,
+                            provider_status: None,
+                            status_checkpointed: false,
+                            reconciliation_terminal: false,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let mut paykit_v1 = HashMap::new();
+        if let Some(tasks) = &self.verification_tasks {
+            for (task_id, paykit_admission_required, _) in snapshot_bundles.values() {
+                if !paykit_admission_required || provider_v2.contains_key(task_id) {
+                    continue;
+                }
+                let task = tasks.get_verification_task(task_id).await?.ok_or(
+                    ApplicationError::MissingRecord {
+                        record: "verification_task",
+                    },
+                )?;
+                let criterion_id = task
+                    .submitted_proof_bundle
+                    .proofs
+                    .iter()
+                    .find(|proof| proof.verifier_type == VerifierType::PaykitPayment)
+                    .map(|proof| proof.criterion_id.clone())
+                    .ok_or_else(|| {
+                        invalid_deletion_state(
+                            "paykit-v1 deletion snapshot is missing its payment criterion",
+                        )
+                    })?;
+                paykit_v1.insert(
+                    *task_id,
+                    FrozenPaykitV1Deletion {
+                        criterion_id,
+                        lock_resource: task.submitted_proof_bundle.pubky_lock_resource,
+                        entitlement_to_publish: task.entitlement_to_publish,
+                    },
+                );
+            }
+        }
         let mut state = self.state.write().await;
         if state.blocked_keys.contains(&key) || state.deletion_jobs_by_key.contains_key(&key) {
             return Err(ApplicationError::ContentLockDeletionInProgress);
@@ -249,6 +390,8 @@ impl InMemoryAccessCredentialStore {
                                 && !had_active_credential_at_cutoff)
                                 .then_some(job.deletion_started_at),
                             final_credential_issued: false,
+                            paykit_v1: paykit_v1.get(task_id).cloned(),
+                            provider_v2: provider_v2.get(task_id).cloned(),
                         },
                     )
                 },
@@ -270,6 +413,9 @@ impl InMemoryAccessCredentialStore {
                 issuance_deadline: None,
                 read_deadline: None,
                 payment_aggregate: None,
+                payment_drain: None,
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
                 bundle_snapshots,
             },
         );
@@ -329,6 +475,26 @@ impl InMemoryAccessCredentialStore {
         if let Some(job_id) = job_id {
             disable_job_access(&mut state, job_id);
         }
+    }
+
+    pub(crate) fn verification_task_repository(
+        &self,
+    ) -> Option<Arc<dyn VerificationTaskRepository>> {
+        self.verification_tasks.clone()
+    }
+
+    pub(crate) async fn purge_deletion(&self, job_id: Uuid) {
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.remove(&job_id) else {
+            return;
+        };
+        let key = (deletion.creator, deletion.lock_id);
+        state.deletion_jobs_by_key.remove(&key);
+        state.blocked_keys.remove(&key);
+        state
+            .records
+            .retain(|_, stored| stored.deletion.is_none_or(|(id, _)| id != job_id));
+        state.final_credentials.retain(|(id, _), _| *id != job_id);
     }
 
     /// Records a terminal payment result only while deletion owns a live drain claim.
@@ -679,6 +845,806 @@ fn payment_aggregate_completed(deletion: &DeletionAccessState) -> bool {
 }
 
 #[async_trait]
+impl PaymentDrainRepository for InMemoryAccessCredentialStore {
+    async fn store_payment_drain(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        summary: &PaymentDrainSummary,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        ) {
+            return Ok(false);
+        }
+        match deletion.payment_drain.as_mut() {
+            Some(existing) => {
+                validate_memory_drain_progress(&existing.summary, summary)?;
+                existing.summary = summary.clone();
+            }
+            None => {
+                deletion.payment_drain = Some(InMemoryPaymentDrain {
+                    summary: summary.clone(),
+                    lock_resource: None,
+                    authority: None,
+                    fence_acknowledged: false,
+                    cleanup_completed: false,
+                });
+            }
+        }
+        deletion.payment_aggregate = Some(DeletionPaymentAggregate {
+            completed: summary.status == PaymentDrainStatus::Completed,
+            accepted_count: summary.accepted_count,
+        });
+        Ok(true)
+    }
+
+    async fn get_payment_drain(
+        &self,
+        deletion_job_id: Uuid,
+    ) -> Result<Option<PaymentDrainSummary>, ApplicationError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .deletions
+            .get(&deletion_job_id)
+            .and_then(|deletion| deletion.payment_drain.as_ref())
+            .map(|drain| drain.summary.clone()))
+    }
+
+    async fn reconcile_payment_drain(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        summary: &PaymentDrainSummary,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        ) {
+            return Ok(false);
+        }
+        let Some(drain) = deletion.payment_drain.as_mut() else {
+            return Ok(false);
+        };
+        validate_memory_drain_progress(&drain.summary, summary)?;
+        drain.summary = summary.clone();
+        deletion.payment_aggregate = Some(DeletionPaymentAggregate {
+            completed: summary.status == PaymentDrainStatus::Completed,
+            accepted_count: summary.accepted_count,
+        });
+        Ok(true)
+    }
+
+    async fn prepare_provider_v2_fence(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !(owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        ) || owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        )) {
+            return Ok(false);
+        }
+        if !deletion
+            .bundle_snapshots
+            .values()
+            .any(|snapshot| snapshot.provider_v2.is_some())
+        {
+            return Err(invalid_deletion_state(
+                "provider-v2 drain preparation is missing its frozen obligation",
+            ));
+        }
+        if deletion
+            .prepared_provider_v2_lock_resource
+            .as_ref()
+            .is_some_and(|stored| stored != lock_resource)
+            || deletion
+                .prepared_provider_v2_authority
+                .as_ref()
+                .is_some_and(|stored| stored != authority)
+        {
+            return Err(invalid_deletion_state(
+                "Paykit authority or lock resource changed before provider-v2 drain replay",
+            ));
+        }
+        deletion
+            .prepared_provider_v2_lock_resource
+            .get_or_insert_with(|| lock_resource.clone());
+        deletion
+            .prepared_provider_v2_authority
+            .get_or_insert_with(|| authority.clone());
+        Ok(true)
+    }
+
+    async fn store_provider_v2_fence(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !(owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::StartPaymentDrain,
+        ) || owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        )) {
+            return Ok(false);
+        }
+        if !deletion
+            .bundle_snapshots
+            .values()
+            .any(|snapshot| snapshot.provider_v2.is_some())
+        {
+            return Ok(false);
+        }
+        if deletion
+            .prepared_provider_v2_lock_resource
+            .as_ref()
+            .is_none_or(|stored| stored != lock_resource)
+            || deletion
+                .prepared_provider_v2_authority
+                .as_ref()
+                .is_none_or(|stored| stored != authority)
+        {
+            return Err(invalid_deletion_state(
+                "provider-v2 drain acknowledgement is missing its prepared authority fence",
+            ));
+        }
+        let Some(drain) = deletion.payment_drain.as_mut() else {
+            return Ok(false);
+        };
+        if drain
+            .lock_resource
+            .as_ref()
+            .is_some_and(|stored| stored != lock_resource)
+            || drain
+                .authority
+                .as_ref()
+                .is_some_and(|stored| stored != authority)
+        {
+            return Err(invalid_deletion_state(
+                "Paykit authority or lock resource changed for provider-v2 deletion",
+            ));
+        }
+        drain
+            .lock_resource
+            .get_or_insert_with(|| lock_resource.clone());
+        drain.authority.get_or_insert_with(|| authority.clone());
+        drain.fence_acknowledged = true;
+        Ok(true)
+    }
+
+    async fn list_obligations(
+        &self,
+        deletion_job_id: Uuid,
+    ) -> Result<Vec<PaymentDrainObligation>, ApplicationError> {
+        let deletion = {
+            let state = self.state.read().await;
+            state.deletions.get(&deletion_job_id).cloned()
+        };
+        let Some(deletion) = deletion else {
+            return Ok(Vec::new());
+        };
+        let mut obligations = Vec::new();
+        for (bundle_id, frozen) in &deletion.bundle_snapshots {
+            if !frozen.paykit_admission_required {
+                continue;
+            }
+            let (lock_resource, kind, entitlement_to_publish) =
+                if let Some(provider) = &frozen.provider_v2 {
+                    (
+                        provider
+                            .snapshot
+                            .as_v1()
+                            .submitted_proof_bundle
+                            .pubky_lock_resource
+                            .clone(),
+                        PaymentDrainObligationKind::ProviderV2 {
+                            evaluator_revision: provider.evaluator_revision,
+                            snapshot: Box::new(provider.snapshot.clone()),
+                            reconciliation_terminal: provider.reconciliation_terminal,
+                        },
+                        None,
+                    )
+                } else if let Some(legacy) = &frozen.paykit_v1 {
+                    let admission = self
+                        .invoice_admissions
+                        .as_ref()
+                        .ok_or_else(|| {
+                            invalid_deletion_state(
+                                "in-memory paykit-v1 deletion is missing invoice admission storage",
+                            )
+                        })?
+                        .get_invoice_admission(&frozen.task_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid_deletion_state(
+                                "paykit-v1 deletion snapshot is missing invoice admission",
+                            )
+                        })?;
+                    let invoice_created_at = admission.invoice_created_at.ok_or_else(|| {
+                        invalid_deletion_state("paykit-v1 deletion invoice admission is not ready")
+                    })?;
+                    let payment_deadline = admission.payment_deadline.ok_or_else(|| {
+                        invalid_deletion_state(
+                            "paykit-v1 deletion invoice admission has no payment deadline",
+                        )
+                    })?;
+                    (
+                        legacy.lock_resource.clone(),
+                        PaymentDrainObligationKind::PaykitV1 {
+                            criterion_id: legacy.criterion_id.clone(),
+                            invoice_created_at,
+                            payment_deadline,
+                        },
+                        legacy.entitlement_to_publish.clone(),
+                    )
+                } else {
+                    return Err(invalid_deletion_state(
+                        "Paykit deletion snapshot has no closed obligation kind",
+                    ));
+                };
+            obligations.push(PaymentDrainObligation {
+                task_id: frozen.task_id,
+                creator: deletion.creator.clone(),
+                bundle_id: bundle_id.clone(),
+                lock_resource,
+                kind,
+                status: frozen.resolved_status.unwrap_or(frozen.status_at_cutoff),
+                entitlement_to_publish,
+            });
+        }
+        Ok(obligations)
+    }
+
+    async fn begin_entitlement_publication(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        entitlement: &locks_core::verification::VerifiedProofBundle,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        {
+            let state = self.state.read().await;
+            let Some(deletion) = state.deletions.get(&deletion_job_id) else {
+                return Ok(None);
+            };
+            if !owns_memory_drain_claim(
+                deletion,
+                worker_id,
+                claim_token,
+                now,
+                ContentLockDeletionPhase::DrainPayments,
+            ) || !deletion.bundle_snapshots.values().any(|snapshot| {
+                snapshot.task_id == *task_id
+                    && snapshot.paykit_v1.is_some()
+                    && snapshot.resolved_status.is_none()
+            }) {
+                return Ok(None);
+            }
+        }
+        let tasks = self.verification_tasks.as_ref().ok_or_else(|| {
+            invalid_deletion_state("in-memory paykit-v1 deletion has no task repository")
+        })?;
+        let current =
+            tasks
+                .get_verification_task(task_id)
+                .await?
+                .ok_or(ApplicationError::MissingRecord {
+                    record: "verification_task",
+                })?;
+        let token = {
+            let fence = self
+                .verification_task_deletion_fence
+                .as_ref()
+                .ok_or_else(|| invalid_deletion_state("missing in-memory deletion fence"))?;
+            if let Some(existing) = fence
+                .records
+                .read()
+                .await
+                .get(task_id)
+                .and_then(|record| record.entitlement_publication_claim_token)
+            {
+                if current.entitlement_to_publish.as_ref() == Some(entitlement) {
+                    return Ok(Some(existing));
+                }
+                return Err(invalid_deletion_state(
+                    "paykit-v1 deletion publication payload changed",
+                ));
+            }
+            Uuid::new_v4()
+        };
+        let publishing = current.begin_entitlement_publication(entitlement.clone())?;
+        tasks.update_verification_task(publishing).await?;
+        let fence = self
+            .verification_task_deletion_fence
+            .as_ref()
+            .ok_or_else(|| invalid_deletion_state("missing in-memory deletion fence"))?;
+        let mut records = fence.records.write().await;
+        let record = records
+            .get_mut(task_id)
+            .ok_or(ApplicationError::MissingRecord {
+                record: "verification_task",
+            })?;
+        record.entitlement_publication_claim_token = Some(token);
+        Ok(Some(token))
+    }
+
+    async fn persist_terminal_obligation(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        transition: PaymentDrainTerminalTransition,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        {
+            let state = self.state.read().await;
+            let Some(deletion) = state.deletions.get(&deletion_job_id) else {
+                return Ok(false);
+            };
+            if !owns_memory_drain_claim(
+                deletion,
+                worker_id,
+                claim_token,
+                now,
+                ContentLockDeletionPhase::DrainPayments,
+            ) || !deletion
+                .bundle_snapshots
+                .values()
+                .any(|snapshot| snapshot.task_id == *task_id && snapshot.paykit_v1.is_some())
+            {
+                return Ok(false);
+            }
+        }
+        let fence = self
+            .verification_task_deletion_fence
+            .as_ref()
+            .ok_or_else(|| invalid_deletion_state("missing in-memory deletion fence"))?;
+        let publication_token = fence
+            .records
+            .read()
+            .await
+            .get(task_id)
+            .and_then(|record| record.entitlement_publication_claim_token);
+        if publication_token != transition.entitlement_publication_token {
+            return Ok(false);
+        }
+        let tasks = self.verification_tasks.as_ref().ok_or_else(|| {
+            invalid_deletion_state("in-memory paykit-v1 deletion has no task repository")
+        })?;
+        let current =
+            tasks
+                .get_verification_task(task_id)
+                .await?
+                .ok_or(ApplicationError::MissingRecord {
+                    record: "verification_task",
+                })?;
+        if current.status != transition.status {
+            let terminal = match transition.status {
+                VerificationTaskStatus::Completed => {
+                    current.complete_entitlement_publication(now)?
+                }
+                VerificationTaskStatus::Expired => current.expire(
+                    transition.terminal_reason.ok_or_else(|| {
+                        invalid_deletion_state("expired paykit-v1 task requires terminal reason")
+                    })?,
+                    now,
+                )?,
+                _ => {
+                    return Err(invalid_deletion_state(
+                        "paykit-v1 deletion terminal transition has invalid status",
+                    ));
+                }
+            };
+            tasks.update_verification_task(terminal).await?;
+        }
+        {
+            let mut records = fence.records.write().await;
+            if let Some(record) = records.get_mut(task_id) {
+                record.status = transition.status;
+                record.entitlement_publication_claim_token = None;
+            }
+        }
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        let Some(snapshot) = deletion
+            .bundle_snapshots
+            .values_mut()
+            .find(|snapshot| snapshot.task_id == *task_id)
+        else {
+            return Ok(false);
+        };
+        snapshot.resolved_status = Some(transition.status);
+        snapshot.resolved_at = Some(now);
+        if transition.status == VerificationTaskStatus::Completed
+            && !snapshot.had_active_credential_at_cutoff
+        {
+            snapshot.final_credential_eligible_at.get_or_insert(now);
+        }
+        Ok(true)
+    }
+
+    async fn persist_provider_v2_binding(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        create_conflict: bool,
+        response: Option<PaymentProviderCreateResponse>,
+    ) -> Result<bool, ApplicationError> {
+        if create_conflict == response.is_some() {
+            return Err(invalid_deletion_state(
+                "provider-v2 binding checkpoint has an invalid closed shape",
+            ));
+        }
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        ) {
+            return Ok(false);
+        }
+        let Some(provider) = deletion
+            .bundle_snapshots
+            .values_mut()
+            .find(|snapshot| snapshot.task_id == *task_id)
+            .and_then(|snapshot| snapshot.provider_v2.as_mut())
+        else {
+            return Ok(false);
+        };
+        if let Some(stored_conflict) = provider.create_conflict {
+            return Ok(stored_conflict == create_conflict && provider.create_response == response);
+        }
+        provider.create_conflict = Some(create_conflict);
+        provider.create_response = response;
+        Ok(true)
+    }
+
+    async fn persist_provider_v2_status(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        status: Option<&crate::application::models::PaymentProviderStatus>,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        ) {
+            return Ok(false);
+        }
+        let Some(provider) = deletion
+            .bundle_snapshots
+            .values_mut()
+            .find(|snapshot| snapshot.task_id == *task_id)
+            .and_then(|snapshot| snapshot.provider_v2.as_mut())
+        else {
+            return Ok(false);
+        };
+        let Some(create_conflict) = provider.create_conflict else {
+            return Ok(false);
+        };
+        if status.is_none() && !create_conflict {
+            return Err(invalid_deletion_state(
+                "exact provider-v2 replay cannot checkpoint invoice absence",
+            ));
+        }
+        provider.provider_status = status.cloned();
+        provider.status_checkpointed = true;
+        Ok(true)
+    }
+
+    async fn persist_provider_v2_terminal(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        task_id: &TaskId,
+        reconciliation: &ProviderV2DeletionReconciliation,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let fence = self
+            .verification_task_deletion_fence
+            .as_ref()
+            .ok_or_else(|| invalid_deletion_state("provider-v2 deletion fence is unavailable"))?;
+        let mut fence_records = fence.records.write().await;
+        let mut payment_records = fence.payment_records.write().await;
+        let mut current_statuses = fence.current_statuses.write().await;
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::DrainPayments,
+        ) {
+            return Ok(false);
+        }
+        let Some(frozen) = deletion
+            .bundle_snapshots
+            .values_mut()
+            .find(|snapshot| snapshot.task_id == *task_id)
+        else {
+            return Ok(false);
+        };
+        let Some(provider) = frozen.provider_v2.as_mut() else {
+            return Ok(false);
+        };
+        if provider.reconciliation_terminal {
+            return Ok(true);
+        }
+        if !provider.status_checkpointed
+            || provider.create_conflict != Some(reconciliation.create_conflict)
+            || provider.create_response != reconciliation.create_response
+            || provider.provider_status != reconciliation.status
+        {
+            return Err(invalid_deletion_state(
+                "provider-v2 terminalization requires matching durable binding and status checkpoints",
+            ));
+        }
+        let Some(stored) = payment_records
+            .iter_mut()
+            .find(|stored| stored.task.task_id == *task_id)
+        else {
+            return Err(invalid_deletion_state(
+                "frozen provider-v2 payment task is missing",
+            ));
+        };
+        if matches!(
+            stored.task.status,
+            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
+        ) {
+            if stored.task.evaluator_revision != provider.evaluator_revision
+                || stored.task.snapshot != provider.snapshot
+                || stored.task.entitlement_publication_token.is_some()
+            {
+                return Ok(false);
+            }
+            stored.task.status = VerificationTaskStatus::Expired;
+            stored.task.snapshot = reconciliation.terminal_snapshot.clone();
+            stored.task.evaluator_revision = provider.evaluator_revision.saturating_add(1);
+            stored.task.entitlement_to_publish = None;
+            stored.task.entitlement_publication_token = None;
+            stored.task.completed_at = Some(now);
+        }
+        stored.claimed_by = None;
+        stored.claim_token = None;
+        stored.claim_expires_at = None;
+        stored.next_attempt_at = None;
+        let resolved_status = stored.task.status;
+        current_statuses.insert(*task_id, resolved_status);
+        if let Some(record) = fence_records.get_mut(task_id) {
+            record.status = resolved_status;
+            record.entitlement_publication_claim_token = None;
+        }
+        frozen.resolved_status = Some(resolved_status);
+        frozen.resolved_at = Some(now);
+        frozen.final_credential_eligible_at = (resolved_status
+            == VerificationTaskStatus::Completed
+            && !frozen.had_active_credential_at_cutoff)
+            .then_some(now);
+        provider.reconciliation_terminal = true;
+        Ok(true)
+    }
+
+    async fn all_obligations_terminal(
+        &self,
+        deletion_job_id: Uuid,
+    ) -> Result<bool, ApplicationError> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .deletions
+            .get(&deletion_job_id)
+            .is_none_or(|deletion| {
+                deletion.bundle_snapshots.values().all(|snapshot| {
+                    !snapshot.paykit_admission_required
+                        || (snapshot.resolved_status.is_some()
+                            && snapshot
+                                .provider_v2
+                                .as_ref()
+                                .is_none_or(|provider| provider.reconciliation_terminal))
+                })
+            }))
+    }
+
+    async fn prepare_payment_drain_cleanup(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+        authority: &PaykitAuthority,
+    ) -> Result<PaymentDrainCleanupPreparation, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let state = self.state.read().await;
+        let Some(deletion) = state.deletions.get(&deletion_job_id) else {
+            return Ok(PaymentDrainCleanupPreparation::ClaimLost);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::PurgeOperationalState,
+        ) {
+            return Ok(PaymentDrainCleanupPreparation::ClaimLost);
+        }
+        let Some(drain) = deletion.payment_drain.as_ref() else {
+            return Ok(PaymentDrainCleanupPreparation::NotRequired);
+        };
+        let has_frozen_authority = drain.lock_resource.is_some() || drain.authority.is_some();
+        if has_frozen_authority
+            && (drain.lock_resource.as_ref() != Some(lock_resource)
+                || drain.authority.as_ref() != Some(authority))
+        {
+            return Err(invalid_deletion_state(
+                "Paykit authority or lock resource changed before deletion cleanup",
+            ));
+        }
+        if drain.cleanup_completed {
+            return Ok(PaymentDrainCleanupPreparation::Completed);
+        }
+        Ok(PaymentDrainCleanupPreparation::Pending(
+            drain.summary.cleanup_token.clone(),
+        ))
+    }
+
+    async fn persist_payment_drain_cleanup(
+        &self,
+        deletion_job_id: Uuid,
+        worker_id: &str,
+        claim_token: Uuid,
+        cleanup_token: &PaymentDrainCleanupToken,
+    ) -> Result<bool, ApplicationError> {
+        let now = self.authoritative_winner_time();
+        let mut state = self.state.write().await;
+        let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
+            return Ok(false);
+        };
+        if !owns_memory_drain_claim(
+            deletion,
+            worker_id,
+            claim_token,
+            now,
+            ContentLockDeletionPhase::PurgeOperationalState,
+        ) {
+            return Ok(false);
+        }
+        let Some(drain) = deletion.payment_drain.as_mut() else {
+            return Ok(false);
+        };
+        if &drain.summary.cleanup_token != cleanup_token {
+            return Err(invalid_deletion_state(
+                "payment drain cleanup token changed for deletion job",
+            ));
+        }
+        drain.cleanup_completed = true;
+        Ok(true)
+    }
+}
+
+fn owns_memory_drain_claim(
+    deletion: &DeletionAccessState,
+    worker_id: &str,
+    claim_token: Uuid,
+    now: OffsetDateTime,
+    phase: ContentLockDeletionPhase,
+) -> bool {
+    deletion.state == ContentLockDeletionState::Running
+        && deletion.phase == phase
+        && !deletion.force_requested
+        && deletion.claimed_by.as_deref() == Some(worker_id)
+        && deletion.claim_token == Some(claim_token)
+        && deletion
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at > now)
+}
+
+fn validate_memory_drain_progress(
+    previous: &PaymentDrainSummary,
+    current: &PaymentDrainSummary,
+) -> Result<(), ApplicationError> {
+    let accepted_delta = previous.accepted_count.checked_sub(current.accepted_count);
+    let terminal_delta = current.terminal_count.checked_sub(previous.terminal_count);
+    if previous.cleanup_token != current.cleanup_token
+        || previous.cancellation_enqueued_count != current.cancellation_enqueued_count
+        || accepted_delta.is_none()
+        || terminal_delta.is_none()
+        || accepted_delta != terminal_delta
+        || (current.status == PaymentDrainStatus::Completed && current.accepted_count != 0)
+        || (current.status == PaymentDrainStatus::Active && current.accepted_count == 0)
+        || (previous.status == PaymentDrainStatus::Completed
+            && current.status != PaymentDrainStatus::Completed)
+    {
+        return Err(invalid_deletion_state(
+            "Paykit payment drain aggregate changed incompatibly for deletion job",
+        ));
+    }
+    Ok(())
+}
+
+#[async_trait]
 impl AccessCredentialStore for InMemoryAccessCredentialStore {
     async fn insert_access_credential(
         &self,
@@ -945,7 +1911,6 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             || !deletion
                 .bundle_snapshots
                 .get(bundle_id)
-                .copied()
                 .is_some_and(DeletionBundleSnapshot::permits_final_credential)
         {
             return Ok(None);
@@ -964,10 +1929,10 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             });
         }
         let mut reads = HashMap::new();
-        if let Some(resource) = frozen_content_lock.primary_resource {
-            reads.insert(resource.path, FinalReadState::default());
+        if let Some(resource) = frozen_content_lock.primary_resource() {
+            reads.insert(resource.path.clone(), FinalReadState::default());
         }
-        for path in frozen_content_lock.secondary_resources.keys() {
+        for path in frozen_content_lock.secondary_resources().keys() {
             reads.insert(path.clone(), FinalReadState::default());
         }
         state.records.insert(
@@ -1039,7 +2004,6 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             && deletion
                 .bundle_snapshots
                 .get(bundle_id)
-                .copied()
                 .is_some_and(DeletionBundleSnapshot::permits_final_credential);
         if !owns_live_issue_claim {
             return Ok(None);
@@ -1080,10 +2044,10 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             });
         }
         let mut reads = HashMap::new();
-        if let Some(resource) = frozen_content_lock.primary_resource {
-            reads.insert(resource.path, FinalReadState::default());
+        if let Some(resource) = frozen_content_lock.primary_resource() {
+            reads.insert(resource.path.clone(), FinalReadState::default());
         }
-        for path in frozen_content_lock.secondary_resources.keys() {
+        for path in frozen_content_lock.secondary_resources().keys() {
             reads.insert(path.clone(), FinalReadState::default());
         }
         state.records.insert(
@@ -1161,7 +2125,6 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
                 && deletion
                     .bundle_snapshots
                     .get(bundle_id)
-                    .copied()
                     .is_some_and(DeletionBundleSnapshot::permits_final_credential),
         )
     }
@@ -1399,16 +2362,23 @@ mod tests {
     use tokio::sync::RwLock;
 
     use locks_core::{
-        ids::{BundleId, CreatorPubky, GuardedResourceHash, LockId, PubkyLockResource, TaskId},
+        ids::{
+            BundleId, CreatorPubky, GuardedResourceHash, LockHash, LockId, PubkyLockResource,
+            TaskId,
+        },
         lock_policy::{
             AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
-            LockServerConfig, VerifierType,
+            LockServerConfig, PaymentPolicyV2, VerifierType,
         },
-        verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle},
+        verification::{
+            Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
+        },
     };
 
     use super::*;
     use crate::application::models::VerificationTaskRecord;
+    use crate::application::ports::{AdmitPaymentTask, PaymentTaskRepository};
+    use crate::infrastructure::memory::payment_tasks::InMemoryPaymentTaskRepository;
 
     #[derive(Debug, Default)]
     struct FailingVerificationTaskRepository {
@@ -1525,6 +2495,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_v2_terminalization_records_the_post_transition_expired_status() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
+        let store = InMemoryAccessCredentialStore::with_deletion_fence(Arc::clone(&fence));
+        let creator = record().creator;
+        let lock_hash = LockHash::from_bytes([7; 32]);
+        let lock_id = LockId::from_hash(lock_hash);
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let task_id = TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap();
+        let lock_resource =
+            PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{lock_id}.json"))
+                .unwrap();
+        let admitted = payments
+            .admit_payment_task(AdmitPaymentTask {
+                task_id,
+                submitted_proof_bundle: SubmittedProofBundleV2 {
+                    version: locks_core::verification::SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                    bundle_id: bundle_id.clone(),
+                    pubky_lock_resource: lock_resource,
+                    reader_pubky: Some(creator.clone()),
+                },
+                lock_hash: [7; 32],
+                payment: PaymentPolicyV2 {
+                    recipient_pubky: creator.clone(),
+                    amount: "1".to_owned(),
+                    asset: "BTC".to_owned(),
+                    minimum_confirmations: 0,
+                },
+                verification_window_seconds: 300,
+            })
+            .await
+            .unwrap();
+        let job_id = Uuid::from_u128(17);
+        let claim_token = Uuid::from_u128(18);
+        let now = store.authoritative_winner_time();
+        store.state.write().await.deletions.insert(
+            job_id,
+            DeletionAccessState {
+                creator: creator.clone(),
+                lock_id,
+                frozen_content_lock: test_content_lock().into(),
+                state: ContentLockDeletionState::Running,
+                phase: ContentLockDeletionPhase::DrainPayments,
+                force_requested: false,
+                claimed_by: Some("worker".to_owned()),
+                claim_token: Some(claim_token),
+                claim_expires_at: Some(now + Duration::minutes(5)),
+                issuance_started_at: None,
+                issuance_deadline: None,
+                read_deadline: None,
+                payment_aggregate: None,
+                payment_drain: None,
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
+                bundle_snapshots: HashMap::from([(
+                    bundle_id,
+                    DeletionBundleSnapshot {
+                        task_id,
+                        paykit_admission_required: true,
+                        had_active_credential_at_cutoff: false,
+                        status_at_cutoff: VerificationTaskStatus::Pending,
+                        resolved_status: None,
+                        resolved_at: None,
+                        final_credential_eligible_at: None,
+                        final_credential_issued: false,
+                        paykit_v1: None,
+                        provider_v2: Some(FrozenProviderV2Deletion {
+                            evaluator_revision: admitted.evaluator_revision,
+                            snapshot: admitted.snapshot.clone(),
+                            create_conflict: Some(false),
+                            create_response: None,
+                            provider_status: None,
+                            status_checkpointed: true,
+                            reconciliation_terminal: false,
+                        }),
+                    },
+                )]),
+            },
+        );
+
+        assert!(
+            store
+                .persist_provider_v2_terminal(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &task_id,
+                    &ProviderV2DeletionReconciliation {
+                        create_conflict: false,
+                        create_response: None,
+                        status: None,
+                        terminal_snapshot: admitted.snapshot,
+                    },
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .state
+                .read()
+                .await
+                .deletions
+                .get(&job_id)
+                .unwrap()
+                .bundle_snapshots
+                .values()
+                .next()
+                .unwrap()
+                .resolved_status,
+            Some(VerificationTaskStatus::Expired)
+        );
+        assert_eq!(
+            fence.current_statuses.read().await.get(&task_id).copied(),
+            Some(VerificationTaskStatus::Expired)
+        );
+    }
+
+    #[tokio::test]
     async fn non_paykit_expiry_missing_later_task_mutates_neither_tasks_nor_snapshots() {
         let tasks = Arc::new(FailingVerificationTaskRepository::default());
         let store = non_paykit_expiry_store(tasks.clone()).await;
@@ -1591,7 +2680,7 @@ mod tests {
     async fn non_paykit_expiry_store(
         tasks: Arc<FailingVerificationTaskRepository>,
     ) -> InMemoryAccessCredentialStore {
-        let store = InMemoryAccessCredentialStore::build(Some(tasks), None);
+        let store = InMemoryAccessCredentialStore::build(Some(tasks), None, None);
         let snapshots = [
             (
                 "000G40R40M30E209185GR38E1W",
@@ -1615,6 +2704,8 @@ mod tests {
                     resolved_at: None,
                     final_credential_eligible_at: None,
                     final_credential_issued: false,
+                    paykit_v1: None,
+                    provider_v2: None,
                 },
             )
         })
@@ -1625,7 +2716,7 @@ mod tests {
                 creator: record().creator,
                 lock_id: LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG")
                     .unwrap(),
-                frozen_content_lock: test_content_lock(),
+                frozen_content_lock: test_content_lock().into(),
                 state: ContentLockDeletionState::Running,
                 phase: ContentLockDeletionPhase::StartPaymentDrain,
                 force_requested: false,
@@ -1636,6 +2727,9 @@ mod tests {
                 issuance_deadline: None,
                 read_deadline: None,
                 payment_aggregate: None,
+                payment_drain: None,
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
                 bundle_snapshots: snapshots,
             },
         );
@@ -2086,6 +3180,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_paykit_v1_cleanup_does_not_require_provider_v2_authority() {
+        let store = InMemoryAccessCredentialStore::new();
+        let job_id = Uuid::from_u128(41);
+        let claim_token = Uuid::from_u128(42);
+        let creator = record().creator;
+        let lock_id =
+            LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG").unwrap();
+        let lock_resource =
+            PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{lock_id}.json"))
+                .unwrap();
+        let authority = PaykitAuthority {
+            scheme: "https".to_owned(),
+            host: "paykit.example".to_owned(),
+            port: 443,
+            base_path: "/".to_owned(),
+        };
+        let cleanup_token =
+            PaymentDrainCleanupToken::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        store.state.write().await.deletions.insert(
+            job_id,
+            DeletionAccessState {
+                creator,
+                lock_id,
+                frozen_content_lock: test_content_lock().into(),
+                state: ContentLockDeletionState::Running,
+                phase: ContentLockDeletionPhase::PurgeOperationalState,
+                force_requested: false,
+                claimed_by: Some("worker".to_owned()),
+                claim_token: Some(claim_token),
+                claim_expires_at: Some(datetime!(2100-01-01 00:00:00 UTC)),
+                issuance_started_at: None,
+                issuance_deadline: None,
+                read_deadline: None,
+                payment_aggregate: Some(DeletionPaymentAggregate {
+                    completed: true,
+                    accepted_count: 0,
+                }),
+                payment_drain: Some(InMemoryPaymentDrain {
+                    summary: PaymentDrainSummary {
+                        status: PaymentDrainStatus::Completed,
+                        accepted_count: 0,
+                        terminal_count: 1,
+                        cancellation_enqueued_count: 0,
+                        cleanup_token: cleanup_token.clone(),
+                    },
+                    lock_resource: None,
+                    authority: None,
+                    fence_acknowledged: false,
+                    cleanup_completed: false,
+                }),
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
+                bundle_snapshots: HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            store
+                .prepare_payment_drain_cleanup(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .unwrap(),
+            PaymentDrainCleanupPreparation::Pending(cleanup_token)
+        );
+
+        {
+            let mut state = store.state.write().await;
+            let drain = state
+                .deletions
+                .get_mut(&job_id)
+                .unwrap()
+                .payment_drain
+                .as_mut()
+                .unwrap();
+            drain.lock_resource = Some(lock_resource.clone());
+            drain.authority = Some(PaykitAuthority {
+                host: "other.example".to_owned(),
+                ..authority.clone()
+            });
+        }
+        assert!(
+            store
+                .prepare_payment_drain_cleanup(
+                    job_id,
+                    "worker",
+                    claim_token,
+                    &lock_resource,
+                    &authority,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn final_materialization_enumeration_does_not_create_eligibility() {
         let store = final_materialization_store().await;
         let job_id = Uuid::from_u128(7);
@@ -2154,7 +3348,7 @@ mod tests {
         clock: Arc<dyn crate::application::ports::Clock>,
     ) -> InMemoryAccessCredentialStore {
         let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(clock));
-        let store = InMemoryAccessCredentialStore::build(None, Some(fence));
+        let store = InMemoryAccessCredentialStore::build(None, None, Some(fence));
         let creator =
             CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
                 .unwrap();
@@ -2181,6 +3375,8 @@ mod tests {
                     resolved_at: Some(eligible_at),
                     final_credential_eligible_at: eligible.then_some(eligible_at),
                     final_credential_issued: false,
+                    paykit_v1: None,
+                    provider_v2: None,
                 },
             )
         })
@@ -2191,7 +3387,7 @@ mod tests {
                 creator,
                 lock_id: LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG")
                     .unwrap(),
-                frozen_content_lock: test_content_lock(),
+                frozen_content_lock: test_content_lock().into(),
                 state: ContentLockDeletionState::Running,
                 phase: ContentLockDeletionPhase::IssueFinalCredentials,
                 force_requested: false,
@@ -2202,6 +3398,9 @@ mod tests {
                 issuance_deadline: Some(datetime!(2026-08-17 12:15:00 UTC)),
                 read_deadline: Some(datetime!(2026-08-17 12:30:00 UTC)),
                 payment_aggregate: None,
+                payment_drain: None,
+                prepared_provider_v2_lock_resource: None,
+                prepared_provider_v2_authority: None,
                 bundle_snapshots: snapshots,
             },
         );

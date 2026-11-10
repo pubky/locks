@@ -1,7 +1,12 @@
+use std::str::FromStr;
+
+use locks_core::ids::{CreatorPubky, PubkyLockResource};
 use sqlx::{FromRow, PgConnection, PgPool, Postgres, Transaction};
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::{EvaluatorMode, EvaluatorTaskKernel};
+
+use super::proof_admission::lock_proof_admission;
 
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct EvaluatorTaskRow {
@@ -220,6 +225,24 @@ where
     ) -> Result<(serde_json::Value, EvaluatorSnapshotTransition), ApplicationError>,
 {
     let mut transaction = pool.begin().await.map_err(storage_error)?;
+    let identity: Option<(String, String)> = sqlx::query_as(
+        "SELECT creator, submitted_proof_bundle->>'pubky_lock_resource'
+         FROM verification_tasks WHERE task_id = $1::uuid AND evaluator_mode = $2",
+    )
+    .bind(task_id)
+    .bind(mode.as_storage_value())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    let Some((creator, lock_resource)) = identity else {
+        transaction.rollback().await.map_err(storage_error)?;
+        return Ok(None);
+    };
+    let creator = CreatorPubky::from_str(&creator)
+        .map_err(|_| invalid_state("persisted evaluator creator is invalid"))?;
+    let lock_resource = PubkyLockResource::from_str(&lock_resource)
+        .map_err(|_| invalid_state("persisted evaluator lock resource is invalid"))?;
+    lock_proof_admission(&mut transaction, &creator, lock_resource.lock_id()).await?;
     let Some(current) = lock_claimed_task(
         &mut transaction,
         mode,
@@ -417,6 +440,12 @@ pub(super) async fn complete_publication_connection(
         .fetch_optional(connection)
         .await
         .map_err(storage_error)
+}
+
+fn invalid_state(message: impl Into<String>) -> ApplicationError {
+    ApplicationError::InvalidVerificationTaskState {
+        message: message.into(),
+    }
 }
 
 fn storage_error(error: sqlx::Error) -> ApplicationError {
