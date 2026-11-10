@@ -2277,6 +2277,35 @@ async fn assert_terminal_job_force_defers_until_stale_worker_releases_action_lan
     let app = router(state.clone());
 
     let deferred = force_delete_request(&app, &lock_id).await;
+    if failure_code.is_none() {
+        assert_eq!(deferred.status(), StatusCode::OK);
+        stale_guard.release().await.unwrap();
+        assert!(
+            state
+                .content_locks()
+                .get_content_lock(&creator(), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .guarded_resources()
+                .get_current_guarded_resource(&creator(), &resource.path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .content_lock_deletions()
+                .get_force_receipt(&creator(), &lock_id)
+                .await
+                .unwrap()
+                .is_some_and(|receipt| receipt.completed_at.is_some())
+        );
+        return;
+    }
     assert_eq!(deferred.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response_json(deferred).await,

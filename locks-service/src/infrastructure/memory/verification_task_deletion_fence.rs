@@ -146,10 +146,11 @@ impl InMemoryVerificationTaskDeletionFence {
         creator: &CreatorPubky,
         lock_id: &LockId,
         forced_at: OffsetDateTime,
+        preserve_terminal: &HashSet<TaskId>,
     ) {
+        let mut fence_records = self.records.write().await;
         let mut payment_records = self.payment_records.write().await;
         let mut current_statuses = self.current_statuses.write().await;
-        let mut fence_records = self.records.write().await;
         for stored in payment_records.iter_mut().filter(|stored| {
             let snapshot = stored.task.snapshot.as_v1();
             &snapshot.creator == creator
@@ -159,6 +160,7 @@ impl InMemoryVerificationTaskDeletionFence {
                     .lock_id()
                     == lock_id
                 && stored.task.status != VerificationTaskStatus::Completed
+                && !preserve_terminal.contains(&stored.task.task_id)
         }) {
             stored.task.status = VerificationTaskStatus::Expired;
             stored.task.snapshot.as_v1_mut().root =

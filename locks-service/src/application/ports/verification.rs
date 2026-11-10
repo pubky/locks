@@ -140,6 +140,17 @@ pub trait VerificationTaskRepository: Send + Sync {
         })
     }
 
+    /// Deletes all listed tasks as one deletion-scoped operation.
+    ///
+    /// Implementations may override this to participate in a repository-owned
+    /// deletion fence without reacquiring per-task admission locks.
+    async fn purge_verification_tasks(&self, task_ids: &[TaskId]) -> Result<(), ApplicationError> {
+        for task_id in task_ids {
+            self.delete_verification_task(task_id).await?;
+        }
+        Ok(())
+    }
+
     /// Ensures a verification task is absent.
     ///
     /// Deleting a missing task is successful.

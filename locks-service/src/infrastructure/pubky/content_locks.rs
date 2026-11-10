@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
 use locks_core::ids::{ContentLockPath, CreatorPubky};
 use locks_core::lock_policy::{ContentLock, ContentLockPayload};
+use serde::de::DeserializeOwned;
 
 use crate::application::errors::ApplicationError;
 use crate::application::ports::{ContentLockRepository, ContentLockWriteError};
@@ -21,6 +23,32 @@ impl<C> PubkyContentLockRepository<C> {
     /// Returns the storage client. Exposed for tests and composition.
     pub fn client(&self) -> &C {
         &self.client
+    }
+}
+
+fn deserialize_content_lock_or_tombstone<T>(
+    value: serde_json::Value,
+    content_lock_path: &ContentLockPath,
+) -> Result<Option<T>, ApplicationError>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value(value.clone()) {
+        Ok(content_lock) => Ok(Some(content_lock)),
+        Err(content_lock_error) => {
+            let is_canonical_tombstone =
+                serde_json::from_value::<ContentLockDeletionTombstone>(value)
+                    .is_ok_and(|tombstone| tombstone.lock_id == *content_lock_path.lock_id());
+            if is_canonical_tombstone {
+                Ok(None)
+            } else {
+                Err(ApplicationError::Storage {
+                    message: format!(
+                        "failed to deserialize content lock from Pubky storage: {content_lock_error}"
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -80,17 +108,14 @@ where
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLock>, ApplicationError> {
-        self.client
+        let value = self
+            .client
             .get_json_value_as_creator(creator, &content_lock_path.to_string())
-            .await?
-            .map(|value| {
-                serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
-                    message: format!(
-                        "failed to deserialize content lock from Pubky storage: {error}"
-                    ),
-                })
-            })
+            .await?;
+        value
+            .map(|value| deserialize_content_lock_or_tombstone(value, content_lock_path))
             .transpose()
+            .map(Option::flatten)
     }
 
     async fn get_content_lock_payload(
@@ -98,17 +123,14 @@ where
         creator: &CreatorPubky,
         content_lock_path: &ContentLockPath,
     ) -> Result<Option<ContentLockPayload>, ApplicationError> {
-        self.client
+        let value = self
+            .client
             .get_json_value_as_creator(creator, &content_lock_path.to_string())
-            .await?
-            .map(|value| {
-                serde_json::from_value(value).map_err(|error| ApplicationError::Storage {
-                    message: format!(
-                        "failed to deserialize content lock from Pubky storage: {error}"
-                    ),
-                })
-            })
+            .await?;
+        value
+            .map(|value| deserialize_content_lock_or_tombstone(value, content_lock_path))
             .transpose()
+            .map(Option::flatten)
     }
 
     async fn delete_content_lock(
@@ -138,7 +160,8 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockServerPubky};
+    use locks_core::content_lock_deletion::ContentLockDeletionTombstone;
+    use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockHash, LockId, LockServerPubky};
     use locks_core::lock_policy::{
         AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
         LockServerConfig, VerifierType,
@@ -207,6 +230,24 @@ mod tests {
 
         let loaded = repository
             .get_content_lock(&creator(), &requested_path)
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, None);
+    }
+
+    #[tokio::test]
+    async fn get_content_lock_payload_treats_canonical_deletion_tombstone_as_absent() {
+        let lock_id = LockId::from_hash(LockHash::from_bytes([9; 32]));
+        let requested_path = locks_core::ids::ContentLockPath::from_lock_id(lock_id.clone());
+        let tombstone =
+            ContentLockDeletionTombstone::new(lock_id, datetime!(2026-08-12 05:00:00 UTC));
+        let client = FakeStorageClient::default()
+            .with_json_read(Some(serde_json::to_value(tombstone).unwrap()));
+        let repository = PubkyContentLockRepository::new(client);
+
+        let loaded = repository
+            .get_content_lock_payload(&creator(), &requested_path)
             .await
             .unwrap();
 

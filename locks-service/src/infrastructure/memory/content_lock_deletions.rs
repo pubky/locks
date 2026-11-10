@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -239,6 +242,10 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             });
         }
         let key = (creator.clone(), lock_id.clone());
+        let _admission = self
+            .verification_task_fence
+            .acquire_lock_admission(creator, lock_id)
+            .await;
         let mut intents = self.publication_intents.write().await;
         let jobs = self.jobs.read().await;
         let receipts = self.force_receipts.read().await;
@@ -700,6 +707,89 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         claim_token: Uuid,
         failure_code: Option<ContentLockDeletionFailureCode>,
     ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+        if failure_code.is_none() {
+            let key = {
+                let jobs = self.jobs.read().await;
+                let Some(stored) = jobs.values().find(|stored| stored.job.job_id == job_id) else {
+                    return Ok(None);
+                };
+                (stored.job.creator.clone(), stored.job.lock_id.clone())
+            };
+            let _admission = self
+                .verification_task_fence
+                .acquire_lock_admission(&key.0, &key.1)
+                .await;
+            let _claim_transition = self.claim_transition_gate.lock().await;
+            let now = self.verification_task_fence.authoritative_cutoff();
+            let phase = {
+                let jobs = self.jobs.read().await;
+                let Some(stored) = jobs
+                    .values()
+                    .find(|stored| owns_claim(stored, job_id, worker_id, claim_token, now))
+                else {
+                    return Ok(None);
+                };
+                stored.job.phase
+            };
+            let mut fence_records = self.verification_task_fence.records.write().await;
+            let task_ids = fence_records
+                .iter()
+                .filter_map(|(task_id, record)| {
+                    (record.creator == key.0 && record.lock_id == key.1).then_some(*task_id)
+                })
+                .collect::<HashSet<_>>();
+            let task_handles = fence_records
+                .iter()
+                .filter_map(|(task_id, record)| {
+                    task_ids
+                        .contains(task_id)
+                        .then_some((record.creator.clone(), record.bundle_id.clone()))
+                })
+                .collect::<HashSet<_>>();
+            let mut graph_records = self.verification_task_fence.graph_records.write().await;
+            let mut payment_records = self.verification_task_fence.payment_records.write().await;
+            let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
+            let mut folded_auth_reservations = self
+                .verification_task_fence
+                .folded_auth_reservations
+                .write()
+                .await;
+            let mut deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.write().await;
+            let mut intents = self.publication_intents.write().await;
+            let mut ownership = self.ownership_records.write().await;
+            let mut jobs = self.jobs.write().await;
+            let Some(stored) = jobs
+                .values()
+                .find(|stored| owns_claim(stored, job_id, worker_id, claim_token, now))
+            else {
+                return Ok(None);
+            };
+            self.access_credentials
+                .check_successful_finish(job_id, phase, now)
+                .await?;
+            if let Some(verification_tasks) = self.access_credentials.verification_task_repository()
+            {
+                verification_tasks
+                    .purge_verification_tasks(&task_ids.iter().copied().collect::<Vec<_>>())
+                    .await?;
+            }
+            let mut completed = stored.job.clone();
+            completed.state = ContentLockDeletionState::Completed;
+            completed.failure_code = None;
+            completed.next_attempt_at = None;
+            self.access_credentials.purge_deletion(job_id).await;
+            fence_records.retain(|task_id, _| !task_ids.contains(task_id));
+            graph_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
+            payment_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
+            current_statuses.retain(|task_id, _| !task_ids.contains(task_id));
+            folded_auth_reservations.retain(|handle| !task_handles.contains(handle));
+            intents.remove(&key);
+            ownership.retain(|_, record| record.creator != key.0 || record.lock_id != key.1);
+            deletion_cutoffs.remove(&key);
+            jobs.remove(&key);
+            return Ok(Some(completed));
+        }
+
         let _claim_transition = self.claim_transition_gate.lock().await;
         let mut jobs = self.jobs.write().await;
         let now = self.verification_task_fence.authoritative_cutoff();
@@ -709,16 +799,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         else {
             return Ok(None);
         };
-        if failure_code.is_none() {
-            self.access_credentials
-                .check_successful_finish(job_id, stored.job.phase, now)
-                .await?;
-        }
-        stored.job.state = if failure_code.is_some() {
-            ContentLockDeletionState::Failed
-        } else {
-            ContentLockDeletionState::Completed
-        };
+        stored.job.state = ContentLockDeletionState::Failed;
         stored.job.failure_code = failure_code;
         stored.job.next_attempt_at = None;
         clear_claim(stored);
@@ -799,21 +880,50 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         lock_id: &LockId,
         frozen_content_lock: Option<&ContentLockPayload>,
     ) -> Result<PrepareForceDeletionResult, ApplicationError> {
+        let _admission = self
+            .verification_task_fence
+            .acquire_lock_admission(creator, lock_id)
+            .await;
         let _claim_transition = self.claim_transition_gate.lock().await;
         let forced_at = self.verification_task_fence.authoritative_cutoff();
         let key = (creator.clone(), lock_id.clone());
-        let intents = self.publication_intents.read().await;
-        if intents.contains_key(&key) {
-            return Ok(PrepareForceDeletionResult::PublicationInProgress);
-        }
         let verification_tasks = self.verification_task_fence.records.read().await;
         let entitlement_publication_in_progress = verification_tasks.values().any(|task| {
             task.creator == *creator
                 && task.lock_id == *lock_id
-                && task.deletion_job_id.is_some()
                 && task.entitlement_publication_claim_token.is_some()
         });
         drop(verification_tasks);
+        let intents = self.publication_intents.read().await;
+        if intents.contains_key(&key) {
+            return Ok(PrepareForceDeletionResult::PublicationInProgress);
+        }
+        drop(intents);
+        let requires_terminal_abandonment = {
+            let jobs = self.jobs.read().await;
+            let receipts = self.force_receipts.read().await;
+            !receipts.contains_key(&key)
+                && match jobs.get(&key) {
+                    None => true,
+                    Some(stored) => {
+                        !(matches!(
+                            stored.job.state,
+                            ContentLockDeletionState::Queued | ContentLockDeletionState::Running
+                        ) || (stored.job.state == ContentLockDeletionState::Failed
+                            && entitlement_publication_in_progress))
+                    }
+                }
+        };
+        if requires_terminal_abandonment {
+            self.verification_task_fence
+                .deletion_cutoffs
+                .write()
+                .await
+                .insert(key.clone());
+            self.verification_task_fence
+                .abandon_provider_v2_tasks(creator, lock_id, forced_at, &HashSet::new())
+                .await;
+        }
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         if let Some(receipt) = receipts.get_mut(&key) {
@@ -858,9 +968,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 return Ok(PrepareForceDeletionResult::Active(stored.job.clone()));
             }
             let job = stored.job.clone();
-            self.verification_task_fence
-                .abandon_provider_v2_tasks(creator, lock_id, forced_at)
-                .await;
             self.access_credentials
                 .block_key_and_disable_job(creator, lock_id, Some(job.job_id))
                 .await;
@@ -876,14 +983,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             );
             return Ok(PrepareForceDeletionResult::Synchronous(Some(job)));
         }
-        self.verification_task_fence
-            .deletion_cutoffs
-            .write()
-            .await
-            .insert(key.clone());
-        self.verification_task_fence
-            .abandon_provider_v2_tasks(creator, lock_id, forced_at)
-            .await;
         self.access_credentials
             .block_key_and_disable_job(creator, lock_id, None)
             .await;
@@ -933,7 +1032,6 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         worker_id: &str,
         claim_token: Uuid,
     ) -> Result<bool, ApplicationError> {
-        let _claim_transition = self.claim_transition_gate.lock().await;
         let now = self.verification_task_fence.authoritative_cutoff();
         let key = self
             .jobs
@@ -948,6 +1046,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .verification_task_fence
             .acquire_lock_admission(&key.0, &key.1)
             .await;
+        let _claim_transition = self.claim_transition_gate.lock().await;
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
         let Some(stored) = jobs.get(&key) else {
@@ -959,8 +1058,12 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         let Some(forced_at) = stored.job.force_requested_at else {
             return Ok(false);
         };
+        let preserve_terminal = self
+            .access_credentials
+            .reconciled_provider_v2_terminal_task_ids(job_id)
+            .await;
         self.verification_task_fence
-            .abandon_provider_v2_tasks(&key.0, &key.1, forced_at)
+            .abandon_provider_v2_tasks(&key.0, &key.1, forced_at, &preserve_terminal)
             .await;
         self.access_credentials
             .block_key_and_disable_job(&key.0, &key.1, Some(job_id))

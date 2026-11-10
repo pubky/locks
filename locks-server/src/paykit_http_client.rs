@@ -869,7 +869,7 @@ impl PaymentDrainClient for PaykitHttpClient {
         let body: PaymentDrainCleanupResponse =
             read_bounded_json(response, PAYMENT_DRAIN_BODY_LIMIT)
                 .await
-                .map_err(|_| PaymentDrainClientError::MalformedSuccess)?;
+                .map_err(map_cleanup_body_error)?;
         if body.status != "removed" {
             return Err(PaymentDrainClientError::MalformedSuccess);
         }
@@ -980,6 +980,13 @@ fn elapsed_millis(started: Instant) -> u64 {
 enum BoundedJsonError {
     Transport,
     Invalid,
+}
+
+fn map_cleanup_body_error(error: BoundedJsonError) -> PaymentDrainClientError {
+    match error {
+        BoundedJsonError::Transport => PaymentDrainClientError::Transport,
+        BoundedJsonError::Invalid => PaymentDrainClientError::MalformedSuccess,
+    }
 }
 
 fn map_provider_body_error(error: BoundedJsonError) -> PaymentProviderError {
@@ -1315,6 +1322,39 @@ mod tests {
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn cleanup_body_transport_and_decode_failures_keep_distinct_retry_semantics() {
+        assert_eq!(
+            map_cleanup_body_error(BoundedJsonError::Transport),
+            PaymentDrainClientError::Transport
+        );
+        assert_eq!(
+            map_cleanup_body_error(BoundedJsonError::Invalid),
+            PaymentDrainClientError::MalformedSuccess
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_truncated_success_body_is_a_transport_failure() {
+        let server_url = spawn_truncated_cleanup_body().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let lock_resource = locks_core::ids::PubkyLockResource::from_str(LOCK_RESOURCE).unwrap();
+        let cleanup_token =
+            PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([7_u8; 32])).unwrap();
+
+        assert_eq!(
+            client
+                .cleanup_payment_drain(&lock_resource, &cleanup_token)
+                .await,
+            Err(PaymentDrainClientError::Transport)
+        );
+    }
 
     #[test]
     fn provider_body_transport_and_decode_failures_keep_distinct_retry_semantics() {
@@ -2192,6 +2232,21 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_truncated_cleanup_body() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 20\r\nconnection: close\r\n\r\n{\"status\":",
+                )
+                .await
+                .unwrap();
         });
         format!("http://{address}")
     }

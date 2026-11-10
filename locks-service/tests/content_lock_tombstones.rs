@@ -60,11 +60,12 @@ async fn memory_content_lock_and_tombstone_adapters_share_one_canonical_public_p
             .unwrap(),
         TombstoneReadback::Exact
     );
-    assert!(
+    assert_eq!(
         content_locks
             .get_content_lock(&creator, &path)
             .await
-            .is_err()
+            .unwrap(),
+        None
     );
 
     assert_eq!(
@@ -74,11 +75,12 @@ async fn memory_content_lock_and_tombstone_adapters_share_one_canonical_public_p
             .unwrap(),
         TombstoneReadback::Exact
     );
-    assert!(
+    assert_eq!(
         content_locks
             .get_content_lock(&creator, &path)
             .await
-            .is_err()
+            .unwrap(),
+        None
     );
 }
 

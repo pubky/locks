@@ -180,15 +180,10 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                     .cleanup_payment_drain(&lock_resource, &cleanup_token)
                     .await
                 {
-                    return DeletionPhaseExecution::new(match error {
-                        PaymentDrainClientError::Transport | PaymentDrainClientError::Server => {
-                            DeletionPhaseExecutionOutcome::TransientDependencyFailure
-                        }
-                        _ => DeletionPhaseExecutionOutcome::FatalFailure,
-                    })
-                    .with_evidence(DeletionDependencyEvidence::unavailable(
-                        DeletionDependencySource::PaymentProvider,
-                    ));
+                    return DeletionPhaseExecution::new(cleanup_failure_outcome(error))
+                        .with_evidence(DeletionDependencyEvidence::unavailable(
+                            DeletionDependencySource::PaymentProvider,
+                        ));
                 }
                 evidence = evidence.merge(DeletionDependencyEvidence::healthy(
                     DeletionDependencySource::PaymentProvider,
@@ -1122,6 +1117,18 @@ fn observe_unavailable(
     *evidence = evidence.merge(DeletionDependencyEvidence::unavailable(source));
 }
 
+fn cleanup_failure_outcome(error: PaymentDrainClientError) -> DeletionPhaseExecutionOutcome {
+    match error {
+        PaymentDrainClientError::Transport
+        | PaymentDrainClientError::Server
+        | PaymentDrainClientError::Conflict
+        | PaymentDrainClientError::MalformedSuccess => {
+            DeletionPhaseExecutionOutcome::TransientDependencyFailure
+        }
+        PaymentDrainClientError::NotFound => DeletionPhaseExecutionOutcome::FatalFailure,
+    }
+}
+
 fn map_client_error(error: PaymentDrainClientError) -> ApplicationError {
     ApplicationError::Verifier {
         message: match error {
@@ -1262,16 +1269,39 @@ mod tests {
         VerificationTerminalReason,
     };
     use crate::application::ports::{
-        EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainStatus, PaymentDrainSummary,
-        PaymentRequestState, PaymentRequestStatus, PaymentState,
+        EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainClientError,
+        PaymentDrainStatus, PaymentDrainSummary, PaymentRequestState, PaymentRequestStatus,
+        PaymentState,
     };
 
-    use crate::application::use_cases::execute_content_lock_deletion_phase::DeletionDependencyStatus;
+    use crate::application::use_cases::execute_content_lock_deletion_phase::{
+        DeletionDependencyStatus, DeletionPhaseExecutionOutcome,
+    };
 
     use super::{
         DeletionDependencyEvidence, DeletionDependencySource, classify_payment_task,
-        persist_entitlement, provider_v2_status_is_terminal, validate_aggregate_progress,
+        cleanup_failure_outcome, persist_entitlement, provider_v2_status_is_terminal,
+        validate_aggregate_progress,
     };
+
+    #[test]
+    fn cleanup_conflict_and_malformed_success_are_job_local_retries() {
+        for error in [
+            PaymentDrainClientError::Transport,
+            PaymentDrainClientError::Server,
+            PaymentDrainClientError::Conflict,
+            PaymentDrainClientError::MalformedSuccess,
+        ] {
+            assert_eq!(
+                cleanup_failure_outcome(error),
+                DeletionPhaseExecutionOutcome::TransientDependencyFailure
+            );
+        }
+        assert_eq!(
+            cleanup_failure_outcome(PaymentDrainClientError::NotFound),
+            DeletionPhaseExecutionOutcome::FatalFailure
+        );
+    }
 
     #[tokio::test]
     async fn exact_duplicate_entitlement_replay_finishes_with_healthy_evidence() {

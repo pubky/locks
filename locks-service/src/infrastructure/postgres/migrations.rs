@@ -620,11 +620,13 @@ mod tests {
             sqlx::query(
                 "INSERT INTO verification_tasks
                      (task_id, creator, bundle_id, status, submitted_proof_bundle,
-                      submitted_at, invoice_admission_phase, evaluator_mode,
-                      evaluator_snapshot, evaluator_revision, deletion_job_id)
-                 VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'pending',
-                         '{\"proofs\":[]}'::jsonb, clock_timestamp(), 'ready', 'payment',
-                         '{\"schema_version\":1}'::jsonb, 0, $2)",
+                      submitted_at, started_at, completed_at, entitlement_to_publish,
+                      invoice_admission_phase, evaluator_mode, evaluator_snapshot,
+                      evaluator_revision, deletion_job_id)
+                 VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'completed',
+                         '{\"proofs\":[]}'::jsonb, clock_timestamp(), clock_timestamp(),
+                         clock_timestamp(), '{}'::jsonb, 'ready', 'payment',
+                         '{\"schema_version\":1}'::jsonb, 7, $2)",
             )
             .bind(task_id)
             .bind(job_id)
@@ -634,9 +636,11 @@ mod tests {
             sqlx::query(
                 "INSERT INTO content_lock_deletion_task_snapshot
                      (deletion_job_id, verification_task_id, creator, bundle_id,
-                      pubky_lock_resource, status_at_cutoff, paykit_admission_required)
+                      pubky_lock_resource, status_at_cutoff, paykit_admission_required,
+                      resolved_status, resolved_at, final_credential_eligible_at)
                  VALUES ($1, $2, 'upgrade-creator', 'upgrade-bundle',
-                         'upgrade-creator/pub/app.locks/upgrade-lock.json', 'pending', TRUE)",
+                         'upgrade-creator/pub/app.locks/upgrade-lock.json', 'completed', TRUE,
+                         'completed', clock_timestamp(), clock_timestamp())",
             )
             .bind(job_id)
             .bind(task_id)
@@ -644,24 +648,28 @@ mod tests {
             .await
             .unwrap();
 
-            let migration = super::MIGRATOR
-                .iter()
-                .find(|migration| migration.version == 32)
-                .unwrap();
-            let result = sqlx::raw_sql(migration.sql.as_ref())
-                .execute(database.pool())
-                .await;
+            let result = super::run_migrations(database.pool()).await;
             if should_succeed {
                 result.unwrap();
-                let kind: String = sqlx::query_scalar(
-                    "SELECT obligation_kind FROM content_lock_deletion_task_snapshot
+                let row: (
+                    String,
+                    String,
+                    Option<String>,
+                    Option<time::OffsetDateTime>,
+                    Option<time::OffsetDateTime>,
+                ) = sqlx::query_as(
+                    "SELECT obligation_kind, provider_reconciliation_state,
+                            resolved_status, resolved_at, final_credential_eligible_at
+                     FROM content_lock_deletion_task_snapshot
                      WHERE deletion_job_id = $1",
                 )
                 .bind(job_id)
                 .fetch_one(database.pool())
                 .await
                 .unwrap();
-                assert_eq!(kind, "provider_v2");
+                assert_eq!(row.0, "provider_v2");
+                assert_eq!(row.1, "pending");
+                assert_eq!((row.2, row.3, row.4), (None, None, None));
             } else {
                 let error = result.expect_err("post-drain provider-v2 upgrade must refuse closed");
                 assert!(
@@ -673,6 +681,78 @@ mod tests {
             }
             database.cleanup().await;
         }
+    }
+
+    #[tokio::test]
+    async fn populated_0031_upgrade_refuses_completed_provider_v2_without_force_abandonment() {
+        let database = TestDatabase::create_unmigrated().await;
+        let through_0031 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(31).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        through_0031.run(database.pool()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_jobs
+                 (job_id, creator, lock_id, frozen_content_lock, deletion_started_at,
+                  state, phase)
+             VALUES ($1, 'upgrade-creator', 'upgrade-lock', '{}'::jsonb,
+                     clock_timestamp(), 'completed', 'purge_operational_state')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO verification_tasks
+                 (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                  submitted_at, started_at, completed_at, entitlement_to_publish,
+                  invoice_admission_phase, evaluator_mode, evaluator_snapshot,
+                  evaluator_revision, deletion_job_id)
+             VALUES ($1, 'upgrade-creator', 'upgrade-bundle', 'completed',
+                     '{\"proofs\":[]}'::jsonb, clock_timestamp(), clock_timestamp(),
+                     clock_timestamp(), '{}'::jsonb, 'ready', 'payment',
+                     '{\"schema_version\":1}'::jsonb, 7, $2)",
+        )
+        .bind(task_id)
+        .bind(job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_lock_deletion_task_snapshot
+                 (deletion_job_id, verification_task_id, creator, bundle_id,
+                  pubky_lock_resource, status_at_cutoff, paykit_admission_required,
+                  resolved_status, resolved_at, final_credential_eligible_at)
+             VALUES ($1, $2, 'upgrade-creator', 'upgrade-bundle',
+                     'upgrade-creator/pub/app.locks/upgrade-lock.json', 'completed', TRUE,
+                     'completed', clock_timestamp(), clock_timestamp())",
+        )
+        .bind(job_id)
+        .bind(task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let error = super::run_migrations(database.pool())
+            .await
+            .expect_err("completed provider-v2 upgrade without force abandonment must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("completed provider-v2 deletion without a persisted rc3 fence"),
+            "unexpected 0032 refusal: {error}"
+        );
+        let applied_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(applied_versions, (1..=31).collect::<Vec<_>>());
+        database.cleanup().await;
     }
 
     #[tokio::test]

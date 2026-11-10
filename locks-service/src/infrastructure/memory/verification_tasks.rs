@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as SyncRwLock, Weak};
 
 use async_trait::async_trait;
@@ -241,6 +241,24 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
                 &task.creator == creator && &task.submitted_proof_bundle.bundle_id == bundle_id
             })
             .cloned())
+    }
+
+    async fn purge_verification_tasks(&self, task_ids: &[TaskId]) -> Result<(), ApplicationError> {
+        let task_ids = task_ids.iter().copied().collect::<HashSet<_>>();
+        self.records
+            .write()
+            .await
+            .retain(|task_id, _| !task_ids.contains(task_id));
+        self.invoice_admissions
+            .write()
+            .await
+            .retain(|task_id, _| !task_ids.contains(task_id));
+        if let Some(claimer) = self.verification_task_claimer() {
+            for task_id in &task_ids {
+                claimer.remove_task(task_id).await;
+            }
+        }
+        Ok(())
     }
 
     async fn delete_verification_task(&self, task_id: &TaskId) -> Result<(), ApplicationError> {

@@ -96,15 +96,14 @@ drain_timeout = "2s"
     )
     .await
     .expect("Paykit server did not become ready");
-    std::fs::write(
-        coord.join("paykit-ready.json"),
-        serde_json::to_vec(&serde_json::json!({
+    write_coord_json(
+        &coord,
+        "paykit-ready.json",
+        &serde_json::json!({
             "creator": creator.creator.to_string(),
             "reader": reader.to_string(),
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+        }),
+    );
 
     let locks = read_coord_json(&coord, "locks-ready.json").await;
     creator.lock_resource = locks["lock_resource"].as_str().unwrap().to_owned();
@@ -152,7 +151,17 @@ drain_timeout = "2s"
     } else {
         assert_eq!(scenario, "drain-first");
         wait_coord_file(&coord, "fence-acknowledged").await;
-        let response = send_http("127.0.0.1:3001".parse().unwrap(), request()).await;
+        let response = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let response = send_http("127.0.0.1:3001".parse().unwrap(), request()).await;
+                if response.status != StatusCode::SERVICE_UNAVAILABLE {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("provider-v2 fenced replay did not become ready");
         assert_eq!(
             response.status,
             StatusCode::CONFLICT,
@@ -192,6 +201,13 @@ drain_timeout = "2s"
     homeserver_database.cleanup().await;
     database.cleanup().await;
     std::fs::write(coord.join("paykit-complete"), b"ok").unwrap();
+}
+
+fn write_coord_json(coord: &std::path::Path, name: &str, value: &serde_json::Value) {
+    let path = coord.join(name);
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec(value).unwrap()).unwrap();
+    std::fs::rename(temporary, path).unwrap();
 }
 
 async fn read_coord_json(coord: &std::path::Path, name: &str) -> serde_json::Value {

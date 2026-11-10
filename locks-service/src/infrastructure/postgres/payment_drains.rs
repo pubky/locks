@@ -643,20 +643,21 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
             .terminal_snapshot
             .to_json()
             .map_err(storage_display)?;
-        let task_updated = sqlx::query(
+        let resolved_task_status = sqlx::query_scalar::<_, String>(
             "UPDATE verification_tasks AS task
-             SET status = CASE WHEN task.status = 'completed' THEN task.status ELSE 'expired' END,
-                 started_at = CASE WHEN task.status = 'completed' THEN task.started_at
+             SET status = CASE WHEN task.status IN ('completed', 'failed', 'expired')
+                               THEN task.status ELSE 'expired' END,
+                 started_at = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.started_at
                                    ELSE COALESCE(task.started_at, $3) END,
-                 completed_at = CASE WHEN task.status = 'completed' THEN task.completed_at ELSE $3 END,
-                 failure_message = CASE WHEN task.status = 'completed' THEN task.failure_message ELSE NULL END,
-                 terminal_reason = CASE WHEN task.status = 'completed' THEN task.terminal_reason
+                 completed_at = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.completed_at ELSE $3 END,
+                 failure_message = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.failure_message ELSE NULL END,
+                 terminal_reason = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.terminal_reason
                                         ELSE 'content_lock_deleted' END,
-                 evaluator_snapshot = CASE WHEN task.status = 'completed' THEN task.evaluator_snapshot
+                 evaluator_snapshot = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.evaluator_snapshot
                      ELSE $4 END,
-                 evaluator_revision = CASE WHEN task.status = 'completed' THEN task.evaluator_revision
+                 evaluator_revision = CASE WHEN task.status IN ('completed', 'failed', 'expired') THEN task.evaluator_revision
                                            ELSE snapshot.evaluator_revision_at_cutoff + 1 END,
-                 entitlement_to_publish = CASE WHEN task.status = 'completed'
+                 entitlement_to_publish = CASE WHEN task.status IN ('completed', 'failed', 'expired')
                      THEN task.entitlement_to_publish ELSE NULL END,
                  claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
                  next_attempt_at = NULL, last_attempt_error = NULL,
@@ -669,28 +670,29 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                AND snapshot.resolved_status IS NULL
                AND task.deletion_job_id = $1
                AND (
-                    task.status = 'completed'
+                    task.status IN ('completed', 'failed', 'expired')
                     OR (task.status IN ('pending', 'in_progress')
                         AND task.evaluator_revision = snapshot.evaluator_revision_at_cutoff
                         AND task.evaluator_snapshot = snapshot.evaluator_snapshot_at_cutoff
                         AND task.entitlement_to_publish IS NOT DISTINCT FROM snapshot.entitlement_payload_at_cutoff
                         AND task.entitlement_publication_claim_token IS NOT DISTINCT FROM snapshot.publication_token_at_cutoff)
-               )",
+               )
+             RETURNING task.status",
         )
         .bind(deletion_job_id)
         .bind(task_id.to_string())
         .bind(now)
         .bind(terminal_snapshot)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        if task_updated.rows_affected() != 1 {
+        let Some(resolved_task_status) = resolved_task_status else {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(false);
-        }
+        };
         let resolved = sqlx::query(
             "UPDATE content_lock_deletion_task_snapshot
-             SET resolved_status = CASE WHEN status_at_cutoff = 'completed' THEN 'completed' ELSE 'expired' END,
+             SET resolved_status = $9,
                  resolved_at = $3,
                  provider_reconciliation_state = 'terminal',
                  provider_create_replay_result = $4,
@@ -700,7 +702,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                  provider_status_snapshot = $8,
                  provider_reconciled_at = $3,
                  final_credential_eligible_at = CASE
-                     WHEN status_at_cutoff = 'completed'
+                     WHEN $9 = 'completed'
                       AND NOT had_active_credential_at_cutoff
                      THEN $3
                      ELSE final_credential_eligible_at
@@ -729,6 +731,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
         .bind(response.map(|value| value.proposal_expires_at))
         .bind(response.map(|value| value.deadline))
         .bind(status)
+        .bind(&resolved_task_status)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

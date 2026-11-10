@@ -22,7 +22,7 @@ use locks_server::deletion_worker::{
 };
 use locks_server::testing::TestServerApp;
 use locks_service::application::models::{
-    ContentLockDeletionState, FrontendSessionToken, GuardedResourceRecord, VerificationTaskStatus,
+    ContentLockDeletionState, FrontendSessionToken, GuardedResourceRecord,
 };
 use locks_service::application::ports::{ContentLockRepository, GuardedResourceRepository};
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
@@ -288,13 +288,15 @@ async fn provider_v2_deletion_compose_exercises_real_locks_http_and_paykit_rc3()
         "{}",
         replay.text().await.unwrap()
     );
-    let task = state
-        .payment_tasks()
-        .get_payment_task_by_handle(&creator, &BundleId::from_str(BUNDLE).unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(task.status, VerificationTaskStatus::Expired);
+    assert!(
+        state
+            .payment_tasks()
+            .get_payment_task_by_handle(&creator, &BundleId::from_str(BUNDLE).unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "graceful purge must remove lock-scoped verification task state"
+    );
     let observations: Value = http
         .get(format!("{paykit_url}/observations"))
         .send()

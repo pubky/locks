@@ -33,7 +33,8 @@ use locks_service::{
             ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, GraphTaskClaimer, GraphTaskRepository,
             InvoiceAdmissionRepository, PaymentDrainObligationKind, PaymentDrainRepository,
-            PaymentTaskRepository, VerificationTaskClaimer, VerificationTaskRepository,
+            PaymentTaskRepository, ProviderV2DeletionReconciliation, VerificationTaskClaimer,
+            VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -49,6 +50,7 @@ use locks_service::{
 };
 use serde_json::json;
 use time::macros::datetime;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 struct PausingVerificationTaskRepository {
@@ -146,7 +148,14 @@ async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_re
         FixedClock(NOW),
     )));
     let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
-    let deletions = InMemoryContentLockDeletionRepository::with_verification_task_fence(fence);
+    let access = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            Arc::clone(&access),
+            fence,
+        );
     let lock = content_lock();
     let lock_hash = lock.lock_hash().unwrap();
     let request = AdmitPaymentTask {
@@ -173,11 +182,35 @@ async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_re
     };
     let admitted = payments.admit_payment_task(request.clone()).await.unwrap();
 
+    assert!(
+        !tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            access.persist_provider_v2_terminal(
+                Uuid::new_v4(),
+                "missing-job-worker",
+                Uuid::new_v4(),
+                &admitted.task_id,
+                &ProviderV2DeletionReconciliation {
+                    create_conflict: false,
+                    create_response: None,
+                    status: None,
+                    terminal_snapshot: admitted.snapshot.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("provider terminalization without access state must not invert the fence")
+        .unwrap()
+    );
+
     assert!(matches!(
-        deletions
-            .prepare_force_deletion(&lock.creator, &lock.lock_id().unwrap())
-            .await
-            .unwrap(),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            deletions.prepare_force_deletion(&lock.creator, &lock.lock_id().unwrap()),
+        )
+        .await
+        .expect("force without a job or receipt must not invert the deletion fence")
+        .unwrap(),
         PrepareForceDeletionResult::Synchronous(None)
     ));
 
@@ -205,6 +238,126 @@ async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_re
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress),
         "force receipt permanently fences every later bundle for the deleted lock"
     );
+}
+
+#[tokio::test]
+async fn in_memory_force_prepare_and_deletion_admission_race_completes_without_lock_inversion() {
+    for _ in 0..16 {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock(NOW),
+        )));
+        let access = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let deletions = Arc::new(
+            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                access,
+                fence,
+            ),
+        );
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let insert = {
+            let deletions = Arc::clone(&deletions);
+            let barrier = Arc::clone(&barrier);
+            let job = job.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                deletions.insert_job(job).await
+            })
+        };
+        let force = {
+            let deletions = Arc::clone(&deletions);
+            let barrier = Arc::clone(&barrier);
+            let creator = job.creator.clone();
+            let lock_id = job.lock_id.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                deletions.prepare_force_deletion(&creator, &lock_id).await
+            })
+        };
+        barrier.wait().await;
+        let (inserted, forced) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            (insert.await.unwrap(), force.await.unwrap().unwrap())
+        })
+        .await
+        .expect("concurrent force and deletion admission must not deadlock");
+        match forced {
+            PrepareForceDeletionResult::Synchronous(None) => assert_eq!(
+                inserted,
+                Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)
+            ),
+            PrepareForceDeletionResult::Active(_) => inserted.unwrap(),
+            other => panic!("unexpected race outcome: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn in_memory_provider_terminalization_and_deletion_admission_race_is_bounded() {
+    for _ in 0..16 {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock(NOW),
+        )));
+        let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
+        let access = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let deletions = Arc::new(
+            InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+                Arc::clone(&access),
+                fence,
+            ),
+        );
+        let lock = content_lock();
+        let admitted = payments
+            .admit_payment_task(payment_task_request(&lock, BundleId::new_random()))
+            .await
+            .unwrap();
+        let job = ContentLockDeletionJob::new(Uuid::new_v4(), lock, NOW).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let insert = {
+            let deletions = Arc::clone(&deletions);
+            let barrier = Arc::clone(&barrier);
+            let job = job.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                deletions.insert_job(job).await
+            })
+        };
+        let terminalize = {
+            let access = Arc::clone(&access);
+            let barrier = Arc::clone(&barrier);
+            let task_id = admitted.task_id;
+            let snapshot = admitted.snapshot.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                access
+                    .persist_provider_v2_terminal(
+                        Uuid::new_v4(),
+                        "non-owner",
+                        Uuid::new_v4(),
+                        &task_id,
+                        &ProviderV2DeletionReconciliation {
+                            create_conflict: false,
+                            create_response: None,
+                            status: None,
+                            terminal_snapshot: snapshot,
+                        },
+                    )
+                    .await
+            })
+        };
+        barrier.wait().await;
+        let (inserted, terminalized) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                (insert.await.unwrap(), terminalize.await.unwrap())
+            })
+            .await
+            .expect("concurrent provider terminalization and deletion admission must not deadlock");
+        inserted.unwrap();
+        assert!(!terminalized.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -2246,6 +2399,124 @@ async fn in_memory_payment_drain_waits_for_completed_aggregate() {
 }
 
 #[tokio::test]
+async fn in_memory_successful_finish_purges_job_task_and_access_state() {
+    let clock = Arc::new(MutableClock::new(NOW));
+    let (verification_tasks, access, deletions) = in_memory_access_stack_with_clock(clock.clone());
+    let job = ContentLockDeletionJob::new(Uuid::new_v4(), content_lock(), NOW).unwrap();
+    let task = verification_task_with_verifier(
+        &job,
+        VerificationTaskStatus::Completed,
+        VerifierType::DevStatic,
+    );
+    let bundle_id = task.submitted_proof_bundle.bundle_id.clone();
+    verification_tasks
+        .insert_verification_task(task)
+        .await
+        .unwrap();
+    deletions.insert_job(job.clone()).await.unwrap();
+    let issue_claim = advance_to_phase(
+        &deletions,
+        &access,
+        job.job_id,
+        ContentLockDeletionPhase::IssueFinalCredentials,
+    )
+    .await;
+    access
+        .initialize_final_access_windows(
+            job.job_id,
+            "worker-final",
+            issue_claim.claim_token,
+            time::Duration::seconds(1),
+            time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    clock.set(NOW + time::Duration::seconds(2));
+    deletions
+        .advance_phase(
+            job.job_id,
+            "worker-final",
+            issue_claim.claim_token,
+            ContentLockDeletionPhase::DrainFinalReads,
+        )
+        .await
+        .unwrap()
+        .advanced()
+        .unwrap();
+    for next_phase in [
+        ContentLockDeletionPhase::DeleteContent,
+        ContentLockDeletionPhase::DeleteTombstone,
+        ContentLockDeletionPhase::PurgeOperationalState,
+    ] {
+        let claimed = deletions
+            .claim_next("worker-final", time::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        deletions
+            .advance_phase(job.job_id, "worker-final", claimed.claim_token, next_phase)
+            .await
+            .unwrap()
+            .advanced()
+            .unwrap();
+    }
+    let claim = deletions
+        .claim_next("worker-final", time::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        deletions
+            .finish(job.job_id, "worker-final", Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        verification_tasks
+            .get_verification_task_by_handle(&job.creator, &bundle_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let completed = deletions
+        .finish(job.job_id, "worker-final", claim.claim_token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, ContentLockDeletionState::Completed);
+    assert!(
+        deletions
+            .get_job(&job.creator, &job.lock_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        verification_tasks
+            .get_verification_task_by_handle(&job.creator, &bundle_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !access
+            .final_credential_available(&job.creator, &bundle_id, NOW)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations() {
     let clock = Arc::new(MutableClock::new(NOW));
     let (verification_tasks, access, deletions) = in_memory_access_stack_with_clock(clock.clone());
@@ -2723,6 +2994,31 @@ fn graph_task_for_job(job: &ContentLockDeletionJob) -> GraphTaskRecord {
         entitlement_to_publish: None,
         entitlement_publication_token: None,
         completed_at: None,
+    }
+}
+
+fn payment_task_request(lock: &ContentLock, bundle_id: BundleId) -> AdmitPaymentTask {
+    AdmitPaymentTask {
+        task_id: TaskId::from_str(&Uuid::new_v4().to_string()).unwrap(),
+        submitted_proof_bundle: locks_core::verification::SubmittedProofBundleV2 {
+            version: locks_core::verification::SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+            bundle_id,
+            pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                "{}/pub/app.locks/{}.json",
+                lock.creator,
+                lock.lock_id().unwrap()
+            ))
+            .unwrap(),
+            reader_pubky: Some(lock.creator.clone()),
+        },
+        lock_hash: *lock.lock_hash().unwrap().as_bytes(),
+        payment: PaymentPolicyV2 {
+            recipient_pubky: lock.creator.clone(),
+            amount: "1".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 0,
+        },
+        verification_window_seconds: 300,
     }
 }
 

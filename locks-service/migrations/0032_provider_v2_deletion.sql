@@ -1,3 +1,16 @@
+UPDATE content_lock_deletion_task_snapshot AS snapshot
+SET resolved_status = NULL,
+    resolved_at = NULL,
+    final_credential_eligible_at = NULL
+FROM content_lock_deletion_jobs AS deletion,
+     verification_tasks AS task
+WHERE snapshot.deletion_job_id = deletion.job_id
+  AND task.task_id = snapshot.verification_task_id
+  AND task.evaluator_mode = 'payment'
+  AND deletion.state IN ('queued', 'running', 'failed')
+  AND deletion.force_requested_at IS NULL
+  AND deletion.phase IN ('withdraw', 'start_payment_drain');
+
 DO $$
 BEGIN
     IF EXISTS (
@@ -8,10 +21,25 @@ BEGIN
         JOIN verification_tasks AS task
           ON task.task_id = snapshot.verification_task_id
         WHERE task.evaluator_mode = 'payment'
+          AND deletion.state = 'completed'
+          AND deletion.force_requested_at IS NULL
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'migration 0032 found a completed provider-v2 deletion without a persisted rc3 fence',
+            HINT = 'restore the deletion to a retryable state at a pre-drain phase for rc3 reconciliation, or explicitly record force abandonment, before retrying the migration';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM content_lock_deletion_jobs AS deletion
+        JOIN content_lock_deletion_task_snapshot AS snapshot
+          ON snapshot.deletion_job_id = deletion.job_id
+        JOIN verification_tasks AS task
+          ON task.task_id = snapshot.verification_task_id
+        WHERE task.evaluator_mode = 'payment'
           AND deletion.state IN ('queued', 'running', 'failed')
           AND deletion.force_requested_at IS NULL
-          AND (snapshot.resolved_status IS NOT NULL
-               OR deletion.phase NOT IN ('withdraw', 'start_payment_drain'))
+          AND deletion.phase NOT IN ('withdraw', 'start_payment_drain')
     ) THEN
         RAISE EXCEPTION USING
             MESSAGE = 'migration 0032 found an active provider-v2 deletion that may have crossed payment drain without a persisted rc3 fence',

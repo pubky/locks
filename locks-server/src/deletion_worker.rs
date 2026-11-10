@@ -969,6 +969,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_retry_outcomes_keep_supervised_worker_alive_for_later_jobs() {
+        let repository = Arc::new(FakeRepository::with_claims([claim(1), claim(1)]));
+        let executor = Arc::new(FakeExecutor::new(
+            DeletionPhaseExecutionOutcome::TransientDependencyFailure,
+        ));
+        let worker = Arc::new(OwnedWorker::new(
+            Arc::clone(&repository),
+            Arc::clone(&executor),
+            Arc::new(FixedJitter(StdDuration::ZERO)),
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(async move { worker.run_until_shutdown(shutdown_rx).await });
+
+        tokio::time::timeout(StdDuration::from_millis(200), async {
+            while executor.calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must execute a later job after scheduling the cleanup retry");
+        assert!(
+            !run.is_finished(),
+            "retryable cleanup must not exit supervision"
+        );
+        assert_eq!(repository.retries.lock().unwrap().len(), 2);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(StdDuration::from_millis(200), run)
+            .await
+            .expect("worker must remain responsive to shutdown")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn dependency_failure_exhausts_on_exact_max_attempt() {
         let repository = FakeRepository::with_claim(claim(4));
         let executor = FakeExecutor::new(DeletionPhaseExecutionOutcome::TransientDependencyFailure);
