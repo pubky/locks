@@ -20,21 +20,23 @@ use locks_service::{
         graph0conf_reducer::reduce_graph_snapshot,
         models::{
             AccessCredential, AccessCredentialLookupKey, AccessCredentialRecord,
-            AdvanceContentLockDeletionPhaseResult, ContentLockDeletionFailureCode,
-            ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
-            FinalAccessWindows, GraphObservationOutcome, GraphTaskRecord, GraphTaskSnapshot,
-            GraphTaskSnapshotV1, INVOICE_ADMISSION_INTENT_VERSION,
-            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1, PaymentRootState,
-            PrepareForceDeletionResult, VerificationTaskRecord, VerificationTaskStatus,
-            VerificationTerminalReason,
+            AdvanceContentLockDeletionPhaseResult, BitcoinOutpointV2,
+            ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+            ContentLockDeletionState, FinalAccessWindows, GraphObservationOutcome, GraphTaskRecord,
+            GraphTaskSnapshot, GraphTaskSnapshotV1, INVOICE_ADMISSION_INTENT_VERSION,
+            InitializeFinalAccessWindowsResult, InvoiceAdmissionIntentV1, PaymentAssetV2,
+            PaymentProviderStatus, PaymentRequestStateV2, PaymentRootState, PaymentSampleStatusV2,
+            PaymentSampleV2, PaymentStateV2, PrepareForceDeletionResult, VerificationTaskRecord,
+            VerificationTaskStatus, VerificationTerminalReason,
         },
+        payment_v2_reducer::reduce_payment_snapshot,
         ports::{
             AccessCredentialStore, AdmitPaymentTask, Clock, ContentLockDeletionActionAcquireResult,
             ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
             ContentLockDeletionRepository, GraphTaskClaimer, GraphTaskRepository,
             InvoiceAdmissionRepository, PaymentDrainObligationKind, PaymentDrainRepository,
-            PaymentTaskRepository, ProviderV2DeletionReconciliation, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            PaymentTaskClaimer, PaymentTaskRepository, ProviderV2DeletionReconciliation,
+            VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -238,6 +240,110 @@ async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_re
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress),
         "force receipt permanently fences every later bundle for the deleted lock"
     );
+}
+
+#[tokio::test]
+async fn in_memory_force_after_deferred_payment_publication_preserves_fence() {
+    let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+        FixedClock(NOW),
+    )));
+    let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
+    let access = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+        Arc::clone(&fence),
+    ));
+    let deletions =
+        InMemoryContentLockDeletionRepository::with_access_credentials_and_verification_task_fence(
+            access, fence,
+        );
+    let lock = content_lock();
+    let request = payment_task_request(&lock, BundleId::new_random());
+    let admitted = payments.admit_payment_task(request.clone()).await.unwrap();
+    let claimed = payments
+        .claim_next_payment_task("payment-worker", NOW, LEASE_END)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut snapshot = claimed.task.snapshot;
+    let state = snapshot.as_v1_mut();
+    let accepted = state.accepted_at;
+    let deadline = state.deadline_at;
+    state
+        .apply_create_response(
+            accepted + time::Duration::seconds(1),
+            accepted + time::Duration::seconds(60),
+            deadline,
+        )
+        .unwrap();
+    let sample = PaymentSampleV2 {
+        observed_at: accepted + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "ab".repeat(32),
+            vout: 1,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    state
+        .apply_status(PaymentProviderStatus {
+            creator: state.creator.clone(),
+            bundle_id: state.bundle_id.clone(),
+            request_state: PaymentRequestStateV2::Accepted,
+            payment_state: PaymentStateV2::Detected,
+            invoice_created_at: accepted + time::Duration::seconds(1),
+            proposal_expires_at: accepted + time::Duration::seconds(60),
+            deadline,
+            asset: PaymentAssetV2::Btc,
+            minimum_confirmations: state.payment.minimum_confirmations,
+            current_sample: Some(sample.clone()),
+            first_threshold_satisfied: Some(sample.clone()),
+        })
+        .unwrap();
+    reduce_payment_snapshot(state, sample.observed_at).unwrap();
+    let publishing = payments
+        .persist_claimed_payment_snapshot(
+            &admitted.task_id,
+            "payment-worker",
+            &claimed.claim_token,
+            NOW,
+            0,
+            snapshot,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let publication_token = publishing.entitlement_publication_token.unwrap();
+    let publication_payload = publishing.entitlement_to_publish.clone().unwrap();
+    let action = payments
+        .acquire_payment_publication_action(
+            &publishing.task_id,
+            "payment-worker",
+            &claimed.claim_token,
+            publishing.evaluator_revision,
+            publication_token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    action.release().await.unwrap();
+
+    assert_eq!(
+        deletions
+            .prepare_force_deletion(&lock.creator, &lock.lock_id().unwrap())
+            .await
+            .unwrap(),
+        PrepareForceDeletionResult::PublicationInProgress
+    );
+    let retained = payments
+        .get_payment_task_by_handle(&lock.creator, &request.submitted_proof_bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.entitlement_publication_token,
+        Some(publication_token)
+    );
+    assert_eq!(retained.entitlement_to_publish, Some(publication_payload));
 }
 
 #[tokio::test]

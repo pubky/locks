@@ -904,6 +904,9 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                     }
                 }
         };
+        if requires_terminal_abandonment && entitlement_publication_in_progress {
+            return Ok(PrepareForceDeletionResult::PublicationInProgress);
+        }
         if requires_terminal_abandonment {
             self.verification_task_fence
                 .deletion_cutoffs
