@@ -22,7 +22,7 @@ use crate::application::models::{
     GrantPopKeyId,
 };
 use crate::application::ports::GrantCreatorConnectFlowClient;
-use crate::infrastructure::pubky::legacy_connect_flow::{
+use crate::infrastructure::pubky::creator_identity::{
     creator_from_pubky_public_key_z32, requested_scopes_to_capabilities,
 };
 
@@ -433,10 +433,8 @@ mod tests {
     };
     use crate::application::errors::ApplicationError;
     use crate::application::models::{CreatorAuthoritySecret, CreatorConnectFlowId, GrantPopKeyId};
-    use crate::application::ports::{
-        GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
-    };
-    use crate::infrastructure::pubky::PubkyLegacyCreatorConnectFlowClient;
+    use crate::application::ports::GrantCreatorConnectFlowClient;
+    use crate::infrastructure::pubky::creator_identity::requested_scopes_to_capabilities;
 
     const SEED: [u8; 32] = [42; 32];
     const CLIENT_ID: &str = "locks.example";
@@ -783,15 +781,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_and_legacy_connect_request_identical_capabilities() {
+    async fn grant_connect_requests_exact_scopes_through_configured_relay() {
         let relay: Url = "http://localhost:15412/inbox/".parse().unwrap();
-        let legacy = PubkyLegacyCreatorConnectFlowClient::new_with_auth_relay(
-            pubky::Pubky::testnet().unwrap(),
-            relay.clone(),
-        );
         let grant = PubkyGrantCreatorConnectFlowClient::new(
             pubky::PubkyHttpClient::testnet().unwrap(),
-            Some(relay),
+            Some(relay.clone()),
             ClientId::new(CLIENT_ID).unwrap(),
             keys(),
         );
@@ -800,14 +794,6 @@ mod tests {
             "/priv/locks.app/:rw".to_owned(),
         ];
 
-        let legacy_url = Url::parse(
-            legacy
-                .start_legacy_creator_connect_flow(&scopes)
-                .await
-                .unwrap()
-                .expose_url(),
-        )
-        .unwrap();
         let grant_url = Url::parse(
             grant
                 .start_grant_creator_connect_flow(&scopes, &key_id())
@@ -823,12 +809,41 @@ mod tests {
 
         assert_eq!(grant_url.scheme(), "pubkyauth");
         assert_eq!(grant_url.host_str(), Some("signin_grant"));
-        assert_eq!(param(&grant_url, "caps"), param(&legacy_url, "caps"));
-        assert_eq!(param(&grant_url, "relay"), param(&legacy_url, "relay"));
+        assert_eq!(
+            param(&grant_url, "caps"),
+            Some(
+                requested_scopes_to_capabilities(&scopes)
+                    .unwrap()
+                    .to_string()
+            )
+        );
+        assert_eq!(param(&grant_url, "relay"), Some(relay.to_string()));
         assert_eq!(param(&grant_url, "cid").as_deref(), Some(CLIENT_ID));
         assert_eq!(
             param(&grant_url, "cpk"),
             Some(keys().public_key(&key_id()).z32())
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_connect_rejects_invalid_requested_scope_before_starting_flow() {
+        let grant = PubkyGrantCreatorConnectFlowClient::new(
+            pubky::PubkyHttpClient::testnet().unwrap(),
+            None,
+            ClientId::new(CLIENT_ID).unwrap(),
+            keys(),
+        );
+
+        let error = grant
+            .start_grant_creator_connect_flow(&["relative-scope:rw".to_owned()], &key_id())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ApplicationError::CreatorAuthoritySecret {
+                message: "invalid creator capability scope".to_owned(),
+            }
         );
     }
 

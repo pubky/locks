@@ -6,7 +6,7 @@ use crate::application::ports::{CreatorAuthorityManager, CreatorAuthorityStatus}
 /// Ensures the Lock Server has creator-granted authority before doing Pubky homeserver IO.
 ///
 /// This seam is intentionally tiny so future Pubky-backed content/priv repositories can
-/// require creator authority without depending on legacy cookie auth, grant auth, or any
+/// require creator authority without depending on grant auth or any
 /// concrete infrastructure adapter.
 pub async fn require_creator_authority_for_pubky_io(
     manager: &dyn CreatorAuthorityManager,
@@ -43,7 +43,7 @@ mod tests {
     async fn valid_creator_authority_returns_secret_free_status() {
         let status = CreatorAuthorityStatus {
             creator: creator(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             authorized: true,
             granted_scopes: vec!["/pub/app.locks/:rw".to_owned()],
             session_expires_at: None,

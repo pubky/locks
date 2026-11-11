@@ -3,9 +3,10 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
+use locks_service::application::errors::ApplicationError;
+use locks_service::application::ports::GrantCreatorConnectFlowClient;
 use locks_service::application::use_cases::complete_creator_connect_flow::{
-    CompleteCreatorConnectFlowRequest, SelectedCreatorConnectFlowClient,
-    complete_creator_connect_flow,
+    CompleteCreatorConnectFlowRequest, complete_creator_connect_flow,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::exchange_frontend_session_code;
 use locks_service::application::use_cases::get_creator_authority_status::{
@@ -29,22 +30,28 @@ use crate::api::dtos::{
 use crate::api::errors::{ApiError, ApiErrorCode};
 use crate::api::extractors::parse_json;
 use crate::app_state::AppState;
-use crate::config::{CreatorAuthorityAcquisitionMethod, RuntimeEnvironment};
+use crate::config::RuntimeEnvironment;
 
+/// `/connect` is mounted only when acquisition is enabled, which config validation ties to a
+/// grant-connect table; without one no return origin is allowed.
 fn connect_allowed_return_origins(state: &AppState) -> &[String] {
-    let acquisition = &state.config().creator_authority_acquisition;
-    match acquisition.method {
-        CreatorAuthorityAcquisitionMethod::LegacyConnect => {
-            &acquisition.legacy_connect.allowed_return_origins
-        }
-        CreatorAuthorityAcquisitionMethod::GrantConnect => {
-            &acquisition
-                .grant_connect
-                .as_ref()
-                .expect("validated grant-connect config")
-                .allowed_return_origins
-        }
-    }
+    state
+        .config()
+        .creator_authority_acquisition
+        .grant_connect
+        .as_ref()
+        .map_or(&[], |grant| grant.allowed_return_origins.as_slice())
+}
+
+/// The grant client exists whenever `/connect` is mounted with a grant-connect table; a runtime
+/// built without one (in-memory, or acquisition disabled) answers creator-authority-unavailable.
+fn required_grant_connect_flow_client(
+    state: &AppState,
+) -> Result<&dyn GrantCreatorConnectFlowClient, ApiError> {
+    state
+        .grant_creator_connect_flow_client()
+        .map(|client| client.as_ref())
+        .ok_or_else(|| ApplicationError::CreatorAuthorityUnavailable.into())
 }
 
 pub(super) async fn creator_authority_status_route(
@@ -109,12 +116,10 @@ pub(super) async fn connect_shell_start(
     // Guaranteed `Some` because `validate_return_to_url` already parsed the origin.
     let target_origin = origin_from_return_to(&return_to).ok_or_else(invalid_return_to_url)?;
 
+    let grant_client = required_grant_connect_flow_client(&state)?;
     let response = start_creator_connect_flow(
         state.creator_connect_flows().as_ref(),
-        state.legacy_creator_connect_flow_client().as_ref(),
-        state
-            .grant_creator_connect_flow_client()
-            .map(|client| client.as_ref()),
+        grant_client,
         state.creator_connect_flow_id_generator().as_ref(),
         state.clock().as_ref(),
         StartCreatorConnectFlowRequest {
@@ -517,7 +522,7 @@ fn js_string_literal(value: &str) -> String {
 fn render_authorization_qr_svg(authorization_url: &str) -> String {
     // High error correction (~30% recovery) so the centered brand badge does not break scanning.
     QrCode::with_error_correction_level(authorization_url.as_bytes(), qrcode::EcLevel::H)
-        .expect("legacy Pubky authorization URL fits QR capacity")
+        .expect("Pubky authorization URL fits QR capacity")
         .render::<svg::Color>()
         .min_dimensions(192, 192)
         // No built-in quiet zone: the white panel's padding is the margin, so the modules fill the
@@ -570,17 +575,12 @@ pub(super) async fn connect_shell_complete(
     let Query(query) =
         query.map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
     let delivery = ConnectDeliveryMode::from_query(query.delivery.as_deref());
-    let connect_client = match state.grant_creator_connect_flow_client() {
-        Some(client) => SelectedCreatorConnectFlowClient::Grant(client.as_ref()),
-        None => SelectedCreatorConnectFlowClient::Legacy(
-            state.legacy_creator_connect_flow_client().as_ref(),
-        ),
-    };
+    let grant_client = required_grant_connect_flow_client(&state)?;
     let response = complete_creator_connect_flow(
         state.creator_connect_flows().as_ref(),
         state.creator_authorities().as_ref(),
         state.frontend_session_codes().as_ref(),
-        connect_client,
+        grant_client,
         state.frontend_session_code_generator().as_ref(),
         state.clock().as_ref(),
         CompleteCreatorConnectFlowRequest {

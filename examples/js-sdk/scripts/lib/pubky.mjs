@@ -11,6 +11,9 @@ import {
 
 export { AuthFlowKind, Keypair, Pubky, PublicKey };
 
+// Client id the demo scripts sign in with. Grant sessions are bound to it.
+export const DEMO_CLIENT_ID = 'localhost';
+
 export function pubkyForConfig(config, PubkyImplementation = Pubky) {
   if (config.mode === 'staging') return new PubkyImplementation();
   const host = new URL(config.testnet.httpRelay).hostname;
@@ -76,7 +79,7 @@ export function isAlreadyRegisteredError(error) {
   return message.includes('already') || message.includes('409') || message.includes('conflict');
 }
 
-export async function signupBestEffort(signer, homeserver) {
+export async function signupBestEffort(signer, homeserver, clientId = DEMO_CLIENT_ID) {
   try {
     return await signer.signup(homeserver, null);
   } catch (error) {
@@ -87,7 +90,7 @@ export async function signupBestEffort(signer, homeserver) {
       } finally {
         pkdns.free();
       }
-      return await signer.signinCookieBlocking();
+      return await signer.signinBlocking(clientId);
     }
     throw error;
   }

@@ -1,5 +1,7 @@
 # ADR 0019: Creator Authority Acquisition Shell
 
+> **Update:** legacy-connect was removed; grant-connect is the only acquisition method.
+
 ## Status
 
 Accepted

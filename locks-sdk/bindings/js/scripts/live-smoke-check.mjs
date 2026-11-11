@@ -3,7 +3,7 @@ const required = [
   ['LOCKS_LIVE_PKARR_RELAY', 'PKARR relay URL; local pubky-testnet uses http://127.0.0.1:15411'],
   ['LOCKS_LIVE_CREATOR', 'Creator Pubky that publishes /pub/app.locks/config.json'],
   ['LOCKS_LIVE_CONTENT_LOCK_RESOURCE', 'Canonical pubky.../pub/app.locks/<lock_id>.json resource'],
-  ['LOCKS_LIVE_DEMO_ORIGIN', 'Origin allowed by creator_authority_acquisition.legacy_connect.allowed_return_origins'],
+  ['LOCKS_LIVE_DEMO_ORIGIN', 'Origin allowed by creator_authority_acquisition.grant_connect.allowed_return_origins'],
 ];
 
 console.log('SDK live browser smoke prerequisite check');

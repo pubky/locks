@@ -19,7 +19,7 @@ const RECOVERY_FILE: &str = "recovery_file";
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Dev helper for legacy-connect auth against a local Pubky testnet"
+    about = "Dev helper for grant-connect auth against a local Pubky testnet"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,7 +37,7 @@ enum Command {
         #[arg(long)]
         homeserver: String,
     },
-    /// Approve a Lock Server legacy-connect pubkyauth URL with the local dev Pubky user.
+    /// Approve a Lock Server grant-connect pubkyauth URL with the local dev Pubky user.
     ApproveAuth {
         /// Directory containing generated dev recovery/passphrase material.
         #[arg(long)]
@@ -45,7 +45,7 @@ enum Command {
         /// Testnet homeserver public key, e.g. pubky8pinxx...
         #[arg(long)]
         homeserver: String,
-        /// Lock Server legacy-connect pubkyauth URL.
+        /// Lock Server grant-connect pubkyauth URL.
         #[arg(long)]
         auth_url: String,
     },
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
             signer
                 .approve_auth(&auth_url)
                 .await
-                .context("failed to approve legacy-connect auth URL")?;
+                .context("failed to approve grant-connect auth URL")?;
             write_json(&ApproveAuthOutput {
                 creator: creator_pubky(&identity.keypair),
                 approved: true,

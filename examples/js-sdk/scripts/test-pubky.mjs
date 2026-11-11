@@ -17,8 +17,8 @@ const signer = {
     calls.push(['signup', value, token]);
     throw new Error('HTTP 409 conflict: user already registered');
   },
-  async signinCookieBlocking() {
-    calls.push(['signin']);
+  async signinBlocking(clientId) {
+    calls.push(['signin', clientId]);
     return session;
   },
 };
@@ -27,7 +27,7 @@ assert.equal(await signupBestEffort(signer, homeserver), session);
 assert.deepEqual(calls, [
   ['signup', homeserver, null],
   ['publish', homeserver],
-  ['signin'],
+  ['signin', 'localhost'],
 ]);
 
 console.log('pubky helper tests passed');

@@ -4,7 +4,7 @@
 
 This guide runs the current local/dev Lock Server over real HTTP for operator/reviewer inspection.
 
-Creator publishing is authenticated. The removed unauthenticated local/dev creator publishing route shape is no longer available. For a complete local Pubky testnet creator-publishing flow, use `scripts/dev-legacy-connect-testnet.sh locked-content`; it obtains a frontend session through legacy-connect, then calls the authenticated creator routes.
+Creator publishing is authenticated. The removed unauthenticated local/dev creator publishing route shape is no longer available. For a complete local Pubky testnet creator-publishing flow, use `scripts/dev-grant-connect-testnet.sh locked-content`; it obtains a frontend session through legacy-connect, then calls the authenticated creator routes.
 
 ## Relationship to other docs
 
@@ -70,12 +70,12 @@ The bootstrap and configuration services are one-shot startup jobs. Exiting succ
 
 The complete startup and reset commands, browser URLs, local state boundaries, and manual payment workflow are maintained in [`examples/js-sdk/README.md`](../examples/js-sdk/README.md).
 
-## Dev legacy-connect testnet automation
+## Dev grant-connect testnet automation
 
 For local Pubky testnet work without pubky.app, use:
 
 ```bash
-scripts/dev-legacy-connect-testnet.sh auth
+scripts/dev-grant-connect-testnet.sh auth
 ```
 
 This assumes both the Pubky testnet and Lock Server are already running. It creates/reuses a local dev Pubky user under `.local/pubky-lock-dev/`, starts the hosted Lock-Server `/connect` shell, approves the rendered `pubkyauth://` URL with the Pubky SDK, completes the shell flow, and exchanges the redirected one-time code for a Locks-local frontend session token.
@@ -83,10 +83,10 @@ This assumes both the Pubky testnet and Lock Server are already running. It crea
 To continue into creator publishing with the acquired frontend session, run:
 
 ```bash
-scripts/dev-legacy-connect-testnet.sh locked-content
+scripts/dev-grant-connect-testnet.sh locked-content
 ```
 
-`locked-content` creates a Lock Service Pointer, uploads guarded bytes via `PUT /creator/priv-resources/content/<path>`, creates a content lock, submits a viewer proof bundle, manually completes verification through the dev route, issues an access credential, and proxy-reads the guarded bytes. It expects a dev integration runtime shape: `runtime.environment = "development"` and `creator_authority_acquisition.enabled = true` with `method = "legacy-connect"`.
+`locked-content` creates a Lock Service Pointer, uploads guarded bytes via `PUT /creator/priv-resources/content/<path>`, creates a content lock, submits a viewer proof bundle, manually completes verification through the dev route, issues an access credential, and proxy-reads the guarded bytes. It expects a dev integration runtime shape: `runtime.environment = "development"` and `creator_authority_acquisition.enabled = true` with `method = "grant-connect"` and a `[creator_authority_acquisition.grant_connect]` table.
 
 Canonical config for the script:
 
@@ -99,11 +99,14 @@ environment = "development"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 
+[creator_authority_acquisition.grant_connect]
+client_id = "localhost"
+allowed_return_origins = ["*"]
 ```
 
-If `/connect` returns `404`, the running server has not mounted hosted legacy-connect routes. For this testnet integration flow, enable `[creator_authority_acquisition].enabled = true` with `method = "legacy-connect"`.
+If `/connect` returns `404`, the running server has not mounted hosted connect routes. For this testnet integration flow, enable `[creator_authority_acquisition].enabled = true` with `method = "grant-connect"` and a `grant_connect` table.
 
 If `/creator/lock-service-config` or `/creator/priv-resources/content/<path>` returns `401 frontend_session_unavailable`, the authenticated Pubky-backed creator routes are mounted but the frontend session token was missing/invalid. If it returns `503 creator_authority_unavailable`, creator authority could not be restored or revalidated for Pubky homeserver I/O.
 
@@ -200,7 +203,7 @@ The supported creator publishing route uses a frontend session bearer token and 
 
 ```bash
 BASE_URL='http://127.0.0.1:3000'
-FRONTEND_SESSION_TOKEN='<from scripts/dev-legacy-connect-testnet.sh auth or locked-content>'
+FRONTEND_SESSION_TOKEN='<from scripts/dev-grant-connect-testnet.sh auth or locked-content>'
 
 printf 'guarded bytes' | curl -sS -X PUT "$BASE_URL/creator/priv-resources/content/example.txt" \
   -H "Authorization: Bearer $FRONTEND_SESSION_TOKEN" \
@@ -211,5 +214,5 @@ printf 'guarded bytes' | curl -sS -X PUT "$BASE_URL/creator/priv-resources/conte
 For a complete creator-to-viewer sequence, prefer the maintained automation:
 
 ```bash
-scripts/dev-legacy-connect-testnet.sh locked-content
+scripts/dev-grant-connect-testnet.sh locked-content
 ```

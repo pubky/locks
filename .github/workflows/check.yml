@@ -133,7 +133,6 @@ jobs:
 
       - name: Additional integration tests
         run: |
-          cargo nextest run -p locks-e2e --test legacy_connect_shell_http
           cargo nextest run -p locks-e2e --test postgres_runtime
           cargo nextest run -p locks-e2e --test pubky_homeserver_repositories
 

@@ -8,7 +8,7 @@ use crate::application::models::{
 };
 use crate::application::ports::CreatorConnectFlowStore;
 
-/// Postgres-backed store for short-lived pending legacy creator connect flows.
+/// Postgres-backed store for short-lived pending creator connect flows.
 #[derive(Debug, Clone)]
 pub struct PostgresCreatorConnectFlowStore {
     pool: PgPool,

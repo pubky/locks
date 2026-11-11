@@ -157,7 +157,7 @@ mod tests {
         let session_expires_at = now + Duration::days(30);
         let authority = CreatorAuthorityRecord {
             creator: creator(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),
@@ -180,10 +180,7 @@ mod tests {
 
         assert_eq!(status.creator, creator());
         assert!(status.authorized);
-        assert_eq!(
-            status.auth_kind,
-            Some(CreatorAuthorityAuthKind::LegacyCookie)
-        );
+        assert_eq!(status.auth_kind, Some(CreatorAuthorityAuthKind::Grant));
         assert_eq!(
             status.granted_scopes,
             vec!["/pub/app.locks/:rw", "/priv/app.locks/:rw"]

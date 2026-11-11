@@ -9,7 +9,7 @@ use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     FrontendSessionRecord, FrontendSessionToken, GuardedResourceRecord,
 };
-use locks_service::application::ports::LegacyCreatorConnectFlowClient;
+use locks_service::application::ports::GrantCreatorConnectFlowClient;
 use locks_service::infrastructure::memory::{
     content_lock_tombstones::InMemoryContentLockTombstoneRepository,
     content_locks::InMemoryContentLockRepository, entitlements::InMemoryEntitlementRepository,
@@ -120,11 +120,11 @@ impl TestServerApp {
         &self.state
     }
 
-    pub fn with_legacy_creator_connect_flow_client(
+    pub fn with_grant_creator_connect_flow_client(
         mut self,
-        client: Arc<dyn LegacyCreatorConnectFlowClient>,
+        client: Arc<dyn GrantCreatorConnectFlowClient>,
     ) -> Self {
-        self.state = self.state.with_legacy_creator_connect_flow_client(client);
+        self.state = self.state.with_grant_creator_connect_flow_client(client);
         self
     }
 

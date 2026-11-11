@@ -26,7 +26,7 @@ The filesystem identity provider validates that `credentials.lock_server_public_
 
 Current config example:
 
-- `locks-server/config/example.dev.postgres.toml` — runnable development Postgres operation with worker, legacy-connect, Pubky testnet, and dev route gates.
+- `locks-server/config/example.dev.postgres.toml` — runnable development Postgres operation with worker, grant-connect, Pubky testnet, and dev route gates.
 
 No runnable in-memory binary config exists. In-memory runtime is test support only.
 
@@ -109,15 +109,15 @@ client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 ```
 
-`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` must contain at least one origin. Concrete entries must be unique canonical HTTPS origins; explicit default ports, credentials, paths, query strings, fragments, and HTTP origins are rejected. Development and staging may instead use the sole entry `["*"]` for HTTP/HTTPS test return targets and canonical HTTPS browser Origins on folded-auth `/proof-bundles` and `/proof-bundles/auth-status` requests. Folded-auth CORS reflects the concrete accepted Origin and never emits literal `*`. Production rejects wildcard, and wildcard cannot be mixed with concrete origins. Grant mode does not fall back to legacy or top-level origins.
+`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` must contain at least one origin. Concrete entries must be unique canonical HTTPS origins; explicit default ports, credentials, paths, query strings, fragments, and HTTP origins are rejected. Development and staging may instead use the sole entry `["*"]` for HTTP/HTTPS test return targets and canonical HTTPS browser Origins on folded-auth `/proof-bundles` and `/proof-bundles/auth-status` requests. Folded-auth CORS reflects the concrete accepted Origin and never emits literal `*`. Production rejects wildcard, and wildcard cannot be mixed with concrete origins. There is no fallback to top-level origins.
 
 When enabled, the Lock Server derives a distinct PoP key for each pending flow from the Lock Server signing seed, starts grant auth, validates exact issuer/session identity, `client_id`, PoP key, exact requested capability set, and expiry, then stores only encrypted delegated restore state. PoP private keys, grant bearers, authorization URLs, and frontend session tokens are not stored in creator authority. The short-lived callback code and Locks-local frontend session protocol remain unchanged.
 
-`legacy-connect` remains an explicit compatibility mode for older operator/test flows. It uses `[creator_authority_acquisition.legacy_connect]`, where exact HTTP/HTTPS origins remain supported and one development/staging wildcard may be configured; production rejects wildcard. Grant mode rejects stored `LegacyCookie` authority instead of silently using it; creators must reconnect with a grant after switching modes. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+`grant-connect` is the only acquisition method and the default when `method` is omitted. The former `legacy-connect` (cookie session) mode was removed: `method = "legacy-connect"` and a `[creator_authority_acquisition.legacy_connect]` table are rejected during config loading, as are other removed or unknown methods such as `legacy-self-relay`. Creator authority rows or pending connect flows written by older versions in legacy mode (`auth_kind = "legacy_cookie"`) still load but are never authorized; those creators reconnect with a grant. No migration rewrites them. With `enabled = false` the `grant_connect` table may be omitted; creator authority is then unavailable.
 
 Grant PoP keys depend on both the configured Lock Server signing seed and a fixed derivation context. Rotating that seed or changing the context makes stored grants unrestorable; reconnect creators before such a rotation. Restore exchanges delegated state with the homeserver stored at approval time; a creator who moves homeserver must reconnect. The delegated callback signs only a syntactically closed Pubky PoP JWS input (`EdDSA`, `pubky-pop`, exact `aud`/`gid`/`iat`/`nonce` claims); grant ID and homeserver audience validation remain inside the pinned SDK credential exchange because its callback does not expose expected context separately. Grant composition currently uses pinned Pubky SDK delegated-flow APIs that are `#[doc(hidden)]`; upgrading `pubky` requires explicit compatibility and signing-boundary review or an upstream public server-held delegated signer API.
 
-The pinned Pubky SDK reports cached grant-bearer refresh transport/5xx failures through the same public error variants as ordinary homeserver storage transport/5xx failures. Upstream issue pubky/pubky#698 remains open, so in `grant-connect` mode Locks temporarily maps both classes to coarse `503 creator_authority_unavailable` and invalidates only the cache generation used by that operation. Grant-backed reads then reacquire creator storage and replay the same read once; this can add one read retry for an ordinary storage transport/5xx failure. Writes and deletes are never replayed because their side effects may already have occurred. `legacy-connect` keeps ordinary storage transport/5xx failures mapped as internal storage errors and does not use the read retry. Logs expose only operation stage and closed error class, never upstream bodies, paths, grants, or bearers.
+The pinned Pubky SDK reports cached grant-bearer refresh transport/5xx failures through the same public error variants as ordinary homeserver storage transport/5xx failures. Upstream issue pubky/pubky#698 remains open, so in `grant-connect` mode Locks temporarily maps both classes to coarse `503 creator_authority_unavailable` and invalidates only the cache generation used by that operation. Grant-backed reads then reacquire creator storage and replay the same read once; this can add one read retry for an ordinary storage transport/5xx failure. Writes and deletes are never replayed because their side effects may already have occurred. Logs expose only operation stage and closed error class, never upstream bodies, paths, grants, or bearers.
 
 ## PKARR and browser SDK reachability
 
@@ -306,10 +306,14 @@ environment = "development"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
+
+[creator_authority_acquisition.grant_connect]
+client_id = "localhost"
+allowed_return_origins = ["*"]
 ```
 
-This legacy development shape mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route. Use the grant-connect configuration above for Ring 2.0 / Bitkit grant testing.
+This development shape mounts authenticated Pubky-backed creator publishing routes, hosted grant-connect routes, and the dev-only manual verification completion route. The wildcard return origin is accepted only outside production.
 
 ## Staging/production shape
 

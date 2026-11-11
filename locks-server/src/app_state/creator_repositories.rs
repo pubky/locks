@@ -9,14 +9,15 @@ use locks_service::{
         postgres::PostgresCreatorAuthorityStore,
         pubky::{
             GrantCreatorScopedPubkyStorageProvider, GrantSessionCache,
-            LegacyCookieCreatorScopedPubkyStorageProvider,
             ProviderBackedPubkyHomeserverStorageClient, PubkyContentLockRepository,
             PubkyContentLockTombstoneRepository, PubkyEntitlementRepository,
-            PubkyHomeserverStorageClient, PubkyLegacyCookieSessionImporter,
+            PubkyGrantSessionImporter, PubkyHomeserverStorageClient,
             PubkyLockServicePointerRepository, PubkyPrivResourceRepository,
         },
     },
 };
+
+use super::UnavailablePubkyHomeserverStorageClient;
 
 #[derive(Clone)]
 pub(super) struct CreatorRepositoryAdapters {
@@ -44,25 +45,18 @@ impl CreatorRepositoryAdapters {
         }
     }
 
+    /// Homeserver-backed repositories over the grant session cache. Without one (acquisition
+    /// disabled and no grant-connect table) every creator homeserver operation fails closed.
     pub(super) fn pubky_homeserver(
-        creator_authority_store: PostgresCreatorAuthorityStore,
-        pubky_http_client: pubky::PubkyHttpClient,
         grant_session_cache: Option<
-            Arc<GrantSessionCache<PostgresCreatorAuthorityStore, PubkyLegacyCookieSessionImporter>>,
+            Arc<GrantSessionCache<PostgresCreatorAuthorityStore, PubkyGrantSessionImporter>>,
         >,
     ) -> Self {
         let client: Arc<dyn PubkyHomeserverStorageClient> = match grant_session_cache {
             Some(cache) => Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(
                 GrantCreatorScopedPubkyStorageProvider::new(cache),
             )),
-            None => {
-                let importer = PubkyLegacyCookieSessionImporter::new(pubky_http_client);
-                let provider = LegacyCookieCreatorScopedPubkyStorageProvider::new(
-                    creator_authority_store,
-                    importer,
-                );
-                Arc::new(ProviderBackedPubkyHomeserverStorageClient::new(provider))
-            }
+            None => Arc::new(UnavailablePubkyHomeserverStorageClient),
         };
 
         Self::new(

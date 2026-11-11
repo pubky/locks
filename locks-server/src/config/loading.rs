@@ -4,7 +4,7 @@ use super::defaults::{DEFAULT_CONFIG_FILE, DEFAULT_SECRET_FILE, DEFAULT_SERVICE_
 use super::raw::RawConfig;
 use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
-    CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
+    DatabaseConfig, DeletionConfig, DeletionWorkerConfig, GrantConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig,
     PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
 };
@@ -91,9 +91,7 @@ fn validate_existing_config_secret(
     if config.paykit.is_some() {
         validate_paykit_signing_seed(secret_path)?;
     }
-    if config.creator_authority_acquisition.method
-        == CreatorAuthorityAcquisitionMethod::GrantConnect
-    {
+    if config.creator_authority_acquisition.grant_connect.is_some() {
         validate_grant_signing_seed(secret_path)?;
     }
 
@@ -177,7 +175,13 @@ fn initialize_default_config_with_database_url(
         runtime: RuntimeConfig {
             environment: RuntimeEnvironment::Development,
         },
-        creator_authority_acquisition: CreatorAuthorityAcquisitionConfig::default(),
+        creator_authority_acquisition: CreatorAuthorityAcquisitionConfig {
+            grant_connect: Some(GrantConnectAcquisitionConfig {
+                client_id: "localhost".to_owned(),
+                allowed_return_origins: vec!["*".to_owned()],
+            }),
+            ..CreatorAuthorityAcquisitionConfig::default()
+        },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
         pubky: PubkyConfig::default(),
@@ -192,6 +196,11 @@ fn initialize_default_config_with_database_url(
         }),
         nexus: None,
     };
+    let generated_grant = config
+        .creator_authority_acquisition
+        .grant_connect
+        .as_ref()
+        .expect("generated config enables grant-connect");
     let config_text = format!(
         r#"# Lock Server runtime configuration. Generated on first run; edit intentionally per environment.
 bind_addr = "{}" # Socket address the HTTP server binds. Use 127.0.0.1:3000 for local-only; use 0.0.0.0:<port> only behind a trusted proxy/firewall.
@@ -222,12 +231,13 @@ minimum_confirmations = {} # Bitcoin confirmation threshold. 0 allows full on-ti
 
 [creator_authority_acquisition]
 enabled = {} # true mounts hosted creator connect/session routes; false disables browser acquisition of creator authority.
-method = "legacy-connect" # One of: legacy-connect, grant-connect. Grant mode requires a grant_connect table with client_id and allowed_return_origins.
+method = "grant-connect" # Only grant-connect is supported. enabled = true requires the grant_connect table below.
 frontend_session_ttl_seconds = {} # Locks-local browser session lifetime after connect. Higher values reduce reauth; lower values reduce stolen-token lifetime.
 frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep short; browser must exchange it quickly for a frontend session.
 
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = [] # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"]. Empty rejects all /connect return_to values; ["*"] is development/staging-only and rejected in production.
+[creator_authority_acquisition.grant_connect]
+client_id = "{}" # Hostname naming this Lock Server to Pubky signers in grant requests, e.g. "locks.example". No scheme, port, or path.
+allowed_return_origins = {} # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"] (https only). Must not be empty; ["*"] is development/staging-only and rejected in production.
 
 [secrets]
 runtime_master_key_env = "{}" # Environment variable containing the 32-byte base64url runtime master key. Domain-separated keys encrypt creator authority and final credentials. Rotating requires data migration.
@@ -310,6 +320,8 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
         config
             .creator_authority_acquisition
             .frontend_session_code_ttl_seconds,
+        generated_grant.client_id,
+        toml_string_array(&generated_grant.allowed_return_origins),
         config.secrets.runtime_master_key_env,
         config.deletion.retry_max_attempts,
         config.deletion.retry_initial_backoff_seconds,
@@ -369,6 +381,15 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
     Ok(config)
 }
 
+fn toml_string_array(values: &[String]) -> String {
+    let quoted = values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +443,15 @@ mod tests {
         assert!(config_text.contains("server_url = \"http://127.0.0.1:3001\""));
         assert!(config_text.contains("minimum_confirmations = 0"));
         assert!(config_text.contains("paykit_payment_retry_interval_seconds = 3"));
+        assert!(config_text.contains("method = \"grant-connect\""));
+        assert!(config_text.contains("[creator_authority_acquisition.grant_connect]"));
+        assert!(config_text.contains("client_id = \"localhost\""));
+        assert!(config_text.contains("allowed_return_origins = [\"*\"]"));
+        assert!(!config_text.contains("legacy"));
+        assert_eq!(
+            parsed.runtime.environment,
+            crate::config::RuntimeEnvironment::Development
+        );
     }
 
     #[test]
@@ -432,7 +462,7 @@ mod tests {
         std::fs::write(
             &secret_path,
             format!(
-                "{}:legacy-session-secret",
+                "{}:not-a-keypair-seed",
                 generated.credentials.lock_server_public_key
             ),
         )
@@ -460,8 +490,6 @@ mod tests {
         let home = tempdir().unwrap();
         let mut generated = initialize_test_default_config(home.path());
         generated.paykit = None;
-        generated.creator_authority_acquisition.method =
-            CreatorAuthorityAcquisitionMethod::GrantConnect;
         generated.creator_authority_acquisition.grant_connect =
             Some(GrantConnectAcquisitionConfig {
                 client_id: "locks.example".to_owned(),
@@ -471,7 +499,7 @@ mod tests {
         std::fs::write(
             &secret_path,
             format!(
-                "{}:legacy-session-secret",
+                "{}:not-a-keypair-seed",
                 generated.credentials.lock_server_public_key
             ),
         )

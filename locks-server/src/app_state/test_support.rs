@@ -22,7 +22,10 @@ use crate::config::{
 
 use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
-use locks_service::application::models::ContentLockDeletionPhase;
+use locks_service::application::models::{
+    ContentLockDeletionPhase, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
+    CreatorAuthoritySecret,
+};
 use locks_service::application::ports::{
     ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
     ContentLockDeletionActionOwnership, ContentLockTombstoneRepository,
@@ -213,9 +216,9 @@ fn assert_action_ownership_adapter(_: &dyn ContentLockDeletionActionOwnership) {
 fn assert_tombstone_adapter(_: &dyn ContentLockTombstoneRepository) {}
 
 #[tokio::test]
-async fn postgres_state_wires_legacy_connect_flow_runtime_state() {
+async fn postgres_state_wires_connect_flow_runtime_state() {
     let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://locks:locks@localhost/locks_test")
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
         .unwrap();
 
     let state = AppState::new_with_postgres_runtime(
@@ -229,16 +232,28 @@ async fn postgres_state_wires_legacy_connect_flow_runtime_state() {
     assert!(Arc::strong_count(state.frontend_session_codes()) >= 1);
     assert!(Arc::strong_count(state.frontend_sessions()) >= 1);
     assert!(Arc::strong_count(state.creator_authority_manager()) >= 1);
-    assert!(Arc::strong_count(state.legacy_creator_connect_flow_client()) >= 1);
 }
 
 #[tokio::test]
-async fn postgres_state_uses_acquisition_gate_to_wire_legacy_connect_client() {
+async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configured() {
     let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://locks:locks@localhost/locks_test")
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
         .unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
     let mut config = test_config();
+    config.credentials.lock_server_secret_key = write_keypair_seed_secret(secret_dir.path());
+    config.credentials.lock_server_public_key = LockServerPubky::from_str(
+        &pubky_common::crypto::Keypair::from_secret(&[9; 32])
+            .public_key()
+            .to_string(),
+    )
+    .unwrap();
     config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.grant_connect =
+        Some(crate::config::GrantConnectAcquisitionConfig {
+            client_id: "locks.example".to_owned(),
+            allowed_return_origins: vec!["https://pubky.app".to_owned()],
+        });
 
     let state = AppState::new_with_postgres_runtime(
         config,
@@ -247,15 +262,98 @@ async fn postgres_state_uses_acquisition_gate_to_wire_legacy_connect_client() {
         test_final_credential_cipher(),
     );
 
-    let result = state
-        .legacy_creator_connect_flow_client()
-        .start_legacy_creator_connect_flow(&[])
-        .await;
-    assert_ne!(result, Err(ApplicationError::CreatorAuthorityUnavailable));
+    assert!(state.grant_creator_connect_flow_client().is_some());
+}
+
+#[tokio::test]
+async fn postgres_state_with_acquisition_disabled_and_no_grant_table_does_not_mount_connect() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
+        .unwrap();
+    let mut config = test_config();
+    config.creator_authority_acquisition.enabled = false;
+    config.creator_authority_acquisition.grant_connect = None;
+
+    let state = AppState::new_with_postgres_runtime(
+        config,
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+    );
+
+    assert!(state.grant_creator_connect_flow_client().is_none());
+    for (method, path) in [
+        (
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Fcallback&state=opaque-state",
+        ),
+        ("POST", "/connect/flow-123/complete"),
+    ] {
+        let response = crate::api::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn in_memory_state_refuses_stored_legacy_cookie_authority() {
+    let state = AppState::new_empty_in_memory(test_config());
+    let creator =
+        CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+            .unwrap();
+    state
+        .creator_authorities()
+        .upsert_creator_authority(CreatorAuthorityRecord {
+            creator: creator.clone(),
+            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            granted_scopes: vec!["/pub/app.locks/:rw".to_owned()],
+            secret: CreatorAuthoritySecret::new("legacy-cookie-session-secret"),
+            session_expires_at: None,
+            last_revalidated_at: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state
+            .creator_authority_manager()
+            .require_creator_authority(&creator)
+            .await
+            .unwrap_err(),
+        ApplicationError::CreatorAuthorityUnavailable
+    );
+}
+
+fn write_keypair_seed_secret(dir: &std::path::Path) -> PathBuf {
+    use base64::Engine as _;
+
+    let path = dir.join("secret.sess");
+    let keypair = pubky_common::crypto::Keypair::from_secret(&[9; 32]);
+    std::fs::write(
+        &path,
+        format!(
+            "keypair-seed:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(keypair.secret())
+        ),
+    )
+    .unwrap();
+    path
 }
 
 #[test]
-fn legacy_connect_flow_generators_return_non_reused_secret_bearers() {
+fn connect_flow_generators_return_non_reused_secret_bearers() {
     let state = AppState::new_empty_in_memory(test_config());
 
     let first_flow_id = state

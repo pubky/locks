@@ -6,8 +6,8 @@ MODE="${1:-}"
 if [[ -z "${MODE}" || "${MODE}" == "-h" || "${MODE}" == "--help" ]]; then
   cat >&2 <<'USAGE'
 Usage:
-  scripts/dev-legacy-connect-testnet.sh auth
-  scripts/dev-legacy-connect-testnet.sh locked-content
+  scripts/dev-grant-connect-testnet.sh auth
+  scripts/dev-grant-connect-testnet.sh locked-content
 
 Environment:
   LOCK_SERVER_URL                Default: http://127.0.0.1:3000
@@ -22,8 +22,9 @@ Environment:
 Assumptions:
   - The local Pubky testnet is already running.
   - Lock Server is already running and configured for [pubky].network = "testnet".
-  - legacy-connect JSON routes are mounted.
-  - locked-content mode expects dev integration config: mode = "dev", pubky-homeserver backend, legacy-connect enabled, and dev manual completion enabled.
+  - The hosted grant-connect shell (/connect) is mounted.
+  - locked-content mode expects a development config with grant-connect enabled (see the
+    expected config printed when preflight fails).
 USAGE
   exit 2
 fi
@@ -321,17 +322,15 @@ Expected Lock Server config for ${mode} mode:
   network = "testnet"
 
   [runtime]
-  mode = "dev"
-  expose_dev_completion_route = true
-  expose_creator_publishing_routes = false
-  expose_creator_connect_routes = false
+  environment = "development"
 
   [creator_authority_acquisition]
   enabled = true
-  method = "legacy-connect"
+  method = "grant-connect"
 
-  [creator_repositories]
-  backend = "pubky-homeserver"
+  [creator_authority_acquisition.grant_connect]
+  client_id = "localhost"
+  allowed_return_origins = ["*"]
 EOF
   if [[ "${mode}" == "locked-content" ]]; then
     cat >&2 <<'EOF'
@@ -342,7 +341,7 @@ EOF
 }
 
 ensure_user() {
-  cargo run -p locks-server --example dev_legacy_connect_testnet -- \
+  cargo run -p locks-server --example dev_grant_connect_testnet -- \
     ensure-user \
     --home "${PUBKY_LOCK_DEV_HOME}" \
     --homeserver "${PUBKY_LOCK_DEV_HOMESERVER}"
@@ -350,7 +349,7 @@ ensure_user() {
 
 approve_auth() {
   local auth_url="$1"
-  cargo run -p locks-server --example dev_legacy_connect_testnet -- \
+  cargo run -p locks-server --example dev_grant_connect_testnet -- \
     approve-auth \
     --home "${PUBKY_LOCK_DEV_HOME}" \
     --homeserver "${PUBKY_LOCK_DEV_HOMESERVER}" \
@@ -369,7 +368,7 @@ acquire_frontend_session() {
   creator="$(jq -r '.creator' <<<"${user_json}")"
   echo "Dev creator: ${creator}" >&2
 
-  echo "Starting Lock Server hosted legacy-connect shell" >&2
+  echo "Starting Lock Server hosted grant-connect shell" >&2
   local return_to_q state_q shell_path shell_body flow_id auth_url
   return_to_q="$(jq -nr --arg v "${PUBKY_LOCK_DEV_RETURN_TO}" '$v|@uri')"
   state_q="$(jq -nr --arg v "${STATE}" '$v|@uri')"
@@ -386,7 +385,7 @@ acquire_frontend_session() {
 import html, re, sys
 body = open(sys.argv[1], encoding='utf-8').read()
 flow = re.search(r'action="/connect/([^"/]+)/complete"', body)
-auth = re.search(r'href="([^"]+)"', body)
+auth = re.search(r'href="(pubkyauth://signin_grant[^"]+)"', body)
 if not flow or not auth:
     raise SystemExit('connect shell missing flow action or auth href')
 print(flow.group(1), html.unescape(auth.group(1)))
@@ -399,10 +398,10 @@ PY
     exit 1
   fi
 
-  echo "Approving legacy-connect auth URL for flow ${flow_id}" >&2
+  echo "Approving grant-connect auth URL for flow ${flow_id}" >&2
   approve_auth "${auth_url}" >/dev/null
 
-  echo "Completing Lock Server hosted legacy-connect flow" >&2
+  echo "Completing Lock Server hosted grant-connect flow" >&2
   local completion_headers completion_body completion_status location code completed_state
   completion_headers="${DEMO_TMP_DIR}/connect_completion_headers.txt"
   completion_body="${DEMO_TMP_DIR}/connect_completion_body.txt"
