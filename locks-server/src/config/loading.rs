@@ -227,7 +227,7 @@ frontend_session_ttl_seconds = {} # Locks-local browser session lifetime after c
 frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep short; browser must exchange it quickly for a frontend session.
 
 [creator_authority_acquisition.legacy_connect]
-allowed_return_origins = [] # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"]. Empty rejects all /connect return_to values; ["*"] is dev-only and unsafe for staging/prod.
+allowed_return_origins = [] # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"]. Empty rejects all /connect return_to values; ["*"] is development/staging-only and rejected in production.
 
 [secrets]
 runtime_master_key_env = "{}" # Environment variable containing the 32-byte base64url runtime master key. Domain-separated keys encrypt creator authority and final credentials. Rotating requires data migration.

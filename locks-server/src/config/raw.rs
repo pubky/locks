@@ -426,6 +426,10 @@ fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, C
 }
 
 fn validate_grant_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    if values.iter().any(|value| value == "*") {
+        return validate_allowed_return_origins(values);
+    }
+
     let mut seen = std::collections::HashSet::with_capacity(values.len());
     values
         .into_iter()

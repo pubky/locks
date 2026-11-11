@@ -142,6 +142,9 @@ pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> b
     let Some(origin) = crate::config::canonical_grant_origin(origin) else {
         return false;
     };
+    if allowed_origins.iter().any(|allowed| allowed == "*") {
+        return allowed_origins == ["*"];
+    }
     allowed_origins.iter().any(|allowed| allowed == &origin)
 }
 

@@ -821,14 +821,65 @@ allowed_return_origins = ["*"]
 
     assert!(matches!(
         load_existing_config_from_path(&config_path).unwrap_err(),
-        ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(_)
+        ConfigError::WildcardReturnOriginInProduction
     ));
 }
 
 #[test]
-fn grant_connect_rejects_non_https_wildcard_and_duplicate_origins_in_every_environment() {
+fn grant_connect_allows_wildcard_return_origin_in_development_and_staging() {
+    for environment in ["development", "staging"] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config(&secret_path, &public_key, environment)
+            .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+            + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["*"]
+"#;
+        std::fs::write(&config_path, config).unwrap();
+
+        let config = load_existing_config_from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config
+                .creator_authority_acquisition
+                .grant_connect
+                .unwrap()
+                .allowed_return_origins,
+            vec!["*".to_owned()],
+            "environment={environment}"
+        );
+    }
+}
+
+#[test]
+fn grant_connect_rejects_wildcard_mixed_with_concrete_origin() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "staging")
+        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["*", "https://pubky.app"]
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(message)
+            if message == "* cannot be mixed with concrete origins"
+    ));
+}
+
+#[test]
+fn grant_connect_rejects_non_https_and_duplicate_origins_in_every_environment() {
     for origins in [
-        r#"["*"]"#,
         r#"["http://localhost:4173"]"#,
         r#"["https://pubky.app:443"]"#,
         r#"["https://pubky.app", "https://pubky.app"]"#,

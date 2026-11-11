@@ -1175,6 +1175,42 @@ async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
     assert_eq!(body["error"]["code"], "folded_auth_unavailable");
 }
 
+#[test]
+fn folded_auth_origin_policy_applies_singleton_wildcard_only_to_valid_origins() {
+    let wildcard = vec!["*".to_owned()];
+    assert!(super::auth_origin_allowed(
+        &wildcard,
+        "https://reader.example"
+    ));
+
+    for invalid_origin in [
+        "null",
+        "http://reader.example",
+        "https://reader.example/path",
+        "data:text/plain,opaque",
+        "not an origin",
+    ] {
+        assert!(
+            !super::auth_origin_allowed(&wildcard, invalid_origin),
+            "unexpectedly accepted Origin {invalid_origin:?}"
+        );
+    }
+
+    let mixed = vec!["*".to_owned(), "https://pubky.app".to_owned()];
+    assert!(!super::auth_origin_allowed(
+        &mixed,
+        "https://reader.example"
+    ));
+    assert!(!super::auth_origin_allowed(&mixed, "https://pubky.app"));
+
+    let explicit = vec!["https://pubky.app".to_owned()];
+    assert!(super::auth_origin_allowed(&explicit, "https://pubky.app"));
+    assert!(!super::auth_origin_allowed(
+        &explicit,
+        "https://reader.example"
+    ));
+}
+
 #[tokio::test]
 async fn folded_auth_cors_preflight_allows_browser_sdk_headers_on_both_routes() {
     let app = router(test_state_with_folded_auth_origins(vec![
@@ -1250,6 +1286,88 @@ async fn folded_auth_cors_rejects_duplicate_origin_headers() {
             .is_none()
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_wildcard_accepts_and_reflects_valid_concrete_origin() {
+    let origin = "https://reader.example";
+    let (state, bundle) = folded_auth_test_state_with_poller_and_origins(
+        Arc::new(FakeFoldedAuth),
+        vec!["*".to_owned()],
+    )
+    .await;
+    let app = router(state);
+
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41006))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    let submitted_body = response_json(submitted).await;
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles/auth-status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"state": submitted_body["state"]})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let preflight = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/proof-bundles/auth-status")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
 }
 
 #[tokio::test]
@@ -6447,6 +6565,90 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
     assert!(body.contains("pubkyauth://signin_grant?secret=fake-grant"));
     assert!(!body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
     assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
+}
+
+#[tokio::test]
+async fn grant_connect_staging_wildcard_accepts_http_return_to_with_concrete_browser_origin() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let response = router(state.clone())
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=http%3A%2F%2Fcreator.example%3A4173%2Fcallback&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "frame-ancestors http://creator.example:4173"
+    );
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains(r#"const TARGET_ORIGIN = "http://creator.example:4173";"#));
+    assert!(!body.contains(r#"const TARGET_ORIGIN = "*";"#));
+
+    for path in [
+        "/connect?return_to=pubky%3A%2F%2Fcreator.example%2Fcallback&state=opaque-state",
+        "/connect?return_to=not%20a%20url&state=opaque-state",
+    ] {
+        let response = router(state.clone())
+            .oneshot(empty_request("GET", path))
+            .await
+            .unwrap();
+
+        assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    }
+}
+
+#[tokio::test]
+async fn grant_connect_staging_wildcard_revalidates_completion_return_to() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    seed_pending_grant_creator_connect_flow(
+        &state,
+        "grant-flow-wildcard",
+        "http://creator.example:4173/callback",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "POST",
+            "/connect/grant-flow-wildcard/complete",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(location.starts_with("http://creator.example:4173/callback?state=opaque-state&code="));
 }
 
 #[tokio::test]
