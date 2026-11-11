@@ -4,7 +4,7 @@ This file tracks only unresolved decisions before production implementation. Con
 
 ## Current status
 
-Plan 0018 SDK-backed Pubky repository runtime composition is implemented through the server binary using encrypted creator-authority records and session-scoped SDK storage. Plan 0019 implemented the hosted Creator Authority Acquisition shell. Plan 0024 removed the abandoned `legacy-self-relay` / `srvr/caps/sign` surface. Production now selects `grant-connect`; `legacy-connect` remains explicit compatibility mode and is never a fallback from grant mode.
+Plan 0018 SDK-backed Pubky repository runtime composition is implemented through the server binary using encrypted creator-authority records and session-scoped SDK storage. Plan 0019 implemented the hosted Creator Authority Acquisition shell. Plan 0024 removed the abandoned `legacy-self-relay` / `srvr/caps/sign` surface. Production now selects `grant-connect`; `legacy-connect` was removed; `grant-connect` is the only acquisition method.
 
 There are no unresolved Pubky integration or deferred design questions blocking repository runtime composition or the backend acquisition protocol itself.
 

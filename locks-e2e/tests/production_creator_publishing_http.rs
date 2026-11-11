@@ -348,7 +348,7 @@ impl CreatorAuthorityManager for FakeCreatorAuthorityManager {
         }
         Ok(CreatorAuthorityStatus {
             creator: creator.clone(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             authorized: true,
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),

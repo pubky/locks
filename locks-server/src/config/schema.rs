@@ -184,13 +184,8 @@ pub struct CreatorAuthorityAcquisitionConfig {
     pub method: CreatorAuthorityAcquisitionMethod,
     pub frontend_session_ttl_seconds: u64,
     pub frontend_session_code_ttl_seconds: u64,
-    pub legacy_connect: LegacyConnectAcquisitionConfig,
+    /// Required when `enabled`; `None` only when hosted creator acquisition is disabled.
     pub grant_connect: Option<GrantConnectAcquisitionConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyConnectAcquisitionConfig {
-    pub allowed_return_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,12 +198,9 @@ impl Default for CreatorAuthorityAcquisitionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            method: CreatorAuthorityAcquisitionMethod::LegacyConnect,
+            method: CreatorAuthorityAcquisitionMethod::GrantConnect,
             frontend_session_ttl_seconds: 86_400,
             frontend_session_code_ttl_seconds: 120,
-            legacy_connect: LegacyConnectAcquisitionConfig {
-                allowed_return_origins: Vec::new(),
-            },
             grant_connect: None,
         }
     }
@@ -217,7 +209,7 @@ impl Default for CreatorAuthorityAcquisitionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CreatorAuthorityAcquisitionMethod {
-    LegacyConnect,
+    /// Delegated Pubky grant auth; the only creator authority acquisition method.
     GrantConnect,
 }
 
@@ -458,15 +450,15 @@ pub enum ConfigError {
     )]
     InvalidGrantConnectClientId(String),
     #[error(
-        "creator_authority_acquisition.method = grant-connect requires [creator_authority_acquisition.grant_connect]"
+        "creator_authority_acquisition.enabled = true requires [creator_authority_acquisition.grant_connect]"
     )]
     MissingGrantConnectConfig,
     #[error(
-        "creator_authority_acquisition.method = grant-connect requires creator_authority_acquisition.grant_connect.allowed_return_origins to contain at least one origin"
+        "creator_authority_acquisition.grant_connect.allowed_return_origins must contain at least one origin"
     )]
     EmptyGrantConnectAllowedReturnOrigins,
     #[error(
-        "creator_authority_acquisition.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
+        "creator_authority_acquisition.grant_connect.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
     #[error("pubky.pkarr_relays must contain at least one relay when configured")]

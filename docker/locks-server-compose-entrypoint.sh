@@ -124,12 +124,14 @@ environment = "development"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
+[creator_authority_acquisition.grant_connect]
+client_id = "localhost"
+# Development only: any return origin, so the http:// demo pages on :8080 work.
+allowed_return_origins = ["*"]
 
 [secrets]
 runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"

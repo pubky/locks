@@ -21,8 +21,8 @@ export function buildLocksOptions({ pkarrRelays = [] } = {}) {
  * Starts the creator connect flow.
  *
  * The caller must persist `state` until the callback returns. The Lock Server
- * hosts legacy-connect; the app receives only `code` and `state` on callback,
- * not the raw legacy Pubky authorization URL.
+ * hosts grant-connect; the app receives only `code` and `state` on callback,
+ * not the raw Pubky authorization URL.
  */
 export async function startCreatorConnect({ lockServer, returnTo, state, pkarrRelays = [] }) {
   await init();

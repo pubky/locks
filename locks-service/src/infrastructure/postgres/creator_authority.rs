@@ -299,7 +299,7 @@ mod tests {
         let database = TestDatabase::create().await;
         let store = PostgresCreatorAuthorityStore::new(database.pool().clone());
         let creator = creator();
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         assert_eq!(store.get_creator_authority(&creator).await.unwrap(), None);
 
@@ -342,7 +342,7 @@ mod tests {
         let original_store = PostgresCreatorAuthorityStore::new(database.pool().clone());
         let recreated_store = PostgresCreatorAuthorityStore::new(database.pool().clone());
         let creator = creator();
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         original_store
             .upsert_creator_authority(record.clone())
@@ -355,15 +355,12 @@ mod tests {
             .unwrap()
             .expect("stored creator authority exists");
         assert_eq!(loaded, record);
-        assert_eq!(
-            loaded.secret.expose_secret(),
-            "legacy-cookie-session-secret"
-        );
+        assert_eq!(loaded.secret.expose_secret(), "creator-grant-state");
 
         let debug = format!("{loaded:?}");
         assert!(debug.contains("CreatorAuthorityRecord"));
         assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("legacy-cookie-session-secret"));
+        assert!(!debug.contains("creator-grant-state"));
 
         database.cleanup().await;
     }
@@ -404,7 +401,7 @@ mod tests {
             CreatorAuthoritySecretCipher::new([7; 32]),
         );
         let creator = creator();
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         store
             .upsert_creator_authority(record.clone())
@@ -412,9 +409,9 @@ mod tests {
             .unwrap();
 
         let stored_secret = raw_stored_secret(database.pool()).await;
-        assert_ne!(stored_secret, "legacy-cookie-session-secret");
+        assert_ne!(stored_secret, "creator-grant-state");
         assert!(stored_secret.starts_with("v1.xchacha20poly1305:"));
-        assert!(!stored_secret.contains("legacy-cookie-session-secret"));
+        assert!(!stored_secret.contains("creator-grant-state"));
 
         let loaded = store
             .get_creator_authority(&creator)
@@ -422,10 +419,7 @@ mod tests {
             .unwrap()
             .expect("stored creator authority exists");
         assert_eq!(loaded, record);
-        assert_eq!(
-            loaded.secret.expose_secret(),
-            "legacy-cookie-session-secret"
-        );
+        assert_eq!(loaded.secret.expose_secret(), "creator-grant-state");
 
         database.cleanup().await;
     }
@@ -441,7 +435,7 @@ mod tests {
             database.pool().clone(),
             CreatorAuthoritySecretCipher::new([8; 32]),
         );
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         writer.upsert_creator_authority(record).await.unwrap();
         let stored_secret = raw_stored_secret(database.pool()).await;
@@ -458,7 +452,7 @@ mod tests {
             }
         );
         let debug = format!("{error:?}");
-        assert!(!debug.contains("legacy-cookie-session-secret"));
+        assert!(!debug.contains("creator-grant-state"));
         assert!(!debug.contains(&stored_secret));
         assert!(!debug.contains('7'));
         assert!(!debug.contains('8'));
@@ -471,7 +465,7 @@ mod tests {
         let database = TestDatabase::create().await;
         let store = PostgresCreatorAuthorityStore::new(database.pool().clone());
         let creator = creator();
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         store.upsert_creator_authority(record).await.unwrap();
         sqlx::query("UPDATE creator_authorities SET auth_kind = 'cookie' WHERE creator = $1")
@@ -494,7 +488,7 @@ mod tests {
     async fn stores_granted_scopes_as_json_array() {
         let database = TestDatabase::create().await;
         let store = PostgresCreatorAuthorityStore::new(database.pool().clone());
-        let record = creator_authority_record("legacy-cookie-session-secret");
+        let record = creator_authority_record("creator-grant-state");
 
         store.upsert_creator_authority(record).await.unwrap();
 
@@ -525,7 +519,7 @@ mod tests {
     fn creator_authority_record(secret: &str) -> CreatorAuthorityRecord {
         CreatorAuthorityRecord {
             creator: creator(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),

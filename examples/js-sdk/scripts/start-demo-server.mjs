@@ -114,9 +114,11 @@ async function startDemoAuth() {
   if (!activeDemoAuthFlow) {
     const capabilities = '/pub/app.locks/:rw,/priv/app.locks/:rw';
     const authRelay = demoAuthRelayForConfig(serviceConfig);
-    activeDemoAuthFlow = authRelay
-      ? pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin(), authRelay)
-      : pubky.startCookieAuthFlow(capabilities, AuthFlowKind.signin());
+    const clientId = new URL(config.demoServer.url).hostname;
+    activeDemoAuthFlow = await pubky.startGrantAuthFlow(capabilities, AuthFlowKind.signin(), {
+      clientId,
+      relay: authRelay ?? null,
+    });
     activeDemoAuthUrl = activeDemoAuthFlow.authorizationUrl;
     activeDemoAuthStartedAt = new Date().toISOString();
     demoAuthPromise = activeDemoAuthFlow
@@ -126,7 +128,7 @@ async function startDemoAuth() {
           role: 'content-creator',
           pubky: session.info.publicKey.toString(),
           capabilities: session.info.capabilities,
-          exported_session: session.export(),
+          exported_session: await session.exportLocalSecret(),
           authenticated_at: new Date().toISOString(),
         };
         await writeCreatorDemoSessionForCurrentRole(creatorSession, sessionStateOptions());

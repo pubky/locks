@@ -146,7 +146,7 @@ The endpoint is public, always mounted, CORS-enabled, and must not return secret
 
 ## Creator connect/session routes
 
-These routes implement Creator Authority Acquisition using the explicitly configured method. Production deployments should use `method = "grant-connect"`; this emits exactly one `signin_grant` QR/deeplink and never starts or falls back to cookie auth. `method = "legacy-connect"` remains an explicit compatibility mode.
+These routes implement Creator Authority Acquisition with `grant-connect`, the only supported method: it emits exactly one `signin_grant` QR/deeplink and never starts cookie auth. The former `legacy-connect` mode was removed; a pending flow it left behind is refused with `503 creator_authority_unavailable`.
 
 The hosted browser routes are mounted when `[creator_authority_acquisition].enabled = true`:
 
@@ -155,19 +155,19 @@ The hosted browser routes are mounted when `[creator_authority_acquisition].enab
 - `POST /frontend-sessions`
 - `DELETE /frontend-sessions/current`
 
-In grant mode, the Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, exact requested capability set, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and exact required scopes, including after a Postgres-backed restart. Restore uses the homeserver stored at approval time, so a creator who moves homeserver must reconnect. The persisted authorization URL identifies whether each pending flow is `signin` or `signin_grant`; changing acquisition method while a flow is pending therefore fails closed instead of completing it through the other mechanism. Legacy records fail closed in grant mode and require creator reconnection. Both methods preserve the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
+The Lock Server owns a per-flow deterministic PoP signer, validates grant issuer/session identity, configured `client_id`, PoP key, exact requested capability set, and expiry, then stores encrypted delegated restore state without storing the PoP private key. Creator I/O restores and revalidates the grant against the current configured client ID and exact required scopes, including after a Postgres-backed restart. Restore uses the homeserver stored at approval time, so a creator who moves homeserver must reconnect. Flows and creator authority records left by the removed `legacy-connect` mode are refused and require creator reconnection. The flow preserves the hosted shell callback, one-time frontend code, Locks-local frontend session, `return_to` validation, and CSP contract.
 
 ### `GET /connect`
 
-Starts the human-facing Lock-Server-hosted connect shell using the selected acquisition method.
+Starts the human-facing Lock-Server-hosted grant-connect shell.
 
 ```http
 GET /connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state
 ```
 
-`return_to` must have an origin allowed by the selected acquisition mode. Grant mode normally requires an exact match against a unique canonical HTTPS origin in `[creator_authority_acquisition.grant_connect].allowed_return_origins`; explicit default ports, credentials, paths in the configured origin, query strings, fragments, and HTTP origins are rejected. In development and staging only, a sole wildcard entry (`["*"]`) instead admits any syntactically valid HTTP/HTTPS `return_to`; production rejects the wildcard, and it cannot be mixed with concrete origins. Grant mode does not fall back to legacy or top-level origins. Legacy mode separately accepts exact HTTP/HTTPS origins from `[creator_authority_acquisition.legacy_connect].allowed_return_origins`; outside production, its explicit wildcard has the same return-target policy. In either mode, wildcard policy still derives a concrete origin from `return_to` for CSP and `postMessage`; it is never emitted as a literal browser target. The Lock Server validates this before starting Pubky auth.
+`return_to` must have an origin allowed by the grant-connect configuration, which normally requires an exact match against a unique canonical HTTPS origin in `[creator_authority_acquisition.grant_connect].allowed_return_origins`; explicit default ports, credentials, paths in the configured origin, query strings, fragments, and HTTP origins are rejected. In development and staging only, a sole wildcard entry (`["*"]`) instead admits any syntactically valid HTTP/HTTPS `return_to`; production rejects the wildcard, and it cannot be mixed with concrete origins. There is no fallback to top-level origins. Wildcard policy still derives a concrete origin from `return_to` for CSP and `postMessage`; it is never emitted as a literal browser target. The Lock Server validates this before starting Pubky auth.
 
-Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and, for touch devices, deeplink buttons on the Lock Server origin: "Continue with Pubky Ring" in both modes, plus "Continue with Bitkit" in grant mode, because Bitkit accepts only grant auth. In legacy mode the standalone page also names and shows only Pubky Ring in its description and logos. In grant mode the URL host is `signin_grant`; no cookie-auth URL is generated. In grant mode on Android, each button opens an `intent://` URL for its app's package, except in Firefox for Android, which keeps the plain `pubkyauth://` link. Ring uses `to.pubky.ring`, while Bitkit uses `to.bitkit` when `[runtime].environment = "production"` and `to.bitkit.dev` for `staging` or `development`. On iOS the Bitkit button uses `bitkit://pubky-auth/signin` with the same query. Legacy mode keeps the plain `pubkyauth://signin` link on every platform. On desktop, clicking the QR copies the same `pubkyauth://` URL to the clipboard and shows a "Copied" label on it. In Chromium browsers an embedding iframe needs `allow="clipboard-write"` for that copy.
+Success returns `200 text/html; charset=utf-8`. The HTML contains one Pubky authorization QR SVG and, for touch devices, deeplink buttons on the Lock Server origin: "Continue with Pubky Ring" and "Continue with Bitkit". The URL host is `signin_grant`; no cookie-auth URL is generated. On Android, each button opens an `intent://` URL for its app's package, except in Firefox for Android, which keeps the plain `pubkyauth://` link. Ring uses `to.pubky.ring`, while Bitkit uses `to.bitkit` when `[runtime].environment = "production"` and `to.bitkit.dev` for `staging` or `development`. On iOS the Bitkit button uses `bitkit://pubky-auth/signin` with the same query. On desktop, clicking the QR copies the same `pubkyauth://` URL to the clipboard and shows a "Copied" label on it. In Chromium browsers an embedding iframe needs `allow="clipboard-write"` for that copy.
 
 The HTML form posts back to:
 
@@ -257,7 +257,7 @@ Authorized response:
 {
   "creator": "pubkycreator123",
   "authorized": true,
-  "auth_kind": "legacy_cookie",
+  "auth_kind": "grant",
   "granted_scopes": ["/pub/app.locks/:rw", "/priv/app.locks/:rw"],
   "session_expires_at": null
 }

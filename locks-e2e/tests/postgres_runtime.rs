@@ -1057,7 +1057,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
 
     state
         .creator_authorities()
-        .upsert_creator_authority(creator_authority_record("legacy-cookie-session-secret"))
+        .upsert_creator_authority(creator_authority_record("grant-restore-state-secret"))
         .await
         .unwrap();
 
@@ -1066,7 +1066,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
         .await
         .unwrap();
     assert!(stored_secret.starts_with("v1.xchacha20poly1305:"));
-    assert!(!stored_secret.contains("legacy-cookie-session-secret"));
+    assert!(!stored_secret.contains("grant-restore-state-secret"));
 
     let loaded = state
         .creator_authorities()
@@ -1074,10 +1074,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        loaded.secret.expose_secret(),
-        "legacy-cookie-session-secret"
-    );
+    assert_eq!(loaded.secret.expose_secret(), "grant-restore-state-secret");
 
     database.cleanup().await;
 }
@@ -1875,7 +1872,7 @@ fn app_state(pool: PgPool) -> AppState {
 fn creator_authority_record(secret: &str) -> CreatorAuthorityRecord {
     CreatorAuthorityRecord {
         creator: creator(),
-        auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+        auth_kind: CreatorAuthorityAuthKind::Grant,
         granted_scopes: vec![
             "/pub/app.locks/:rw".to_owned(),
             "/priv/app.locks/:rw".to_owned(),

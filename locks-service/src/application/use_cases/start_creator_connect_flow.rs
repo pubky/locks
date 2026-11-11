@@ -7,13 +7,12 @@ use crate::application::models::{
 };
 use crate::application::ports::{
     Clock, CreatorConnectFlowIdGenerator, CreatorConnectFlowStore, GrantCreatorConnectFlowClient,
-    LegacyCreatorConnectFlowClient,
 };
 
 const CREATOR_CONNECT_FLOW_TTL: Duration = Duration::minutes(5);
 const DEFAULT_REQUESTED_SCOPES: [&str; 2] = ["/pub/app.locks/:rw", "/priv/app.locks/:rw"];
 
-/// Request to start a legacy Pubky creator connect flow.
+/// Request to start a grant Pubky creator connect flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartCreatorConnectFlowRequest {
     /// Frontend return target carried through the connect flow.
@@ -35,11 +34,10 @@ pub struct StartCreatorConnectFlowResponse {
     pub state: String,
 }
 
-/// Starts and persists a pending legacy creator connect flow.
+/// Starts and persists a pending grant creator connect flow.
 pub async fn start_creator_connect_flow(
     store: &dyn CreatorConnectFlowStore,
-    client: &dyn LegacyCreatorConnectFlowClient,
-    grant_client: Option<&dyn GrantCreatorConnectFlowClient>,
+    grant_client: &dyn GrantCreatorConnectFlowClient,
     flow_id_generator: &dyn CreatorConnectFlowIdGenerator,
     clock: &dyn Clock,
     request: StartCreatorConnectFlowRequest,
@@ -49,21 +47,12 @@ pub async fn start_creator_connect_flow(
     let expires_at = now + CREATOR_CONNECT_FLOW_TTL;
     let flow_id = flow_id_generator.generate_creator_connect_flow_id();
     let requested_scopes = default_requested_scopes();
-    let authorization_url = match grant_client {
-        Some(grant_client) => {
-            grant_client
-                .start_grant_creator_connect_flow(
-                    &requested_scopes,
-                    &GrantPopKeyId::for_connect_flow(&flow_id),
-                )
-                .await?
-        }
-        None => {
-            client
-                .start_legacy_creator_connect_flow(&requested_scopes)
-                .await?
-        }
-    };
+    let authorization_url = grant_client
+        .start_grant_creator_connect_flow(
+            &requested_scopes,
+            &GrantPopKeyId::for_connect_flow(&flow_id),
+        )
+        .await?;
 
     store
         .insert_pending_creator_connect_flow(PendingCreatorConnectFlowRecord {
@@ -117,11 +106,11 @@ mod tests {
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
         CreatorConnectAuthorizationUrl, CreatorConnectFlowId, GrantCreatorConnectFlowApproval,
-        GrantPopKeyId, LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+        GrantPopKeyId, PendingCreatorConnectFlowRecord,
     };
     use crate::application::ports::{
         Clock, CreatorConnectFlowIdGenerator, CreatorConnectFlowStore,
-        GrantCreatorConnectFlowClient, LegacyCreatorConnectFlowClient,
+        GrantCreatorConnectFlowClient,
     };
 
     #[tokio::test]
@@ -132,8 +121,7 @@ mod tests {
 
         let response = start_creator_connect_flow(
             &store,
-            &PanicLegacyConnectFlowClient,
-            Some(&grant),
+            &grant,
             &FixedFlowIdGenerator,
             &FixedClock(now),
             StartCreatorConnectFlowRequest {
@@ -159,14 +147,13 @@ mod tests {
     async fn start_creator_connect_flow_stores_pending_flow_and_returns_safe_response() {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let store = RecordingFlowStore::default();
-        let client = FakeConnectFlowClient;
+        let client = RecordingGrantConnectFlowClient::default();
         let generator = FixedFlowIdGenerator;
         let clock = FixedClock(now);
 
         let response = start_creator_connect_flow(
             &store,
             &client,
-            None,
             &generator,
             &clock,
             StartCreatorConnectFlowRequest {
@@ -180,11 +167,15 @@ mod tests {
         assert_eq!(response.flow_id, CreatorConnectFlowId::new("flow-123"));
         assert_eq!(
             response.authorization_url.expose_url(),
-            "pubkyauth://signin?secret=secret-flow-url"
+            "pubkyauth://signin_grant?secret=grant"
         );
         assert_eq!(response.state, "opaque-state");
         assert!(response.expires_at <= now + Duration::minutes(5));
-        assert!(!format!("{response:?}").contains("secret-flow-url"));
+        assert!(!format!("{response:?}").contains("secret=grant"));
+        assert_eq!(
+            client.started.lock().unwrap().as_slice(),
+            [GrantPopKeyId::for_connect_flow(&response.flow_id)]
+        );
 
         let stored = store.record().expect("pending flow stored");
         assert_eq!(stored.flow_id, response.flow_id);
@@ -192,7 +183,7 @@ mod tests {
         assert_eq!(stored.state, "opaque-state");
         assert_eq!(
             stored.authorization_url.expose_url(),
-            "pubkyauth://signin?secret=secret-flow-url"
+            "pubkyauth://signin_grant?secret=grant"
         );
         assert_eq!(stored.created_at, now);
         assert_eq!(stored.expires_at, response.expires_at);
@@ -207,7 +198,7 @@ mod tests {
     {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let store = RecordingFlowStore::default();
-        let client = FakeConnectFlowClient;
+        let client = RecordingGrantConnectFlowClient::default();
         let generator = FixedFlowIdGenerator;
         let clock = FixedClock(now);
 
@@ -221,14 +212,14 @@ mod tests {
                 state: "".to_owned(),
             },
         ] {
-            let error =
-                start_creator_connect_flow(&store, &client, None, &generator, &clock, request)
-                    .await
-                    .unwrap_err();
+            let error = start_creator_connect_flow(&store, &client, &generator, &clock, request)
+                .await
+                .unwrap_err();
             assert!(matches!(error, ApplicationError::Storage { .. }));
         }
 
         assert!(store.record().is_none());
+        assert!(client.started.lock().unwrap().is_empty());
     }
 
     #[derive(Default)]
@@ -281,46 +272,6 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> OffsetDateTime {
             self.0
-        }
-    }
-
-    struct FakeConnectFlowClient;
-
-    #[async_trait]
-    impl LegacyCreatorConnectFlowClient for FakeConnectFlowClient {
-        async fn start_legacy_creator_connect_flow(
-            &self,
-            _requested_scopes: &[String],
-        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
-            Ok(CreatorConnectAuthorizationUrl::new(
-                "pubkyauth://signin?secret=secret-flow-url",
-            ))
-        }
-
-        async fn await_legacy_creator_connect_flow_approval(
-            &self,
-            _authorization_url: &CreatorConnectAuthorizationUrl,
-        ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
-            unreachable!("start use case must not await approval")
-        }
-    }
-
-    struct PanicLegacyConnectFlowClient;
-
-    #[async_trait]
-    impl LegacyCreatorConnectFlowClient for PanicLegacyConnectFlowClient {
-        async fn start_legacy_creator_connect_flow(
-            &self,
-            _requested_scopes: &[String],
-        ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
-            panic!("grant-only mode must not start legacy cookie flow")
-        }
-
-        async fn await_legacy_creator_connect_flow_approval(
-            &self,
-            _authorization_url: &CreatorConnectAuthorizationUrl,
-        ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
-            unreachable!()
         }
     }
 
