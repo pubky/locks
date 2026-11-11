@@ -1175,6 +1175,42 @@ async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
     assert_eq!(body["error"]["code"], "folded_auth_unavailable");
 }
 
+#[test]
+fn folded_auth_origin_policy_applies_singleton_wildcard_only_to_valid_origins() {
+    let wildcard = vec!["*".to_owned()];
+    assert!(super::auth_origin_allowed(
+        &wildcard,
+        "https://reader.example"
+    ));
+
+    for invalid_origin in [
+        "null",
+        "http://reader.example",
+        "https://reader.example/path",
+        "data:text/plain,opaque",
+        "not an origin",
+    ] {
+        assert!(
+            !super::auth_origin_allowed(&wildcard, invalid_origin),
+            "unexpectedly accepted Origin {invalid_origin:?}"
+        );
+    }
+
+    let mixed = vec!["*".to_owned(), "https://pubky.app".to_owned()];
+    assert!(!super::auth_origin_allowed(
+        &mixed,
+        "https://reader.example"
+    ));
+    assert!(!super::auth_origin_allowed(&mixed, "https://pubky.app"));
+
+    let explicit = vec!["https://pubky.app".to_owned()];
+    assert!(super::auth_origin_allowed(&explicit, "https://pubky.app"));
+    assert!(!super::auth_origin_allowed(
+        &explicit,
+        "https://reader.example"
+    ));
+}
+
 #[tokio::test]
 async fn folded_auth_cors_preflight_allows_browser_sdk_headers_on_both_routes() {
     let app = router(test_state_with_folded_auth_origins(vec![
@@ -1250,6 +1286,88 @@ async fn folded_auth_cors_rejects_duplicate_origin_headers() {
             .is_none()
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_wildcard_accepts_and_reflects_valid_concrete_origin() {
+    let origin = "https://reader.example";
+    let (state, bundle) = folded_auth_test_state_with_poller_and_origins(
+        Arc::new(FakeFoldedAuth),
+        vec!["*".to_owned()],
+    )
+    .await;
+    let app = router(state);
+
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41006))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    let submitted_body = response_json(submitted).await;
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles/auth-status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"state": submitted_body["state"]})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let preflight = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/proof-bundles/auth-status")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
 }
 
 #[tokio::test]
