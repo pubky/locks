@@ -6450,6 +6450,90 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
 }
 
 #[tokio::test]
+async fn grant_connect_staging_wildcard_accepts_http_return_to_with_concrete_browser_origin() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let response = router(state.clone())
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=http%3A%2F%2Fcreator.example%3A4173%2Fcallback&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "frame-ancestors http://creator.example:4173"
+    );
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains(r#"const TARGET_ORIGIN = "http://creator.example:4173";"#));
+    assert!(!body.contains(r#"const TARGET_ORIGIN = "*";"#));
+
+    for path in [
+        "/connect?return_to=pubky%3A%2F%2Fcreator.example%2Fcallback&state=opaque-state",
+        "/connect?return_to=not%20a%20url&state=opaque-state",
+    ] {
+        let response = router(state.clone())
+            .oneshot(empty_request("GET", path))
+            .await
+            .unwrap();
+
+        assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
+    }
+}
+
+#[tokio::test]
+async fn grant_connect_staging_wildcard_revalidates_completion_return_to() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    seed_pending_grant_creator_connect_flow(
+        &state,
+        "grant-flow-wildcard",
+        "http://creator.example:4173/callback",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "POST",
+            "/connect/grant-flow-wildcard/complete",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(location.starts_with("http://creator.example:4173/callback?state=opaque-state&code="));
+}
+
+#[tokio::test]
 async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
     for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
         let state =
