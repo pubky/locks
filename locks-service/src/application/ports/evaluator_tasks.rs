@@ -11,6 +11,7 @@ use crate::application::models::{EvaluatorTaskIdentityV1, VerificationTaskStatus
 pub enum EvaluatorMode {
     Graph,
     Payment,
+    Mixed,
 }
 
 impl EvaluatorMode {
@@ -18,13 +19,15 @@ impl EvaluatorMode {
         match self {
             Self::Graph => "graph",
             Self::Payment => "payment",
+            Self::Mixed => "mixed",
         }
     }
 
-    pub const fn satisfied_by(self) -> SatisfiedByV2 {
+    pub const fn satisfied_by(self) -> Option<SatisfiedByV2> {
         match self {
-            Self::Graph => SatisfiedByV2::Graph,
-            Self::Payment => SatisfiedByV2::Payment,
+            Self::Graph => Some(SatisfiedByV2::Graph),
+            Self::Payment => Some(SatisfiedByV2::Payment),
+            Self::Mixed => None,
         }
     }
 }
@@ -106,6 +109,18 @@ pub fn build_evaluator_publication(
     mode: EvaluatorMode,
     verified_at: OffsetDateTime,
 ) -> Result<VerifiedProofBundleV2, ApplicationError> {
+    let satisfied_by = mode
+        .satisfied_by()
+        .map(|value| vec![value])
+        .ok_or_else(|| invalid_state("mixed publication requires exact satisfaction path"))?;
+    build_evaluator_publication_with_path(identity, satisfied_by, verified_at)
+}
+
+pub fn build_evaluator_publication_with_path(
+    identity: &EvaluatorTaskIdentityV1,
+    satisfied_by: Vec<SatisfiedByV2>,
+    verified_at: OffsetDateTime,
+) -> Result<VerifiedProofBundleV2, ApplicationError> {
     let publication = VerifiedProofBundleV2 {
         version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
         creator: identity.creator.clone(),
@@ -113,7 +128,7 @@ pub fn build_evaluator_publication(
         bundle_id: identity.bundle_id.clone(),
         pubky_lock_resource: identity.pubky_lock_resource.clone(),
         verified_at,
-        satisfied_by: vec![mode.satisfied_by()],
+        satisfied_by,
     };
     publication
         .validate()

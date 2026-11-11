@@ -3,6 +3,7 @@ pub mod creator;
 pub mod discovery;
 pub mod error;
 pub mod graph;
+pub mod mixed;
 pub mod paykit;
 pub mod payment;
 pub mod session;
@@ -26,6 +27,10 @@ pub use graph::{
     CreatorVerificationEvidenceResponse, FoldedAuthStatusRequest, FoldedAuthStatusResponse,
     GraphEvidenceMode, GraphObservationOutcome, GraphOperationalErrorCategory,
     GraphPredicateEvidenceState, GraphSubmitResponse, GraphVerificationTaskLifecycleResponse,
+};
+pub use mixed::{
+    CreatorMixedVerificationEvidenceResponse, MixedEvidenceMode, MixedPaymentEvidenceResponse,
+    MixedPaymentInvoiceEvidence, MixedVerificationTaskLifecycleResponse,
 };
 pub use paykit::has_paykit_data;
 pub use payment::PaymentVerificationTaskLifecycleResponse;

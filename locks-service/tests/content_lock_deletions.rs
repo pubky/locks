@@ -36,7 +36,7 @@ use locks_service::{
             ContentLockDeletionRepository, GraphTaskClaimer, GraphTaskRepository,
             InvoiceAdmissionRepository, PaymentDrainObligationKind, PaymentDrainRepository,
             PaymentTaskClaimer, PaymentTaskRepository, ProviderV2DeletionReconciliation,
-            VerificationTaskClaimer, VerificationTaskRepository,
+            ProviderV2EvaluatorSnapshot, VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::no_paykit_deletion_drain::NoPaykitDeletionDrainUseCase,
     },
@@ -196,7 +196,9 @@ async fn in_memory_force_terminalizes_provider_v2_task_and_permanently_fences_re
                     create_conflict: false,
                     create_response: None,
                     status: None,
-                    terminal_snapshot: admitted.snapshot.clone(),
+                    terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(
+                        admitted.snapshot.clone(),
+                    ),
                 },
             ),
         )
@@ -448,7 +450,7 @@ async fn in_memory_provider_terminalization_and_deletion_admission_race_is_bound
                             create_conflict: false,
                             create_response: None,
                             status: None,
-                            terminal_snapshot: snapshot,
+                            terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(snapshot),
                         },
                     )
                     .await

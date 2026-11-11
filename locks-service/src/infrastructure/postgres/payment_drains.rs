@@ -9,12 +9,13 @@ use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    PaymentTaskSnapshot, VerificationTaskStatus, VerificationTerminalReason,
+    MixedTaskSnapshot, PaymentTaskSnapshot, VerificationTaskStatus, VerificationTerminalReason,
 };
 use crate::application::ports::{
     PaykitAuthority, PaymentDrainCleanupPreparation, PaymentDrainCleanupToken,
     PaymentDrainObligation, PaymentDrainObligationKind, PaymentDrainRepository, PaymentDrainStatus,
     PaymentDrainSummary, PaymentDrainTerminalTransition, ProviderV2DeletionReconciliation,
+    ProviderV2EvaluatorSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ struct ObligationRow {
     invoice_created_at: Option<OffsetDateTime>,
     payment_deadline: Option<OffsetDateTime>,
     evaluator_revision_at_cutoff: Option<i64>,
+    evaluator_mode_at_cutoff: Option<String>,
     evaluator_snapshot_at_cutoff: Option<serde_json::Value>,
     provider_reconciliation_state: Option<String>,
     status: String,
@@ -384,7 +386,7 @@ impl PaymentDrainRepository for PostgresPaymentDrainRepository {
                     snapshot.bundle_id, snapshot.pubky_lock_resource,
                     snapshot.obligation_kind, snapshot.criterion_id,
                     snapshot.invoice_created_at, snapshot.payment_deadline,
-                    snapshot.evaluator_revision_at_cutoff,
+                    snapshot.evaluator_revision_at_cutoff, snapshot.evaluator_mode_at_cutoff,
                     snapshot.evaluator_snapshot_at_cutoff,
                     snapshot.provider_reconciliation_state,
                     task.status, task.entitlement_to_publish
@@ -1051,12 +1053,24 @@ fn row_to_obligation(row: ObligationRow) -> Result<PaymentDrainObligation, Appli
                     invalid_deletion("provider-v2 obligation is missing evaluator revision")
                 })?)
                 .map_err(storage_display)?;
-            let snapshot =
-                PaymentTaskSnapshot::from_json(row.evaluator_snapshot_at_cutoff.ok_or_else(
-                    || invalid_deletion("provider-v2 obligation is missing evaluator snapshot"),
-                )?)
-                .map_err(storage_display)?;
-            let frozen = snapshot.as_v1();
+            let snapshot_json = row.evaluator_snapshot_at_cutoff.ok_or_else(|| {
+                invalid_deletion("provider-v2 obligation is missing evaluator snapshot")
+            })?;
+            let snapshot = match row.evaluator_mode_at_cutoff.as_deref() {
+                Some("payment") => ProviderV2EvaluatorSnapshot::Payment(
+                    PaymentTaskSnapshot::from_json(snapshot_json).map_err(storage_display)?,
+                ),
+                Some("mixed") => ProviderV2EvaluatorSnapshot::Mixed(
+                    MixedTaskSnapshot::from_json(snapshot_json).map_err(storage_display)?,
+                ),
+                _ => {
+                    return Err(invalid_deletion(
+                        "provider-v2 obligation has an invalid evaluator mode",
+                    ));
+                }
+            };
+            let payment = snapshot.payment_snapshot()?;
+            let frozen = payment.as_v1();
             if frozen.creator != creator
                 || frozen.bundle_id != bundle_id
                 || frozen.pubky_lock_resource != lock_resource
@@ -1198,6 +1212,7 @@ mod tests {
         PaykitAuthority, PaymentDrainCleanupToken, PaymentDrainObligationKind,
         PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
         PaymentDrainTerminalTransition, ProviderV2DeletionReconciliation,
+        ProviderV2EvaluatorSnapshot,
     };
     use crate::infrastructure::postgres::testing::TestDatabase;
 
@@ -1385,7 +1400,7 @@ mod tests {
                         create_conflict: true,
                         create_response: None,
                         status: None,
-                        terminal_snapshot,
+                        terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(terminal_snapshot),
                     },
                 )
                 .await

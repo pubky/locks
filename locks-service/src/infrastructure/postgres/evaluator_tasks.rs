@@ -23,21 +23,28 @@ pub(super) struct EvaluatorTaskRow {
     pub(super) terminal_reason: Option<String>,
     pub(super) entitlement_to_publish: Option<serde_json::Value>,
     pub(super) entitlement_publication_claim_token: Option<uuid::Uuid>,
+    pub(super) deletion_projection_authorized: bool,
 }
 
 pub(super) const EVALUATOR_TASK_COLUMNS: &str = "task_id::text AS task_id, creator, bundle_id, status, \
     submitted_proof_bundle, submitted_at, evaluator_mode, evaluator_snapshot, evaluator_revision, \
-    completed_at, terminal_reason, entitlement_to_publish, entitlement_publication_claim_token";
+    completed_at, terminal_reason, entitlement_to_publish, entitlement_publication_claim_token, \
+    (deletion_job_id IS NOT NULL OR EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r \
+      WHERE r.creator=verification_tasks.creator AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'= \
+      r.creator||'/pub/app.locks/'||r.lock_id||'.json')) AS deletion_projection_authorized";
 
 const CLAIMED_EVALUATOR_TASK_COLUMNS: &str = "task.task_id::text AS task_id, task.creator, task.bundle_id, task.status, \
     task.submitted_proof_bundle, task.submitted_at, task.evaluator_mode, task.evaluator_snapshot, \
     task.evaluator_revision, task.completed_at, task.terminal_reason, task.entitlement_to_publish, \
-    task.entitlement_publication_claim_token";
+    task.entitlement_publication_claim_token, \
+    (task.deletion_job_id IS NOT NULL OR EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r \
+      WHERE r.creator=task.creator AND task.submitted_proof_bundle->>'pubky_lock_resource'= \
+      r.creator||'/pub/app.locks/'||r.lock_id||'.json')) AS deletion_projection_authorized";
 
 fn force_receipt_fence(mode: EvaluatorMode) -> &'static str {
     match mode {
         EvaluatorMode::Graph => "",
-        EvaluatorMode::Payment => {
+        EvaluatorMode::Payment | EvaluatorMode::Mixed => {
             "AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r \
              WHERE r.creator=verification_tasks.creator \
              AND verification_tasks.submitted_proof_bundle->>'pubky_lock_resource'= \
@@ -49,7 +56,7 @@ fn force_receipt_fence(mode: EvaluatorMode) -> &'static str {
 fn terminal_root_values(mode: EvaluatorMode) -> &'static str {
     match mode {
         EvaluatorMode::Graph => "'satisfied','expired','failed_invalid_response'",
-        EvaluatorMode::Payment => "'satisfied','expired','failed'",
+        EvaluatorMode::Payment | EvaluatorMode::Mixed => "'satisfied','expired','failed'",
     }
 }
 
@@ -122,7 +129,7 @@ pub(super) async fn release_claim(
     let (started_at, fences) = match mode {
         // Preserve released graph release semantics exactly.
         EvaluatorMode::Graph => ("", ""),
-        EvaluatorMode::Payment => (
+        EvaluatorMode::Payment | EvaluatorMode::Mixed => (
             "started_at = CASE WHEN status='in_progress' AND evaluator_snapshot->'root'->>'status'='pending' THEN NULL ELSE started_at END,",
             "AND deletion_job_id IS NULL \
              AND NOT EXISTS(SELECT 1 FROM content_lock_force_deletion_receipts r \

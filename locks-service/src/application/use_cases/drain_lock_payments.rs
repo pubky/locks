@@ -16,7 +16,7 @@ use crate::application::ports::{
     PaymentDrainClient, PaymentDrainClientError, PaymentDrainObligation,
     PaymentDrainObligationKind, PaymentDrainRepository, PaymentDrainStatus, PaymentDrainSummary,
     PaymentDrainTerminalTransition, PaymentRequestState, PaymentRequestStatus, PaymentState,
-    ProviderV2DeletionReconciliation, same_entitlement_decision,
+    ProviderV2DeletionReconciliation, ProviderV2EvaluatorSnapshot, same_entitlement_decision,
 };
 
 use super::execute_content_lock_deletion_phase::{
@@ -772,7 +772,8 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         let PaymentDrainObligationKind::ProviderV2 { snapshot, .. } = &obligation.kind else {
             unreachable!("provider-v2 reconciliation requires a provider-v2 obligation");
         };
-        let frozen = snapshot.as_v1();
+        let frozen_snapshot = snapshot.payment_snapshot()?;
+        let frozen = frozen_snapshot.as_v1();
         let request = PaymentProviderCreateRequest {
             bundle_id: frozen.bundle_id.clone(),
             lock_resource: frozen.pubky_lock_resource.clone(),
@@ -862,13 +863,22 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                 expected.apply_status(status.clone()).map_err(|message| {
                     ApplicationError::InvalidContentLockDeletionState { message }
                 })?;
-                expected.root =
-                    PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted);
+                let terminal_snapshot = match snapshot.as_ref() {
+                    ProviderV2EvaluatorSnapshot::Payment(_) => {
+                        expected.root = PaymentRootState::Expired(
+                            VerificationTerminalReason::ContentLockDeleted,
+                        );
+                        ProviderV2EvaluatorSnapshot::Payment(PaymentTaskSnapshot::V1(expected))
+                    }
+                    ProviderV2EvaluatorSnapshot::Mixed(_) => {
+                        snapshot.with_payment_snapshot(PaymentTaskSnapshot::V1(expected))?
+                    }
+                };
                 ProviderV2DeletionReconciliation {
                     create_conflict: false,
                     create_response: Some(response),
                     status: Some(status),
-                    terminal_snapshot: PaymentTaskSnapshot::V1(expected),
+                    terminal_snapshot,
                 }
             }
             Err(PaymentDrainClientError::Conflict) => {
@@ -913,10 +923,18 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
                                         .to_owned(),
                             });
                         }
-                        let mut terminal_snapshot = (**snapshot).clone();
-                        terminal_snapshot.as_v1_mut().root = PaymentRootState::Expired(
-                            VerificationTerminalReason::ContentLockDeleted,
-                        );
+                        let terminal_snapshot = match snapshot.as_ref() {
+                            ProviderV2EvaluatorSnapshot::Payment(_) => {
+                                let mut payment = snapshot.payment_snapshot()?;
+                                payment.as_v1_mut().root = PaymentRootState::Expired(
+                                    VerificationTerminalReason::ContentLockDeleted,
+                                );
+                                ProviderV2EvaluatorSnapshot::Payment(payment)
+                            }
+                            ProviderV2EvaluatorSnapshot::Mixed(_) => {
+                                snapshot.with_payment_snapshot(snapshot.payment_snapshot()?)?
+                            }
+                        };
                         ProviderV2DeletionReconciliation {
                             create_conflict: true,
                             create_response: None,

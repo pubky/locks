@@ -4,8 +4,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    GraphTaskRecord, GraphTaskSnapshot, PaymentTaskRecord, PaymentTaskSnapshot,
-    VerificationTaskStatus,
+    GraphTaskRecord, GraphTaskSnapshot, MixedTaskRecord, MixedTaskSnapshot, PaymentTaskRecord,
+    PaymentTaskSnapshot, VerificationTaskStatus,
 };
 use crate::application::ports::EvaluatorTaskKernel;
 
@@ -104,6 +104,55 @@ impl MemoryEvaluatorTask for PaymentTaskRecord {
     }
     fn root_satisfied(&self) -> bool {
         self.snapshot.as_v1().root == crate::application::models::PaymentRootState::Satisfied
+    }
+    fn set_snapshot(&mut self, snapshot: Self::Snapshot) {
+        self.snapshot = snapshot;
+    }
+    fn set_publication(
+        &mut self,
+        publication: Option<VerifiedProofBundleV2>,
+        token: Option<uuid::Uuid>,
+    ) {
+        self.entitlement_to_publish = publication;
+        self.entitlement_publication_token = token;
+    }
+    fn publication_token(&self) -> Option<uuid::Uuid> {
+        self.entitlement_publication_token
+    }
+    fn clear_publication_token(&mut self) {
+        self.entitlement_publication_token = None;
+    }
+    fn has_publication(&self) -> bool {
+        self.entitlement_to_publish.is_some()
+    }
+    fn set_completed_at(&mut self, completed_at: Option<OffsetDateTime>) {
+        self.completed_at = completed_at;
+    }
+}
+
+impl MemoryEvaluatorTask for MixedTaskRecord {
+    type Snapshot = MixedTaskSnapshot;
+
+    fn task_id(&self) -> TaskId {
+        self.task_id
+    }
+    fn revision(&self) -> u64 {
+        self.evaluator_revision
+    }
+    fn set_revision(&mut self, revision: u64) {
+        self.evaluator_revision = revision;
+    }
+    fn status(&self) -> VerificationTaskStatus {
+        self.status
+    }
+    fn set_status(&mut self, status: VerificationTaskStatus) {
+        self.status = status;
+    }
+    fn root_pending(&self) -> bool {
+        self.snapshot.as_v1().root == crate::application::models::MixedRootState::Pending
+    }
+    fn root_satisfied(&self) -> bool {
+        self.snapshot.as_v1().root == crate::application::models::MixedRootState::Satisfied
     }
     fn set_snapshot(&mut self, snapshot: Self::Snapshot) {
         self.snapshot = snapshot;

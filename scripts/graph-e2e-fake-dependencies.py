@@ -15,6 +15,7 @@ STATE = {
     "nexus_calls": 0,
     "paykit_calls": 0,
     "last_nexus_path": None,
+    "reader": READER,
 }
 LOCK = threading.Lock()
 
@@ -52,10 +53,18 @@ class ControlHandler(BaseHTTPRequestHandler):
                     nexus_calls=0,
                     paykit_calls=0,
                     last_nexus_path=None,
+                    reader=READER,
                 )
             reply(self, 200, {"status": "reset"})
             return
         pieces = self.path.strip("/").split("/")
+        if len(pieces) == 3 and pieces[0] == "control" and pieces[1] == "reader":
+            reader = pieces[2]
+            if reader.startswith("pubky") and len(reader) > 5:
+                with LOCK:
+                    STATE["reader"] = reader
+                reply(self, 200, {"dependency": "reader", "status": "configured"})
+                return
         if len(pieces) == 3 and pieces[0] == "control":
             dependency, mode = pieces[1:]
             allowed = {
@@ -71,8 +80,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             with LOCK:
                 STATE["auth_polls"] += 1
                 mode = STATE["auth_mode"]
+                reader = STATE["reader"]
             if mode == "approved":
-                reply(self, 200, {"status": "approved", "reader": READER})
+                reply(self, 200, {"status": "approved", "reader": reader})
             elif mode == "pending":
                 reply(self, 200, {"status": "pending"})
             elif mode == "unavailable":

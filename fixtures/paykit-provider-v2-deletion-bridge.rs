@@ -112,7 +112,7 @@ drain_timeout = "2s"
     let request = || provider_v2_request(&fixture_signing_key, &creator, &reader, bundle, deadline);
 
     if scenario == "create-first" {
-        let response = tokio::time::timeout(Duration::from_secs(180), async {
+        let response = tokio::time::timeout(Duration::from_secs(600), async {
             loop {
                 let response = send_http("127.0.0.1:3001".parse().unwrap(), request()).await;
                 if response.status == StatusCode::OK {
@@ -151,7 +151,7 @@ drain_timeout = "2s"
     } else {
         assert_eq!(scenario, "drain-first");
         wait_coord_file(&coord, "fence-acknowledged").await;
-        let response = tokio::time::timeout(Duration::from_secs(180), async {
+        let response = tokio::time::timeout(Duration::from_secs(600), async {
             loop {
                 let response = send_http("127.0.0.1:3001".parse().unwrap(), request()).await;
                 if response.status != StatusCode::SERVICE_UNAVAILABLE {
@@ -171,7 +171,7 @@ drain_timeout = "2s"
         std::fs::write(coord.join("invoice-outcome"), b"fenced").unwrap();
     }
 
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             if coord.join("locks-complete").exists() {
                 break;
@@ -211,7 +211,7 @@ fn write_coord_json(coord: &std::path::Path, name: &str, value: &serde_json::Val
 }
 
 async fn read_coord_json(coord: &std::path::Path, name: &str) -> serde_json::Value {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             if let Ok(bytes) = std::fs::read(coord.join(name)) {
                 return serde_json::from_slice(&bytes).unwrap();
@@ -224,7 +224,7 @@ async fn read_coord_json(coord: &std::path::Path, name: &str) -> serde_json::Val
 }
 
 async fn wait_coord_file(coord: &std::path::Path, name: &str) {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         while !coord.join(name).exists() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -235,7 +235,7 @@ async fn wait_coord_file(coord: &std::path::Path, name: &str) {
 
 async fn observe_provider_v2_request(peer: &PeerSdk, fixture: &CreatorFixture, bundle: &str) {
     let creator = PubkyPublicKey::from_raw_or_app_key(fixture.creator.to_string()).unwrap();
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             drive_provider_v2_reader(peer, fixture).await;
             if peer

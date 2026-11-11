@@ -13,8 +13,9 @@ use locks_core::verification::{
 };
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    FoldedAuthStateHash, FoldedAuthStatus, GrantPopKeyId, GraphTaskRecord, InvoiceAdmissionPhase,
-    InvoiceAdmissionRecord, InvoiceAdmissionRetryReason, StartFoldedAuthAttempt,
+    FoldedAuthEvaluatorMode, FoldedAuthPendingResponse, FoldedAuthStateHash, FoldedAuthStatus,
+    GrantPopKeyId, GraphTaskRecord, InvoiceAdmissionPhase, InvoiceAdmissionRecord,
+    InvoiceAdmissionRetryReason, MixedTaskRecord, StartFoldedAuthAttempt,
 };
 use locks_service::application::ports::{AdmitPaymentTask, VerificationTaskIdGenerator};
 use locks_service::application::use_cases::complete_verification_task::{
@@ -81,6 +82,7 @@ pub(super) async fn lookup_folded_auth_status(
             expires_at: attempt.expires_at,
         },
         PollFoldedAuthOutcome::Accepted(task) => accepted_status_response(task),
+        PollFoldedAuthOutcome::AcceptedMixed(task) => accepted_mixed_status_response(*task),
         PollFoldedAuthOutcome::RestartRequired(_) => FoldedAuthStatusHttpResponse::RestartRequired,
         PollFoldedAuthOutcome::Expired(attempt) => FoldedAuthStatusHttpResponse::Expired {
             expired_at: attempt.terminal_at.unwrap_or(attempt.expires_at),
@@ -108,6 +110,12 @@ fn accepted_status_response(task: GraphTaskRecord) -> FoldedAuthStatusHttpRespon
     }
 }
 
+fn accepted_mixed_status_response(task: MixedTaskRecord) -> FoldedAuthStatusHttpResponse {
+    FoldedAuthStatusHttpResponse::Accepted {
+        task: GraphVerificationTaskLifecycleHttpResponse::from(&task),
+    }
+}
+
 pub(super) async fn submit_proof_bundle(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -115,6 +123,21 @@ pub(super) async fn submit_proof_bundle(
     request: Result<Json<SubmitProofBundleHttpRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let request = parse_json(request)?;
+    if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
+        && let Some(existing) = state
+            .mixed_tasks()
+            .get_mixed_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+            .await?
+    {
+        if existing.snapshot.as_v1().submitted_proof_bundle != *bundle {
+            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(accepted_mixed_status_response(existing)),
+        )
+            .into_response());
+    }
     if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
         && let Some(existing) = state
             .payment_tasks()
@@ -246,7 +269,13 @@ async fn start_v2_verification(
             )
                 .into_response())
         }
-        (Some(_), None) => {
+        (Some(_), payment) => {
+            if payment.is_some() && state.paykit_http_client().is_none() {
+                return Err(ApiError::new(
+                    ApiErrorCode::PaykitNotConfigured,
+                    "paykit is not configured",
+                ));
+            }
             if let Some(origin) = headers.get(header::ORIGIN) {
                 let allowed = origin.to_str().ok().is_some_and(|origin| {
                     state
@@ -284,10 +313,10 @@ async fn start_folded_auth(
     submitted: locks_core::verification::SubmittedProofBundleV2,
 ) -> Result<Response, ApiError> {
     let repository = state.folded_auth().ok_or_else(folded_auth_unavailable)?;
+    let resource = submitted.pubky_lock_resource.clone();
     let starter = state
         .folded_auth_flow_starter()
         .ok_or_else(folded_auth_unavailable)?;
-    let resource = submitted.pubky_lock_resource.clone();
     let payload = state
         .content_locks()
         .get_content_lock_payload(resource.creator(), resource.content_lock_path())
@@ -295,23 +324,24 @@ async fn start_folded_auth(
         .ok_or_else(|| {
             ApiError::new(ApiErrorCode::ContentLockNotFound, "content lock not found")
         })?;
-    validate_content_lock_submission(
-        &payload,
-        &SubmittedProofBundlePayload::V2(submitted.clone()),
-    )
-    .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
     let ContentLockPayload::V2(lock) = payload else {
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
             "invalid request",
         ));
     };
-    if lock.payment.is_some() {
-        return Err(ApiError::new(
-            ApiErrorCode::InvalidRequest,
-            "invalid request",
-        ));
-    }
+    let payment = lock.payment.clone();
+    let evaluator_mode = if payment.is_some() {
+        if submitted.reader_pubky.is_some() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "invalid request",
+            ));
+        }
+        FoldedAuthEvaluatorMode::Mixed
+    } else {
+        FoldedAuthEvaluatorMode::Graph
+    };
     let graph = lock
         .graph
         .clone()
@@ -324,26 +354,62 @@ async fn start_folded_auth(
         .get_latest_by_handle(resource.creator(), &submitted.bundle_id)
         .await?
     {
-        let exact_match = existing.submitted_proof_bundle == submitted
-            && existing.pubky_lock_resource == resource
-            && existing.lock_hash == lock_hash
-            && existing.verification_window_seconds == lock.verification_window_seconds
-            && existing.graph == graph;
-        if !exact_match {
+        if existing.submitted_proof_bundle != submitted
+            || existing.pubky_lock_resource != resource
+            || existing.lock_hash != lock_hash
+            || existing.verification_window_seconds != lock.verification_window_seconds
+            || existing.graph != graph
+            || existing.evaluator_mode != evaluator_mode
+            || existing.payment != payment
+        {
             return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
         }
         if existing.status == FoldedAuthStatus::Accepted {
-            let task = repository
-                .accepted_graph_task(&existing.state_hash)
-                .await?
-                .ok_or_else(|| {
-                    ApiError::from(ApplicationError::Storage {
-                        message: "accepted folded auth task is missing".to_owned(),
-                    })
-                })?;
-            return Ok(Json(accepted_status_response(task)).into_response());
+            return match existing.evaluator_mode {
+                FoldedAuthEvaluatorMode::Graph => {
+                    let task = repository
+                        .accepted_graph_task(&existing.state_hash)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::from(ApplicationError::Storage {
+                                message: "accepted folded auth task is missing".to_owned(),
+                            })
+                        })?;
+                    Ok(Json(accepted_status_response(task)).into_response())
+                }
+                FoldedAuthEvaluatorMode::Mixed => {
+                    let task = repository
+                        .accepted_mixed_task(&existing.state_hash)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::from(ApplicationError::Storage {
+                                message: "accepted mixed folded auth task is missing".to_owned(),
+                            })
+                        })?;
+                    Ok(Json(accepted_mixed_status_response(task)).into_response())
+                }
+            };
+        }
+        if existing.status == FoldedAuthStatus::Pending
+            && let Some(pending) = repository.pending_response(&existing.state_hash).await?
+        {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(FoldedAuthPendingHttpResponse {
+                    status: "auth_pending",
+                    auth_url: pending.auth_url,
+                    state: pending.state,
+                    expires_at: existing.expires_at,
+                }),
+            )
+                .into_response());
         }
     }
+    validate_content_lock_submission(
+        &ContentLockPayload::V2(lock.clone()),
+        &SubmittedProofBundlePayload::V2(submitted.clone()),
+    )
+    .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?;
     let state_token = uuid::Uuid::new_v4().to_string();
     let key_id = GrantPopKeyId::new(uuid::Uuid::new_v4().to_string());
     let (auth_url, flow_secret) = starter.start(&key_id).map_err(ApiError::from)?;
@@ -354,8 +420,14 @@ async fn start_folded_auth(
         lock_hash,
         verification_window_seconds: lock.verification_window_seconds,
         graph,
+        evaluator_mode,
+        payment,
         state_hash: FoldedAuthStateHash::derive(state_token.as_bytes()),
         flow_secret,
+        pending_response: FoldedAuthPendingResponse {
+            auth_url: auth_url.clone(),
+            state: state_token.clone(),
+        },
         created_at,
     };
     let started = repository.start_or_rotate(request).await?;
@@ -464,6 +536,15 @@ pub(super) async fn lookup_verification_task(
         if let Some(graph) = graph {
             return Ok(Json(graph_lifecycle_response(&graph)).into_response());
         }
+        if let Some(mixed) = state
+            .mixed_tasks()
+            .get_mixed_task_by_handle(&request.creator, &request.bundle_id)
+            .await?
+        {
+            return Ok(
+                Json(GraphVerificationTaskLifecycleHttpResponse::from(&mixed)).into_response(),
+            );
+        }
         let payment = state
             .payment_tasks()
             .get_payment_task_by_handle(&request.creator, &request.bundle_id)
@@ -490,6 +571,13 @@ pub(super) async fn creator_verification_evidence(
 ) -> Result<Json<CreatorVerificationEvidenceHttpResponse>, ApiError> {
     let creator = authenticated_creator_from_headers(&state, &headers).await?;
     let request = parse_json(request)?;
+    if let Some(task) = state
+        .mixed_tasks()
+        .get_mixed_task_by_handle(&creator, &request.bundle_id)
+        .await?
+    {
+        return Ok(Json(task.into()));
+    }
     let task = state
         .graph_tasks()
         .get_graph_task_by_handle(&creator, &request.bundle_id)

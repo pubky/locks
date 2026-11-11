@@ -702,8 +702,17 @@ fn validate_paykit_setup_status_response_for_tests(
 fn validate_verification_evidence_response_for_tests(
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    locks_sdk::CreatorLocks::parse_verification_evidence_response(value.clone())
-        .map_err(|err| err.to_string())?;
+    match value.get("mode").and_then(serde_json::Value::as_str) {
+        Some("graph") => {
+            locks_sdk::CreatorLocks::parse_verification_evidence_response(value.clone())
+                .map_err(|err| err.to_string())?;
+        }
+        Some("mixed") => {
+            locks_sdk::CreatorLocks::parse_mixed_verification_evidence_response(value.clone())
+                .map_err(|err| err.to_string())?;
+        }
+        _ => return Err("invalid verification evidence mode".to_owned()),
+    }
     Ok(value)
 }
 

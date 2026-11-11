@@ -7,13 +7,14 @@ use crate::application::errors::ApplicationError;
 use crate::application::models::{
     EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL,
     FoldedAuthAttempt, FoldedAuthSecretContext, FoldedAuthStartDisposition, FoldedAuthStartResult,
-    FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, RestoredFoldedAuthAttempt,
-    StartFoldedAuthAttempt,
+    FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, MixedTaskRecord,
+    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
-use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository};
+use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository, MixedTaskRepository};
 use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
 
 use super::graph_tasks::InMemoryGraphTaskRepository;
+use super::mixed_tasks::InMemoryMixedTaskRepository;
 
 #[derive(Debug, Clone)]
 struct StoredAttempt {
@@ -31,14 +32,19 @@ struct FoldedAuthMemoryState {
 pub struct InMemoryFoldedAuthRepository {
     state: Arc<RwLock<FoldedAuthMemoryState>>,
     graph: Arc<InMemoryGraphTaskRepository>,
+    mixed: Arc<InMemoryMixedTaskRepository>,
     cipher: FoldedAuthSecretCipher,
 }
 
 impl InMemoryFoldedAuthRepository {
     pub fn new(graph: Arc<InMemoryGraphTaskRepository>, cipher: FoldedAuthSecretCipher) -> Self {
+        let mixed = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(
+            graph.shared_deletion_fence(),
+        ));
         Self {
             state: Arc::new(RwLock::new(FoldedAuthMemoryState::default())),
             graph,
+            mixed,
             cipher,
         }
     }
@@ -47,8 +53,13 @@ impl InMemoryFoldedAuthRepository {
         Self {
             state: self.state.clone(),
             graph: self.graph.clone(),
+            mixed: self.mixed.clone(),
             cipher,
         }
+    }
+
+    pub fn mixed_repository(&self) -> Arc<InMemoryMixedTaskRepository> {
+        Arc::clone(&self.mixed)
     }
 }
 
@@ -84,6 +95,21 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         }
         self.graph
             .get_graph_task_by_handle(&attempt.creator, &attempt.bundle_id)
+            .await
+    }
+
+    async fn accepted_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
+        let Some(attempt) = self.get_by_state_hash(state_hash).await? else {
+            return Ok(None);
+        };
+        if attempt.status != FoldedAuthStatus::Accepted {
+            return Ok(None);
+        }
+        self.mixed
+            .get_mixed_task_by_handle(&attempt.creator, &attempt.bundle_id)
             .await
     }
 
@@ -163,7 +189,11 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             pubky_lock_resource: request.pubky_lock_resource.clone(),
             lock_hash: request.lock_hash,
         };
-        let encrypted = self.cipher.encrypt(&context, &request.flow_secret)?;
+        let encrypted = self.cipher.encrypt_with_pending_response(
+            &context,
+            &request.flow_secret,
+            &request.pending_response,
+        )?;
         self.graph
             .reserve_folded_auth_under_admission(request.creator(), request.bundle_id())
             .await;
@@ -178,6 +208,8 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             lock_hash: request.lock_hash,
             verification_window_seconds: request.verification_window_seconds,
             graph: request.graph,
+            evaluator_mode: request.evaluator_mode,
+            payment: request.payment,
             created_at: database_now,
             expires_at,
             poll_dispatched: false,
@@ -235,11 +267,43 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .encrypted_flow_secret
             .as_ref()
             .ok_or_else(|| invalid_state("pending folded auth attempt lacks flow secret"))?;
-        let flow_secret = self.cipher.decrypt(&stored.attempt.context(), encrypted)?;
+        let (flow_secret, pending_response) = self
+            .cipher
+            .decrypt_with_pending_response(&stored.attempt.context(), encrypted)?;
         Ok(Some(RestoredFoldedAuthAttempt {
             attempt: stored.attempt,
             flow_secret,
+            pending_response,
         }))
+    }
+
+    async fn pending_response(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<crate::application::models::FoldedAuthPendingResponse>, ApplicationError>
+    {
+        let stored = self
+            .state
+            .read()
+            .await
+            .records
+            .iter()
+            .find(|stored| &stored.attempt.state_hash == state_hash)
+            .cloned();
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.attempt.status != FoldedAuthStatus::Pending {
+            return Ok(None);
+        }
+        let encrypted = stored
+            .encrypted_flow_secret
+            .as_ref()
+            .ok_or_else(|| invalid_state("pending folded auth attempt lacks flow secret"))?;
+        let (_, pending) = self
+            .cipher
+            .decrypt_with_pending_response(&stored.attempt.context(), encrypted)?;
+        Ok(pending)
     }
 
     async fn mark_poll_dispatched(
@@ -417,6 +481,58 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
                 },
                 true,
             )
+            .await?;
+        Ok(Some(inserted))
+    }
+
+    async fn accept_and_insert_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        task_id: locks_core::ids::TaskId,
+        reader: locks_core::ids::CreatorPubky,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
+        let attempt = {
+            let state = self.state.read().await;
+            let Some(stored) = state.records.iter().find(|stored| {
+                &stored.attempt.state_hash == state_hash
+                    && stored.attempt.generation == expected_generation
+                    && stored.attempt.status == FoldedAuthStatus::Pending
+            }) else {
+                return Ok(None);
+            };
+            stored.attempt.clone()
+        };
+        let _admission = self
+            .graph
+            .acquire_admission(&attempt.creator, attempt.pubky_lock_resource.lock_id())
+            .await;
+        let mut state = self.state.write().await;
+        let now = self.graph.authoritative_time();
+        let Some(stored) = exact_pending_mut(&mut state, state_hash, expected_generation) else {
+            return Ok(None);
+        };
+        if stored.attempt.expires_at <= now {
+            let purge_after = checked_purge_after(now)?;
+            terminalize(stored, FoldedAuthStatus::Expired, now, purge_after);
+            self.graph
+                .release_folded_auth_reservation(&stored.attempt.creator, &stored.attempt.bundle_id)
+                .await;
+            return Ok(None);
+        }
+        let task = stored
+            .attempt
+            .accepted_mixed_task(task_id, reader, now)
+            .map_err(invalid_state)?;
+        let purge_after = checked_purge_after(now)?;
+        let inserted = self
+            .mixed
+            .insert_mixed_task_before_publish_under_admission(task, |inserted| {
+                stored.attempt.task_id = Some(inserted.task_id);
+                terminalize(stored, FoldedAuthStatus::Accepted, now, purge_after);
+                Ok(())
+            })
             .await?;
         Ok(Some(inserted))
     }
@@ -849,8 +965,14 @@ mod tests {
             lock_hash: [9; 32],
             verification_window_seconds: 300,
             graph: graph_policy(),
+            evaluator_mode: crate::application::models::FoldedAuthEvaluatorMode::Graph,
+            payment: None,
             state_hash: FoldedAuthStateHash::derive(b"admission-race"),
             flow_secret: FoldedAuthFlowSecret::new(b"admission-race-secret".to_vec()),
+            pending_response: crate::application::models::FoldedAuthPendingResponse {
+                auth_url: "https://auth.example/approve".to_owned(),
+                state: "admission-race".to_owned(),
+            },
             created_at: datetime!(2026-10-30 12:00:00 UTC),
         }
     }

@@ -6,7 +6,8 @@ use locks_core::ids::TaskId;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    FoldedAuthAttempt, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
+    FoldedAuthAttempt, FoldedAuthEvaluatorMode, FoldedAuthStateHash, FoldedAuthStatus,
+    GraphTaskRecord, MixedTaskRecord,
 };
 use crate::application::ports::{
     Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPoller, FoldedAuthPollCall,
@@ -17,6 +18,7 @@ use crate::application::ports::{
 pub enum PollFoldedAuthOutcome {
     Pending(FoldedAuthAttempt),
     Accepted(GraphTaskRecord),
+    AcceptedMixed(Box<MixedTaskRecord>),
     RestartRequired(FoldedAuthAttempt),
     Expired(FoldedAuthAttempt),
     Stale,
@@ -75,12 +77,20 @@ where
                 return Ok(PollFoldedAuthOutcome::RestartRequired(attempt));
             }
             FoldedAuthStatus::Accepted => {
-                return Ok(
-                    match self.repository.accepted_graph_task(state_hash).await? {
-                        Some(task) => PollFoldedAuthOutcome::Accepted(task),
-                        None => PollFoldedAuthOutcome::Stale,
-                    },
-                );
+                return Ok(match attempt.evaluator_mode {
+                    FoldedAuthEvaluatorMode::Graph => {
+                        match self.repository.accepted_graph_task(state_hash).await? {
+                            Some(task) => PollFoldedAuthOutcome::Accepted(task),
+                            None => PollFoldedAuthOutcome::Stale,
+                        }
+                    }
+                    FoldedAuthEvaluatorMode::Mixed => {
+                        match self.repository.accepted_mixed_task(state_hash).await? {
+                            Some(task) => PollFoldedAuthOutcome::AcceptedMixed(Box::new(task)),
+                            None => PollFoldedAuthOutcome::Stale,
+                        }
+                    }
+                });
             }
             FoldedAuthStatus::Pending => {}
         }
@@ -211,8 +221,8 @@ where
             FoldedAuthPollCall::Attempted(Ok(FoldedAuthApprovalPoll::Approved { reader })) => {
                 let task_id = TaskId::from_str(&uuid::Uuid::new_v4().to_string())
                     .expect("UUID v4 is a valid task id");
-                Ok(
-                    match self
+                let accepted = match attempt.evaluator_mode {
+                    FoldedAuthEvaluatorMode::Graph => self
                         .repository
                         .accept_and_insert_graph_task(
                             state_hash,
@@ -222,16 +232,29 @@ where
                             result_time,
                         )
                         .await?
-                    {
-                        Some(task) => PollFoldedAuthOutcome::Accepted(task),
-                        None => match self.repository.get_by_state_hash(state_hash).await? {
-                            Some(attempt) if attempt.status == FoldedAuthStatus::Expired => {
-                                PollFoldedAuthOutcome::Expired(attempt)
-                            }
-                            _ => PollFoldedAuthOutcome::Stale,
-                        },
+                        .map(PollFoldedAuthOutcome::Accepted),
+                    FoldedAuthEvaluatorMode::Mixed => self
+                        .repository
+                        .accept_and_insert_mixed_task(
+                            state_hash,
+                            generation,
+                            task_id,
+                            reader,
+                            result_time,
+                        )
+                        .await?
+                        .map(Box::new)
+                        .map(PollFoldedAuthOutcome::AcceptedMixed),
+                };
+                Ok(match accepted {
+                    Some(outcome) => outcome,
+                    None => match self.repository.get_by_state_hash(state_hash).await? {
+                        Some(attempt) if attempt.status == FoldedAuthStatus::Expired => {
+                            PollFoldedAuthOutcome::Expired(attempt)
+                        }
+                        _ => PollFoldedAuthOutcome::Stale,
                     },
-                )
+                })
             }
         }
     }

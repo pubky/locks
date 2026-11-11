@@ -198,6 +198,12 @@ impl CreatorLocks {
         crate::graph::parse_creator_verification_evidence_response(value)
     }
 
+    pub fn parse_mixed_verification_evidence_response(
+        value: Value,
+    ) -> crate::Result<crate::CreatorMixedVerificationEvidenceResponse> {
+        crate::mixed::parse_creator_mixed_verification_evidence_response(value)
+    }
+
     pub fn parse_paykit_setup_status_response(value: Value) -> crate::Result<PaykitSetupStatus> {
         serde_json::from_value(value).map_err(|_| {
             crate::LocksSdkError::InvalidResponse("invalid paykit setup status response".to_owned())

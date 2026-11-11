@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    PaymentProviderStatus, PaymentTaskSnapshot, VerificationTaskStatus, VerificationTerminalReason,
+    MixedRootState, MixedTaskSnapshot, PaymentProviderStatus, PaymentTaskSnapshot,
+    VerificationTaskStatus, VerificationTerminalReason,
 };
 
 use super::{
@@ -23,9 +24,59 @@ pub enum PaymentDrainObligationKind {
     },
     ProviderV2 {
         evaluator_revision: u64,
-        snapshot: Box<PaymentTaskSnapshot>,
+        snapshot: Box<ProviderV2EvaluatorSnapshot>,
         reconciliation_terminal: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderV2EvaluatorSnapshot {
+    Payment(PaymentTaskSnapshot),
+    Mixed(MixedTaskSnapshot),
+}
+
+impl ProviderV2EvaluatorSnapshot {
+    pub fn payment_snapshot(&self) -> Result<PaymentTaskSnapshot, ApplicationError> {
+        match self {
+            Self::Payment(snapshot) => Ok(snapshot.clone()),
+            Self::Mixed(snapshot) => snapshot
+                .as_v1()
+                .payment_snapshot()
+                .map(PaymentTaskSnapshot::V1)
+                .map_err(|message| ApplicationError::InvalidContentLockDeletionState { message }),
+        }
+    }
+
+    pub fn with_payment_snapshot(
+        &self,
+        payment: PaymentTaskSnapshot,
+    ) -> Result<Self, ApplicationError> {
+        match self {
+            Self::Payment(_) => Ok(Self::Payment(payment)),
+            Self::Mixed(snapshot) => {
+                if snapshot.as_v1().root != MixedRootState::Pending {
+                    return Ok(Self::Mixed(snapshot.clone()));
+                }
+                let mut mixed = snapshot.clone();
+                let frozen_payment_root = mixed.as_v1().payment.root;
+                mixed
+                    .as_v1_mut()
+                    .replace_payment_snapshot(payment.as_v1().clone());
+                mixed.as_v1_mut().payment.root = frozen_payment_root;
+                mixed.as_v1().validate().map_err(|message| {
+                    ApplicationError::InvalidContentLockDeletionState { message }
+                })?;
+                Ok(Self::Mixed(mixed))
+            }
+        }
+    }
+
+    pub fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        match self {
+            Self::Payment(snapshot) => snapshot.to_json(),
+            Self::Mixed(snapshot) => snapshot.to_json(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +95,7 @@ pub struct ProviderV2DeletionReconciliation {
     pub create_conflict: bool,
     pub create_response: Option<PaymentProviderCreateResponse>,
     pub status: Option<PaymentProviderStatus>,
-    pub terminal_snapshot: PaymentTaskSnapshot,
+    pub terminal_snapshot: ProviderV2EvaluatorSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
