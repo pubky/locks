@@ -4,7 +4,7 @@
 
 This guide runs the current local/dev Lock Server over real HTTP for operator/reviewer inspection.
 
-Creator publishing is authenticated. The removed unauthenticated local/dev creator publishing route shape is no longer available. For a complete local Pubky testnet creator-publishing flow, use `scripts/dev-grant-connect-testnet.sh locked-content`; it obtains a frontend session through legacy-connect, then calls the authenticated creator routes.
+Creator publishing is authenticated. The removed unauthenticated local/dev creator publishing route shape is no longer available. For a complete local Pubky testnet creator-publishing flow, use `scripts/dev-grant-connect-testnet.sh locked-content`; it obtains a frontend session through grant-connect, then calls the authenticated creator routes.
 
 ## Relationship to other docs
 
