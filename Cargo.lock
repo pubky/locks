@@ -1838,6 +1838,7 @@ dependencies = [
  "locks-core",
  "locks-server",
  "locks-service",
+ "pubky",
  "pubky-common",
  "reqwest",
  "serde_json",
@@ -1846,6 +1847,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "url",
  "uuid",
 ]
 

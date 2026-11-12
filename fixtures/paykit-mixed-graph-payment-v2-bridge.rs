@@ -1,6 +1,6 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn locks_http_mixed_graph_payment_v2_bridge() {
-    use std::os::unix::fs::PermissionsExt;
+
 
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let coord = std::path::PathBuf::from(std::env::var("LOCKS_PAYKIT_COORD_DIR").unwrap());
@@ -94,18 +94,7 @@ drain_timeout = "2s"
         )
         .await
         .unwrap();
-    #[allow(deprecated)]
-    let creator_legacy_authority = pubky
-        .signer(creator_keypair)
-        .signin_cookie_blocking()
-        .await
-        .unwrap();
-    #[allow(deprecated)]
-    let creator_authority_secret = creator_legacy_authority
-        .as_cookie()
-        .expect("legacy creator authority must be cookie-backed")
-        .export_secret()
-        .expect("native legacy creator authority must expose its cookie secret");
+    let creator_grant_signer = pubky.signer(creator_keypair);
     let creator = parse_creator(&format!("pubky{}", creator_account.public_key)).unwrap();
     let account_index = 0;
     let amount_sats = 50_000;
@@ -159,17 +148,22 @@ drain_timeout = "2s"
         counter_seed: 7_300,
     };
 
-    let authority_path = coord.join("creator-authority.secret");
-    std::fs::write(&authority_path, creator_authority_secret).unwrap();
-    std::fs::set_permissions(&authority_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     write_mixed_coord_json(
         &coord,
         "paykit-ready.json",
         &serde_json::json!({
             "creator": creator.creator.to_string(),
             "reader": reader.to_string(),
+            "auth_relay": auth_relay,
         }),
     );
+
+    let grant_request = read_mixed_coord_json(&coord, "creator-grant-url.json").await;
+    creator_grant_signer
+        .approve_auth(grant_request["authorization_url"].as_str().unwrap())
+        .await
+        .unwrap();
+    std::fs::write(coord.join("creator-grant-approved"), b"ok").unwrap();
 
     let fixture = read_mixed_coord_json(&coord, "locks-fixture.json").await;
     let lock_path = fixture["content_lock_path"].as_str().unwrap();
@@ -301,10 +295,20 @@ drain_timeout = "2s"
         .await
         .expect("Paykit invoice/provider cardinality did not settle");
         assert_eq!((invoice_count, provider_count), (expected, expected));
+        let mut provider_status_barrier = None;
+        if index == 0 {
+            let mut transaction = pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE invoice_provider_v2 IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            provider_status_barrier = Some(transaction);
+        }
         std::fs::write(coord.join(format!("provider-ready-{name}")), b"ok").unwrap();
 
         if index == 0 {
             wait_mixed_coord_file(&coord, "locks-invoice-persisted").await;
+            drop(provider_status_barrier.take());
             server.kill().unwrap();
             server.wait().unwrap();
             std::fs::write(coord.join("paykit-stopped-after-create"), b"ok").unwrap();

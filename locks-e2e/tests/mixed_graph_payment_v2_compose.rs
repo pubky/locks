@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -14,16 +15,20 @@ use locks_core::lock_policy::{
 use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
 use locks_server::config::{FilesystemLockServerIdentityProvider, LockServerIdentityProvider};
 use locks_service::application::models::{
-    CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorAuthoritySecret,
+    CreatorAuthorityAuthKind, CreatorAuthorityRecord, GrantPopKeyId,
 };
-use locks_service::application::ports::CreatorAuthorityStore;
+use locks_service::application::ports::{CreatorAuthorityStore, GrantCreatorConnectFlowClient};
 use locks_service::infrastructure::postgres::{
     CreatorAuthoritySecretCipher, PostgresCreatorAuthorityStore, run_migrations,
+};
+use locks_service::infrastructure::pubky::{
+    LockServerGrantPopKeys, PubkyGrantCreatorConnectFlowClient,
 };
 use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use time::OffsetDateTime;
+use url::Url;
 
 const GRAPH_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const PAYMENT_BUNDLE: &str = "000G40R40M30E209185GR38E2W";
@@ -103,7 +108,7 @@ fn mixed_compose_orders_provider_and_graph_durability_barriers() {
     );
 
     assert!(
-        bridge.find("arm-provider-create").unwrap() < bridge.find(".approve_auth(").unwrap(),
+        bridge.find("arm-provider-create").unwrap() < bridge.rfind(".approve_auth(").unwrap(),
         "Paykit create barrier must be armed before folded authorization makes work claimable"
     );
     let release = bridge.find("release-provider-create").unwrap();
@@ -172,8 +177,11 @@ async fn mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexu
     run_migrations(&pool).await.unwrap();
 
     let secret_path = PathBuf::from("/private/lock-server.keypair-seed");
+    let lock_server_seed = [0_u8; 32];
+    std::fs::write(&secret_path, format!("keypair-seed:{RUNTIME_MASTER_KEY}")).unwrap();
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let public_key = FilesystemLockServerIdentityProvider
-        .generate_secret(&secret_path)
+        .derive_public_key(&secret_path)
         .unwrap();
     write_json(
         &coord.join("locks-key.json"),
@@ -183,8 +191,34 @@ async fn mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexu
     let paykit = wait_json(&coord.join("paykit-ready.json")).await;
     let creator = CreatorPubky::from_str(paykit["creator"].as_str().unwrap()).unwrap();
     let reader = CreatorPubky::from_str(paykit["reader"].as_str().unwrap()).unwrap();
-    let authority_secret_path = coord.join("creator-authority.secret");
-    let authority_secret = wait_secret(&authority_secret_path).await;
+    let requested_scopes = vec![
+        "/pub/app.locks/:rw".to_owned(),
+        "/priv/app.locks/:rw".to_owned(),
+    ];
+    let grant_client = PubkyGrantCreatorConnectFlowClient::new(
+        pubky::PubkyHttpClient::testnet().unwrap(),
+        Some(Url::parse(paykit["auth_relay"].as_str().unwrap()).unwrap()),
+        pubky::ClientId::new("app.locks").unwrap(),
+        LockServerGrantPopKeys::from_lock_server_seed(lock_server_seed),
+    );
+    let pop_key_id = GrantPopKeyId::new("mixed-compose-creator".to_owned());
+    let authorization_url = grant_client
+        .start_grant_creator_connect_flow(&requested_scopes, &pop_key_id)
+        .await
+        .unwrap();
+    write_json(
+        &coord.join("creator-grant-url.json"),
+        json!({"authorization_url": authorization_url.expose_url()}),
+    );
+    let approval = grant_client
+        .await_grant_creator_connect_flow_approval(
+            &authorization_url,
+            &pop_key_id,
+            &requested_scopes,
+        )
+        .await
+        .unwrap();
+    assert_eq!(approval.creator, creator);
     let master = RuntimeMasterKey::from_base64url(RUNTIME_MASTER_KEY).unwrap();
     let authority_store = PostgresCreatorAuthorityStore::new_encrypted(
         pool.clone(),
@@ -193,13 +227,10 @@ async fn mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexu
     authority_store
         .upsert_creator_authority(CreatorAuthorityRecord {
             creator: creator.clone(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
-            granted_scopes: vec![
-                "/pub/app.locks/:rw".to_owned(),
-                "/priv/app.locks/:rw".to_owned(),
-            ],
-            secret: CreatorAuthoritySecret::new(authority_secret),
-            session_expires_at: None,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
+            granted_scopes: approval.granted_scopes,
+            secret: approval.grant_state,
+            session_expires_at: Some(approval.grant_expires_at),
             last_revalidated_at: Some(OffsetDateTime::now_utc()),
         })
         .await
@@ -212,7 +243,6 @@ async fn mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexu
             .is_some(),
         "seeded creator authority must be readable before Locks starts"
     );
-    std::fs::remove_file(authority_secret_path).unwrap();
 
     let (lock, base_bundle) = mixed_fixture(creator.clone(), GRAPH_BUNDLE);
     write_json(
@@ -489,11 +519,9 @@ server_url = "{nexus_url}"
 allow_insecure_loopback = true
 [creator_authority_acquisition]
 enabled = false
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["https://app.example"]
 [creator_authority_acquisition.grant_connect]
 client_id = "app.locks"
 allowed_return_origins = ["https://app.example"]
@@ -927,19 +955,6 @@ async fn wait_json(path: &Path) -> Value {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()))
-}
-
-async fn wait_secret(path: &Path) -> String {
-    tokio::time::timeout(Duration::from_secs(600), async {
-        loop {
-            if let Ok(secret) = std::fs::read_to_string(path) {
-                return secret;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for secret handoff"))
 }
 
 async fn wait_file(path: &Path) {
