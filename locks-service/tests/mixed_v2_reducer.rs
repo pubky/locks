@@ -10,9 +10,9 @@ use locks_core::verification::{
 use locks_service::application::mixed_v2_reducer::reduce_mixed_snapshot;
 use locks_service::application::models::{
     BitcoinOutpointV2, GraphObservationOutcome, MixedRootState, MixedTaskSnapshot,
-    MixedTaskSnapshotV1, PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2,
-    PaymentRootState, PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2, PaymentTaskSnapshot,
-    VerificationTerminalReason,
+    MixedTaskSnapshotV1, PaymentAssetV2, PaymentOperationalErrorCategory, PaymentProviderStatus,
+    PaymentRequestStateV2, PaymentRootState, PaymentSampleStatusV2, PaymentSampleV2,
+    PaymentStateV2, PaymentTaskSnapshot, VerificationTerminalReason,
 };
 use locks_service::application::ports::ProviderV2EvaluatorSnapshot;
 use time::macros::datetime;
@@ -210,6 +210,113 @@ fn deletion_reconciliation_updates_provider_evidence_without_rewriting_pending_r
     assert_eq!(reconciled.as_v1().payment.root, frozen_payment_root);
     assert_eq!(reconciled.as_v1().root, frozen_mixed_root);
     assert!(reconciled.as_v1().payment.provider_status.is_none());
+}
+
+#[test]
+fn unchanged_terminal_graph_allows_later_payment_completion_but_mutation_is_rejected() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+
+    let mut graph = mixed.graph_snapshot().unwrap();
+    graph
+        .terminalize_invalid_nexus_response(
+            0,
+            ACCEPTED + time::Duration::seconds(2),
+            "https://nexus.invalid".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+    locks_service::application::graph0conf_reducer::reduce_graph_snapshot(
+        &mut graph,
+        ACCEPTED + time::Duration::seconds(2),
+    )
+    .unwrap();
+    assert_eq!(
+        graph.root,
+        locks_service::application::models::GraphRootState::FailedInvalidResponse
+    );
+    mixed.replace_graph_snapshot(graph.clone());
+
+    let threshold = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(3),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "ef".repeat(32),
+            vout: 3,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Confirmed,
+            Some(threshold),
+        ))
+        .unwrap();
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(3)).unwrap();
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::Payment]);
+
+    let mut mutated = graph.clone();
+    mutated.predicates[0]
+        .latest_observation
+        .as_mut()
+        .unwrap()
+        .http_status = Some(500);
+    assert!(mutated.validate_progress_from(&graph).is_err());
+}
+
+#[test]
+fn outstanding_payment_outage_takes_precedence_over_graph_false_at_deadline() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::False,
+            DEADLINE - time::Duration::seconds(2),
+        )
+        .unwrap();
+    mixed.payment.operational_failure_count = 1;
+    mixed.payment.operational_failure_total = 1;
+    mixed.payment.operational_first_failure_at = Some(DEADLINE - time::Duration::seconds(1));
+    mixed.payment.operational_last_failure_at = Some(DEADLINE - time::Duration::seconds(1));
+    mixed.payment.operational_last_category = Some(PaymentOperationalErrorCategory::Transport);
+    mixed.payment.next_due_at = Some(DEADLINE);
+
+    reduce_mixed_snapshot(&mut mixed, DEADLINE).unwrap();
+
+    assert_eq!(
+        mixed.root,
+        MixedRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+    );
 }
 
 fn snapshot() -> MixedTaskSnapshotV1 {

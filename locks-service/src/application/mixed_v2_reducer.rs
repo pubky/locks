@@ -99,22 +99,26 @@ pub fn reduce_mixed_snapshot(
             (false, false) => unreachable!(),
         };
     } else if now >= snapshot.deadline_at {
-        snapshot.root = match snapshot.graph.root {
-            GraphRootState::FailedInvalidResponse => {
-                MixedRootState::Failed(VerificationTerminalReason::InvalidVerifierResponse)
-            }
-            GraphRootState::Expired(GraphDeadlineResult::False) => MixedRootState::Expired(
-                VerificationTerminalReason::GraphConditionNotObservedByDeadline,
-            ),
-            GraphRootState::Expired(GraphDeadlineResult::DependencyUnavailable) => {
-                MixedRootState::Failed(
+        snapshot.root = if snapshot.payment.operational_failure_count > 0 {
+            MixedRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+        } else {
+            match snapshot.graph.root {
+                GraphRootState::FailedInvalidResponse => {
+                    MixedRootState::Failed(VerificationTerminalReason::InvalidVerifierResponse)
+                }
+                GraphRootState::Expired(GraphDeadlineResult::False) => MixedRootState::Expired(
+                    VerificationTerminalReason::GraphConditionNotObservedByDeadline,
+                ),
+                GraphRootState::Expired(GraphDeadlineResult::DependencyUnavailable) => {
+                    MixedRootState::Failed(
+                        VerificationTerminalReason::VerificationUnavailableByDeadline,
+                    )
+                }
+                GraphRootState::Pending => MixedRootState::Failed(
                     VerificationTerminalReason::VerificationUnavailableByDeadline,
-                )
+                ),
+                GraphRootState::Satisfied => unreachable!(),
             }
-            GraphRootState::Pending => MixedRootState::Failed(
-                VerificationTerminalReason::VerificationUnavailableByDeadline,
-            ),
-            GraphRootState::Satisfied => unreachable!(),
         };
     }
 
