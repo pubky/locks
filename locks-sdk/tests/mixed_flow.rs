@@ -114,6 +114,79 @@ fn mixed_creator_evidence_requires_both_blocks_and_zero_conf_discriminator() {
     });
     CreatorLocks::parse_mixed_verification_evidence_response(evidence.clone()).unwrap();
 
+    let mut publishing = evidence.clone();
+    publishing["status"] = json!("publishing_entitlement");
+    publishing.as_object_mut().unwrap().remove("completed_at");
+    CreatorLocks::parse_mixed_verification_evidence_response(publishing).unwrap();
+
+    let mut created_before_status = evidence.clone();
+    created_before_status["status"] = json!("in_progress");
+    created_before_status["satisfied_by"] = json!([]);
+    created_before_status
+        .as_object_mut()
+        .unwrap()
+        .remove("completed_at");
+    created_before_status["payment"]
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_status");
+    CreatorLocks::parse_mixed_verification_evidence_response(created_before_status.clone())
+        .unwrap();
+
+    let mut scheduled_retry_before_status = created_before_status.clone();
+    scheduled_retry_before_status["status"] = json!("pending");
+    CreatorLocks::parse_mixed_verification_evidence_response(scheduled_retry_before_status)
+        .unwrap();
+
+    let mut unavailable_before_status = created_before_status.clone();
+    unavailable_before_status["status"] = json!("failed");
+    unavailable_before_status["completed_at"] = json!("2026-11-03T12:10:00Z");
+    unavailable_before_status["terminal_reason"] = json!("verification_unavailable_by_deadline");
+    CreatorLocks::parse_mixed_verification_evidence_response(unavailable_before_status).unwrap();
+
+    for reason in ["invalid_verifier_response", "verification_conflict"] {
+        let mut failed_before_status = created_before_status.clone();
+        failed_before_status["status"] = json!("failed");
+        failed_before_status["completed_at"] = json!("2026-11-03T12:10:00Z");
+        failed_before_status["terminal_reason"] = json!(reason);
+        CreatorLocks::parse_mixed_verification_evidence_response(failed_before_status).unwrap();
+    }
+
+    created_before_status["status"] = json!("expired");
+    created_before_status["completed_at"] = json!("2026-11-03T12:01:00Z");
+    created_before_status["terminal_reason"] = json!("content_lock_deleted");
+    CreatorLocks::parse_mixed_verification_evidence_response(created_before_status.clone())
+        .unwrap();
+
+    created_before_status["terminal_reason"] = json!("payment_request_rejected");
+    assert!(
+        CreatorLocks::parse_mixed_verification_evidence_response(created_before_status).is_err()
+    );
+
+    let mut wrong_expired_reason = evidence.clone();
+    wrong_expired_reason["status"] = json!("expired");
+    wrong_expired_reason["completed_at"] = json!("2026-11-03T12:01:00Z");
+    wrong_expired_reason["terminal_reason"] = json!("invalid_verifier_response");
+    wrong_expired_reason["satisfied_by"] = json!([]);
+    assert!(
+        CreatorLocks::parse_mixed_verification_evidence_response(wrong_expired_reason).is_err()
+    );
+
+    let mut zero_failures_with_metadata = evidence.clone();
+    zero_failures_with_metadata["payment"]["operational_last_category"] = json!("timeout");
+    assert!(
+        CreatorLocks::parse_mixed_verification_evidence_response(zero_failures_with_metadata)
+            .is_err()
+    );
+
+    let mut nonzero_failures_without_metadata = evidence.clone();
+    nonzero_failures_without_metadata["payment"]["operational_failure_count"] = json!(1);
+    nonzero_failures_without_metadata["payment"]["operational_failure_total"] = json!(1);
+    assert!(
+        CreatorLocks::parse_mixed_verification_evidence_response(nonzero_failures_without_metadata)
+            .is_err()
+    );
+
     let mut impossible_sample = evidence.clone();
     impossible_sample["payment"]["provider_status"]["current_sample"] = json!({
         "observed_at": "2026-11-03T12:00:06Z",

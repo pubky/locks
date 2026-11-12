@@ -335,7 +335,7 @@ pub struct CreatorMixedVerificationEvidenceHttpResponse {
     pub bundle_id: BundleId,
     pub pubky_lock_resource: locks_core::ids::PubkyLockResource,
     pub mode: &'static str,
-    #[serde(serialize_with = "serialize_task_status")]
+    #[serde(serialize_with = "serialize_mixed_evidence_task_status")]
     pub status: VerificationTaskStatus,
     #[serde(with = "time::serde::rfc3339")]
     pub submitted_at: OffsetDateTime,
@@ -676,6 +676,20 @@ where
     })
 }
 
+fn serialize_mixed_evidence_task_status<S>(
+    status: &VerificationTaskStatus,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *status == VerificationTaskStatus::PublishingEntitlement {
+        serializer.serialize_str("publishing_entitlement")
+    } else {
+        serialize_task_status(status, serializer)
+    }
+}
+
 fn serialize_optional_terminal_reason<S>(
     reason: &Option<VerificationTerminalReason>,
     serializer: S,
@@ -727,11 +741,29 @@ mod tests {
         GraphVerificationTaskLifecycleHttpResponse, IssueAccessCredentialHttpRequest,
         IssueAccessCredentialHttpResponse, SubmitProofBundleHttpRequest,
         VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
+        serialize_mixed_evidence_task_status,
     };
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+
+    #[test]
+    fn mixed_creator_evidence_preserves_publishing_status_on_wire() {
+        #[derive(serde::Serialize)]
+        struct WireStatus {
+            #[serde(serialize_with = "serialize_mixed_evidence_task_status")]
+            status: VerificationTaskStatus,
+        }
+
+        assert_eq!(
+            serde_json::to_value(WireStatus {
+                status: VerificationTaskStatus::PublishingEntitlement,
+            })
+            .unwrap(),
+            json!({"status": "publishing_entitlement"})
+        );
+    }
 
     #[test]
     fn folded_auth_pending_debug_redacts_auth_url_and_state() {

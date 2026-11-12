@@ -93,41 +93,11 @@ pub fn parse_mixed_lifecycle_response(
     }
     let response: MixedVerificationTaskLifecycleResponse =
         serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
-    let valid = match response.status {
-        VerificationTaskStatus::Pending
-        | VerificationTaskStatus::InProgress
-        | VerificationTaskStatus::PublishingEntitlement => {
-            response.completed_at.is_none() && response.terminal_reason.is_none()
-        }
-        VerificationTaskStatus::Completed => {
-            response.completed_at.is_some() && response.terminal_reason.is_none()
-        }
-        VerificationTaskStatus::Expired => {
-            response.completed_at.is_some()
-                && matches!(
-                    response.terminal_reason,
-                    Some(
-                        VerificationTerminalReason::PaymentRequestRejected
-                            | VerificationTerminalReason::PaymentRequestCanceled
-                            | VerificationTerminalReason::ProposalExpired
-                            | VerificationTerminalReason::PaymentDeadlineExpired
-                            | VerificationTerminalReason::ContentLockDeleted
-                            | VerificationTerminalReason::GraphConditionNotObservedByDeadline
-                    )
-                )
-        }
-        VerificationTaskStatus::Failed => {
-            response.completed_at.is_some()
-                && matches!(
-                    response.terminal_reason,
-                    Some(
-                        VerificationTerminalReason::VerificationUnavailableByDeadline
-                            | VerificationTerminalReason::InvalidVerifierResponse
-                            | VerificationTerminalReason::VerificationConflict
-                    )
-                )
-        }
-    };
+    let valid = valid_mixed_lifecycle_fields(
+        &response.status,
+        response.completed_at,
+        response.terminal_reason.as_ref(),
+    );
     if !valid
         || response.admission_deadline_at < response.submitted_at
         || response
@@ -340,20 +310,11 @@ pub fn parse_creator_mixed_verification_evidence_response(
             | [SatisfiedByV2::ZeroConfGraph]
             | [SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph]
     );
-    let valid_status = match response.status {
-        VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress => {
-            response.completed_at.is_none() && response.terminal_reason.is_none()
-        }
-        VerificationTaskStatus::PublishingEntitlement => {
-            response.completed_at.is_none() && response.terminal_reason.is_none()
-        }
-        VerificationTaskStatus::Completed => {
-            response.completed_at.is_some() && response.terminal_reason.is_none()
-        }
-        VerificationTaskStatus::Expired | VerificationTaskStatus::Failed => {
-            response.completed_at.is_some() && response.terminal_reason.is_some()
-        }
-    };
+    let valid_status = valid_mixed_lifecycle_fields(
+        &response.status,
+        response.completed_at,
+        response.terminal_reason.as_ref(),
+    );
     let graph_satisfied = match response.graph.operator {
         None => {
             response.graph.predicates.len() == 1
@@ -408,6 +369,37 @@ pub fn parse_creator_mixed_verification_evidence_response(
                             && sample.status != MixedPaymentSampleStatus::Undetected
                     })
         }
+        (
+            MixedPaymentInvoiceEvidence::Created {
+                invoice_created_at,
+                proposal_expires_at,
+            },
+            None,
+        ) => {
+            let lifecycle_allows_created_without_status = matches!(
+                (&response.status, response.terminal_reason.as_ref()),
+                (
+                    VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress,
+                    None
+                ) | (
+                    VerificationTaskStatus::Failed,
+                    Some(
+                        VerificationTerminalReason::VerificationUnavailableByDeadline
+                            | VerificationTerminalReason::InvalidVerifierResponse
+                            | VerificationTerminalReason::VerificationConflict
+                    )
+                ) | (
+                    VerificationTaskStatus::Expired,
+                    Some(VerificationTerminalReason::ContentLockDeleted)
+                )
+            );
+            lifecycle_allows_created_without_status
+                && timestamp_has_microsecond_precision(*invoice_created_at)
+                && timestamp_has_microsecond_precision(*proposal_expires_at)
+                && *invoice_created_at >= response.submitted_at
+                && *invoice_created_at < *proposal_expires_at
+                && *proposal_expires_at < response.deadline_at
+        }
         _ => false,
     };
     let path_has_payment = response.satisfied_by.contains(&SatisfiedByV2::Payment);
@@ -461,11 +453,83 @@ pub fn parse_creator_mixed_verification_evidence_response(
         || !valid_status
         || !provider_valid
         || !satisfaction_valid
-        || response.payment.operational_failure_count > response.payment.operational_failure_total
+        || !valid_payment_operational_aggregate(
+            &response.payment,
+            response.submitted_at,
+            response.deadline_at,
+        )
     {
         return Err(invalid("invalid creator mixed verification evidence"));
     }
     Ok(response)
+}
+
+fn valid_mixed_lifecycle_fields(
+    status: &VerificationTaskStatus,
+    completed_at: Option<OffsetDateTime>,
+    terminal_reason: Option<&VerificationTerminalReason>,
+) -> bool {
+    match status {
+        VerificationTaskStatus::Pending
+        | VerificationTaskStatus::InProgress
+        | VerificationTaskStatus::PublishingEntitlement => {
+            completed_at.is_none() && terminal_reason.is_none()
+        }
+        VerificationTaskStatus::Completed => completed_at.is_some() && terminal_reason.is_none(),
+        VerificationTaskStatus::Expired => {
+            completed_at.is_some()
+                && matches!(
+                    terminal_reason,
+                    Some(
+                        VerificationTerminalReason::PaymentRequestRejected
+                            | VerificationTerminalReason::PaymentRequestCanceled
+                            | VerificationTerminalReason::ProposalExpired
+                            | VerificationTerminalReason::PaymentDeadlineExpired
+                            | VerificationTerminalReason::ContentLockDeleted
+                            | VerificationTerminalReason::GraphConditionNotObservedByDeadline
+                    )
+                )
+        }
+        VerificationTaskStatus::Failed => {
+            completed_at.is_some()
+                && matches!(
+                    terminal_reason,
+                    Some(
+                        VerificationTerminalReason::VerificationUnavailableByDeadline
+                            | VerificationTerminalReason::InvalidVerifierResponse
+                            | VerificationTerminalReason::VerificationConflict
+                    )
+                )
+        }
+    }
+}
+
+fn valid_payment_operational_aggregate(
+    payment: &MixedPaymentEvidenceResponse,
+    submitted_at: OffsetDateTime,
+    deadline_at: OffsetDateTime,
+) -> bool {
+    if payment.next_due_at.is_some_and(|due| due > deadline_at) {
+        return false;
+    }
+    if payment.operational_failure_total == 0 {
+        return payment.operational_failure_count == 0
+            && payment.operational_first_failure_at.is_none()
+            && payment.operational_last_failure_at.is_none()
+            && payment.operational_last_category.is_none()
+            && payment.operational_last_http_status.is_none();
+    }
+    let (Some(first), Some(last), Some(_)) = (
+        payment.operational_first_failure_at,
+        payment.operational_last_failure_at,
+        payment.operational_last_category,
+    ) else {
+        return false;
+    };
+    payment.operational_failure_count <= payment.operational_failure_total
+        && first >= submitted_at
+        && first <= last
+        && last <= deadline_at
 }
 
 fn valid_payment_sample(sample: &MixedPaymentSample) -> bool {

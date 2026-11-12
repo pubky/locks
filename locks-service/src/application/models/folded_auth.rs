@@ -243,10 +243,38 @@ pub struct RestoredFoldedAuthAttempt {
     pub pending_response: Option<FoldedAuthPendingResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FoldedAuthPendingResponse {
     pub auth_url: String,
     pub state: String,
+}
+
+impl std::fmt::Debug for FoldedAuthPendingResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FoldedAuthPendingResponse")
+            .field("auth_url", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::FoldedAuthPendingResponse;
+
+    #[test]
+    fn pending_response_debug_redacts_auth_url_and_state() {
+        let pending = FoldedAuthPendingResponse {
+            auth_url: "pubkyauth://secret-bearing-url".to_owned(),
+            state: "secret-bearing-state".to_owned(),
+        };
+
+        let debug = format!("{pending:?}");
+        assert!(!debug.contains("secret-bearing-url"));
+        assert!(!debug.contains("secret-bearing-state"));
+        assert_eq!(debug.matches("<redacted>").count(), 2);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1355,8 +1355,8 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
                 "provider-v2 binding checkpoint has an invalid closed shape",
             ));
         }
-        let now = self.authoritative_winner_time();
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -1393,8 +1393,8 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         task_id: &TaskId,
         status: Option<&crate::application::models::PaymentProviderStatus>,
     ) -> Result<bool, ApplicationError> {
-        let now = self.authoritative_winner_time();
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -1436,7 +1436,6 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         task_id: &TaskId,
         reconciliation: &ProviderV2DeletionReconciliation,
     ) -> Result<bool, ApplicationError> {
-        let now = self.authoritative_winner_time();
         let fence = self
             .verification_task_deletion_fence
             .as_ref()
@@ -1446,6 +1445,7 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         let mut mixed_records = fence.mixed_records.write().await;
         let mut current_statuses = fence.current_statuses.write().await;
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -2423,7 +2423,13 @@ fn revoke_job_read_claims(state: &mut StoreState, job_id: Uuid) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, str::FromStr, sync::Mutex as StdMutex};
+    use std::{
+        collections::BTreeMap,
+        future::{Future, poll_fn},
+        str::FromStr,
+        sync::Mutex as StdMutex,
+        task::Poll,
+    };
 
     use serde_json::json;
     use time::macros::datetime;
@@ -2564,9 +2570,14 @@ mod tests {
 
     #[tokio::test]
     async fn provider_v2_terminalization_records_the_post_transition_expired_status() {
-        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let clock = Arc::new(MutableClock::new(datetime!(2026-08-17 12:00:00 UTC)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
         let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
-        let store = InMemoryAccessCredentialStore::with_deletion_fence(Arc::clone(&fence));
+        let store = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
         let creator = record().creator;
         let lock_hash = LockHash::from_bytes([7; 32]);
         let lock_id = LockId::from_hash(lock_hash);
@@ -2609,7 +2620,7 @@ mod tests {
                 force_requested: false,
                 claimed_by: Some("worker".to_owned()),
                 claim_token: Some(claim_token),
-                claim_expires_at: Some(now + Duration::minutes(5)),
+                claim_expires_at: Some(now + Duration::seconds(1)),
                 issuance_started_at: None,
                 issuance_deadline: None,
                 read_deadline: None,
@@ -2634,16 +2645,136 @@ mod tests {
                             snapshot: ProviderV2EvaluatorSnapshot::Payment(
                                 admitted.snapshot.clone(),
                             ),
-                            create_conflict: Some(false),
+                            create_conflict: None,
                             create_response: None,
                             provider_status: None,
-                            status_checkpointed: true,
+                            status_checkpointed: false,
                             reconciliation_terminal: false,
                         }),
                     },
                 )]),
             },
         );
+
+        let state_guard = store.state.write().await;
+        let mut blocked = Box::pin(store.persist_provider_v2_binding(
+            job_id,
+            "worker",
+            claim_token,
+            &task_id,
+            true,
+            None,
+        ));
+        poll_fn(|context| match blocked.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("provider checkpoint completed before state lock release: {result:?}")
+            }
+        })
+        .await;
+        clock.set(now + Duration::seconds(2));
+        drop(state_guard);
+        assert!(
+            !blocked.await.unwrap(),
+            "provider checkpoint must resample time after waiting for state lock"
+        );
+
+        {
+            let mut state_guard = store.state.write().await;
+            let deletion = state_guard.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::seconds(3));
+            deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap()
+                .create_conflict = Some(true);
+            let mut blocked_status = Box::pin(store.persist_provider_v2_status(
+                job_id,
+                "worker",
+                claim_token,
+                &task_id,
+                None,
+            ));
+            poll_fn(|context| match blocked_status.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("provider status completed before state lock release: {result:?}")
+                }
+            })
+            .await;
+            clock.set(now + Duration::seconds(4));
+            drop(state_guard);
+            assert!(
+                !blocked_status.await.unwrap(),
+                "provider status checkpoint must resample time after waiting for state lock"
+            );
+        }
+
+        {
+            let mut state = store.state.write().await;
+            let deletion = state.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::seconds(5));
+            let provider = deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap();
+            assert!(!provider.status_checkpointed);
+            provider.status_checkpointed = true;
+        }
+
+        let fence_guard = fence.records.write().await;
+        let blocked_snapshot = admitted.snapshot.clone();
+        let reconciliation = ProviderV2DeletionReconciliation {
+            create_conflict: true,
+            create_response: None,
+            status: None,
+            terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(blocked_snapshot),
+        };
+        let mut blocked_terminal = Box::pin(store.persist_provider_v2_terminal(
+            job_id,
+            "worker",
+            claim_token,
+            &task_id,
+            &reconciliation,
+        ));
+        poll_fn(|context| match blocked_terminal.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("provider terminalization completed before fence lock release: {result:?}")
+            }
+        })
+        .await;
+        clock.set(now + Duration::seconds(6));
+        drop(fence_guard);
+        assert!(
+            !blocked_terminal.await.unwrap(),
+            "provider terminalization must resample time after waiting for fence locks"
+        );
+
+        {
+            let mut state = store.state.write().await;
+            let deletion = state.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::minutes(5));
+            let provider = deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap();
+            assert_eq!(provider.create_conflict, Some(true));
+            assert!(provider.status_checkpointed);
+            assert!(!provider.reconciliation_terminal);
+        }
 
         assert!(
             store
@@ -2653,7 +2784,7 @@ mod tests {
                     claim_token,
                     &task_id,
                     &ProviderV2DeletionReconciliation {
-                        create_conflict: false,
+                        create_conflict: true,
                         create_response: None,
                         status: None,
                         terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(admitted.snapshot,),
