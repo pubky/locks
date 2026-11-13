@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eligible_live_provider_then_graph_success_publishes_once() {
+    async fn accepted_undetected_payment_never_publishes_graph_entitlement() {
         let clock = Arc::new(FixedClock(Mutex::new(NOW)));
         let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
             clock.clone(),
@@ -733,8 +733,103 @@ mod tests {
         let entitlements = Arc::new(InMemoryEntitlementRepository::new());
         let worker = MixedVerificationWorker::new(
             repository.clone(),
-            entitlements,
+            entitlements.clone(),
             provider,
+            nexus.clone(),
+            clock.clone(),
+            Arc::new(NoJitter),
+            "mixed-worker".to_owned(),
+            time::Duration::minutes(1),
+        );
+
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            MixedWorkerTick::RetryScheduled(task.task_id)
+        );
+        clock.set(NOW + time::Duration::seconds(6));
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            MixedWorkerTick::RetryScheduled(task.task_id)
+        );
+        assert_eq!(nexus.0.load(Ordering::SeqCst), 1);
+        let pending = repository
+            .get_mixed_task_by_handle(
+                &task.snapshot.as_v1().creator,
+                &task.snapshot.as_v1().bundle_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, VerificationTaskStatus::Pending);
+        assert!(pending.snapshot.as_v1().satisfied_by.is_empty());
+        assert!(
+            entitlements
+                .get_verified_proof_bundle_v2(
+                    &task.snapshot.as_v1().creator,
+                    &task.snapshot.as_v1().bundle_id,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        clock.set(NOW + time::Duration::minutes(5));
+        assert_eq!(
+            worker.run_once().await.unwrap(),
+            MixedWorkerTick::Terminal(task.task_id)
+        );
+        let expired = repository
+            .get_mixed_task_by_handle(
+                &task.snapshot.as_v1().creator,
+                &task.snapshot.as_v1().bundle_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.status, VerificationTaskStatus::Failed);
+        assert_eq!(
+            expired.terminal_reason,
+            Some(VerificationTerminalReason::VerificationUnavailableByDeadline)
+        );
+        assert!(
+            entitlements
+                .get_verified_proof_bundle_v2(
+                    &task.snapshot.as_v1().creator,
+                    &task.snapshot.as_v1().bundle_id,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_amount_matched_payment_and_graph_publish_zero_conf_entitlement() {
+        let clock = Arc::new(FixedClock(Mutex::new(NOW)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let repository = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(fence));
+        let task = mixed_task();
+        repository.insert_mixed_task(task.clone()).await.unwrap();
+        let nexus = Arc::new(CountingNexus(AtomicUsize::new(0)));
+        let mut status = provider_status(PaymentRequestStateV2::Accepted);
+        status.payment_state = PaymentStateV2::Detected;
+        status.current_sample = Some(PaymentSampleV2 {
+            observed_at: NOW + time::Duration::seconds(5),
+            status: PaymentSampleStatusV2::Detected,
+            outpoint: Some(BitcoinOutpointV2 {
+                txid: "10".repeat(32),
+                vout: 0,
+            }),
+            confirmations: 0,
+            amount_matched: true,
+        });
+        let entitlements = Arc::new(InMemoryEntitlementRepository::new());
+        let worker = MixedVerificationWorker::new(
+            repository.clone(),
+            entitlements.clone(),
+            Arc::new(StatusProvider(status)),
             nexus.clone(),
             clock.clone(),
             Arc::new(NoJitter),
@@ -752,20 +847,18 @@ mod tests {
             MixedWorkerTick::Terminal(task.task_id)
         );
         assert_eq!(nexus.0.load(Ordering::SeqCst), 1);
-        let completed = repository
-            .get_mixed_task_by_handle(
+        let entitlement = entitlements
+            .get_verified_proof_bundle_v2(
                 &task.snapshot.as_v1().creator,
                 &task.snapshot.as_v1().bundle_id,
             )
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(completed.status, VerificationTaskStatus::Completed);
         assert_eq!(
-            completed.snapshot.as_v1().satisfied_by,
+            entitlement.satisfied_by,
             vec![locks_core::verification::SatisfiedByV2::ZeroConfGraph]
         );
-        assert!(completed.snapshot.as_v1().payment.provider_status.is_some());
     }
 
     #[tokio::test]

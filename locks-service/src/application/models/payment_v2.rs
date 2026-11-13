@@ -557,6 +557,25 @@ pub struct PaymentProviderStatus {
 }
 
 impl PaymentProviderStatus {
+    pub(crate) fn is_zero_conf_eligible(&self) -> bool {
+        matches!(
+            self.request_state,
+            PaymentRequestStateV2::Accepted
+                | PaymentRequestStateV2::ProofSubmitted
+                | PaymentRequestStateV2::ActiveRecurring
+        ) && matches!(
+            self.payment_state,
+            PaymentStateV2::Detected | PaymentStateV2::Confirmed
+        ) && self.current_sample.as_ref().is_some_and(|sample| {
+            matches!(
+                sample.status,
+                PaymentSampleStatusV2::Detected | PaymentSampleStatusV2::Confirmed
+            ) && sample.outpoint.is_some()
+                && sample.amount_matched
+                && sample.observed_at <= self.deadline
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for value in [
             self.invoice_created_at,

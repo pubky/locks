@@ -33,7 +33,7 @@ fn impossible_satisfaction_path_is_rejected_at_snapshot_boundary() {
 }
 
 #[test]
-fn graph_satisfies_only_while_same_wave_payment_is_eligible_and_live() {
+fn graph_does_not_satisfy_with_accepted_but_undetected_payment() {
     let mut mixed = snapshot();
     mixed
         .apply_create_response(
@@ -59,20 +59,151 @@ fn graph_satisfies_only_while_same_wave_payment_is_eligible_and_live() {
 
     reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
 
+    assert_eq!(mixed.root, MixedRootState::Pending);
+    assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn detected_amount_matched_payment_allows_graph_zero_conf_satisfaction() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
+    );
+    provider_status.current_sample = Some(detected_sample(true));
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
     assert_eq!(mixed.root, MixedRootState::Satisfied);
-    assert_eq!(
-        mixed.satisfied_by,
-        vec![locks_core::verification::SatisfiedByV2::ZeroConfGraph]
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::ZeroConfGraph]);
+}
+
+#[test]
+fn detected_amount_mismatch_does_not_allow_graph_zero_conf_satisfaction() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
     );
-    assert_eq!(
-        mixed
-            .payment
-            .provider_status
-            .as_ref()
-            .unwrap()
-            .payment_state,
-        PaymentStateV2::Undetected
+    provider_status.current_sample = Some(detected_sample(false));
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Pending);
+    assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn retained_payment_threshold_does_not_report_ineligible_graph_path() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let threshold = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "13".repeat(32),
+            vout: 0,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Undetected,
+        Some(threshold),
     );
+    provider_status.current_sample = Some(PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(3),
+        status: PaymentSampleStatusV2::Undetected,
+        outpoint: None,
+        confirmations: 0,
+        amount_matched: false,
+    });
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(3),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(3)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::Payment]);
+}
+
+#[test]
+fn undetected_payment_with_true_graph_fails_closed_at_deadline() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, DEADLINE).unwrap();
+
+    assert_eq!(
+        mixed.root,
+        MixedRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+    );
+    assert!(mixed.satisfied_by.is_empty());
 }
 
 #[test]
@@ -140,13 +271,13 @@ fn deletion_reconciliation_preserves_graph_completed_snapshot_when_payment_later
             DEADLINE,
         )
         .unwrap();
-    mixed
-        .apply_payment_status(status(
-            PaymentRequestStateV2::Accepted,
-            PaymentStateV2::Undetected,
-            None,
-        ))
-        .unwrap();
+    let mut zero_conf_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
+    );
+    zero_conf_status.current_sample = Some(detected_sample(true));
+    mixed.apply_payment_status(zero_conf_status).unwrap();
     mixed
         .record_graph_observation(
             0,
@@ -365,6 +496,19 @@ fn status(
         minimum_confirmations: 1,
         current_sample: first.clone(),
         first_threshold_satisfied: first,
+    }
+}
+
+fn detected_sample(amount_matched: bool) -> PaymentSampleV2 {
+    PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Detected,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "12".repeat(32),
+            vout: 0,
+        }),
+        confirmations: 0,
+        amount_matched,
     }
 }
 

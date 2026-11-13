@@ -34,6 +34,7 @@ pub fn reduce_mixed_snapshot(
             | PaymentRequestStateV2::ActiveRecurring
     );
     let has_threshold = status.first_threshold_satisfied.is_some();
+    let zero_conf_eligible = status.is_zero_conf_eligible();
 
     if has_threshold && !eligible {
         snapshot.root = MixedRootState::Failed(VerificationTerminalReason::InvalidVerifierResponse);
@@ -90,9 +91,10 @@ pub fn reduce_mixed_snapshot(
     snapshot.replace_graph_snapshot(graph);
 
     let graph_satisfied = snapshot.graph.root == GraphRootState::Satisfied;
-    if has_threshold || graph_satisfied {
+    let graph_zero_conf_satisfied = graph_satisfied && zero_conf_eligible;
+    if has_threshold || graph_zero_conf_satisfied {
         snapshot.root = MixedRootState::Satisfied;
-        snapshot.satisfied_by = match (has_threshold, graph_satisfied) {
+        snapshot.satisfied_by = match (has_threshold, graph_zero_conf_satisfied) {
             (true, true) => vec![SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph],
             (true, false) => vec![SatisfiedByV2::Payment],
             (false, true) => vec![SatisfiedByV2::ZeroConfGraph],
@@ -114,10 +116,9 @@ pub fn reduce_mixed_snapshot(
                         VerificationTerminalReason::VerificationUnavailableByDeadline,
                     )
                 }
-                GraphRootState::Pending => MixedRootState::Failed(
+                GraphRootState::Pending | GraphRootState::Satisfied => MixedRootState::Failed(
                     VerificationTerminalReason::VerificationUnavailableByDeadline,
                 ),
-                GraphRootState::Satisfied => unreachable!(),
             }
         };
     }

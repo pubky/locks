@@ -5,7 +5,7 @@ Mixed Content Lock v2 combines one graph policy with one Paykit payment policy. 
 1. Locks durably admits or exact-replays payment obligation before evaluator work.
 2. Folded auth derives Reader server-side. Mixed submissions MUST omit wire `reader_pubky`.
 3. Each evaluation wave keeps payment evidence live and eligible. Payment unavailability, conflict, ineligibility, or expiry blocks Graph bypass.
-4. Timely payment threshold **or** Graph success can satisfy lock. Graph success never cancels, erases, or forgives payment.
+4. Timely payment threshold **or** Graph success paired with same-wave detected, amount-matched payment evidence (the `minimum_confirmations = 0` eligibility rule) can satisfy the lock. Accepted request state alone is never enough. Graph success never cancels, erases, or forgives payment.
 5. Canonical `satisfied_by` values are `payment`, `zero_conf_graph`, or `[payment, zero_conf_graph]` in that order.
 
 ## Lifecycle

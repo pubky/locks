@@ -245,9 +245,10 @@ impl MixedTaskSnapshotV1 {
             let graph_satisfied = self.graph.root == GraphRootState::Satisfied;
             let path_has_payment = self.satisfied_by.contains(&SatisfiedByV2::Payment);
             let path_has_graph = self.satisfied_by.contains(&SatisfiedByV2::ZeroConfGraph);
+            let zero_conf_satisfied = graph_satisfied && status.is_zero_conf_eligible();
             if !payment_live
                 || payment_satisfied != path_has_payment
-                || graph_satisfied != path_has_graph
+                || zero_conf_satisfied != path_has_graph
                 || (self.payment.root == PaymentRootState::Satisfied) != payment_satisfied
             {
                 return Err("mixed satisfaction path diverges from evidence".to_owned());
