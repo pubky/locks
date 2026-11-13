@@ -18,12 +18,11 @@ use super::defaults::{
 use super::schema::{
     ConfigError, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
-    GrantConnectAcquisitionConfig, LegacyConnectAcquisitionConfig, LockServerCredentialsConfig,
-    LockServerRuntimeConfig, LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS,
-    MAX_TRUSTED_PROXY_HOPS, NexusConfig, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
-    PaykitConnectionStateLookupRateLimitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    GrantConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
+    LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS, MAX_TRUSTED_PROXY_HOPS, NexusConfig,
+    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -335,23 +334,12 @@ struct RawCreatorAuthorityAcquisitionConfig {
     enabled: bool,
     #[serde(default = "default_creator_authority_acquisition_method")]
     method: CreatorAuthorityAcquisitionMethod,
-    #[serde(default)]
-    allowed_return_origins: Vec<String>,
     #[serde(default = "default_frontend_session_ttl_seconds")]
     frontend_session_ttl_seconds: u64,
     #[serde(default = "default_frontend_session_code_ttl_seconds")]
     frontend_session_code_ttl_seconds: u64,
     #[serde(default)]
-    legacy_connect: RawLegacyConnectAcquisitionConfig,
-    #[serde(default)]
     grant_connect: Option<RawGrantConnectAcquisitionConfig>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct RawLegacyConnectAcquisitionConfig {
-    #[serde(default)]
-    allowed_return_origins: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,17 +355,15 @@ impl Default for RawCreatorAuthorityAcquisitionConfig {
         Self {
             enabled: true,
             method: default_creator_authority_acquisition_method(),
-            allowed_return_origins: Vec::new(),
             frontend_session_ttl_seconds: default_frontend_session_ttl_seconds(),
             frontend_session_code_ttl_seconds: default_frontend_session_code_ttl_seconds(),
-            legacy_connect: RawLegacyConnectAcquisitionConfig::default(),
             grant_connect: None,
         }
     }
 }
 
 fn default_creator_authority_acquisition_method() -> CreatorAuthorityAcquisitionMethod {
-    CreatorAuthorityAcquisitionMethod::LegacyConnect
+    CreatorAuthorityAcquisitionMethod::GrantConnect
 }
 
 fn default_creator_authority_acquisition_enabled() -> bool {
@@ -426,6 +412,10 @@ fn validate_allowed_return_origins(values: Vec<String>) -> Result<Vec<String>, C
 }
 
 fn validate_grant_return_origins(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    if values.iter().any(|value| value == "*") {
+        return validate_allowed_return_origins(values);
+    }
+
     let mut seen = std::collections::HashSet::with_capacity(values.len());
     values
         .into_iter()
@@ -822,22 +812,9 @@ impl RawCreatorAuthorityAcquisitionConfig {
         self,
         environment: RuntimeEnvironment,
     ) -> Result<CreatorAuthorityAcquisitionConfig, ConfigError> {
-        if self.method == CreatorAuthorityAcquisitionMethod::GrantConnect
-            && self.grant_connect.is_none()
-        {
+        // Hosted acquisition needs the grant table; a disabled server may omit it.
+        if self.enabled && self.grant_connect.is_none() {
             return Err(ConfigError::MissingGrantConnectConfig);
-        }
-        let mut allowed_return_origin_values = self.legacy_connect.allowed_return_origins;
-        if allowed_return_origin_values.is_empty() {
-            allowed_return_origin_values = self.allowed_return_origins;
-        }
-        let allowed_return_origins = validate_allowed_return_origins(allowed_return_origin_values)?;
-        // `*` allows handing the one-time code to any return origin — acceptable for dev/staging,
-        // never for production.
-        if environment == RuntimeEnvironment::Production
-            && allowed_return_origins.iter().any(|origin| origin == "*")
-        {
-            return Err(ConfigError::WildcardReturnOriginInProduction);
         }
         let grant_connect = self
             .grant_connect
@@ -852,13 +829,14 @@ impl RawCreatorAuthorityAcquisitionConfig {
                 },
             )
             .transpose()?;
-        if self.method == CreatorAuthorityAcquisitionMethod::GrantConnect
-            && grant_connect
-                .as_ref()
-                .is_some_and(|grant| grant.allowed_return_origins.is_empty())
+        if grant_connect
+            .as_ref()
+            .is_some_and(|grant| grant.allowed_return_origins.is_empty())
         {
             return Err(ConfigError::EmptyGrantConnectAllowedReturnOrigins);
         }
+        // `*` allows handing the one-time code to any return origin — acceptable for dev/staging,
+        // never for production.
         if environment == RuntimeEnvironment::Production
             && grant_connect.as_ref().is_some_and(|grant| {
                 grant
@@ -874,9 +852,6 @@ impl RawCreatorAuthorityAcquisitionConfig {
             method: self.method,
             frontend_session_ttl_seconds: self.frontend_session_ttl_seconds,
             frontend_session_code_ttl_seconds: self.frontend_session_code_ttl_seconds,
-            legacy_connect: LegacyConnectAcquisitionConfig {
-                allowed_return_origins,
-            },
             grant_connect,
         })
     }

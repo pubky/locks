@@ -593,7 +593,7 @@ impl PaymentProviderStatus {
         Ok(())
     }
 
-    fn validate_against(&self, snapshot: &PaymentTaskSnapshotV1) -> Result<(), String> {
+    pub fn validate_against(&self, snapshot: &PaymentTaskSnapshotV1) -> Result<(), String> {
         self.validate()?;
         if self.creator != snapshot.creator
             || self.bundle_id != snapshot.bundle_id

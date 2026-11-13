@@ -633,10 +633,10 @@ mod tests {
         let cases = [
             ApplicationError::CreatorAuthorityUnavailable,
             ApplicationError::CreatorAuthoritySecret {
-                message: "raw legacy-cookie-session-secret failed to restore".to_owned(),
+                message: "raw grant-restore-state-secret failed to restore".to_owned(),
             },
             ApplicationError::InvalidCreatorAuthorityAuthKind {
-                auth_kind: "legacy-cookie-session-secret".to_owned(),
+                auth_kind: "grant-restore-state-secret".to_owned(),
             },
         ];
 
@@ -647,7 +647,7 @@ mod tests {
             let json = serde_json::to_value(api_error.error_response()).unwrap();
             assert_eq!(json["error"]["code"], "creator_authority_unavailable");
             assert_eq!(json["error"]["message"], "creator authority unavailable");
-            assert!(!json.to_string().contains("legacy-cookie-session-secret"));
+            assert!(!json.to_string().contains("grant-restore-state-secret"));
         }
     }
 

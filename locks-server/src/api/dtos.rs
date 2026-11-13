@@ -937,7 +937,7 @@ mod tests {
             )
             .unwrap(),
             authorized: true,
-            auth_kind: Some(CreatorAuthorityAuthKind::LegacyCookie),
+            auth_kind: Some(CreatorAuthorityAuthKind::Grant),
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),
@@ -952,7 +952,7 @@ mod tests {
             "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
         );
         assert_eq!(json["authorized"], true);
-        assert_eq!(json["auth_kind"], "legacy_cookie");
+        assert_eq!(json["auth_kind"], "grant");
         assert_eq!(
             json["granted_scopes"],
             json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])

@@ -17,7 +17,7 @@ use locks_core::lock_policy::{
 };
 use locks_core::verification::SubmittedProofBundleV2;
 use locks_server::app_state::{AppState, RuntimeSecretCiphers};
-use locks_server::config::{GrantConnectAcquisitionConfig, NexusConfig};
+use locks_server::config::NexusConfig;
 use locks_server::graph_worker::{GraphRetryJitter, GraphVerificationWorker, GraphWorkerTick};
 use locks_server::nexus_http_client::{NexusHttpClient, NexusObservation};
 use locks_server::testing::TestServerApp;
@@ -411,10 +411,10 @@ fn build_state(
 ) -> AppState {
     let mut config = TestServerApp::default_in_memory_config();
     config.database.url = "postgres://redacted".to_owned();
-    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
-        client_id: "https://pubky.app".to_owned(),
-        allowed_return_origins: vec!["https://pubky.app".to_owned()],
-    });
+    // This flow never acquires creator authority (it inserts a frontend session directly), so
+    // hosted acquisition stays off and no grant-connect keypair seed is needed.
+    config.creator_authority_acquisition.enabled = false;
+    config.creator_authority_acquisition.grant_connect = None;
     config.nexus = Some(NexusConfig {
         server_url: nexus_url,
         allow_insecure_loopback: true,

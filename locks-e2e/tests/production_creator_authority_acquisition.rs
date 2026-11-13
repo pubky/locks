@@ -9,14 +9,15 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use locks_core::ids::{ContentLockPath, CreatorPubky};
 use locks_server::config::{
-    CreatorAuthorityAcquisitionConfig, CreatorAuthorityAcquisitionMethod, RuntimeEnvironment,
+    CreatorAuthorityAcquisitionConfig, GrantConnectAcquisitionConfig, RuntimeEnvironment,
 };
 use locks_server::testing::TestServerApp;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
-    CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, LegacyCreatorConnectFlowApproval,
+    CreatorAuthorityAuthKind, CreatorAuthoritySecret, CreatorConnectAuthorizationUrl,
+    GrantCreatorConnectFlowApproval, GrantPopKeyId,
 };
-use locks_service::application::ports::LegacyCreatorConnectFlowClient;
+use locks_service::application::ports::GrantCreatorConnectFlowClient;
 use locks_service::infrastructure::pubky::{
     PubkyBytesResource, PubkyHomeserverStorageClient, PubkyResourceMetadata,
 };
@@ -24,25 +25,18 @@ use serde_json::{Value, json};
 use support::creator_publishing_client::LocalCreatorPublishingClient;
 use tower::ServiceExt;
 
-const CREATOR_AUTHORITY_SECRET: &str = "fake-legacy-session-secret";
+const CREATOR_AUTHORITY_SECRET: &str = "fake-delegated-grant-state";
+const GRANT_AUTHORIZATION_URL: &str = "pubkyauth://signin_grant?secret=fake-grant-flow-url";
 const GUARDED_BYTES: &[u8] = b"production acquisition bytes";
 
 #[tokio::test]
 async fn production_creator_authority_acquisition_enables_pubky_backed_creator_publishing() {
     let storage = FakePubkyHomeserverStorage::default();
-    let mut config = TestServerApp::default_in_memory_config();
-    config.runtime.environment = RuntimeEnvironment::Production;
-    config.creator_authority_acquisition = CreatorAuthorityAcquisitionConfig::default();
-    config.creator_authority_acquisition.enabled = true;
-    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::LegacyConnect;
-    config
-        .creator_authority_acquisition
-        .legacy_connect
-        .allowed_return_origins = vec!["https://pubky.app".to_owned()];
-
-    let test_app =
-        TestServerApp::new_in_memory_with_pubky_homeserver_storage(config, storage.clone())
-            .with_legacy_creator_connect_flow_client(Arc::new(FakeLegacyConnectFlowClient));
+    let test_app = TestServerApp::new_in_memory_with_pubky_homeserver_storage(
+        production_config(),
+        storage.clone(),
+    )
+    .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
     let router = test_app.router();
 
     let raw_connect_start = router
@@ -69,7 +63,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
         .unwrap();
     assert_eq!(shell_response.status(), StatusCode::OK);
     let shell_html = response_text(shell_response).await;
-    assert!(shell_html.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert!(shell_html.contains(GRANT_AUTHORIZATION_URL));
     assert_no_secret_text_material(&shell_html);
     let flow_id = extract_flow_id_from_shell(&shell_html);
 
@@ -131,7 +125,7 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
     .await;
     assert_eq!(status["creator"], creator().to_string());
     assert_eq!(status["authorized"], true);
-    assert_eq!(status["auth_kind"], "legacy_cookie");
+    assert_eq!(status["auth_kind"], "grant");
     assert_eq!(
         status["granted_scopes"],
         json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
@@ -182,36 +176,169 @@ async fn production_creator_authority_acquisition_enables_pubky_backed_creator_p
     }));
 }
 
-struct FakeLegacyConnectFlowClient;
+fn production_config() -> locks_server::config::LockServerRuntimeConfig {
+    let mut config = TestServerApp::default_in_memory_config();
+    config.runtime.environment = RuntimeEnvironment::Production;
+    config.creator_authority_acquisition = CreatorAuthorityAcquisitionConfig::default();
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    config
+}
+
+/// Postmessage delivery (the iframe embed) answers the completion with JSON and frames only the
+/// validated return origin.
+#[tokio::test]
+async fn production_connect_shell_postmessage_mode_returns_json_and_frames_allowed_parent() {
+    let test_app = TestServerApp::new_in_memory(production_config())
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    let router = test_app.router();
+
+    let shell_response = router
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(shell_response.status(), StatusCode::OK);
+    assert_eq!(
+        shell_response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "frame-ancestors https://pubky.app"
+    );
+    let shell_html = response_text(shell_response).await;
+    assert!(shell_html.contains("locks-auth-callback"));
+    assert!(shell_html.contains("TARGET_ORIGIN = \"https://pubky.app\""));
+    assert!(shell_html.contains("CALLBACK_STATE = \"opaque-state\""));
+    assert!(shell_html.contains("error: \"invalid-response\""));
+    assert!(shell_html.contains("error: \"connect-failed\""));
+    assert!(shell_html.contains("error?.error?.code === \"creator_authority_unavailable\""));
+    assert!(shell_html.contains("if (await isTerminalApplicationError(res))"));
+    assert!(shell_html.contains("const RETRYABLE = new Set([408, 425, 429, 502, 503, 504]);"));
+    assert!(!shell_html.contains("connect-failed-\" + res.status"));
+    assert!(!shell_html.contains("I approved this connection"));
+    assert!(!shell_html.contains("<form"));
+    // The postmessage script names the `creator_authority_unavailable` error code, so only the
+    // secret itself is checked here (as the removed legacy shell test did).
+    assert!(!shell_html.contains(CREATOR_AUTHORITY_SECRET));
+    assert!(!shell_html.contains("session_secret"));
+    let flow_id = extract_flow_id_from_postmessage_shell(&shell_html);
+
+    let completion_response = router
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            &format!("/connect/{flow_id}/complete?delivery=postmessage"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completion_response.status(), StatusCode::OK);
+    let body = response_json(completion_response).await;
+    assert_eq!(body["state"], "opaque-state");
+    let code = body["code"]
+        .as_str()
+        .expect("json body carries code")
+        .to_owned();
+    assert!(!code.is_empty());
+    let body_text = body.to_string();
+    assert!(!body_text.contains("pubkyauth"));
+    assert!(!body_text.contains("authorization_url"));
+    assert!(!body_text.contains(CREATOR_AUTHORITY_SECRET));
+
+    let stored_authority = test_app
+        .state()
+        .creator_authorities()
+        .get_creator_authority(&creator())
+        .await
+        .unwrap()
+        .expect("creator authority stored");
+    assert_eq!(stored_authority.auth_kind, CreatorAuthorityAuthKind::Grant);
+    assert_eq!(
+        stored_authority.secret.expose_secret(),
+        CREATOR_AUTHORITY_SECRET
+    );
+
+    let session_response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/frontend-sessions",
+            json!({"code": code, "state": "opaque-state"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(session_response.status(), StatusCode::OK);
+    let session = response_json(session_response).await;
+    assert!(!session["session_token"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn production_connect_shell_postmessage_mode_rejects_disallowed_return_origin() {
+    let test_app = TestServerApp::new_in_memory(production_config())
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let shell_response = test_app
+        .router()
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=https%3A%2F%2Fevil.example%2Fsteal&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+    // A disallowed parent origin never gets a shell, and therefore never a code.
+    assert_ne!(shell_response.status(), StatusCode::OK);
+}
+
+struct FakeGrantConnectFlowClient;
 
 #[async_trait]
-impl LegacyCreatorConnectFlowClient for FakeLegacyConnectFlowClient {
-    async fn start_legacy_creator_connect_flow(
+impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
+    async fn start_grant_creator_connect_flow(
         &self,
         requested_scopes: &[String],
+        _pop_key_id: &GrantPopKeyId,
+        _expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         assert_eq!(
             requested_scopes,
             ["/pub/app.locks/:rw", "/priv/app.locks/:rw"]
         );
-        Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://signin?secret=fake-secret-flow-url",
-        ))
+        Ok(CreatorConnectAuthorizationUrl::new(GRANT_AUTHORIZATION_URL))
     }
 
-    async fn await_legacy_creator_connect_flow_approval(
+    async fn await_grant_creator_connect_flow_approval(
         &self,
         authorization_url: &CreatorConnectAuthorizationUrl,
-    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
-        assert_eq!(
-            authorization_url.expose_url(),
-            "pubkyauth://signin?secret=fake-secret-flow-url"
-        );
-        Ok(LegacyCreatorConnectFlowApproval {
+        _pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+        assert_eq!(authorization_url.expose_url(), GRANT_AUTHORIZATION_URL);
+        Ok(GrantCreatorConnectFlowApproval {
             creator: creator(),
-            session_secret: CreatorAuthoritySecret::new(CREATOR_AUTHORITY_SECRET),
+            grant_state: CreatorAuthoritySecret::new(CREATOR_AUTHORITY_SECRET),
+            granted_scopes: requested_scopes.to_vec(),
+            grant_expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
         })
     }
+}
+
+fn extract_flow_id_from_postmessage_shell(html: &str) -> String {
+    let prefix = "encodeURIComponent(\"";
+    let start = html
+        .find(prefix)
+        .expect("postmessage shell embeds flow id in completion URL")
+        + prefix.len();
+    let rest = &html[start..];
+    let end = rest
+        .find('"')
+        .expect("postmessage shell flow id string is terminated");
+    rest[..end].to_owned()
 }
 
 fn creator() -> CreatorPubky {

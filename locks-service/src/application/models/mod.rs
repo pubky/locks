@@ -166,12 +166,12 @@ mod tests {
                 "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
             )
             .unwrap(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),
             ],
-            secret: CreatorAuthoritySecret::new("legacy-cookie-session-secret"),
+            secret: CreatorAuthoritySecret::new("delegated-grant-state"),
             session_expires_at: None,
             last_revalidated_at: None,
         };
@@ -179,9 +179,9 @@ mod tests {
         let debug = format!("{record:?}");
 
         assert!(debug.contains("CreatorAuthorityRecord"));
-        assert!(debug.contains("LegacyCookie"));
+        assert!(debug.contains("Grant"));
         assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("legacy-cookie-session-secret"));
+        assert!(!debug.contains("delegated-grant-state"));
     }
 
     #[test]

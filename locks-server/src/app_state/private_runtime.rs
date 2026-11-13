@@ -15,7 +15,7 @@ use locks_service::application::{
         ContentLockOwnershipRepository, CreatorAuthorityManager, CreatorAuthorityStore,
         CreatorConnectFlowStore, FrontendSessionCodeStore, FrontendSessionStore,
         GrantCreatorConnectFlowClient, GraphTaskClaimer, GraphTaskRepository,
-        InvoiceAdmissionRepository, LegacyCreatorConnectFlowClient, PaymentTaskClaimer,
+        InvoiceAdmissionRepository, PaymentDrainRepository, PaymentTaskClaimer,
         PaymentTaskRepository, VerificationTaskClaimer, VerificationTaskRepository,
     },
 };
@@ -34,13 +34,13 @@ pub(super) struct PrivateRuntimeAdapters {
     pub(super) graph_task_claimer: Arc<dyn GraphTaskClaimer>,
     pub(super) payment_tasks: Arc<dyn PaymentTaskRepository>,
     pub(super) payment_task_claimer: Arc<dyn PaymentTaskClaimer>,
+    pub(super) payment_drains: Arc<dyn PaymentDrainRepository>,
     pub(super) access_credentials: Arc<dyn AccessCredentialStore>,
     pub(super) creator_authorities: Arc<dyn CreatorAuthorityStore>,
     pub(super) creator_connect_flows: Arc<dyn CreatorConnectFlowStore>,
     pub(super) frontend_session_codes: Arc<dyn FrontendSessionCodeStore>,
     pub(super) frontend_sessions: Arc<dyn FrontendSessionStore>,
     pub(super) creator_authority_manager: Arc<dyn CreatorAuthorityManager>,
-    pub(super) legacy_creator_connect_flow_client: Arc<dyn LegacyCreatorConnectFlowClient>,
     pub(super) grant_creator_connect_flow_client: Option<Arc<dyn GrantCreatorConnectFlowClient>>,
 }
 

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use locks_core::{
     content_lock_deletion::ContentLockDeletionTombstone,
     ids::{ContentLockPath, CreatorPubky, GuardedResourceHash, LockId},
-    lock_policy::ContentLock,
+    lock_policy::{ContentLock, ContentLockPayload},
 };
 use time::{OffsetDateTime, macros::datetime};
 use uuid::Uuid;
@@ -390,7 +390,7 @@ impl ContentLockTombstoneRepository for FakeTombstones {
         &self,
         _: CreatorPubky,
         _: ContentLockPath,
-        _: &ContentLock,
+        _: &ContentLockPayload,
         _: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, ApplicationError> {
         unreachable!()

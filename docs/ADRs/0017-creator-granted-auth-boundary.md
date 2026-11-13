@@ -1,5 +1,7 @@
 # ADR 0017: Creator-Granted Auth Boundary
 
+> **Update:** legacy-connect was removed; grant-connect is the only acquisition method.
+
 ## Status
 
 Accepted

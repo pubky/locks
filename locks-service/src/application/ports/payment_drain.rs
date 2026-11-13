@@ -6,6 +6,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
 use time::OffsetDateTime;
 
+use crate::application::models::{PaymentProviderCreateRequest, PaymentProviderStatus};
+
+use super::PaymentProviderCreateResponse;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentDrainStatus {
     Active,
@@ -52,6 +56,14 @@ pub struct PaymentDrainSummary {
     pub terminal_count: u64,
     pub cancellation_enqueued_count: u64,
     pub cleanup_token: PaymentDrainCleanupToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentDrainCleanupPreparation {
+    ClaimLost,
+    NotRequired,
+    Pending(PaymentDrainCleanupToken),
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +167,20 @@ pub enum PaymentDrainClientError {
     Server,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitAuthority {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub base_path: String,
+}
+
 #[async_trait]
 pub trait PaymentDrainClient: Send + Sync {
+    fn authority(&self) -> Option<PaykitAuthority> {
+        None
+    }
+
     async fn start_payment_drain(
         &self,
         lock_resource: &PubkyLockResource,
@@ -167,9 +191,32 @@ pub trait PaymentDrainClient: Send + Sync {
         lock_resource: &PubkyLockResource,
     ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError>;
 
+    async fn cleanup_payment_drain(
+        &self,
+        _lock_resource: &PubkyLockResource,
+        _cleanup_token: &PaymentDrainCleanupToken,
+    ) -> Result<(), PaymentDrainClientError> {
+        Err(PaymentDrainClientError::MalformedSuccess)
+    }
+
     async fn payment_request_status(
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError>;
+
+    async fn replay_provider_v2_invoice(
+        &self,
+        _request: &PaymentProviderCreateRequest,
+    ) -> Result<PaymentProviderCreateResponse, PaymentDrainClientError> {
+        Err(PaymentDrainClientError::MalformedSuccess)
+    }
+
+    async fn provider_v2_invoice_status(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
+    ) -> Result<Option<PaymentProviderStatus>, PaymentDrainClientError> {
+        Err(PaymentDrainClientError::MalformedSuccess)
+    }
 }

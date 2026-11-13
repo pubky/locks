@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, watch};
 use crate::application::errors::ApplicationError;
 use crate::application::models::{CreatorAuthorityAuthKind, CreatorAuthorityRecord};
 use crate::application::ports::CreatorAuthorityStore;
-use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
+use crate::infrastructure::pubky::creator_identity::creator_from_pubky_public_key_z32;
 use crate::infrastructure::pubky::storage_client::{ImportedPubkySession, PubkySessionImporter};
 
 type RestoreResult<T> = Result<T, ApplicationError>;
@@ -460,7 +460,7 @@ mod tests {
     };
     use crate::application::ports::CreatorAuthorityManager;
     use crate::application::ports::CreatorAuthorityStore;
-    use crate::infrastructure::pubky::legacy_creator_authority::{
+    use crate::infrastructure::pubky::creator_authority_manager::{
         GrantCreatorAuthorityManager, GrantCredentialRevalidator,
     };
     use crate::infrastructure::pubky::storage_client::{
@@ -1065,13 +1065,6 @@ mod tests {
     impl PubkySessionImporter for GrantAwareImporter {
         type Session = FakeImportedSession;
 
-        async fn import_legacy_cookie_session(
-            &self,
-            _secret: &CreatorAuthoritySecret,
-        ) -> Result<Self::Session, ApplicationError> {
-            unreachable!("grant cache never imports legacy cookie sessions")
-        }
-
         async fn import_grant_session(
             &self,
             secret: &CreatorAuthoritySecret,
@@ -1131,13 +1124,6 @@ mod tests {
     impl PubkySessionImporter for RecordingImporter {
         type Session = FakeImportedSession;
 
-        async fn import_legacy_cookie_session(
-            &self,
-            _secret: &CreatorAuthoritySecret,
-        ) -> Result<Self::Session, ApplicationError> {
-            unreachable!("grant cache never imports legacy cookie sessions")
-        }
-
         async fn import_grant_session(
             &self,
             secret: &CreatorAuthoritySecret,
@@ -1177,10 +1163,6 @@ mod tests {
 
         fn public_key_z32(&self) -> String {
             self.creator_z32.clone()
-        }
-
-        fn into_storage(self) -> Self::Storage {
-            FakeStorage
         }
 
         fn into_grant_storage(self) -> Self::Storage {

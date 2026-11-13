@@ -12,10 +12,10 @@ use locks_service::application::models::{
     PaymentStateV2 as PaymentProviderPaymentState,
 };
 use locks_service::application::ports::{
-    PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError, PaymentDrainStatus,
-    PaymentDrainSummary, PaymentObservation, PaymentProviderClient, PaymentProviderCreateResponse,
-    PaymentProviderError, PaymentProviderErrorKind, PaymentRequestState, PaymentRequestStatus,
-    PaymentState,
+    PaykitAuthority, PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError,
+    PaymentDrainStatus, PaymentDrainSummary, PaymentObservation, PaymentProviderClient,
+    PaymentProviderCreateResponse, PaymentProviderError, PaymentProviderErrorKind,
+    PaymentRequestState, PaymentRequestStatus, PaymentState,
 };
 use locks_service::infrastructure::verifiers::paykit_payment::{
     PaykitPaymentObservation, PaykitPaymentRequestState as ServicePaymentRequestState,
@@ -243,6 +243,18 @@ struct PaykitInvoiceResponse {
 #[derive(Debug, Serialize)]
 struct PaymentDrainRequest<'a> {
     lock_resource: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentDrainCleanupRequest<'a> {
+    lock_resource: &'a str,
+    cleanup_token: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentDrainCleanupResponse {
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -799,7 +811,11 @@ fn classify_provider_status(response: &reqwest::Response) -> PaymentProviderErro
             kind: PaymentProviderErrorKind::Conflict,
             retry_after_seconds: None,
         },
-        StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS => retryable_provider(retry_after),
+        StatusCode::NOT_FOUND => PaymentProviderError {
+            kind: PaymentProviderErrorKind::NotFound,
+            retry_after_seconds: None,
+        },
+        StatusCode::TOO_MANY_REQUESTS => retryable_provider(retry_after),
         status if status.is_server_error() => retryable_provider(retry_after),
         _ => invalid_provider_response(),
     }
@@ -807,6 +823,15 @@ fn classify_provider_status(response: &reqwest::Response) -> PaymentProviderErro
 
 #[async_trait]
 impl PaymentDrainClient for PaykitHttpClient {
+    fn authority(&self) -> Option<PaykitAuthority> {
+        Some(PaykitAuthority {
+            scheme: self.server_url.scheme().to_owned(),
+            host: self.server_url.host_str()?.to_owned(),
+            port: self.server_url.port_or_known_default()?,
+            base_path: self.server_url.path().to_owned(),
+        })
+    }
+
     async fn start_payment_drain(
         &self,
         lock_resource: &locks_core::ids::PubkyLockResource,
@@ -822,6 +847,33 @@ impl PaymentDrainClient for PaykitHttpClient {
     ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
         self.payment_drain("payment-request-drain-lookups", &lock_resource.to_string())
             .await
+    }
+
+    async fn cleanup_payment_drain(
+        &self,
+        lock_resource: &locks_core::ids::PubkyLockResource,
+        cleanup_token: &PaymentDrainCleanupToken,
+    ) -> Result<(), PaymentDrainClientError> {
+        let lock_resource = lock_resource.to_string();
+        let response = self
+            .signed_post(
+                "payment-request-drain-cleanups",
+                &PaymentDrainCleanupRequest {
+                    lock_resource: &lock_resource,
+                    cleanup_token: cleanup_token.as_str(),
+                },
+            )
+            .await
+            .map_err(|_| PaymentDrainClientError::Transport)?;
+        map_payment_drain_status(response.status())?;
+        let body: PaymentDrainCleanupResponse =
+            read_bounded_json(response, PAYMENT_DRAIN_BODY_LIMIT)
+                .await
+                .map_err(map_cleanup_body_error)?;
+        if body.status != "removed" {
+            return Err(PaymentDrainClientError::MalformedSuccess);
+        }
+        Ok(())
     }
 
     async fn payment_request_status(
@@ -884,6 +936,40 @@ impl PaymentDrainClient for PaykitHttpClient {
             }),
         }))
     }
+
+    async fn replay_provider_v2_invoice(
+        &self,
+        request: &PaymentProviderCreateRequest,
+    ) -> Result<PaymentProviderCreateResponse, PaymentDrainClientError> {
+        PaymentProviderClient::create_invoice(self, request)
+            .await
+            .map_err(map_provider_drain_error)
+    }
+
+    async fn provider_v2_invoice_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentProviderStatus>, PaymentDrainClientError> {
+        match PaymentProviderClient::invoice_status(self, creator, bundle_id).await {
+            Ok(status) => Ok(Some(status)),
+            Err(PaymentProviderError {
+                kind: PaymentProviderErrorKind::NotFound,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(map_provider_drain_error(error)),
+        }
+    }
+}
+
+fn map_provider_drain_error(error: PaymentProviderError) -> PaymentDrainClientError {
+    match error.kind {
+        PaymentProviderErrorKind::Conflict => PaymentDrainClientError::Conflict,
+        PaymentProviderErrorKind::InvalidResponse | PaymentProviderErrorKind::NotFound => {
+            PaymentDrainClientError::MalformedSuccess
+        }
+        PaymentProviderErrorKind::Retryable => PaymentDrainClientError::Transport,
+    }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -894,6 +980,13 @@ fn elapsed_millis(started: Instant) -> u64 {
 enum BoundedJsonError {
     Transport,
     Invalid,
+}
+
+fn map_cleanup_body_error(error: BoundedJsonError) -> PaymentDrainClientError {
+    match error {
+        BoundedJsonError::Transport => PaymentDrainClientError::Transport,
+        BoundedJsonError::Invalid => PaymentDrainClientError::MalformedSuccess,
+    }
 }
 
 fn map_provider_body_error(error: BoundedJsonError) -> PaymentProviderError {
@@ -1229,6 +1322,39 @@ mod tests {
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn cleanup_body_transport_and_decode_failures_keep_distinct_retry_semantics() {
+        assert_eq!(
+            map_cleanup_body_error(BoundedJsonError::Transport),
+            PaymentDrainClientError::Transport
+        );
+        assert_eq!(
+            map_cleanup_body_error(BoundedJsonError::Invalid),
+            PaymentDrainClientError::MalformedSuccess
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_truncated_success_body_is_a_transport_failure() {
+        let server_url = spawn_truncated_cleanup_body().await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let lock_resource = locks_core::ids::PubkyLockResource::from_str(LOCK_RESOURCE).unwrap();
+        let cleanup_token =
+            PaymentDrainCleanupToken::parse(&URL_SAFE_NO_PAD.encode([7_u8; 32])).unwrap();
+
+        assert_eq!(
+            client
+                .cleanup_payment_drain(&lock_resource, &cleanup_token)
+                .await,
+            Err(PaymentDrainClientError::Transport)
+        );
+    }
 
     #[test]
     fn provider_body_transport_and_decode_failures_keep_distinct_retry_semantics() {
@@ -2106,6 +2232,21 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn spawn_truncated_cleanup_body() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 20\r\nconnection: close\r\n\r\n{\"status\":",
+                )
+                .await
+                .unwrap();
         });
         format!("http://{address}")
     }

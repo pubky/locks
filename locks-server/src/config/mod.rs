@@ -11,12 +11,11 @@ pub use loading::{load_existing_config_from_path, load_or_initialize_config, res
 pub use schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     CreatorAuthorityAcquisitionMethod, DatabaseConfig, DeletionConfig, DeletionWorkerConfig,
-    GrantConnectAcquisitionConfig, LegacyConnectAcquisitionConfig, LockServerCredentialsConfig,
-    LockServerRuntimeConfig, LoggingConfig, MAX_TRUSTED_PROXY_HOPS, NexusConfig,
-    PAYKIT_CONNECT_TIMEOUT_SECONDS, PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig,
-    PaykitConnectionStateLookupRateLimitConfig, PkdnsConfig, PubkyConfig, PubkyNetwork,
-    PubkyResolution, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig,
-    VerificationSubmissionRateLimitConfig, WorkerConfig,
+    GrantConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
+    LoggingConfig, MAX_TRUSTED_PROXY_HOPS, NexusConfig, PAYKIT_CONNECT_TIMEOUT_SECONDS,
+    PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
+    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
 };
 pub use secrets::{FilesystemLockServerIdentityProvider, LockServerIdentityProvider};
 pub(crate) use secrets::{LockServerSigningKeyError, load_lock_server_signing_keypair};

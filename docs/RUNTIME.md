@@ -26,7 +26,7 @@ The filesystem identity provider validates that `credentials.lock_server_public_
 
 Current config example:
 
-- `locks-server/config/example.dev.postgres.toml` — runnable development Postgres operation with worker, legacy-connect, Pubky testnet, and dev route gates.
+- `locks-server/config/example.dev.postgres.toml` — runnable development Postgres operation with worker, grant-connect, Pubky testnet, and dev route gates.
 
 No runnable in-memory binary config exists. In-memory runtime is test support only.
 
@@ -109,15 +109,15 @@ client_id = "locks.example"
 allowed_return_origins = ["https://pubky.app"]
 ```
 
-`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` must contain at least one unique canonical HTTPS origin. Explicit default ports, credentials, paths, query strings, fragments, HTTP origins, and wildcards are rejected in every environment. Grant mode does not fall back to legacy or top-level origins.
+`grant-connect` is the production mode. It emits one `signin_grant` authorization URL and never starts or falls back to cookie auth. `client_id` is the Lock Server's deployment hostname without scheme, port, path, query, or fragment. `grant_connect.allowed_return_origins` must contain at least one origin. Concrete entries must be unique canonical HTTPS origins; explicit default ports, credentials, paths, query strings, fragments, and HTTP origins are rejected. Development and staging may instead use the sole entry `["*"]` for HTTP/HTTPS test return targets and canonical HTTPS browser Origins on folded-auth `/proof-bundles` and `/proof-bundles/auth-status` requests. Folded-auth CORS reflects the concrete accepted Origin and never emits literal `*`. Production rejects wildcard, and wildcard cannot be mixed with concrete origins. There is no fallback to top-level origins.
 
 When enabled, the Lock Server derives a distinct PoP key for each pending flow from the Lock Server signing seed, starts grant auth, validates exact issuer/session identity, `client_id`, PoP key, exact requested capability set, and expiry, then stores only encrypted delegated restore state. PoP private keys, grant bearers, authorization URLs, and frontend session tokens are not stored in creator authority. The short-lived callback code and Locks-local frontend session protocol remain unchanged.
 
-`legacy-connect` remains an explicit compatibility mode for older operator/test flows. It uses `[creator_authority_acquisition.legacy_connect]`, where exact HTTP/HTTPS origins remain supported and one development-only wildcard may be configured. Grant mode rejects stored `LegacyCookie` authority instead of silently using it; creators must reconnect with a grant after switching modes. Removed or unknown methods, including `legacy-self-relay`, are rejected during config loading.
+`grant-connect` is the only acquisition method and the default when `method` is omitted. The former `legacy-connect` (cookie session) mode was removed: `method = "legacy-connect"` and a `[creator_authority_acquisition.legacy_connect]` table are rejected during config loading, as are other removed or unknown methods such as `legacy-self-relay`. Creator authority rows or pending connect flows written by older versions in legacy mode (`auth_kind = "legacy_cookie"`) still load but are never authorized; those creators reconnect with a grant. No migration rewrites them. With `enabled = false` the `grant_connect` table may be omitted; creator authority is then unavailable.
 
 Grant PoP keys depend on both the configured Lock Server signing seed and a fixed derivation context. Rotating that seed or changing the context makes stored grants unrestorable; reconnect creators before such a rotation. Restore exchanges delegated state with the homeserver stored at approval time; a creator who moves homeserver must reconnect. The delegated callback signs only a syntactically closed Pubky PoP JWS input (`EdDSA`, `pubky-pop`, exact `aud`/`gid`/`iat`/`nonce` claims); grant ID and homeserver audience validation remain inside the pinned SDK credential exchange because its callback does not expose expected context separately. Grant composition currently uses pinned Pubky SDK delegated-flow APIs that are `#[doc(hidden)]`; upgrading `pubky` requires explicit compatibility and signing-boundary review or an upstream public server-held delegated signer API.
 
-The pinned Pubky SDK reports cached grant-bearer refresh transport/5xx failures through the same public error variants as ordinary homeserver storage transport/5xx failures. Upstream issue pubky/pubky#698 remains open, so in `grant-connect` mode Locks temporarily maps both classes to coarse `503 creator_authority_unavailable` and invalidates only the cache generation used by that operation. Grant-backed reads then reacquire creator storage and replay the same read once; this can add one read retry for an ordinary storage transport/5xx failure. Writes and deletes are never replayed because their side effects may already have occurred. `legacy-connect` keeps ordinary storage transport/5xx failures mapped as internal storage errors and does not use the read retry. Logs expose only operation stage and closed error class, never upstream bodies, paths, grants, or bearers.
+The pinned Pubky SDK reports cached grant-bearer refresh transport/5xx failures through the same public error variants as ordinary homeserver storage transport/5xx failures. Upstream issue pubky/pubky#698 remains open, so in `grant-connect` mode Locks temporarily maps both classes to coarse `503 creator_authority_unavailable` and invalidates only the cache generation used by that operation. Grant-backed reads then reacquire creator storage and replay the same read once; this can add one read retry for an ordinary storage transport/5xx failure. Writes and deletes are never replayed because their side effects may already have occurred. Logs expose only operation stage and closed error class, never upstream bodies, paths, grants, or bearers.
 
 ## PKARR and browser SDK reachability
 
@@ -154,7 +154,7 @@ server_url = "http://127.0.0.1:3001"
 minimum_confirmations = 0
 ```
 
-`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, `POST /proof-bundles` durably persists the pending verification task and immutable invoice-admission intent before any Reader homeserver or Paykit I/O, then returns that pending lifecycle. The intent contains `payment_in` copied from the validated canonical `paykit-payment` criterion. Task insertion and deletion start serialize on the same per-lock database fence: a committed task is included in the deletion snapshot, while a committed deletion cutoff rejects a genuinely new task. Exact persisted replay returns the same lifecycle. A claimed invoice-admission worker calls Paykit `POST /invoices` with persisted `bundle_id`, `lock_resource`, `reader`, and `payment_in`, plus the stable task UUID in `X-Request-ID`; Paykit independently reads the canonical lock and rejects a `payment_in` mismatch before side effects. Browser clients poll the existing task and never resubmit to drive admission. A deletion job cannot start Paykit draining while a snapshotted admission remains `invoice_pending`. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Verification workers call `POST /payment-requests/status` only after invoice admission is ready. Every Paykit request body is canonical JSON. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body` with the existing Lock Server keypair; body-only signatures are not supported. Therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
+`server_url` must be a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash. Provider-v2 graceful deletion requires Paykit Server `v0.1.1-rc3` or newer because it uses signed drain create/lookup/cleanup plus v2 invoice replay/status. Locks persists normalized authority from this existing URL with deletion state; changing origin during restart fails closed before provider status, absence, or cleanup. No separate deletion-provider config exists. Endpoint paths are appended only after this configuration boundary. For a new `{ creator, bundle_id }` payment lifecycle identity, `POST /proof-bundles` durably persists the pending verification task and immutable invoice-admission intent before any Reader homeserver or Paykit I/O, then returns that pending lifecycle. The intent contains `payment_in` copied from the validated canonical `paykit-payment` criterion. Task insertion and deletion start serialize on the same per-lock database fence: a committed task is included in the deletion snapshot, while a committed deletion cutoff rejects a genuinely new task. Exact persisted replay returns the same lifecycle. A claimed invoice-admission worker calls Paykit `POST /invoices` with persisted `bundle_id`, `lock_resource`, `reader`, and `payment_in`, plus the stable task UUID in `X-Request-ID`; Paykit independently reads the canonical lock and rejects a `payment_in` mismatch before side effects. Browser clients poll the existing task and never resubmit to drive admission. A deletion job cannot start Paykit draining while a snapshotted admission remains `invoice_pending`. Browser connection-state lookup calls Locks `POST /paykit-connection-state-lookups`; Locks derives the accepted task binding and calls Paykit `POST /connections/status`. Verification workers call `POST /payment-requests/status` only after invoice admission is ready. Every Paykit request body is canonical JSON. `X-Paykit-Signature` signs `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body` with the existing Lock Server keypair; body-only signatures are not supported. Therefore `credentials.lock_server_secret_key` must use the `keypair-seed:<base64url-no-pad-32-byte-seed>` format when `[paykit]` is configured.
 
 Public connection-state lookups have independent process-local admission control. Defaults are 60 requests per 60-second window for each `(client IP, creator, bundle_id)`, a process-wide token bucket of 50 requests per second with burst 50, 16 concurrent outbound Paykit status requests, and at most 10,000 retained windows across the process:
 
@@ -243,6 +243,29 @@ WHERE state IN ('queued', 'running', 'failed');
 
 If rows are returned, resume/retry them on the pre-0021 release until every deletion reaches `completed` and then retry the upgrade, or explicitly reset the pre-production environment: stop the stack, back up anything needed, recreate the Locks PostgreSQL database/volume, reconcile or republish any public tombstones/content locks, and reacquire creator authority. Do not bypass the guard by deleting only the job rows; that can strand external Pubky state and accepted obligations.
 
+Migration `0032_provider_v2_deletion` upgrades ordinary graceful payment deletions that already reached `completed` on `v0.1.1-rc3`; it retains their frozen evaluator snapshot, terminal resolution, and final-credential evidence. Only those rows already stored before `0032` may retain the rc3 terminal shape without provider replay/status evidence; PostgreSQL rejects that shape for every later insert or update. It still fails closed if a completed payment deletion has an unresolved snapshot, because that contradicts graceful completion and cannot be repaired by replaying a completed job. Before upgrading from rc3, stop writes and run:
+
+```sql
+SELECT deletion.job_id,
+       deletion.creator,
+       deletion.lock_id,
+       snapshot.verification_task_id,
+       snapshot.status_at_cutoff,
+       snapshot.resolved_status,
+       task.status AS current_task_status
+FROM content_lock_deletion_jobs AS deletion
+JOIN content_lock_deletion_task_snapshot AS snapshot
+  ON snapshot.deletion_job_id = deletion.job_id
+JOIN verification_tasks AS task
+  ON task.task_id = snapshot.verification_task_id
+WHERE deletion.state = 'completed'
+  AND deletion.force_requested_at IS NULL
+  AND task.evaluator_mode = 'payment'
+  AND snapshot.resolved_status IS NULL;
+```
+
+No rows means completed rc3 payment deletions are safe to migrate. If rows exist, keep rc3 data and public state unchanged, retain a database backup, and escalate the listed IDs for evidence-specific reconciliation before retrying. Do not delete the job or snapshot, rewrite it to a retryable phase, or invent terminal/provider evidence: completed jobs cannot be resumed and those edits can erase the only retained cutoff record.
+
 The runtime-master-key cutover intentionally cannot decrypt creator-authority rows written with the retired Compose `creator-authority-encryption-key`. An existing Compose volume containing that file fails startup instead of silently stranding encrypted authority. To upgrade a local stack:
 
 1. Stop the stack and back up any data that must be retained.
@@ -283,10 +306,14 @@ environment = "development"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
+
+[creator_authority_acquisition.grant_connect]
+client_id = "localhost"
+allowed_return_origins = ["*"]
 ```
 
-This legacy development shape mounts authenticated Pubky-backed creator publishing routes, hosted legacy-connect routes, raw JSON dev connect routes, and the dev-only manual verification completion route. Use the grant-connect configuration above for Ring 2.0 / Bitkit grant testing.
+This development shape mounts authenticated Pubky-backed creator publishing routes, hosted grant-connect routes, and the dev-only manual verification completion route. The wildcard return origin is accepted only outside production.
 
 ## Staging/production shape
 

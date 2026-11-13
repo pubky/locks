@@ -42,12 +42,13 @@ worker_id = "test-worker"
 environment = "development"
 
 [creator_authority_acquisition]
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
 
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = ["http://localhost:3000"]
+[creator_authority_acquisition.grant_connect]
+client_id = "localhost"
+allowed_return_origins = ["*"]
 
 [secrets]
 runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"
@@ -92,6 +93,10 @@ max_total_resource_bytes = 100000000
     assert_eq!(config.runtime.environment, RuntimeEnvironment::Development);
     assert_eq!(config.pubky.network, PubkyNetwork::Testnet);
     assert!(config.creator_authority_acquisition.enabled);
+    assert_eq!(
+        config.creator_authority_acquisition.method,
+        CreatorAuthorityAcquisitionMethod::GrantConnect
+    );
     assert_eq!(config.worker.paykit_payment_retry_interval_seconds.get(), 3);
 }
 
@@ -664,46 +669,132 @@ fn rejects_removed_runtime_mode_keys() {
 }
 
 #[test]
-fn rejects_wildcard_return_origin_in_production() {
+fn rejects_removed_legacy_connect_method() {
     let temp_dir = tempdir().unwrap();
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "production").replace(
-        "allowed_return_origins = []",
-        r#"allowed_return_origins = ["*"]"#,
-    );
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"grant-connect\"", "method = \"legacy-connect\"");
+    assert!(config.contains("method = \"legacy-connect\""));
     std::fs::write(&config_path, config).unwrap();
 
     let error = load_existing_config_from_path(&config_path).unwrap_err();
 
-    assert!(matches!(
-        error,
-        ConfigError::WildcardReturnOriginInProduction
-    ));
+    assert!(
+        matches!(&error, ConfigError::ParseConfig { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(error.to_string().contains("legacy-connect"), "{error}");
 }
 
 #[test]
-fn allows_wildcard_return_origin_outside_production() {
+fn rejects_removed_legacy_connect_table() {
     let temp_dir = tempdir().unwrap();
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "staging").replace(
-        "allowed_return_origins = []",
-        r#"allowed_return_origins = ["*"]"#,
+    let config = minimal_config(&secret_path, &public_key, "development")
+        + r#"
+[creator_authority_acquisition.legacy_connect]
+allowed_return_origins = ["https://pubky.app"]
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    let error = load_existing_config_from_path(&config_path).unwrap_err();
+
+    assert!(
+        matches!(&error, ConfigError::ParseConfig { .. }),
+        "unexpected error: {error:?}"
     );
+    assert!(error.to_string().contains("legacy_connect"), "{error}");
+}
+
+#[test]
+fn rejects_removed_top_level_allowed_return_origins() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "frontend_session_code_ttl_seconds = 120",
+        "frontend_session_code_ttl_seconds = 120\nallowed_return_origins = [\"https://pubky.app\"]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::ParseConfig { .. }
+    ));
+}
+
+#[test]
+fn parses_production_grant_connect_deployment_config() {
+    // Shape of the deployed production config: explicit method, grant table, https origin.
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "production")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.pubky.app"
+allowed_return_origins = ["https://pubky.app"]
+"#;
+    assert!(config.contains("method = \"grant-connect\""));
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert_eq!(config.runtime.environment, RuntimeEnvironment::Production);
+    let acquisition = &config.creator_authority_acquisition;
+    assert!(acquisition.enabled);
+    assert_eq!(
+        acquisition.method,
+        CreatorAuthorityAcquisitionMethod::GrantConnect
+    );
+    let grant = acquisition.grant_connect.as_ref().unwrap();
+    assert_eq!(grant.client_id, "locks.pubky.app");
+    assert_eq!(grant.allowed_return_origins, ["https://pubky.app"]);
+}
+
+#[test]
+fn method_key_is_optional_and_defaults_to_grant_connect() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development")
+        .replace("method = \"grant-connect\"\n", "");
+    assert!(!config.contains("method ="));
     std::fs::write(&config_path, config).unwrap();
 
     let config = load_existing_config_from_path(&config_path).unwrap();
 
     assert_eq!(
-        config
-            .creator_authority_acquisition
-            .legacy_connect
-            .allowed_return_origins,
-        vec!["*".to_owned()]
+        config.creator_authority_acquisition.method,
+        CreatorAuthorityAcquisitionMethod::GrantConnect
     );
+}
+
+#[test]
+fn disabled_acquisition_loads_without_grant_table() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "production")
+        .replace(
+            "[creator_authority_acquisition]\nenabled = true",
+            "[creator_authority_acquisition]\nenabled = false",
+        );
+    assert!(config.contains("enabled = false"));
+    std::fs::write(&config_path, config).unwrap();
+
+    let config = load_existing_config_from_path(&config_path).unwrap();
+
+    assert!(!config.creator_authority_acquisition.enabled);
+    assert_eq!(config.creator_authority_acquisition.grant_connect, None);
 }
 
 #[test]
@@ -712,8 +803,7 @@ fn parses_grant_connect_configuration() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "production")
-        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "production")
         + r#"
 [creator_authority_acquisition.grant_connect]
 client_id = "locks.example"
@@ -738,8 +828,7 @@ fn grant_connect_requires_grant_configuration() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "development")
-        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"");
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "development");
     std::fs::write(&config_path, config).unwrap();
 
     assert!(matches!(
@@ -754,12 +843,7 @@ fn grant_connect_requires_nonempty_allowed_return_origins() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "development")
-        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
-        .replace(
-            "frontend_session_code_ttl_seconds = 120",
-            "frontend_session_code_ttl_seconds = 120\nallowed_return_origins = [\"https://legacy.example\"]",
-        )
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "development")
         + r#"
 [creator_authority_acquisition.grant_connect]
 client_id = "locks.example"
@@ -786,8 +870,7 @@ fn grant_connect_rejects_malformed_client_ids() {
         let secret_path = temp_dir.path().join("secret.sess");
         let public_key = test_identity(&secret_path);
         let config_path = temp_dir.path().join("config.toml");
-        let config = minimal_config(&secret_path, &public_key, "development")
-            .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        let config = minimal_config_without_grant_table(&secret_path, &public_key, "development")
             + &format!(
                 r#"
 [creator_authority_acquisition.grant_connect]
@@ -810,8 +893,7 @@ fn grant_connect_rejects_wildcard_return_origin_in_production() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "production")
-        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "production")
         + r#"
 [creator_authority_acquisition.grant_connect]
 client_id = "locks.example"
@@ -821,14 +903,63 @@ allowed_return_origins = ["*"]
 
     assert!(matches!(
         load_existing_config_from_path(&config_path).unwrap_err(),
-        ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(_)
+        ConfigError::WildcardReturnOriginInProduction
     ));
 }
 
 #[test]
-fn grant_connect_rejects_non_https_wildcard_and_duplicate_origins_in_every_environment() {
+fn grant_connect_allows_wildcard_return_origin_in_development_and_staging() {
+    for environment in ["development", "staging"] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config_without_grant_table(&secret_path, &public_key, environment)
+            + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["*"]
+"#;
+        std::fs::write(&config_path, config).unwrap();
+
+        let config = load_existing_config_from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config
+                .creator_authority_acquisition
+                .grant_connect
+                .unwrap()
+                .allowed_return_origins,
+            vec!["*".to_owned()],
+            "environment={environment}"
+        );
+    }
+}
+
+#[test]
+fn grant_connect_rejects_wildcard_mixed_with_concrete_origin() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "staging")
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["*", "https://pubky.app"]
+"#;
+    std::fs::write(&config_path, config).unwrap();
+
+    assert!(matches!(
+        load_existing_config_from_path(&config_path).unwrap_err(),
+        ConfigError::InvalidCreatorAuthorityAllowedReturnOrigin(message)
+            if message == "* cannot be mixed with concrete origins"
+    ));
+}
+
+#[test]
+fn grant_connect_rejects_non_https_and_duplicate_origins_in_every_environment() {
     for origins in [
-        r#"["*"]"#,
         r#"["http://localhost:4173"]"#,
         r#"["https://pubky.app:443"]"#,
         r#"["https://pubky.app", "https://pubky.app"]"#,
@@ -838,8 +969,7 @@ fn grant_connect_rejects_non_https_wildcard_and_duplicate_origins_in_every_envir
         let secret_path = temp_dir.path().join("secret.sess");
         let public_key = test_identity(&secret_path);
         let config_path = temp_dir.path().join("config.toml");
-        let config = minimal_config(&secret_path, &public_key, "development")
-            .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+        let config = minimal_config_without_grant_table(&secret_path, &public_key, "development")
             + &format!(
                 r#"
 [creator_authority_acquisition.grant_connect]
@@ -862,8 +992,7 @@ fn grant_connect_rejects_unknown_fields() {
     let secret_path = temp_dir.path().join("secret.sess");
     let public_key = test_identity(&secret_path);
     let config_path = temp_dir.path().join("config.toml");
-    let config = minimal_config(&secret_path, &public_key, "development")
-        .replace("method = \"legacy-connect\"", "method = \"grant-connect\"")
+    let config = minimal_config_without_grant_table(&secret_path, &public_key, "development")
         + r#"
 [creator_authority_acquisition.grant_connect]
 client_id = "locks.example"
@@ -1068,7 +1197,22 @@ fn test_identity(secret_path: &std::path::Path) -> LockServerPubky {
     public_key
 }
 
+/// Minimal valid config with a production-safe grant-connect table.
 fn minimal_config(
+    secret_path: &std::path::Path,
+    public_key: &LockServerPubky,
+    environment: &str,
+) -> String {
+    minimal_config_without_grant_table(secret_path, public_key, environment)
+        + r#"
+[creator_authority_acquisition.grant_connect]
+client_id = "locks.example"
+allowed_return_origins = ["https://pubky.app"]
+"#
+}
+
+/// Minimal config whose `[creator_authority_acquisition]` is enabled but has no grant table yet.
+fn minimal_config_without_grant_table(
     secret_path: &std::path::Path,
     public_key: &LockServerPubky,
     environment: &str,
@@ -1098,12 +1242,9 @@ environment = "{}"
 
 [creator_authority_acquisition]
 enabled = true
-method = "legacy-connect"
+method = "grant-connect"
 frontend_session_ttl_seconds = 86400
 frontend_session_code_ttl_seconds = 120
-
-[creator_authority_acquisition.legacy_connect]
-allowed_return_origins = []
 
 [secrets]
 runtime_master_key_env = "PUBKY_LOCK_RUNTIME_MASTER_KEY"

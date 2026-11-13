@@ -16,8 +16,8 @@ use locks_core::ids::{
     PubkyLockResource, TaskId,
 };
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, Criterion,
+    GuardedResource, LockLogic, LockServerConfig, VerifierType,
 };
 use locks_core::verification::{
     EntitlementLifetime, Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle,
@@ -1057,7 +1057,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
 
     state
         .creator_authorities()
-        .upsert_creator_authority(creator_authority_record("legacy-cookie-session-secret"))
+        .upsert_creator_authority(creator_authority_record("grant-restore-state-secret"))
         .await
         .unwrap();
 
@@ -1066,7 +1066,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
         .await
         .unwrap();
     assert!(stored_secret.starts_with("v1.xchacha20poly1305:"));
-    assert!(!stored_secret.contains("legacy-cookie-session-secret"));
+    assert!(!stored_secret.contains("grant-restore-state-secret"));
 
     let loaded = state
         .creator_authorities()
@@ -1074,10 +1074,7 @@ async fn postgres_runtime_encrypts_creator_authority_secrets_at_rest() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        loaded.secret.expose_secret(),
-        "legacy-cookie-session-secret"
-    );
+    assert_eq!(loaded.secret.expose_secret(), "grant-restore-state-secret");
 
     database.cleanup().await;
 }
@@ -1430,7 +1427,7 @@ impl ContentLockTombstoneRepository for CrashExternalRepository {
         &self,
         _creator: CreatorPubky,
         _content_lock_path: ContentLockPath,
-        _frozen_original: &ContentLock,
+        _frozen_original: &ContentLockPayload,
         _tombstone: &ContentLockDeletionTombstone,
     ) -> Result<TombstoneReadback, locks_service::application::errors::ApplicationError> {
         self.withdraw_calls.fetch_add(1, Ordering::SeqCst);
@@ -1875,7 +1872,7 @@ fn app_state(pool: PgPool) -> AppState {
 fn creator_authority_record(secret: &str) -> CreatorAuthorityRecord {
     CreatorAuthorityRecord {
         creator: creator(),
-        auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+        auth_kind: CreatorAuthorityAuthKind::Grant,
         granted_scopes: vec![
             "/pub/app.locks/:rw".to_owned(),
             "/priv/app.locks/:rw".to_owned(),

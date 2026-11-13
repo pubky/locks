@@ -17,8 +17,8 @@ const homeserver = { id: 'homeserver' };
       publishHomeserverIfStale: async (...args) => calls.push(['publish', ...args]),
       free: () => calls.push(['free']),
     },
-    signinCookieBlocking: async () => {
-      calls.push(['signin']);
+    signinBlocking: async (clientId) => {
+      calls.push(['signin', clientId]);
       return { id: 'unexpected' };
     },
   };
@@ -39,8 +39,8 @@ const homeserver = { id: 'homeserver' };
       publishHomeserverIfStale: async (...args) => calls.push(['publish', ...args]),
       free: () => calls.push(['free']),
     },
-    signinCookieBlocking: async () => {
-      calls.push(['signin']);
+    signinBlocking: async (clientId) => {
+      calls.push(['signin', clientId]);
       return expectedSession;
     },
   };
@@ -50,7 +50,7 @@ const homeserver = { id: 'homeserver' };
     ['signup', homeserver, null],
     ['publish', homeserver],
     ['free'],
-    ['signin'],
+    ['signin', 'localhost'],
   ]);
 }
 

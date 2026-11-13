@@ -10,7 +10,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use uuid::Uuid;
 
 use crate::application::{
-    models::{GraphTaskRecord, VerificationTaskStatus},
+    models::{
+        GraphTaskRecord, PaymentRootState, PaymentTaskRecord, VerificationTaskStatus,
+        VerificationTerminalReason,
+    },
     ports::Clock,
 };
 
@@ -43,11 +46,18 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
 }
 
 pub(crate) type InMemoryStoredGraphTask = StoredEvaluatorTask<GraphTaskRecord>;
+pub(crate) type InMemoryStoredPaymentTask = StoredEvaluatorTask<PaymentTaskRecord>;
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.
+///
+/// When several fields are needed, acquire them in this global order:
+/// `folded_auth_reservations` -> `records` -> `payment_records` ->
+/// `current_statuses` -> `graph_records`. Per-lock admission does not serialize
+/// operations for different locks, so reversing this order can deadlock globally.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
     pub(crate) graph_records: RwLock<Vec<InMemoryStoredGraphTask>>,
+    pub(crate) payment_records: RwLock<Vec<InMemoryStoredPaymentTask>>,
     pub(crate) current_statuses: RwLock<HashMap<TaskId, VerificationTaskStatus>>,
     pub(crate) deletion_cutoffs: RwLock<HashSet<LockKey>>,
     pub(crate) folded_auth_reservations: RwLock<HashSet<HandleKey>>,
@@ -62,6 +72,7 @@ impl fmt::Debug for InMemoryVerificationTaskDeletionFence {
             .debug_struct("InMemoryVerificationTaskDeletionFence")
             .field("records", &self.records)
             .field("graph_records", &self.graph_records)
+            .field("payment_records", &self.payment_records)
             .field("current_statuses", &self.current_statuses)
             .field("deletion_cutoffs", &self.deletion_cutoffs)
             .field("folded_auth_reservations", &self.folded_auth_reservations)
@@ -87,6 +98,7 @@ impl InMemoryVerificationTaskDeletionFence {
         Self {
             records: RwLock::new(HashMap::new()),
             graph_records: RwLock::new(Vec::new()),
+            payment_records: RwLock::new(Vec::new()),
             current_statuses: RwLock::new(HashMap::new()),
             deletion_cutoffs: RwLock::new(HashSet::new()),
             folded_auth_reservations: RwLock::new(HashSet::new()),
@@ -132,5 +144,66 @@ impl InMemoryVerificationTaskDeletionFence {
 
     pub(crate) fn authoritative_cutoff(&self) -> OffsetDateTime {
         self.clock.now()
+    }
+
+    pub(crate) async fn abandon_provider_v2_tasks(
+        &self,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        forced_at: OffsetDateTime,
+        preserve_terminal: &HashSet<TaskId>,
+    ) {
+        let mut fence_records = self.records.write().await;
+        let mut payment_records = self.payment_records.write().await;
+        let mut current_statuses = self.current_statuses.write().await;
+        Self::abandon_provider_v2_tasks_under_locks(
+            &mut fence_records,
+            &mut payment_records,
+            &mut current_statuses,
+            creator,
+            lock_id,
+            forced_at,
+            preserve_terminal,
+        );
+    }
+
+    pub(crate) fn abandon_provider_v2_tasks_under_locks(
+        fence_records: &mut HashMap<TaskId, InMemoryVerificationTaskFenceRecord>,
+        payment_records: &mut [InMemoryStoredPaymentTask],
+        current_statuses: &mut HashMap<TaskId, VerificationTaskStatus>,
+        creator: &CreatorPubky,
+        lock_id: &LockId,
+        forced_at: OffsetDateTime,
+        preserve_terminal: &HashSet<TaskId>,
+    ) {
+        for stored in payment_records.iter_mut().filter(|stored| {
+            let snapshot = stored.task.snapshot.as_v1();
+            &snapshot.creator == creator
+                && snapshot
+                    .submitted_proof_bundle
+                    .pubky_lock_resource
+                    .lock_id()
+                    == lock_id
+                && stored.task.status != VerificationTaskStatus::Completed
+                && !preserve_terminal.contains(&stored.task.task_id)
+        }) {
+            stored.task.status = VerificationTaskStatus::Expired;
+            stored.task.snapshot.as_v1_mut().root =
+                PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted);
+            stored.task.evaluator_revision = stored.task.evaluator_revision.saturating_add(1);
+            stored.task.entitlement_to_publish = None;
+            stored.task.entitlement_publication_token = None;
+            stored.task.completed_at = Some(forced_at);
+            stored.claimed_by = None;
+            stored.claim_token = None;
+            stored.claim_expires_at = None;
+            stored.next_attempt_at = None;
+            current_statuses.insert(stored.task.task_id, VerificationTaskStatus::Expired);
+            if let Some(record) = fence_records.get_mut(&stored.task.task_id) {
+                record.status = VerificationTaskStatus::Expired;
+                record.entitlement_publication_claim_token = None;
+                record.deletion_job_id = None;
+            }
+        }
     }
 }

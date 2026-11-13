@@ -18,8 +18,8 @@ use crate::application::ports::{
     FoldedAuthApprovalPoll, FoldedAuthApprovalPollError, FoldedAuthApprovalPoller,
     FoldedAuthFlowStarter, FoldedAuthPollCall,
 };
+use crate::infrastructure::pubky::creator_identity::creator_from_pubky_public_key_z32;
 use crate::infrastructure::pubky::grant_connect_flow::LockServerGrantPopKeys;
-use crate::infrastructure::pubky::legacy_connect_flow::creator_from_pubky_public_key_z32;
 
 const FLOW_STATE_VERSION: u16 = 1;
 

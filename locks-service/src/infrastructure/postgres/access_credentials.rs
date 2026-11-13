@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use locks_core::{
     ids::{BundleId, CreatorPubky, LockId},
-    lock_policy::{ContentLock, GuardedResource},
+    lock_policy::{ContentLockPayload, GuardedResource},
 };
 
 use crate::application::errors::ApplicationError;
@@ -504,7 +504,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         }
         let frozen: serde_json::Value =
             job.try_get("frozen_content_lock").map_err(storage_error)?;
-        let frozen: ContentLock = serde_json::from_value(frozen).map_err(|error| {
+        let frozen: ContentLockPayload = serde_json::from_value(frozen).map_err(|error| {
             ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
             }
@@ -547,15 +547,23 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        let mut resources: Vec<GuardedResource> = frozen.primary_resource.into_iter().collect();
+        let mut resources: Vec<GuardedResource> =
+            frozen.primary_resource().cloned().into_iter().collect();
         let secondary_resources = frozen
-            .secondary_resources
-            .into_iter()
+            .secondary_resources()
+            .iter()
             .map(|(path, resource)| {
-                GuardedResource::new(path, resource.hash, resource.content_type, resource.size)
-                    .map_err(|error| ApplicationError::InvalidContentLockDeletionState {
+                GuardedResource::new(
+                    path.clone(),
+                    resource.hash,
+                    resource.content_type.clone(),
+                    resource.size,
+                )
+                .map_err(|error| {
+                    ApplicationError::InvalidContentLockDeletionState {
                         message: format!("state_corrupt: invalid frozen guarded resource: {error}"),
-                    })
+                    }
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         resources.extend(secondary_resources);
@@ -713,7 +721,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         }
         let frozen: serde_json::Value =
             job.try_get("frozen_content_lock").map_err(storage_error)?;
-        let frozen: ContentLock = serde_json::from_value(frozen).map_err(|error| {
+        let frozen: ContentLockPayload = serde_json::from_value(frozen).map_err(|error| {
             ApplicationError::CorruptContentLockDeletionManifest {
                 message: format!("invalid frozen content lock stored in Postgres: {error}"),
             }
@@ -756,18 +764,22 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        let mut resources: Vec<GuardedResource> = frozen.primary_resource.into_iter().collect();
+        let mut resources: Vec<GuardedResource> =
+            frozen.primary_resource().cloned().into_iter().collect();
         resources.extend(
             frozen
-                .secondary_resources
-                .into_iter()
+                .secondary_resources()
+                .iter()
                 .map(|(path, resource)| {
-                    GuardedResource::new(path, resource.hash, resource.content_type, resource.size)
-                        .map_err(|error| ApplicationError::Storage {
-                            message: format!(
-                                "invalid frozen content lock stored in Postgres: {error}"
-                            ),
-                        })
+                    GuardedResource::new(
+                        path.clone(),
+                        resource.hash,
+                        resource.content_type.clone(),
+                        resource.size,
+                    )
+                    .map_err(|error| ApplicationError::Storage {
+                        message: format!("invalid frozen content lock stored in Postgres: {error}"),
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
@@ -883,7 +895,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
             .map_err(storage_error)?;
         let credential_expiry: OffsetDateTime =
             credential.try_get("expires_at").map_err(storage_error)?;
-        let frozen: ContentLock =
+        let frozen: ContentLockPayload =
             serde_json::from_value(job.frozen_content_lock).map_err(|error| {
                 ApplicationError::Storage {
                     message: format!("invalid frozen content lock stored in Postgres: {error}"),
@@ -1955,10 +1967,10 @@ mod tests {
             "INSERT INTO content_lock_deletion_task_snapshot (
                 deletion_job_id, verification_task_id, creator, bundle_id,
                 pubky_lock_resource, criterion_id, status_at_cutoff,
-                paykit_admission_required, resolved_status, resolved_at,
+                paykit_admission_required, obligation_kind, resolved_status, resolved_at,
                 final_credential_eligible_at, final_credential_issued_at
              ) VALUES ($1, $2, $3, $4, 'pubkycreator/pub/locks.app/lock.json',
-                       'payment', 'completed', TRUE, 'completed', $5,
+                       'payment', 'completed', TRUE, 'paykit_v1', 'completed', $5,
                        CASE WHEN $6 THEN $5 END,
                        CASE WHEN $7 THEN $5 END)",
         )

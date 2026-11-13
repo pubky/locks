@@ -33,9 +33,8 @@ use locks_service::application::models::{
     FoldedAuthAttempt, FoldedAuthFlowSecret, FoldedAuthStartResult, FoldedAuthStateHash,
     FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
     GraphTaskRecord, GuardedResourceRecord, InvoiceAdmissionRetryReason,
-    LegacyCreatorConnectFlowApproval, OrdinaryCredentialLookupResult,
-    PendingCreatorConnectFlowRecord, PrepareForceDeletionResult, RestoredFoldedAuthAttempt,
-    StartFoldedAuthAttempt,
+    OrdinaryCredentialLookupResult, PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
+    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
@@ -43,7 +42,7 @@ use locks_service::application::ports::{
     ContentLockDeletionRepository, ContentLockRepository, FoldedAuthApprovalPoll,
     FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthFlowStarter,
     FoldedAuthPollCall, FoldedAuthRepository, GrantCreatorConnectFlowClient,
-    GuardedResourceRepository, LegacyCreatorConnectFlowClient,
+    GuardedResourceRepository,
 };
 
 use pubky_common::crypto::Keypair;
@@ -1175,6 +1174,42 @@ async fn folded_auth_status_without_runtime_dependencies_is_503_and_no_store() {
     assert_eq!(body["error"]["code"], "folded_auth_unavailable");
 }
 
+#[test]
+fn folded_auth_origin_policy_applies_singleton_wildcard_only_to_valid_origins() {
+    let wildcard = vec!["*".to_owned()];
+    assert!(super::auth_origin_allowed(
+        &wildcard,
+        "https://reader.example"
+    ));
+
+    for invalid_origin in [
+        "null",
+        "http://reader.example",
+        "https://reader.example/path",
+        "data:text/plain,opaque",
+        "not an origin",
+    ] {
+        assert!(
+            !super::auth_origin_allowed(&wildcard, invalid_origin),
+            "unexpectedly accepted Origin {invalid_origin:?}"
+        );
+    }
+
+    let mixed = vec!["*".to_owned(), "https://pubky.app".to_owned()];
+    assert!(!super::auth_origin_allowed(
+        &mixed,
+        "https://reader.example"
+    ));
+    assert!(!super::auth_origin_allowed(&mixed, "https://pubky.app"));
+
+    let explicit = vec!["https://pubky.app".to_owned()];
+    assert!(super::auth_origin_allowed(&explicit, "https://pubky.app"));
+    assert!(!super::auth_origin_allowed(
+        &explicit,
+        "https://reader.example"
+    ));
+}
+
 #[tokio::test]
 async fn folded_auth_cors_preflight_allows_browser_sdk_headers_on_both_routes() {
     let app = router(test_state_with_folded_auth_origins(vec![
@@ -1250,6 +1285,88 @@ async fn folded_auth_cors_rejects_duplicate_origin_headers() {
             .is_none()
     );
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn folded_auth_wildcard_accepts_and_reflects_valid_concrete_origin() {
+    let origin = "https://reader.example";
+    let (state, bundle) = folded_auth_test_state_with_poller_and_origins(
+        Arc::new(FakeFoldedAuth),
+        vec!["*".to_owned()],
+    )
+    .await;
+    let app = router(state);
+
+    let submitted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41006))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"submitted_proof_bundle": bundle})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        submitted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    let submitted_body = response_json(submitted).await;
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proof-bundles/auth-status")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"state": submitted_body["state"]})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(
+        status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(status.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let preflight = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/proof-bundles/auth-status")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_ne!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
 }
 
 #[tokio::test]
@@ -1730,6 +1847,92 @@ async fn graceful_delete_of_existing_lock_queues_one_frozen_job_and_replays() {
 }
 
 #[tokio::test]
+async fn graceful_delete_of_payment_v2_lock_freezes_versioned_manifest_and_replays() {
+    let (state, _) = payment_only_v2_test_state().await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = payment_only_v2_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let path = ContentLockPath::from_lock_id(lock_id.clone());
+    assert_eq!(
+        state
+            .content_locks()
+            .get_content_lock_payload(&creator(), &path)
+            .await
+            .unwrap(),
+        Some(ContentLockPayload::V2(content_lock.clone()))
+    );
+    let app = router(state.clone());
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(authenticated_json_request(
+                "DELETE",
+                &format!("/creator/content-locks/{lock_id}"),
+                json!(null),
+                "creator-session",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "lock_id": lock_id, "status": "queued" })
+        );
+    }
+
+    let job = state
+        .content_lock_deletions()
+        .get_job(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        job.frozen_content_lock,
+        ContentLockPayload::V2(content_lock)
+    );
+    assert_eq!(job.state, ContentLockDeletionState::Queued);
+}
+
+#[tokio::test]
+async fn force_delete_of_payment_v2_lock_records_versioned_receipt_without_provider_io() {
+    let (state, _) = payment_only_v2_test_state().await;
+    seed_frontend_session(&state, "creator-session", creator()).await;
+    let content_lock = payment_only_v2_lock();
+    let lock_id = content_lock.lock_id().unwrap();
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}?force=true"),
+            json!(null),
+            "creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "lock_id": lock_id,
+            "lock_deleted": true,
+            "failed_resource_paths": []
+        })
+    );
+    let receipt = state
+        .content_lock_deletions()
+        .get_force_receipt(&creator(), &lock_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.frozen_content_lock,
+        Some(ContentLockPayload::V2(content_lock))
+    );
+}
+
+#[tokio::test]
 async fn force_delete_removes_resources_and_lock_records_receipt_and_replays() {
     let state = test_state();
     seed_frontend_session(&state, "creator-session", creator()).await;
@@ -2191,6 +2394,35 @@ async fn assert_terminal_job_force_defers_until_stale_worker_releases_action_lan
     let app = router(state.clone());
 
     let deferred = force_delete_request(&app, &lock_id).await;
+    if failure_code.is_none() {
+        assert_eq!(deferred.status(), StatusCode::OK);
+        stale_guard.release().await.unwrap();
+        assert!(
+            state
+                .content_locks()
+                .get_content_lock(&creator(), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .guarded_resources()
+                .get_current_guarded_resource(&creator(), &resource.path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .content_lock_deletions()
+                .get_force_receipt(&creator(), &lock_id)
+                .await
+                .unwrap()
+                .is_some_and(|receipt| receipt.completed_at.is_some())
+        );
+        return;
+    }
     assert_eq!(deferred.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response_json(deferred).await,
@@ -4365,7 +4597,6 @@ async fn production_creator_routes_are_mounted_with_pubky_homeserver_repositorie
 async fn dev_pubky_homeserver_routes_mount_authenticated_creator_routes_and_manual_completion() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.enabled = true;
-    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::LegacyConnect;
     let app = router(AppState::new_empty_in_memory_with_creator_repositories(
         config,
         Arc::new(InMemoryContentLockRepository::new()),
@@ -6128,7 +6359,7 @@ async fn creator_authority_status_route_returns_authorized_status_without_secret
         "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"
     );
     assert_eq!(body["authorized"], true);
-    assert_eq!(body["auth_kind"], "legacy_cookie");
+    assert_eq!(body["auth_kind"], "grant");
     assert_eq!(
         body["granted_scopes"],
         json!(["/pub/app.locks/:rw", "/priv/app.locks/:rw"])
@@ -6248,10 +6479,11 @@ async fn creator_connect_flow_routes_are_not_mounted_when_disabled() {
 
 #[tokio::test]
 async fn connect_shell_rejects_unallowlisted_return_to_without_starting_flow() {
-    let client = Arc::new(CountingLegacyConnectFlowClient::default());
-    let state =
-        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-            .with_legacy_creator_connect_flow_client(client.clone());
+    let client = Arc::new(CountingGrantConnectFlowClient::default());
+    let state = test_state_with_creator_connect_return_origins_without_client(vec![
+        "https://pubky.app".to_owned(),
+    ])
+    .with_grant_creator_connect_flow_client(client.clone());
 
     let response = router(state)
         .oneshot(empty_request(
@@ -6270,10 +6502,11 @@ async fn connect_shell_rejects_unallowlisted_return_to_without_starting_flow() {
 
 #[tokio::test]
 async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_origin() {
-    let client = Arc::new(CountingLegacyConnectFlowClient::default());
-    let state =
-        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-            .with_legacy_creator_connect_flow_client(client.clone());
+    let client = Arc::new(CountingGrantConnectFlowClient::default());
+    let state = test_state_with_creator_connect_return_origins_without_client(vec![
+        "https://pubky.app".to_owned(),
+    ])
+    .with_grant_creator_connect_flow_client(client.clone());
     let response = router(state)
             .oneshot(empty_request(
                 "GET",
@@ -6289,7 +6522,7 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
     );
     let body = String::from_utf8(response_bytes(response).await).unwrap();
     assert!(body.contains("Enable Locks"));
-    assert!(body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert!(body.contains("pubkyauth://signin_grant?secret=fake-grant"));
     assert!(body.contains("data-testid=\"pubky-auth-qr\""));
     assert!(body.contains("<svg"));
     assert!(body.contains("aria-label=\"Pubky authorization QR code\""));
@@ -6306,7 +6539,7 @@ async fn connect_shell_starts_flow_and_renders_auth_url_only_on_lock_server_orig
 }
 
 #[tokio::test]
-async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow() {
+async fn grant_connect_shell_renders_one_grant_url() {
     let grant = Arc::new(FakeGrantConnectFlowClient);
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.enabled = true;
@@ -6315,9 +6548,7 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
         client_id: "locks.example".to_owned(),
         allowed_return_origins: vec!["https://pubky.app".to_owned()],
     });
-    let state = AppState::new_empty_in_memory(config)
-        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
-        .with_grant_creator_connect_flow_client(grant);
+    let state = AppState::new_empty_in_memory(config).with_grant_creator_connect_flow_client(grant);
 
     let response = router(state)
         .oneshot(empty_request(
@@ -6330,7 +6561,7 @@ async fn grant_connect_shell_renders_one_grant_url_and_never_starts_cookie_flow(
     assert_eq!(response.status(), StatusCode::OK);
     let body = String::from_utf8(response_bytes(response).await).unwrap();
     assert!(body.contains("pubkyauth://signin_grant?secret=fake-grant"));
-    assert!(!body.contains("pubkyauth://signin?secret=fake-secret-flow-url"));
+    assert!(!body.contains("pubkyauth://signin?"));
     assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
 }
 
@@ -6343,7 +6574,6 @@ fn grant_connect_state() -> AppState {
         allowed_return_origins: vec!["https://pubky.app".to_owned()],
     });
     AppState::new_empty_in_memory(config)
-        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
         .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient))
 }
 
@@ -6386,55 +6616,92 @@ async fn grant_connect_shell_names_the_creator_the_app_expects() {
 }
 
 #[tokio::test]
-async fn legacy_connect_shell_offers_only_the_plain_ring_link() {
-    for (delivery, embedded) in [("&delivery=postmessage", true), ("", false)] {
-        let state =
-            test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-                .with_legacy_creator_connect_flow_client(Arc::new(
-                    CountingLegacyConnectFlowClient::default(),
-                ));
-        let response = router(state)
-            .oneshot(empty_request(
-                "GET",
-                &format!(
-                    "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=s{delivery}"
-                ),
-            ))
+async fn grant_connect_staging_wildcard_accepts_http_return_to_with_concrete_browser_origin() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+
+    let response = router(state.clone())
+        .oneshot(empty_request(
+            "GET",
+            "/connect?return_to=http%3A%2F%2Fcreator.example%3A4173%2Fcallback&state=opaque-state&delivery=postmessage",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "frame-ancestors http://creator.example:4173"
+    );
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(body.contains(r#"const TARGET_ORIGIN = "http://creator.example:4173";"#));
+    assert!(!body.contains(r#"const TARGET_ORIGIN = "*";"#));
+
+    for path in [
+        "/connect?return_to=pubky%3A%2F%2Fcreator.example%2Fcallback&state=opaque-state",
+        "/connect?return_to=not%20a%20url&state=opaque-state",
+    ] {
+        let response = router(state.clone())
+            .oneshot(empty_request("GET", path))
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = String::from_utf8(response_bytes(response).await).unwrap();
-        // Bitkit accepts only grant auth, and only a grant link gets an Android intent.
-        assert!(
-            body.contains(
-                "<a class=\"authorize-btn\" href=\"pubkyauth://signin?secret=fake-secret-flow-url\">"
-            ),
-            "delivery={delivery:?}"
-        );
-        // No Bitkit button, copy or logo.
-        assert!(!body.contains("Bitkit"), "delivery={delivery:?}");
-        assert!(
-            !body.contains("<span class=\"bitkit-logo\">"),
-            "delivery={delivery:?}"
-        );
-        assert!(!body.contains("intent://"), "delivery={delivery:?}");
-        assert_eq!(
-            body.contains("<strong>Pubky Ring</strong> to authorize"),
-            !embedded,
-            "delivery={delivery:?}"
-        );
+        assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
     }
+}
+
+#[tokio::test]
+async fn grant_connect_staging_wildcard_revalidates_completion_return_to() {
+    let mut config = test_config(RuntimeEnvironment::Staging, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["*".to_owned()],
+    });
+    let state = AppState::new_empty_in_memory(config)
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
+    seed_pending_grant_creator_connect_flow(
+        &state,
+        "grant-flow-wildcard",
+        "http://creator.example:4173/callback",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state)
+        .oneshot(empty_request(
+            "POST",
+            "/connect/grant-flow-wildcard/complete",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(location.starts_with("http://creator.example:4173/callback?state=opaque-state&code="));
 }
 
 #[tokio::test]
 async fn connect_shell_qr_copies_the_url_it_encodes() {
     for delivery in ["&delivery=postmessage", ""] {
         let state =
-            test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-                .with_legacy_creator_connect_flow_client(Arc::new(
-                    CountingLegacyConnectFlowClient::default(),
-                ));
+            test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()]);
         let response = router(state)
             .oneshot(empty_request(
                 "GET",
@@ -6450,7 +6717,7 @@ async fn connect_shell_qr_copies_the_url_it_encodes() {
         // A copy button, not a link: the same-device deep link stays on the signer buttons.
         assert!(
             body.contains(
-                "<button type=\"button\" class=\"qr\" data-testid=\"pubky-auth-qr\" data-url=\"pubkyauth://signin?secret=fake-secret-flow-url\" aria-label=\"Copy authorization link\">"
+                "<button type=\"button\" class=\"qr\" data-testid=\"pubky-auth-qr\" data-url=\"pubkyauth://signin_grant?secret=fake-grant\" aria-label=\"Copy authorization link\">"
             ),
             "delivery={delivery:?}"
         );
@@ -6479,7 +6746,6 @@ async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_varia
                     allowed_return_origins: vec!["https://pubky.app".to_owned()],
                 });
             let state = AppState::new_empty_in_memory(config)
-                .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
                 .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
 
             let response = router(state)
@@ -6531,34 +6797,6 @@ async fn grant_connect_shell_offers_a_ring_and_a_bitkit_link_with_platform_varia
 }
 
 #[tokio::test]
-async fn grant_connect_shell_rejects_origin_allowed_only_for_legacy_connect() {
-    let mut config = test_config(RuntimeEnvironment::Development, true);
-    config.creator_authority_acquisition.enabled = true;
-    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
-    config
-        .creator_authority_acquisition
-        .legacy_connect
-        .allowed_return_origins = vec!["https://legacy.example".to_owned()];
-    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
-        client_id: "locks.example".to_owned(),
-        allowed_return_origins: vec!["https://pubky.app".to_owned()],
-    });
-    let state = AppState::new_empty_in_memory(config)
-        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
-        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
-
-    let response = router(state)
-        .oneshot(empty_request(
-            "GET",
-            "/connect?return_to=https%3A%2F%2Flegacy.example%2Fcallback&state=opaque-state",
-        ))
-        .await
-        .unwrap();
-
-    assert_error_response(response, StatusCode::BAD_REQUEST, "invalid_request").await;
-}
-
-#[tokio::test]
 async fn grant_connect_postmessage_completion_returns_only_state_and_code() {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.enabled = true;
@@ -6568,7 +6806,6 @@ async fn grant_connect_postmessage_completion_returns_only_state_and_code() {
         allowed_return_origins: vec!["https://pubky.app".to_owned()],
     });
     let state = AppState::new_empty_in_memory(config)
-        .with_legacy_creator_connect_flow_client(Arc::new(PanicLegacyConnectFlowClient))
         .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient));
     seed_pending_grant_creator_connect_flow(
         &state,
@@ -6617,11 +6854,8 @@ fn connect_shell_android_intent_wraps_only_a_canonical_grant_link() {
 #[tokio::test]
 async fn connect_shell_completion_redirects_to_return_to_with_state_and_code_only() {
     let state =
-        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-            .with_legacy_creator_connect_flow_client(Arc::new(
-                CountingLegacyConnectFlowClient::default(),
-            ));
-    seed_pending_creator_connect_flow(
+        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()]);
+    seed_pending_grant_creator_connect_flow(
         &state,
         "flow-redirect",
         "https://pubky.app/locks/connected?existing=1",
@@ -6652,13 +6886,43 @@ async fn connect_shell_completion_redirects_to_return_to_with_state_and_code_onl
 }
 
 #[tokio::test]
+async fn connect_shell_completion_refuses_pending_flow_written_by_removed_legacy_connect() {
+    let state =
+        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()]);
+    seed_pending_legacy_creator_connect_flow(
+        &state,
+        "flow-legacy-pending",
+        "https://pubky.app/locks/connected",
+        "opaque-state",
+    )
+    .await;
+
+    let response = router(state.clone())
+        .oneshot(empty_request(
+            "POST",
+            "/connect/flow-legacy-pending/complete",
+        ))
+        .await
+        .unwrap();
+
+    // Same answer master gave a flow whose kind did not match the configured method.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get(header::LOCATION).is_none());
+    assert!(
+        state
+            .creator_authorities()
+            .get_creator_authority(&creator())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn connect_shell_completion_revalidates_return_to_allowlist_before_redirect() {
     let state =
-        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()])
-            .with_legacy_creator_connect_flow_client(Arc::new(
-                CountingLegacyConnectFlowClient::default(),
-            ));
-    seed_pending_creator_connect_flow(
+        test_state_with_creator_connect_return_origins(vec!["https://pubky.app".to_owned()]);
+    seed_pending_grant_creator_connect_flow(
         &state,
         "flow-evil-return",
         "https://evil.example/steal",
@@ -6679,11 +6943,8 @@ async fn connect_shell_completion_revalidates_return_to_allowlist_before_redirec
 
 #[tokio::test]
 async fn connect_shell_completion_redirect_does_not_include_auth_url_or_session_secret() {
-    let state = test_state_with_creator_connect_return_origins(vec!["*".to_owned()])
-        .with_legacy_creator_connect_flow_client(Arc::new(
-            CountingLegacyConnectFlowClient::default(),
-        ));
-    seed_pending_creator_connect_flow(
+    let state = test_state_with_creator_connect_return_origins(vec!["*".to_owned()]);
+    seed_pending_grant_creator_connect_flow(
         &state,
         "flow-secret-free-location",
         "https://creator.example/callback",
@@ -6718,7 +6979,6 @@ async fn connect_shell_completion_redirect_does_not_include_auth_url_or_session_
 async fn self_relay_acquisition_routes_are_not_mounted() {
     let mut config = test_config(RuntimeEnvironment::Production, false);
     config.creator_authority_acquisition.enabled = true;
-    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::LegacyConnect;
 
     let response = router(AppState::new_empty_in_memory(config))
         .oneshot(json_request(
@@ -6737,13 +6997,13 @@ async fn raw_creator_connect_flow_routes_are_never_mounted() {
     let mut config = test_config(RuntimeEnvironment::Production, false);
     config.creator_authority_acquisition = CreatorAuthorityAcquisitionConfig {
         enabled: true,
-        method: CreatorAuthorityAcquisitionMethod::LegacyConnect,
+        method: CreatorAuthorityAcquisitionMethod::GrantConnect,
         frontend_session_ttl_seconds: 86_400,
         frontend_session_code_ttl_seconds: 120,
-        legacy_connect: crate::config::LegacyConnectAcquisitionConfig {
+        grant_connect: Some(GrantConnectAcquisitionConfig {
+            client_id: "locks.example".to_owned(),
             allowed_return_origins: vec!["https://pubky.app".to_owned()],
-        },
-        grant_connect: None,
+        }),
     };
     let app = router(AppState::new_empty_in_memory(config));
 
@@ -7015,15 +7275,30 @@ fn test_state_with_creator_publishing(_enabled: bool) -> AppState {
 fn test_state_with_creator_connect(expose_creator_connect_routes: bool) -> AppState {
     let mut config = test_config(RuntimeEnvironment::Development, true);
     config.creator_authority_acquisition.enabled = expose_creator_connect_routes;
+    if expose_creator_connect_routes {
+        config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+            client_id: "locks.example".to_owned(),
+            allowed_return_origins: vec!["https://pubky.app".to_owned()],
+        });
+    }
     AppState::new_empty_in_memory(config)
 }
 
+/// Grant-connect shell state with the given return origins and the fixed fake grant client.
 fn test_state_with_creator_connect_return_origins(allowed_return_origins: Vec<String>) -> AppState {
+    test_state_with_creator_connect_return_origins_without_client(allowed_return_origins)
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient))
+}
+
+fn test_state_with_creator_connect_return_origins_without_client(
+    allowed_return_origins: Vec<String>,
+) -> AppState {
     let mut config = test_config(RuntimeEnvironment::Development, true);
-    config
-        .creator_authority_acquisition
-        .legacy_connect
-        .allowed_return_origins = allowed_return_origins;
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins,
+    });
     AppState::new_empty_in_memory(config)
 }
 
@@ -7136,8 +7411,8 @@ async fn folded_auth_test_state_with_runtime(
     (state, bundle)
 }
 
-async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
-    let lock = ContentLockV2 {
+fn payment_only_v2_lock() -> ContentLockV2 {
+    ContentLockV2 {
         version: 2,
         creator: creator(),
         primary_resource: Some(
@@ -7163,7 +7438,11 @@ async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
         },
         lock_server: LockServerConfig { override_: None },
         created_at: datetime!(2026-10-30 11:00:00 UTC),
-    };
+    }
+}
+
+async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
+    let lock = payment_only_v2_lock();
     let path = ContentLockPath::from_lock_id(lock.lock_id().unwrap());
     let bundle = SubmittedProofBundleV2 {
         version: 2,
@@ -7745,7 +8024,7 @@ async fn seed_creator_authority(state: &AppState) {
         .creator_authorities()
         .upsert_creator_authority(CreatorAuthorityRecord {
             creator: creator(),
-            auth_kind: CreatorAuthorityAuthKind::LegacyCookie,
+            auth_kind: CreatorAuthorityAuthKind::Grant,
             granted_scopes: vec![
                 "/pub/app.locks/:rw".to_owned(),
                 "/priv/app.locks/:rw".to_owned(),
@@ -7758,7 +8037,8 @@ async fn seed_creator_authority(state: &AppState) {
         .unwrap();
 }
 
-async fn seed_pending_creator_connect_flow(
+/// A pending flow as the removed legacy-connect mode wrote it (`pubkyauth://signin`).
+async fn seed_pending_legacy_creator_connect_flow(
     state: &AppState,
     flow_id: &str,
     return_to: &str,
@@ -7847,55 +8127,43 @@ impl InvoiceRetryJitter for ZeroInvoiceJitter {
 }
 
 #[derive(Debug, Default)]
-struct CountingLegacyConnectFlowClient {
+struct CountingGrantConnectFlowClient {
     start_calls: AtomicUsize,
 }
 
-impl CountingLegacyConnectFlowClient {
+impl CountingGrantConnectFlowClient {
     fn start_call_count(&self) -> usize {
         self.start_calls.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
-impl LegacyCreatorConnectFlowClient for CountingLegacyConnectFlowClient {
-    async fn start_legacy_creator_connect_flow(
+impl GrantCreatorConnectFlowClient for CountingGrantConnectFlowClient {
+    async fn start_grant_creator_connect_flow(
         &self,
-        _requested_scopes: &[String],
+        requested_scopes: &[String],
+        pop_key_id: &GrantPopKeyId,
+        expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://signin?secret=fake-secret-flow-url",
-        ))
+        FakeGrantConnectFlowClient
+            .start_grant_creator_connect_flow(requested_scopes, pop_key_id, expected_creator)
+            .await
     }
 
-    async fn await_legacy_creator_connect_flow_approval(
+    async fn await_grant_creator_connect_flow_approval(
         &self,
-        _authorization_url: &CreatorConnectAuthorizationUrl,
-    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
-        Ok(LegacyCreatorConnectFlowApproval {
-            creator: creator(),
-            session_secret: CreatorAuthoritySecret::new("session-secret"),
-        })
-    }
-}
-
-struct PanicLegacyConnectFlowClient;
-
-#[async_trait]
-impl LegacyCreatorConnectFlowClient for PanicLegacyConnectFlowClient {
-    async fn start_legacy_creator_connect_flow(
-        &self,
-        _requested_scopes: &[String],
-    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
-        panic!("grant-connect mode must not start legacy cookie flow")
-    }
-
-    async fn await_legacy_creator_connect_flow_approval(
-        &self,
-        _authorization_url: &CreatorConnectAuthorizationUrl,
-    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError> {
-        panic!("grant-connect mode must not await legacy cookie flow")
+        authorization_url: &CreatorConnectAuthorizationUrl,
+        pop_key_id: &GrantPopKeyId,
+        requested_scopes: &[String],
+    ) -> Result<GrantCreatorConnectFlowApproval, ApplicationError> {
+        FakeGrantConnectFlowClient
+            .await_grant_creator_connect_flow_approval(
+                authorization_url,
+                pop_key_id,
+                requested_scopes,
+            )
+            .await
     }
 }
 
@@ -8484,7 +8752,11 @@ async fn force_retry_uses_frozen_manifest_after_resource_limits_are_lowered() {
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .prepare_force_deletion_with_manifest(
+                &creator(),
+                &lock_id,
+                Some(&ContentLockPayload::V1(content_lock.clone())),
+            )
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)
@@ -8588,7 +8860,11 @@ async fn corrupt_frozen_force_manifest_reports_state_corrupt_and_keeps_receipt_r
     assert!(matches!(
         state
             .content_lock_deletions()
-            .prepare_force_deletion_with_manifest(&creator(), &lock_id, Some(&content_lock))
+            .prepare_force_deletion_with_manifest(
+                &creator(),
+                &lock_id,
+                Some(&ContentLockPayload::V1(content_lock.clone())),
+            )
             .await
             .unwrap(),
         PrepareForceDeletionResult::Synchronous(_)

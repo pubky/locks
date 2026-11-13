@@ -6,7 +6,7 @@ use crate::application::models::{
     CreatorAuthorityAuthKind, CreatorAuthorityRecord, CreatorConnectAuthorizationUrl,
     CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord, FrontendSessionRecord,
     FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
-    LegacyCreatorConnectFlowApproval, PendingCreatorConnectFlowRecord,
+    PendingCreatorConnectFlowRecord,
 };
 
 /// Secret-free status view for creator-granted homeserver authority.
@@ -167,22 +167,6 @@ pub trait FrontendSessionTokenGenerator: Send + Sync {
     fn generate_frontend_session_token(&self) -> FrontendSessionToken;
 }
 
-/// Object-safe seam for starting and completing legacy Pubky creator connect flows.
-#[async_trait]
-pub trait LegacyCreatorConnectFlowClient: Send + Sync {
-    /// Starts a legacy Pubky auth flow and returns the secret-bearing authorization URL.
-    async fn start_legacy_creator_connect_flow(
-        &self,
-        requested_scopes: &[String],
-    ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError>;
-
-    /// Resumes a pending flow from its authorization URL and awaits signer approval.
-    async fn await_legacy_creator_connect_flow_approval(
-        &self,
-        authorization_url: &CreatorConnectAuthorizationUrl,
-    ) -> Result<LegacyCreatorConnectFlowApproval, ApplicationError>;
-}
-
 /// Object-safe seam for delegated grant creator connect flows.
 #[async_trait]
 pub trait GrantCreatorConnectFlowClient: Send + Sync {
@@ -204,7 +188,7 @@ pub trait GrantCreatorConnectFlowClient: Send + Sync {
 }
 
 #[cfg(test)]
-mod legacy_connect_flow_port_tests {
+mod connect_flow_port_tests {
     use super::*;
     use crate::application::models::{
         CreatorConnectFlowId, FrontendSessionCode, FrontendSessionCodeRecord,
@@ -305,7 +289,7 @@ mod legacy_connect_flow_port_tests {
     }
 
     #[test]
-    fn legacy_connect_flow_ports_are_object_safe() {
+    fn connect_flow_ports_are_object_safe() {
         let connect_flow_store: &dyn CreatorConnectFlowStore = &CompileOnlyConnectFlowStore;
         let code_store: &dyn FrontendSessionCodeStore = &CompileOnlyFrontendSessionCodeStore;
         let session_store: &dyn FrontendSessionStore = &CompileOnlyFrontendSessionStore;

@@ -239,7 +239,7 @@ Responsibilities:
 - Persist encrypted delegated grant restore state for the Lock Server; never persist the derived PoP private key.
 - Own Creator Authority Acquisition: the process by which the Lock Server obtains or refreshes creator-granted homeserver authority for Locks public and private namespaces.
 - Treat redirect, popup, iframe, and native pubky.app rendering as presentation shells over the same acquisition state machine, not as domain/application concepts. ADR 0019's Lock-Server-hosted redirect/popup preserves the one-time callback boundary.
-- Use the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the production primitive. Derive one PoP key per flow from Lock Server signing seed; verify issuer/session identity, client id, key binding, scope coverage, and expiry. Keep legacy/cookie auth only as an explicitly selected compatibility mode, never a grant fallback.
+- Use the SDK grant flow (`PubkyGrantAuthFlow` / `GrantCredential`) as the production primitive. Derive one PoP key per flow from Lock Server signing seed; verify issuer/session identity, client id, key binding, scope coverage, and expiry. Cookie auth (the former `legacy-connect` mode) was removed.
 - Reject manual operator provisioning and direct raw-session submission as production paths for creator-granted session acquisition.
 - Treat creator authority status-check UX/API semantics as part of the authenticated `pubky.app/browser -> Lock Server` relationship; if exposed, derive creator from that authenticated context rather than accepting an arbitrary public key query parameter.
 - Read and write public Locks app resources under `/pub/app.locks/`.
@@ -611,11 +611,11 @@ Local dev/test creator publishing use case that stores or replaces the creator's
 
 ### CreatorAuthorityAcquisition
 
-Lock-Server-owned protocol that starts the explicitly selected Pubky auth flow, completes it after creator approval, stores creator-granted homeserver authority as encrypted private runtime state, returns a short-lived one-time frontend session code, and exchanges that code plus state for a Locks-local frontend session token. Production uses `method = "grant-connect"`: one grant URL, no cookie race/fallback, per-flow PoP, closed delegated restore state, and exact grant validation. `legacy-connect` remains explicit compatibility mode; grant mode rejects legacy records. Redirect, popup, iframe, and native rendering remain presentation shells, not separate domain concepts. Live Ring/Bitkit and Postgres restart smoke remains deferred.
+Lock-Server-owned protocol that starts the Pubky grant auth flow, completes it after creator approval, stores creator-granted homeserver authority as encrypted private runtime state, returns a short-lived one-time frontend session code, and exchanges that code plus state for a Locks-local frontend session token. Production uses `method = "grant-connect"`: one grant URL, no cookie race/fallback, per-flow PoP, closed delegated restore state, and exact grant validation. `legacy-connect` was removed; legacy records left by older versions are refused. Redirect, popup, iframe, and native rendering remain presentation shells, not separate domain concepts. Live Ring/Bitkit and Postgres restart smoke remains deferred.
 
 ### GetCreatorAuthorityStatus
 
-Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, and asks the runtime-selected authority manager to revalidate the current authority before returning a secret-free status. Missing, revoked, expired, wrong-kind, or otherwise unavailable authority is represented as `authorized = false`; grant mode therefore cannot report a retained legacy record as connected after a configuration change.
+Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, and asks the runtime-selected authority manager to revalidate the current authority before returning a secret-free status. Missing, revoked, expired, wrong-kind, or otherwise unavailable authority is represented as `authorized = false`; a retained legacy record from an older version is therefore never reported as connected.
 
 ### FrontendSessionExchange
 

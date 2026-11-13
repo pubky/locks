@@ -8,7 +8,9 @@ use crate::application::errors::ApplicationError;
 /// Auth mechanism used for a creator-granted Lock Server homeserver authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreatorAuthorityAuthKind {
-    /// Interim legacy cookie/session auth flow.
+    /// Written by the removed legacy-connect mode; never authorized.
+    ///
+    /// Kept so rows and pending flows stored by older versions still deserialize and are refused.
     LegacyCookie,
     /// Grant + Proof-of-Possession auth flow. Stored secret is delegated restore state.
     Grant,
@@ -88,24 +90,6 @@ impl fmt::Debug for CreatorAuthorityRecord {
             .field("secret", &"<redacted>")
             .field("session_expires_at", &self.session_expires_at)
             .field("last_revalidated_at", &self.last_revalidated_at)
-            .finish()
-    }
-}
-
-/// Approved legacy Pubky auth-flow material, converted to Locks creator-authority state.
-#[derive(Clone, PartialEq, Eq)]
-pub struct LegacyCreatorConnectFlowApproval {
-    /// Approved creator identity.
-    pub creator: CreatorPubky,
-    /// Restorable legacy Pubky session secret.
-    pub session_secret: CreatorAuthoritySecret,
-}
-
-impl fmt::Debug for LegacyCreatorConnectFlowApproval {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LegacyCreatorConnectFlowApproval")
-            .field("creator", &self.creator)
-            .field("session_secret", &"<redacted>")
             .finish()
     }
 }
