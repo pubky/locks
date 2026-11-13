@@ -1,8 +1,11 @@
+use std::str::FromStr;
+
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
+use locks_core::ids::CreatorPubky;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::ports::GrantCreatorConnectFlowClient;
 use locks_service::application::use_cases::complete_creator_connect_flow::{
@@ -101,6 +104,9 @@ pub(super) struct ConnectShellStartQuery {
     return_to: String,
     state: String,
     delivery: Option<String>,
+    /// Signed-in creator the embedding app expects to approve. Named in the grant link (`spk`)
+    /// so Pubky Ring opens that key instead of its picker; any other key's approval is refused.
+    creator: Option<String>,
 }
 
 pub(super) async fn connect_shell_start(
@@ -112,6 +118,12 @@ pub(super) async fn connect_shell_start(
     let allowed_origins = connect_allowed_return_origins(&state);
     let return_to = validate_return_to_url(&query.return_to, allowed_origins)?;
     let delivery = ConnectDeliveryMode::from_query(query.delivery.as_deref());
+    let expected_creator = query
+        .creator
+        .as_deref()
+        .map(CreatorPubky::from_str)
+        .transpose()
+        .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid creator"))?;
     let callback_state = query.state.clone();
     // Guaranteed `Some` because `validate_return_to_url` already parsed the origin.
     let target_origin = origin_from_return_to(&return_to).ok_or_else(invalid_return_to_url)?;
@@ -125,6 +137,7 @@ pub(super) async fn connect_shell_start(
         StartCreatorConnectFlowRequest {
             return_to,
             state: query.state,
+            expected_creator,
         },
     )
     .await?;

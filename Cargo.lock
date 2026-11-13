@@ -1820,7 +1820,7 @@ dependencies = [
  "base32",
  "blake3",
  "mime",
- "pubky",
+ "pubky 0.18.0",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -1838,7 +1838,7 @@ dependencies = [
  "locks-core",
  "locks-server",
  "locks-service",
- "pubky-common",
+ "pubky-common 0.18.0",
  "reqwest",
  "serde_json",
  "sqlx",
@@ -1858,8 +1858,8 @@ dependencies = [
  "paykit-lib",
  "percent-encoding",
  "pkarr",
- "pubky",
- "pubky-common",
+ "pubky 0.18.0",
+ "pubky-common 0.18.0",
  "pubky-noise",
  "serde",
  "serde_json",
@@ -1879,7 +1879,7 @@ dependencies = [
  "locks-core",
  "locks-sdk",
  "pkarr",
- "pubky",
+ "pubky 0.18.0",
  "reqwest",
  "serde",
  "serde-wasm-bindgen",
@@ -1910,8 +1910,8 @@ dependencies = [
  "mime",
  "percent-encoding",
  "pkarr",
- "pubky",
- "pubky-common",
+ "pubky 0.18.0",
+ "pubky-common 0.18.0",
  "qrcode",
  "rand 0.8.8",
  "reqwest",
@@ -1943,8 +1943,8 @@ dependencies = [
  "blake3",
  "chacha20poly1305 0.10.1",
  "locks-core",
- "pubky",
- "pubky-common",
+ "pubky 0.18.0",
+ "pubky-common 0.18.0",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1989,6 +1989,12 @@ name = "lru"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d317b4b9eb398e6acce275758ec6125535505e7a146fb1a9b8bda2451b0ff4c"
+
+[[package]]
+name = "lru"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 
 [[package]]
 name = "lru-slab"
@@ -2242,7 +2248,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "chrono",
  "hex",
- "pubky",
+ "pubky 0.16.2",
  "pubky-noise",
  "reqwest",
  "serde",
@@ -2511,7 +2517,41 @@ dependencies = [
  "lru 0.18.3",
  "percent-encoding",
  "pkarr",
- "pubky-common",
+ "pubky-common 0.16.2",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sse-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "wasm-bindgen-futures",
+ "web-time",
+ "webpki-roots 1.0.10",
+ "zeroize",
+]
+
+[[package]]
+name = "pubky"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2819510cf61acee641ac6df8cbf82331fe3458a3c67cc55e769fda9c55b5688c"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "cookie",
+ "flume 0.12.0",
+ "futures-lite",
+ "futures-util",
+ "hpke",
+ "httpdate",
+ "log",
+ "lru 0.19.0",
+ "percent-encoding",
+ "pkarr",
+ "pubky-common 0.18.0",
  "reqwest",
  "rustls",
  "serde",
@@ -2554,6 +2594,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky-common"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "412b393b971615cc0a6fca916882ad20283093db52832fd92b69f008611288da"
+dependencies = [
+ "argon2",
+ "base64 0.23.1",
+ "blake3",
+ "crypto_secretbox",
+ "ed25519-dalek",
+ "hkdf 0.13.0",
+ "percent-encoding",
+ "pkarr",
+ "postcard",
+ "pubky-timestamp",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "pubky-noise"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2564,7 +2630,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
  "hex",
- "pubky",
+ "pubky 0.16.2",
  "rand 0.9.5",
  "reqwest",
  "sha2 0.11.0",

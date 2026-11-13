@@ -6565,6 +6565,56 @@ async fn grant_connect_shell_renders_one_grant_url() {
     assert_eq!(body.matches("data-testid=\"pubky-auth-qr\"").count(), 1);
 }
 
+fn grant_connect_state() -> AppState {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.creator_authority_acquisition.enabled = true;
+    config.creator_authority_acquisition.method = CreatorAuthorityAcquisitionMethod::GrantConnect;
+    config.creator_authority_acquisition.grant_connect = Some(GrantConnectAcquisitionConfig {
+        client_id: "locks.example".to_owned(),
+        allowed_return_origins: vec!["https://pubky.app".to_owned()],
+    });
+    AppState::new_empty_in_memory(config)
+        .with_grant_creator_connect_flow_client(Arc::new(FakeGrantConnectFlowClient))
+}
+
+#[tokio::test]
+async fn grant_connect_shell_names_the_creator_the_app_expects() {
+    const CONNECT: &str =
+        "/connect?return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fconnected&state=opaque-state";
+    let z32 = "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    for creator in [z32.to_owned(), format!("pubky{z32}")] {
+        let response = router(grant_connect_state())
+            .oneshot(empty_request(
+                "GET",
+                &format!("{CONNECT}&creator={creator}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+        assert!(body.contains(&format!("&amp;spk=pubky{z32}")), "{creator}");
+    }
+
+    let response = router(grant_connect_state())
+        .oneshot(empty_request("GET", CONNECT))
+        .await
+        .unwrap();
+    let body = String::from_utf8(response_bytes(response).await).unwrap();
+    assert!(!body.contains("spk="));
+
+    for invalid in ["", "not-a-pubky", "tkrq8zmwb8a3m9k15"] {
+        let response = router(grant_connect_state())
+            .oneshot(empty_request(
+                "GET",
+                &format!("{CONNECT}&creator={invalid}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{invalid:?}");
+    }
+}
+
 #[tokio::test]
 async fn grant_connect_staging_wildcard_accepts_http_return_to_with_concrete_browser_origin() {
     let mut config = test_config(RuntimeEnvironment::Staging, true);
@@ -8093,10 +8143,11 @@ impl GrantCreatorConnectFlowClient for CountingGrantConnectFlowClient {
         &self,
         requested_scopes: &[String],
         pop_key_id: &GrantPopKeyId,
+        expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
         FakeGrantConnectFlowClient
-            .start_grant_creator_connect_flow(requested_scopes, pop_key_id)
+            .start_grant_creator_connect_flow(requested_scopes, pop_key_id, expected_creator)
             .await
     }
 
@@ -8124,10 +8175,13 @@ impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
         &self,
         _requested_scopes: &[String],
         _pop_key_id: &GrantPopKeyId,
+        expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
-        Ok(CreatorConnectAuthorizationUrl::new(
-            "pubkyauth://signin_grant?secret=fake-grant",
-        ))
+        let mut url = "pubkyauth://signin_grant?secret=fake-grant".to_owned();
+        if let Some(creator) = expected_creator {
+            url.push_str(&format!("&spk={creator}"));
+        }
+        Ok(CreatorConnectAuthorizationUrl::new(url))
     }
 
     async fn await_grant_creator_connect_flow_approval(
