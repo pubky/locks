@@ -73,6 +73,10 @@ impl InMemoryGraphTaskRepository {
         Self { deletion_fence }
     }
 
+    pub(crate) fn shared_deletion_fence(&self) -> Arc<InMemoryVerificationTaskDeletionFence> {
+        self.deletion_fence.clone()
+    }
+
     /// Graph-only records never own invoice-admission/payment intent state.
     pub async fn has_payment_intent(&self, _task_id: &TaskId) -> bool {
         false
@@ -108,14 +112,11 @@ impl InMemoryGraphTaskRepository {
         bundle_id: &BundleId,
     ) -> bool {
         self.deletion_fence
-            .graph_records
+            .records
             .read()
             .await
-            .iter()
-            .any(|stored| {
-                let snapshot = stored.task.snapshot.as_v1();
-                &snapshot.creator == creator && &snapshot.bundle_id == bundle_id
-            })
+            .values()
+            .any(|record| &record.creator == creator && &record.bundle_id == bundle_id)
     }
 
     pub(crate) async fn reserve_folded_auth_under_admission(

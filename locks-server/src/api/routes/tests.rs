@@ -32,9 +32,9 @@ use locks_service::application::models::{
     CreatorConnectAuthorizationUrl, CreatorConnectFlowId, DeletionReadAuthorization,
     FoldedAuthAttempt, FoldedAuthFlowSecret, FoldedAuthStartResult, FoldedAuthStateHash,
     FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
-    GraphTaskRecord, GuardedResourceRecord, InvoiceAdmissionRetryReason,
-    OrdinaryCredentialLookupResult, PendingCreatorConnectFlowRecord, PrepareForceDeletionResult,
-    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
+    GraphTaskRecord, GuardedResourceRecord, InvoiceAdmissionRetryReason, MixedTaskRecord,
+    OrdinaryCredentialLookupResult, PaymentInvoiceState, PendingCreatorConnectFlowRecord,
+    PrepareForceDeletionResult, RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
@@ -252,6 +252,17 @@ impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
         Err(folded_auth_storage_failure())
     }
 
+    async fn accept_and_insert_mixed_task(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _expected_generation: u64,
+        _task_id: TaskId,
+        _reader: CreatorPubky,
+        _now: time::OffsetDateTime,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
     async fn purge_terminal_before(
         &self,
         _now: time::OffsetDateTime,
@@ -263,6 +274,13 @@ impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
         &self,
         _state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn accepted_mixed_task(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
         Err(folded_auth_storage_failure())
     }
 }
@@ -757,6 +775,123 @@ async fn graph_v2_submission_starts_folded_auth_then_polls_pending_without_secre
     let status_body = response_json(status).await;
     assert_eq!(status_body["status"], "pending");
     assert!(status_body.get("flow_secret").is_none());
+}
+
+#[tokio::test]
+async fn mixed_v2_submission_accepts_folded_auth_into_one_invoice_pending_task() {
+    let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
+        Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
+        vec!["https://pubky.app".to_owned()],
+        None,
+        Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let state = state.with_paykit_http_client(Some(paykit));
+    seed_frontend_session(&state, "mixed-creator-session", creator()).await;
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted = response_json(submitted).await;
+    let replayed = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(replayed).await, submitted);
+
+    let accepted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted["state"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted = response_json(accepted).await;
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(accepted["task"]["status"], "pending");
+    assert_json_contains_no_null(&accepted["task"]);
+
+    let accepted_replay = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted_replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(accepted_replay).await, accepted);
+
+    let task = state
+        .mixed_tasks()
+        .get_mixed_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.snapshot.as_v1().reader, other_creator());
+    assert_eq!(task.snapshot.as_v1().submitted_proof_bundle, bundle);
+    assert!(matches!(
+        task.snapshot.as_v1().payment.invoice,
+        PaymentInvoiceState::Pending
+    ));
+
+    let evidence = app
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/verification-evidence",
+            json!({"bundle_id": BUNDLE_ID}),
+            "mixed-creator-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(evidence.status(), StatusCode::OK);
+    let evidence = response_json(evidence).await;
+    assert_eq!(evidence["mode"], "mixed");
+    assert_eq!(evidence["status"], "pending");
+    assert_eq!(evidence["payment"]["invoice"]["status"], "pending");
+    assert_eq!(evidence["satisfied_by"], json!([]));
+    assert_no_keys(
+        &evidence,
+        &[
+            "task_id",
+            "claim_token",
+            "evaluator_revision",
+            "raw_body",
+            "response_digest",
+            "history",
+            "flow_secret",
+            "authorization_url",
+            "invoice_address",
+            "config",
+            "failure_message",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -7286,6 +7421,16 @@ async fn folded_auth_test_state_with_runtime(
     allowed_return_origins: Vec<String>,
     clock: Option<Arc<dyn Clock>>,
 ) -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_runtime_and_payment(poller, allowed_return_origins, clock, None)
+        .await
+}
+
+async fn folded_auth_test_state_with_runtime_and_payment(
+    poller: Arc<dyn FoldedAuthApprovalPoller>,
+    allowed_return_origins: Vec<String>,
+    clock: Option<Arc<dyn Clock>>,
+    payment: Option<PaymentPolicyV2>,
+) -> (AppState, SubmittedProofBundleV2) {
     let lock = ContentLockV2 {
         version: 2,
         creator: creator(),
@@ -7299,7 +7444,7 @@ async fn folded_auth_test_state_with_runtime(
             .unwrap(),
         ),
         secondary_resources: BTreeMap::new(),
-        payment: None,
+        payment,
         graph: Some(GraphPolicyV2 {
             predicates: vec![GraphPredicateV2::Follows {
                 follower: GraphParticipantV2::Reader,
@@ -7354,6 +7499,7 @@ async fn folded_auth_test_state_with_runtime(
         graph,
         FoldedAuthSecretCipher::from_runtime_master_key(&master_key),
     ));
+    state = state.with_in_memory_mixed_tasks(folded_auth.mixed_repository());
     state = state.with_folded_auth_runtime(folded_auth, poller, Arc::new(FakeFoldedAuth));
     if let Some(clock) = clock {
         state = state.with_clock(clock);

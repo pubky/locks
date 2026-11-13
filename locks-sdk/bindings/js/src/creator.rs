@@ -702,8 +702,17 @@ fn validate_paykit_setup_status_response_for_tests(
 fn validate_verification_evidence_response_for_tests(
     value: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    locks_sdk::CreatorLocks::parse_verification_evidence_response(value.clone())
-        .map_err(|err| err.to_string())?;
+    match value.get("mode").and_then(serde_json::Value::as_str) {
+        Some("graph") => {
+            locks_sdk::CreatorLocks::parse_verification_evidence_response(value.clone())
+                .map_err(|err| err.to_string())?;
+        }
+        Some("mixed") => {
+            locks_sdk::CreatorLocks::parse_mixed_verification_evidence_response(value.clone())
+                .map_err(|err| err.to_string())?;
+        }
+        _ => return Err("invalid verification evidence mode".to_owned()),
+    }
     Ok(value)
 }
 
@@ -1151,6 +1160,106 @@ mod tests {
                 "accepted impossible JS graph evidence: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn creator_mixed_evidence_js_boundary_accepts_publication_wire_status() {
+        let evidence = serde_json::json!({
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "reader": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+            "bundle_id": "000G40R40M30E209185GR38E1W",
+            "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "mode": "mixed",
+            "status": "publishing_entitlement",
+            "submitted_at": "2026-11-03T12:00:00Z",
+            "deadline_at": "2026-11-03T12:10:00Z",
+            "satisfied_by": ["zero_conf_graph"],
+            "graph": {"predicates": [{
+                "index": 0,
+                "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+                "state": "satisfied",
+                "first_true_observation": {
+                    "outcome": "true",
+                    "observed_at": "2026-11-03T12:00:30Z",
+                    "origin": "https://nexus.example",
+                    "http_status": 200
+                }
+            }]},
+            "payment": {
+                "invoice": {
+                    "status": "created",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z"
+                },
+                "provider_status": {
+                    "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                    "bundle_id": "000G40R40M30E209185GR38E1W",
+                    "request_state": "accepted",
+                    "payment_state": "undetected",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z",
+                    "deadline": "2026-11-03T12:10:00Z",
+                    "asset": "BTC",
+                    "minimum_confirmations": 1,
+                    "current_sample": null,
+                    "first_threshold_satisfied": null
+                },
+                "operational_failure_count": 0,
+                "operational_failure_total": 0
+            }
+        });
+
+        assert_eq!(
+            validate_verification_evidence_response_for_tests(evidence.clone()).unwrap(),
+            evidence
+        );
+
+        let mut created_without_status = evidence.clone();
+        created_without_status["status"] = serde_json::json!("in_progress");
+        created_without_status["satisfied_by"] = serde_json::json!([]);
+        created_without_status
+            .as_object_mut()
+            .unwrap()
+            .remove("completed_at");
+        created_without_status["payment"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_status");
+        validate_verification_evidence_response_for_tests(created_without_status.clone()).unwrap();
+
+        let mut scheduled_retry_before_status = created_without_status.clone();
+        scheduled_retry_before_status["status"] = serde_json::json!("pending");
+        validate_verification_evidence_response_for_tests(scheduled_retry_before_status).unwrap();
+
+        for reason in ["invalid_verifier_response", "verification_conflict"] {
+            let mut failed_before_status = created_without_status.clone();
+            failed_before_status["status"] = serde_json::json!("failed");
+            failed_before_status["completed_at"] = serde_json::json!("2026-11-03T12:10:00Z");
+            failed_before_status["terminal_reason"] = serde_json::json!(reason);
+            validate_verification_evidence_response_for_tests(failed_before_status).unwrap();
+        }
+
+        created_without_status["status"] = serde_json::json!("expired");
+        created_without_status["completed_at"] = serde_json::json!("2026-11-03T12:01:00Z");
+        created_without_status["terminal_reason"] = serde_json::json!("content_lock_deleted");
+        validate_verification_evidence_response_for_tests(created_without_status.clone()).unwrap();
+
+        created_without_status["terminal_reason"] = serde_json::json!("payment_request_rejected");
+        assert!(validate_verification_evidence_response_for_tests(created_without_status).is_err());
+
+        let mut wrong_expired_reason = evidence.clone();
+        wrong_expired_reason["status"] = serde_json::json!("expired");
+        wrong_expired_reason["completed_at"] = serde_json::json!("2026-11-03T12:01:00Z");
+        wrong_expired_reason["terminal_reason"] = serde_json::json!("invalid_verifier_response");
+        wrong_expired_reason["satisfied_by"] = serde_json::json!([]);
+        assert!(validate_verification_evidence_response_for_tests(wrong_expired_reason).is_err());
+
+        let mut zero_failures_with_metadata = evidence.clone();
+        zero_failures_with_metadata["payment"]["operational_last_category"] =
+            serde_json::json!("timeout");
+        assert!(
+            validate_verification_evidence_response_for_tests(zero_failures_with_metadata).is_err()
+        );
     }
 
     #[test]

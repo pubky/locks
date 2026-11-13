@@ -760,7 +760,13 @@ fn start_request_with(
         lock_hash: *lock.lock_hash().unwrap().as_bytes(),
         verification_window_seconds: lock.verification_window_seconds,
         graph: lock.graph.clone().unwrap(),
+        evaluator_mode: locks_service::application::models::FoldedAuthEvaluatorMode::Graph,
+        payment: None,
         flow_secret: FoldedAuthFlowSecret::new(flow_secret.to_vec()),
+        pending_response: locks_service::application::models::FoldedAuthPendingResponse {
+            auth_url: "https://auth.example/approve".to_owned(),
+            state: "persistence-test-state".to_owned(),
+        },
         created_at,
     }
 }

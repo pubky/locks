@@ -1,0 +1,518 @@
+use std::str::FromStr;
+
+use locks_core::ids::{BundleId, CreatorPubky, LockHash, LockId, PubkyLockResource};
+use locks_core::lock_policy::{
+    GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, PaymentPolicyV2,
+};
+use locks_core::verification::{
+    SUBMITTED_PROOF_BUNDLE_V2_VERSION, SatisfiedByV2, SubmittedProofBundleV2,
+};
+use locks_service::application::mixed_v2_reducer::reduce_mixed_snapshot;
+use locks_service::application::models::{
+    BitcoinOutpointV2, GraphObservationOutcome, MixedRootState, MixedTaskSnapshot,
+    MixedTaskSnapshotV1, PaymentAssetV2, PaymentOperationalErrorCategory, PaymentProviderStatus,
+    PaymentRequestStateV2, PaymentRootState, PaymentSampleStatusV2, PaymentSampleV2,
+    PaymentStateV2, PaymentTaskSnapshot, VerificationTerminalReason,
+};
+use locks_service::application::ports::ProviderV2EvaluatorSnapshot;
+use time::macros::datetime;
+
+const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
+const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+const ACCEPTED: time::OffsetDateTime = datetime!(2026-11-05 12:00:00 UTC);
+const DEADLINE: time::OffsetDateTime = datetime!(2026-11-05 12:05:00 UTC);
+
+#[test]
+fn impossible_satisfaction_path_is_rejected_at_snapshot_boundary() {
+    let mut mixed = snapshot();
+    mixed.root = MixedRootState::Satisfied;
+    mixed.satisfied_by = vec![locks_core::verification::SatisfiedByV2::Payment];
+
+    assert!(mixed.validate().is_err());
+}
+
+#[test]
+fn graph_does_not_satisfy_with_accepted_but_undetected_payment() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Pending);
+    assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn detected_amount_matched_payment_allows_graph_zero_conf_satisfaction() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
+    );
+    provider_status.current_sample = Some(detected_sample(true));
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::ZeroConfGraph]);
+}
+
+#[test]
+fn detected_amount_mismatch_does_not_allow_graph_zero_conf_satisfaction() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
+    );
+    provider_status.current_sample = Some(detected_sample(false));
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Pending);
+    assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn retained_payment_threshold_does_not_report_ineligible_graph_path() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let threshold = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "13".repeat(32),
+            vout: 0,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Undetected,
+        Some(threshold),
+    );
+    provider_status.current_sample = Some(PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(3),
+        status: PaymentSampleStatusV2::Undetected,
+        outpoint: None,
+        confirmations: 0,
+        amount_matched: false,
+    });
+    mixed.apply_payment_status(provider_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(3),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(3)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::Payment]);
+}
+
+#[test]
+fn undetected_payment_with_true_graph_fails_closed_at_deadline() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, DEADLINE).unwrap();
+
+    assert_eq!(
+        mixed.root,
+        MixedRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+    );
+    assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn expired_payment_blocks_graph_and_retained_threshold() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let first = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "ab".repeat(32),
+            vout: 1,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Expired,
+            Some(first.clone()),
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(3),
+        )
+        .unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(3)).unwrap();
+
+    assert_eq!(
+        mixed.root.terminal_reason(),
+        Some(
+            locks_service::application::models::VerificationTerminalReason::PaymentDeadlineExpired
+        )
+    );
+    assert!(mixed.satisfied_by.is_empty());
+    assert_eq!(
+        mixed
+            .payment
+            .provider_status
+            .as_ref()
+            .unwrap()
+            .first_threshold_satisfied,
+        Some(first)
+    );
+}
+
+#[test]
+fn deletion_reconciliation_preserves_graph_completed_snapshot_when_payment_later_satisfies() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut zero_conf_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Detected,
+        None,
+    );
+    zero_conf_status.current_sample = Some(detected_sample(true));
+    mixed.apply_payment_status(zero_conf_status).unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::True,
+            ACCEPTED + time::Duration::seconds(2),
+        )
+        .unwrap();
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::ZeroConfGraph]);
+
+    let frozen = MixedTaskSnapshot::V1(mixed.clone());
+    let mut later_payment = mixed.payment_snapshot().unwrap();
+    later_payment
+        .apply_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Confirmed,
+            Some(PaymentSampleV2 {
+                observed_at: ACCEPTED + time::Duration::seconds(3),
+                status: PaymentSampleStatusV2::Confirmed,
+                outpoint: Some(BitcoinOutpointV2 {
+                    txid: "cd".repeat(32),
+                    vout: 2,
+                }),
+                confirmations: 1,
+                amount_matched: true,
+            }),
+        ))
+        .unwrap();
+
+    let reconciled = ProviderV2EvaluatorSnapshot::Mixed(frozen.clone())
+        .with_payment_snapshot(PaymentTaskSnapshot::V1(later_payment))
+        .expect("completed mixed snapshot must remain immutable during deletion reconciliation");
+    assert_eq!(reconciled, ProviderV2EvaluatorSnapshot::Mixed(frozen));
+}
+
+#[test]
+fn deletion_reconciliation_updates_provider_evidence_without_rewriting_pending_roots() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let frozen_graph_root = mixed.graph.root;
+    let frozen_payment_root = mixed.payment.root;
+    let frozen_mixed_root = mixed.root;
+    let mut reconciled_payment = mixed.payment_snapshot().unwrap();
+    reconciled_payment.root =
+        PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted);
+
+    let reconciled = ProviderV2EvaluatorSnapshot::Mixed(MixedTaskSnapshot::V1(mixed))
+        .with_payment_snapshot(PaymentTaskSnapshot::V1(reconciled_payment))
+        .unwrap();
+    let ProviderV2EvaluatorSnapshot::Mixed(reconciled) = reconciled else {
+        panic!("mixed reconciliation changed evaluator mode");
+    };
+
+    assert_eq!(reconciled.as_v1().graph.root, frozen_graph_root);
+    assert_eq!(reconciled.as_v1().payment.root, frozen_payment_root);
+    assert_eq!(reconciled.as_v1().root, frozen_mixed_root);
+    assert!(reconciled.as_v1().payment.provider_status.is_none());
+}
+
+#[test]
+fn unchanged_terminal_graph_allows_later_payment_completion_but_mutation_is_rejected() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+
+    let mut graph = mixed.graph_snapshot().unwrap();
+    graph
+        .terminalize_invalid_nexus_response(
+            0,
+            ACCEPTED + time::Duration::seconds(2),
+            "https://nexus.invalid".to_owned(),
+            Some(200),
+        )
+        .unwrap();
+    locks_service::application::graph0conf_reducer::reduce_graph_snapshot(
+        &mut graph,
+        ACCEPTED + time::Duration::seconds(2),
+    )
+    .unwrap();
+    assert_eq!(
+        graph.root,
+        locks_service::application::models::GraphRootState::FailedInvalidResponse
+    );
+    mixed.replace_graph_snapshot(graph.clone());
+
+    let threshold = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(3),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "ef".repeat(32),
+            vout: 3,
+        }),
+        confirmations: 1,
+        amount_matched: true,
+    };
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Confirmed,
+            Some(threshold),
+        ))
+        .unwrap();
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(3)).unwrap();
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::Payment]);
+
+    let mut mutated = graph.clone();
+    mutated.predicates[0]
+        .latest_observation
+        .as_mut()
+        .unwrap()
+        .http_status = Some(500);
+    assert!(mutated.validate_progress_from(&graph).is_err());
+}
+
+#[test]
+fn outstanding_payment_outage_takes_precedence_over_graph_false_at_deadline() {
+    let mut mixed = snapshot();
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    mixed
+        .apply_payment_status(status(
+            PaymentRequestStateV2::Accepted,
+            PaymentStateV2::Undetected,
+            None,
+        ))
+        .unwrap();
+    mixed
+        .record_graph_observation(
+            0,
+            GraphObservationOutcome::False,
+            DEADLINE - time::Duration::seconds(2),
+        )
+        .unwrap();
+    mixed.payment.operational_failure_count = 1;
+    mixed.payment.operational_failure_total = 1;
+    mixed.payment.operational_first_failure_at = Some(DEADLINE - time::Duration::seconds(1));
+    mixed.payment.operational_last_failure_at = Some(DEADLINE - time::Duration::seconds(1));
+    mixed.payment.operational_last_category = Some(PaymentOperationalErrorCategory::Transport);
+    mixed.payment.next_due_at = Some(DEADLINE);
+
+    reduce_mixed_snapshot(&mut mixed, DEADLINE).unwrap();
+
+    assert_eq!(
+        mixed.root,
+        MixedRootState::Failed(VerificationTerminalReason::VerificationUnavailableByDeadline)
+    );
+}
+
+fn snapshot() -> MixedTaskSnapshotV1 {
+    MixedTaskSnapshotV1::new(
+        SubmittedProofBundleV2 {
+            version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+            bundle_id: BundleId::from_str(BUNDLE).unwrap(),
+            pubky_lock_resource: resource(),
+            reader_pubky: None,
+        },
+        [0; 32],
+        CreatorPubky::from_str(READER).unwrap(),
+        GraphPolicyV2 {
+            operator: None,
+            predicates: vec![GraphPredicateV2::Follows {
+                follower: GraphParticipantV2::Reader,
+                followed: GraphParticipantV2::Creator,
+            }],
+        },
+        PaymentPolicyV2 {
+            recipient_pubky: CreatorPubky::from_str(CREATOR).unwrap(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        },
+        ACCEPTED,
+        300,
+    )
+    .unwrap()
+}
+
+fn status(
+    request_state: PaymentRequestStateV2,
+    payment_state: PaymentStateV2,
+    first: Option<PaymentSampleV2>,
+) -> PaymentProviderStatus {
+    PaymentProviderStatus {
+        creator: CreatorPubky::from_str(CREATOR).unwrap(),
+        bundle_id: BundleId::from_str(BUNDLE).unwrap(),
+        request_state,
+        payment_state,
+        invoice_created_at: ACCEPTED + time::Duration::seconds(1),
+        proposal_expires_at: ACCEPTED + time::Duration::seconds(60),
+        deadline: DEADLINE,
+        asset: PaymentAssetV2::Btc,
+        minimum_confirmations: 1,
+        current_sample: first.clone(),
+        first_threshold_satisfied: first,
+    }
+}
+
+fn detected_sample(amount_matched: bool) -> PaymentSampleV2 {
+    PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Detected,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "12".repeat(32),
+            vout: 0,
+        }),
+        confirmations: 0,
+        amount_matched,
+    }
+}
+
+fn resource() -> PubkyLockResource {
+    let lock_id = LockId::from_hash(LockHash::from_bytes([0; 32]));
+    PubkyLockResource::from_str(&format!("{CREATOR}/pub/app.locks/{lock_id}.json")).unwrap()
+}

@@ -369,6 +369,9 @@ impl GraphTaskSnapshotV1 {
         current.validate()?;
         self.validate()?;
         if current.root != GraphRootState::Pending {
+            if self == current {
+                return Ok(());
+            }
             return Err("terminal graph task snapshot cannot be replaced".to_owned());
         }
         if current.predicates.len() != self.predicates.len()

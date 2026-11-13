@@ -24,9 +24,9 @@ use locks_service::{
             FoldedAuthFlowStarter, FoldedAuthRepository, FrontendSessionCodeStore,
             FrontendSessionStore, GrantCreatorConnectFlowClient, GraphTaskClaimer,
             GraphTaskRepository, GuardedResourceRepository, InvoiceAdmissionRepository,
-            LockServicePointerRepository, PaymentDrainClient, PaymentDrainRepository,
-            PaymentTaskClaimer, PaymentTaskRepository, VerificationTaskClaimer,
-            VerificationTaskRepository,
+            LockServicePointerRepository, MixedTaskClaimer, MixedTaskRepository,
+            PaymentDrainClient, PaymentDrainRepository, PaymentTaskClaimer, PaymentTaskRepository,
+            VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::start_creator_connect_flow::default_requested_scopes,
     },
@@ -38,7 +38,7 @@ use locks_service::{
             content_lock_deletion_action_ownership::InMemoryContentLockDeletionActionOwnership,
             content_lock_tombstones::InMemoryContentLockTombstoneRepository,
             content_locks::InMemoryContentLockRepository, graph_tasks::InMemoryGraphTaskRepository,
-            payment_tasks::InMemoryPaymentTaskRepository,
+            mixed_tasks::InMemoryMixedTaskRepository, payment_tasks::InMemoryPaymentTaskRepository,
             public_content_locks::InMemoryPublicContentLockStore,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
@@ -50,9 +50,9 @@ use locks_service::{
             PostgresContentLockOwnershipRepository, PostgresCreatorAuthorityStore,
             PostgresCreatorConnectFlowStore, PostgresFoldedAuthRepository,
             PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
-            PostgresGraphTaskRepository, PostgresPaymentDrainRepository,
-            PostgresPaymentTaskRepository, PostgresVerificationTaskClaimer,
-            PostgresVerificationTaskRepository,
+            PostgresGraphTaskRepository, PostgresMixedTaskRepository,
+            PostgresPaymentDrainRepository, PostgresPaymentTaskRepository,
+            PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
             AuthorizingPubkyHomeserverStorageClient, GrantCreatorAuthorityManager,
@@ -250,6 +250,8 @@ pub struct AppState {
     graph_task_claimer: Arc<dyn GraphTaskClaimer>,
     payment_tasks: Arc<dyn PaymentTaskRepository>,
     payment_task_claimer: Arc<dyn PaymentTaskClaimer>,
+    mixed_tasks: Arc<dyn MixedTaskRepository>,
+    mixed_task_claimer: Arc<dyn MixedTaskClaimer>,
     entitlements: Arc<dyn EntitlementRepository>,
     access_credentials: Arc<dyn AccessCredentialStore>,
     creator_authorities: Arc<dyn CreatorAuthorityStore>,
@@ -340,6 +342,9 @@ impl AppState {
         let payment_tasks = Arc::new(InMemoryPaymentTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
+        let mixed_tasks = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
         let verification_task_claimer = Arc::new(
             InMemoryVerificationTaskClaimer::with_task_repository_and_deletion_fence(
                 vec![],
@@ -400,6 +405,8 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            mixed_tasks: mixed_tasks.clone(),
+            mixed_task_claimer: mixed_tasks,
             payment_drains,
             access_credentials,
             creator_authorities,
@@ -436,6 +443,9 @@ impl AppState {
             Arc::clone(&verification_task_deletion_fence),
         ));
         let payment_tasks = Arc::new(InMemoryPaymentTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
+        let mixed_tasks = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
         let verification_task_claimer = Arc::new(
@@ -487,6 +497,8 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            mixed_tasks: mixed_tasks.clone(),
+            mixed_task_claimer: mixed_tasks,
             payment_drains,
             access_credentials,
             creator_authorities,
@@ -522,6 +534,9 @@ impl AppState {
             Arc::clone(&verification_task_deletion_fence),
         ));
         let payment_tasks = Arc::new(InMemoryPaymentTaskRepository::with_deletion_fence(
+            Arc::clone(&verification_task_deletion_fence),
+        ));
+        let mixed_tasks = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(
             Arc::clone(&verification_task_deletion_fence),
         ));
         let verification_task_claimer = Arc::new(
@@ -587,6 +602,8 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            mixed_tasks: mixed_tasks.clone(),
+            mixed_task_claimer: mixed_tasks,
             payment_drains,
             access_credentials,
             creator_authorities,
@@ -617,6 +634,7 @@ impl AppState {
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
         let graph_tasks = Arc::new(PostgresGraphTaskRepository::new(pool.clone()));
         let payment_tasks = Arc::new(PostgresPaymentTaskRepository::new(pool.clone()));
+        let mixed_tasks = Arc::new(PostgresMixedTaskRepository::new(pool.clone()));
         let access_credentials =
             Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
                 pool.clone(),
@@ -649,6 +667,8 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            mixed_tasks: mixed_tasks.clone(),
+            mixed_task_claimer: mixed_tasks,
             payment_drains,
             access_credentials,
             creator_authorities,
@@ -727,6 +747,7 @@ impl AppState {
             Arc::new(PostgresVerificationTaskClaimer::new(pool.clone()));
         let graph_tasks = Arc::new(PostgresGraphTaskRepository::new(pool.clone()));
         let payment_tasks = Arc::new(PostgresPaymentTaskRepository::new(pool.clone()));
+        let mixed_tasks = Arc::new(PostgresMixedTaskRepository::new(pool.clone()));
         let access_credentials =
             Arc::new(PostgresAccessCredentialStore::with_final_credential_cipher(
                 pool.clone(),
@@ -764,6 +785,8 @@ impl AppState {
             graph_task_claimer: graph_tasks,
             payment_tasks: payment_tasks.clone(),
             payment_task_claimer: payment_tasks,
+            mixed_tasks: mixed_tasks.clone(),
+            mixed_task_claimer: mixed_tasks,
             payment_drains,
             access_credentials,
             creator_authorities,
@@ -863,6 +886,8 @@ impl AppState {
             graph_task_claimer: private_runtime.graph_task_claimer,
             payment_tasks: private_runtime.payment_tasks,
             payment_task_claimer: private_runtime.payment_task_claimer,
+            mixed_tasks: private_runtime.mixed_tasks,
+            mixed_task_claimer: private_runtime.mixed_task_claimer,
             entitlements: creator_repositories.entitlements,
             access_credentials: private_runtime.access_credentials,
             creator_authorities: private_runtime.creator_authorities,
@@ -1021,6 +1046,14 @@ impl AppState {
         &self.payment_task_claimer
     }
 
+    pub fn mixed_tasks(&self) -> &Arc<dyn MixedTaskRepository> {
+        &self.mixed_tasks
+    }
+
+    pub fn mixed_task_claimer(&self) -> &Arc<dyn MixedTaskClaimer> {
+        &self.mixed_task_claimer
+    }
+
     pub fn entitlements(&self) -> &Arc<dyn EntitlementRepository> {
         &self.entitlements
     }
@@ -1102,6 +1135,16 @@ impl AppState {
     ) -> Self {
         self.graph_tasks = graph_tasks.clone();
         self.graph_task_claimer = graph_tasks;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_in_memory_mixed_tasks(
+        mut self,
+        mixed_tasks: Arc<InMemoryMixedTaskRepository>,
+    ) -> Self {
+        self.mixed_tasks = mixed_tasks.clone();
+        self.mixed_task_claimer = mixed_tasks;
         self
     }
 
