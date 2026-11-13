@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use locks_core::ids::{ContentLockPath, CreatorPubky, LockId};
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, SecondaryGuardedResource,
+    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
+    GraphPolicyV2, GuardedResource, LockLogic, LockServerConfig, PaymentPolicyV2,
+    SecondaryGuardedResource,
 };
 use uuid::Uuid;
 
@@ -35,6 +36,20 @@ pub struct CreateContentLockRequest {
     pub lock_server: LockServerConfig,
 }
 
+/// Request to create an explicitly versioned v2 content lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContentLockV2Request {
+    pub creator: CreatorPubky,
+    pub version: u16,
+    pub primary_resource: Option<GuardedResource>,
+    pub secondary_resources: BTreeMap<String, SecondaryGuardedResource>,
+    pub payment: Option<PaymentPolicyV2>,
+    pub graph: Option<GraphPolicyV2>,
+    pub verification_window_seconds: u64,
+    pub access_policy: AccessPolicy,
+    pub lock_server: LockServerConfig,
+}
+
 /// Created content lock plus its derived identifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedContentLock {
@@ -44,6 +59,14 @@ pub struct CreatedContentLock {
     pub content_lock_path: ContentLockPath,
     /// Stored content lock payload.
     pub content_lock: ContentLock,
+}
+
+/// Created version-dispatched content lock plus canonical identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedContentLockPayload {
+    pub lock_id: LockId,
+    pub content_lock_path: ContentLockPath,
+    pub content_lock: ContentLockPayload,
 }
 
 /// Creates local content locks after verifying current guarded resource metadata.
@@ -78,7 +101,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         &self,
         request: CreateContentLockRequest,
     ) -> Result<CreatedContentLock, ApplicationError> {
-        let mut content_lock = ContentLock {
+        let content_lock = ContentLock {
             version: CONTENT_LOCK_VERSION,
             creator: request.creator.clone(),
             primary_resource: request.primary_resource,
@@ -101,10 +124,55 @@ impl<'a> CreateContentLockUseCase<'a> {
                 message: error.to_string(),
             })?;
 
+        let created = self
+            .execute_payload(request.creator, ContentLockPayload::V1(content_lock))
+            .await?;
+        let ContentLockPayload::V1(content_lock) = created.content_lock else {
+            unreachable!("v1 creation returned a v2 payload");
+        };
+        Ok(CreatedContentLock {
+            lock_id: created.lock_id,
+            content_lock_path: created.content_lock_path,
+            content_lock,
+        })
+    }
+
+    /// Creates and publishes a validated v2 content lock through the same fenced path as v1.
+    pub async fn execute_v2(
+        &self,
+        request: CreateContentLockV2Request,
+    ) -> Result<CreatedContentLockPayload, ApplicationError> {
+        let creator = request.creator.clone();
+        let content_lock = ContentLockV2 {
+            version: request.version,
+            creator: creator.clone(),
+            primary_resource: request.primary_resource,
+            secondary_resources: request.secondary_resources,
+            payment: request.payment,
+            graph: request.graph,
+            verification_window_seconds: request.verification_window_seconds,
+            access_policy: request.access_policy,
+            lock_server: request.lock_server,
+            created_at: self.clock.now(),
+        };
+        content_lock
+            .validate()
+            .map_err(|error| ApplicationError::InvalidGuardedResource {
+                message: error.to_string(),
+            })?;
+        self.execute_payload(creator, ContentLockPayload::V2(content_lock))
+            .await
+    }
+
+    async fn execute_payload(
+        &self,
+        creator: CreatorPubky,
+        mut content_lock: ContentLockPayload,
+    ) -> Result<CreatedContentLockPayload, ApplicationError> {
         for guarded_resource in resource_descriptors(&content_lock) {
             let current = self
                 .guarded_resources
-                .get_current_guarded_resource(&request.creator, &guarded_resource.path)
+                .get_current_guarded_resource(&creator, &guarded_resource.path)
                 .await?
                 .ok_or(ApplicationError::GuardedResourceUnavailable)?;
 
@@ -125,7 +193,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         let mut ownership_status = None;
         let mut recovered_publication = None;
         if let Some((existing, existing_status, recovery)) = self
-            .resolve_owned_content_lock(&request.creator, &guarded_paths, &content_lock)
+            .resolve_owned_content_lock(&creator, &guarded_paths, &content_lock)
             .await?
         {
             content_lock = existing;
@@ -147,7 +215,7 @@ impl<'a> CreateContentLockUseCase<'a> {
                 Some(recovery) => recovery,
                 None => {
                     self.content_lock_deletions
-                        .recover_publication(&request.creator, &lock_id, &content_lock)
+                        .recover_publication(&creator, &lock_id, &content_lock)
                         .await?
                 }
             };
@@ -155,7 +223,7 @@ impl<'a> CreateContentLockUseCase<'a> {
                 PublicationRecovery::None
                     if existing_status == ContentLockOwnershipStatus::Published =>
                 {
-                    return Ok(CreatedContentLock {
+                    return Ok(CreatedContentLockPayload {
                         lock_id,
                         content_lock_path,
                         content_lock,
@@ -168,12 +236,7 @@ impl<'a> CreateContentLockUseCase<'a> {
                     content_lock = recovered_content_lock;
                     if !self
                         .content_lock_deletions
-                        .reconcile_publication(
-                            &request.creator,
-                            &lock_id,
-                            &content_lock,
-                            &guarded_paths,
-                        )
+                        .reconcile_publication(&creator, &lock_id, &content_lock, &guarded_paths)
                         .await?
                     {
                         return Err(ApplicationError::Storage {
@@ -183,10 +246,10 @@ impl<'a> CreateContentLockUseCase<'a> {
                     }
                     if existing_status == ContentLockOwnershipStatus::Reserved {
                         self.content_lock_ownership
-                            .mark_paths_published(&request.creator, &guarded_paths, &lock_id)
+                            .mark_paths_published(&creator, &guarded_paths, &lock_id)
                             .await?;
                     }
-                    return Ok(CreatedContentLock {
+                    return Ok(CreatedContentLockPayload {
                         lock_id,
                         content_lock_path,
                         content_lock,
@@ -207,27 +270,27 @@ impl<'a> CreateContentLockUseCase<'a> {
         let newly_reserved = ownership_status.is_none();
         if newly_reserved {
             self.content_lock_ownership
-                .reserve_paths(&request.creator, &guarded_paths, &lock_id)
+                .reserve_paths(&creator, &guarded_paths, &lock_id)
                 .await?;
         }
 
         let publication_token = Uuid::new_v4();
         if let Err(error) = self
             .content_lock_deletions
-            .begin_publication(&request.creator, &lock_id, publication_token, &content_lock)
+            .begin_publication(&creator, &lock_id, publication_token, &content_lock)
             .await
         {
             if newly_reserved {
                 let _ = self
                     .content_lock_ownership
-                    .compensate_reserved_paths(&request.creator, &guarded_paths, &lock_id)
+                    .compensate_reserved_paths(&creator, &guarded_paths, &lock_id)
                     .await;
             }
             return Err(error);
         }
 
         self.publish_with_token(
-            &request.creator,
+            &creator,
             &lock_id,
             &content_lock,
             &guarded_paths,
@@ -236,7 +299,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         )
         .await?;
 
-        Ok(CreatedContentLock {
+        Ok(CreatedContentLockPayload {
             lock_id,
             content_lock_path,
             content_lock,
@@ -247,7 +310,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        content_lock: &ContentLock,
+        content_lock: &ContentLockPayload,
         guarded_paths: &[String],
         publication_token: Uuid,
         compensate_ownership: bool,
@@ -259,7 +322,7 @@ impl<'a> CreateContentLockUseCase<'a> {
         })?;
         match self
             .content_locks
-            .upsert_content_lock_classified(
+            .upsert_content_lock_payload_classified(
                 creator.clone(),
                 content_lock_path,
                 content_lock.clone(),
@@ -384,10 +447,10 @@ impl<'a> CreateContentLockUseCase<'a> {
         &self,
         creator: &CreatorPubky,
         guarded_paths: &[String],
-        requested: &ContentLock,
+        requested: &ContentLockPayload,
     ) -> Result<
         Option<(
-            ContentLock,
+            ContentLockPayload,
             ContentLockOwnershipStatus,
             Option<PublicationRecovery>,
         )>,
@@ -460,7 +523,7 @@ impl<'a> CreateContentLockUseCase<'a> {
             } => {
                 if self
                     .content_locks
-                    .get_content_lock(creator, &existing_path)
+                    .get_content_lock_payload(creator, &existing_path)
                     .await?
                     .is_none_or(|published| published != *content_lock)
                 {
@@ -503,7 +566,7 @@ impl<'a> CreateContentLockUseCase<'a> {
 
         let Some(existing) = self
             .content_locks
-            .get_content_lock(creator, &existing_path)
+            .get_content_lock_payload(creator, &existing_path)
             .await?
         else {
             return Err(ApplicationError::ContentLockPathConflict {
@@ -517,7 +580,7 @@ impl<'a> CreateContentLockUseCase<'a> {
                     message: error.to_string(),
                 })?;
         let mut expected = requested.clone();
-        expected.created_at = existing.created_at;
+        expected.set_created_at(existing.created_at());
         if canonical_lock_id != existing_lock_id || existing != expected {
             return Err(ApplicationError::ContentLockPathConflict {
                 guarded_path: guarded_paths[0].clone(),
@@ -546,14 +609,14 @@ fn validate_criterion_params(content_lock: &ContentLock) -> Result<(), Applicati
     Ok(())
 }
 
-fn resource_descriptors(content_lock: &ContentLock) -> Vec<GuardedResource> {
+fn resource_descriptors(content_lock: &ContentLockPayload) -> Vec<GuardedResource> {
     let mut resources = Vec::with_capacity(content_lock.resource_count());
-    if let Some(primary_resource) = &content_lock.primary_resource {
+    if let Some(primary_resource) = content_lock.primary_resource() {
         resources.push(primary_resource.clone());
     }
     resources.extend(
         content_lock
-            .secondary_resources
+            .secondary_resources()
             .iter()
             .map(|(path, secondary)| GuardedResource {
                 path: path.clone(),
@@ -578,7 +641,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use locks_core::ids::{CreatorPubky, GuardedResourceHash, LockServerPubky};
-    use locks_core::lock_policy::VerifierType;
+    use locks_core::lock_policy::{
+        CONTENT_LOCK_V2_VERSION, GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, VerifierType,
+    };
 
     use super::*;
     use crate::application::models::{
@@ -652,6 +717,145 @@ mod tests {
             .unwrap();
         assert_eq!(ownership.lock_id, result.lock_id);
         assert_eq!(ownership.status.as_str(), "published");
+    }
+
+    #[tokio::test]
+    async fn create_v2_graph_content_lock_stores_canonical_payload() {
+        let fixture = Fixture::seeded().await;
+        let guarded_resource = registered_guarded_resource();
+
+        let created = fixture
+            .use_case()
+            .execute_v2(CreateContentLockV2Request {
+                creator: creator(),
+                version: CONTENT_LOCK_V2_VERSION,
+                primary_resource: Some(guarded_resource),
+                secondary_resources: BTreeMap::new(),
+                payment: None,
+                graph: Some(GraphPolicyV2 {
+                    predicates: vec![GraphPredicateV2::Follows {
+                        follower: GraphParticipantV2::Reader,
+                        followed: GraphParticipantV2::Creator,
+                    }],
+                    operator: None,
+                }),
+                verification_window_seconds: 300,
+                access_policy: AccessPolicy {
+                    requested_credential_ttl_seconds: 900,
+                },
+                lock_server: LockServerConfig { override_: None },
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            created.content_lock,
+            locks_core::lock_policy::ContentLockPayload::V2(ref lock)
+                if lock.version == CONTENT_LOCK_V2_VERSION && lock.graph.is_some()
+        ));
+        assert_eq!(
+            fixture
+                .content_locks
+                .get_content_lock_payload(&creator(), &created.content_lock_path)
+                .await
+                .unwrap(),
+            Some(created.content_lock)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_v2_payment_and_mixed_content_locks_store_canonical_payloads() {
+        for with_graph in [false, true] {
+            let fixture = Fixture::seeded().await;
+            let created = fixture
+                .use_case()
+                .execute_v2(CreateContentLockV2Request {
+                    creator: creator(),
+                    version: CONTENT_LOCK_V2_VERSION,
+                    primary_resource: Some(registered_guarded_resource()),
+                    secondary_resources: BTreeMap::new(),
+                    payment: Some(PaymentPolicyV2 {
+                        recipient_pubky: creator(),
+                        amount: "50000".to_owned(),
+                        asset: "BTC".to_owned(),
+                        minimum_confirmations: 1,
+                    }),
+                    graph: with_graph.then(|| GraphPolicyV2 {
+                        predicates: vec![GraphPredicateV2::Follows {
+                            follower: GraphParticipantV2::Reader,
+                            followed: GraphParticipantV2::Creator,
+                        }],
+                        operator: None,
+                    }),
+                    verification_window_seconds: 300,
+                    access_policy: AccessPolicy {
+                        requested_credential_ttl_seconds: 900,
+                    },
+                    lock_server: LockServerConfig { override_: None },
+                })
+                .await
+                .unwrap();
+
+            let ContentLockPayload::V2(lock) = &created.content_lock else {
+                panic!("v2 creator request must publish v2 payload");
+            };
+            assert!(lock.payment.is_some());
+            assert_eq!(lock.graph.is_some(), with_graph);
+            assert_eq!(created.lock_id, lock.lock_id().unwrap());
+            assert_eq!(
+                created.content_lock_path,
+                created.content_lock.content_lock_path().unwrap()
+            );
+            assert_eq!(
+                fixture
+                    .content_locks
+                    .get_content_lock_payload(&creator(), &created.content_lock_path)
+                    .await
+                    .unwrap(),
+                Some(created.content_lock)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_v2_rejects_invalid_version_and_missing_policy() {
+        for (version, payment, graph) in [
+            (
+                3,
+                None,
+                Some(GraphPolicyV2 {
+                    predicates: vec![GraphPredicateV2::Follows {
+                        follower: GraphParticipantV2::Reader,
+                        followed: GraphParticipantV2::Creator,
+                    }],
+                    operator: None,
+                }),
+            ),
+            (CONTENT_LOCK_V2_VERSION, None, None),
+        ] {
+            let fixture = Fixture::seeded().await;
+            let result = fixture
+                .use_case()
+                .execute_v2(CreateContentLockV2Request {
+                    creator: creator(),
+                    version,
+                    primary_resource: Some(registered_guarded_resource()),
+                    secondary_resources: BTreeMap::new(),
+                    payment,
+                    graph,
+                    verification_window_seconds: 300,
+                    access_policy: AccessPolicy {
+                        requested_credential_ttl_seconds: 900,
+                    },
+                    lock_server: LockServerConfig { override_: None },
+                })
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(ApplicationError::InvalidGuardedResource { .. })
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1219,7 +1423,7 @@ mod tests {
                 &creator(),
                 &created.lock_id,
                 retained_token,
-                &created.content_lock,
+                &ContentLockPayload::V1(created.content_lock.clone()),
             )
             .await
             .unwrap();
@@ -1638,6 +1842,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_v2_publication_recovery_restart_and_deletion_matrix() {
+        for (with_payment, with_graph) in [(false, true), (true, false), (true, true)] {
+            let database = TestDatabase::create().await;
+            let first_repository =
+                PostgresContentLockDeletionRepository::new(database.pool().clone());
+            let content_lock = v2_content_lock_payload(with_payment, with_graph);
+            let lock_id = content_lock.lock_id().unwrap();
+            let token = Uuid::new_v4();
+            let guarded_paths = vec!["/priv/app.locks/content/hello.txt".to_owned()];
+
+            first_repository
+                .begin_publication(&creator(), &lock_id, token, &content_lock)
+                .await
+                .unwrap();
+            drop(first_repository);
+
+            let restarted = PostgresContentLockDeletionRepository::new(database.pool().clone());
+            assert_eq!(
+                restarted
+                    .recover_publication(&creator(), &lock_id, &content_lock)
+                    .await
+                    .unwrap(),
+                PublicationRecovery::Pending {
+                    publication_token: token,
+                    content_lock: content_lock.clone(),
+                }
+            );
+            let deletion_job = crate::application::models::ContentLockDeletionJob::new(
+                Uuid::new_v4(),
+                content_lock.clone(),
+                datetime!(2026-06-03 12:01:00 UTC),
+            )
+            .unwrap();
+            assert_eq!(
+                restarted.insert_job(deletion_job.clone()).await,
+                Err(ApplicationError::ContentLockPublicationInProgress)
+            );
+            assert_eq!(
+                restarted
+                    .prepare_force_deletion(&creator(), &lock_id)
+                    .await
+                    .unwrap(),
+                PrepareForceDeletionResult::PublicationInProgress
+            );
+
+            if !with_payment {
+                assert!(
+                    restarted
+                        .compensate_publication(&creator(), &lock_id, token)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                assert!(
+                    restarted
+                        .mark_publication_written(&creator(), &lock_id, token)
+                        .await
+                        .unwrap()
+                );
+                drop(restarted);
+                let restarted = PostgresContentLockDeletionRepository::new(database.pool().clone());
+                assert_eq!(
+                    restarted
+                        .recover_publication(&creator(), &lock_id, &content_lock)
+                        .await
+                        .unwrap(),
+                    PublicationRecovery::WriteCompleted {
+                        publication_token: token,
+                        content_lock: content_lock.clone(),
+                    }
+                );
+                assert!(
+                    !restarted
+                        .reconcile_publication(
+                            &creator(),
+                            &lock_id,
+                            &content_lock,
+                            &["/priv/app.locks/content/wrong.txt".to_owned()],
+                        )
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    restarted
+                        .publication_in_progress(&creator(), &lock_id)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    restarted
+                        .reconcile_publication(&creator(), &lock_id, &content_lock, &guarded_paths,)
+                        .await
+                        .unwrap()
+                );
+            }
+
+            let restarted = PostgresContentLockDeletionRepository::new(database.pool().clone());
+            assert_eq!(
+                restarted
+                    .recover_publication(&creator(), &lock_id, &content_lock)
+                    .await
+                    .unwrap(),
+                PublicationRecovery::None
+            );
+            restarted.insert_job(deletion_job).await.unwrap();
+            database.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
     async fn postgres_exact_retry_keeps_absent_ambiguous_write_fenced() {
         let database = TestDatabase::create().await;
         let content_locks = AmbiguousThenSuccessfulContentLockRepository::default();
@@ -1947,7 +2261,7 @@ mod tests {
             created_at: fixture.clock.now(),
         };
         let lock_id = content_lock.lock_id().unwrap();
-        let guarded_paths = resource_descriptors(&content_lock)
+        let guarded_paths = resource_descriptors(&ContentLockPayload::V1(content_lock.clone()))
             .into_iter()
             .map(|resource| resource.path)
             .collect::<Vec<_>>();
@@ -1959,7 +2273,12 @@ mod tests {
             .unwrap();
         fixture
             .content_lock_deletions
-            .begin_publication(&request.creator, &lock_id, publication_token, &content_lock)
+            .begin_publication(
+                &request.creator,
+                &lock_id,
+                publication_token,
+                &ContentLockPayload::V1(content_lock.clone()),
+            )
             .await
             .unwrap();
 
@@ -2260,7 +2579,7 @@ mod tests {
                 &creator(),
                 &created.lock_id,
                 Uuid::new_v4(),
-                &created.content_lock,
+                &ContentLockPayload::V1(created.content_lock.clone()),
             )
             .await
             .unwrap();
@@ -3100,6 +3419,36 @@ mod tests {
                 .unwrap();
             usize::from(first.is_some()) + usize::from(second.is_some())
         }
+    }
+
+    fn v2_content_lock_payload(with_payment: bool, with_graph: bool) -> ContentLockPayload {
+        ContentLockPayload::V2(ContentLockV2 {
+            version: CONTENT_LOCK_V2_VERSION,
+            creator: creator(),
+            primary_resource: Some(registered_guarded_resource()),
+            secondary_resources: BTreeMap::new(),
+            payment: with_payment.then(|| PaymentPolicyV2 {
+                recipient_pubky: creator(),
+                amount: "50000".to_owned(),
+                asset: "BTC".to_owned(),
+                minimum_confirmations: 1,
+            }),
+            graph: with_graph.then(|| GraphPolicyV2 {
+                predicates: vec![GraphPredicateV2::Follows {
+                    follower: GraphParticipantV2::Reader,
+                    followed: GraphParticipantV2::Creator,
+                }],
+                operator: None,
+            }),
+            verification_window_seconds: 300,
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig {
+                override_: Some(server()),
+            },
+            created_at: datetime!(2026-06-03 12:00:00 UTC),
+        })
     }
 
     fn content_lock_request(guarded_resource: GuardedResource) -> CreateContentLockRequest {

@@ -5,6 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use locks_core::{
     content_lock_deletion::ContentLockDeletionTombstone,
+    creator_publishing::CreateContentLockPayload,
     ids::{ContentLockPath, CreatorPubky, LockId},
 };
 use locks_service::application::errors::ApplicationError;
@@ -16,7 +17,7 @@ use locks_service::application::ports::{
     ContentLockDeletionActionAcquireResult, TombstoneReadback,
 };
 use locks_service::application::use_cases::create_content_lock::{
-    CreateContentLockRequest, CreateContentLockUseCase,
+    CreateContentLockRequest, CreateContentLockUseCase, CreateContentLockV2Request,
 };
 use locks_service::application::use_cases::delete_guarded_resource::{
     DeleteGuardedResourceRequest, DeleteGuardedResourceUseCase,
@@ -746,15 +747,6 @@ pub(super) async fn create_content_lock_for_authenticated_creator(
     let authenticated_creator = authenticated_creator_from_headers(&state, &headers).await?;
     let request = parse_json(request)?;
     validate_content_lock_limits(&request, state.config().content_locks.clone())?;
-    let create_request = CreateContentLockRequest {
-        creator: authenticated_creator,
-        primary_resource: request.primary_resource,
-        secondary_resources: request.secondary_resources,
-        criteria: request.criteria,
-        lock_logic: request.lock_logic,
-        access_policy: request.access_policy,
-        lock_server: request.lock_server,
-    };
     let creation_state = state.clone();
     let created = tokio::spawn(async move {
         let use_case = CreateContentLockUseCase::new(
@@ -764,7 +756,37 @@ pub(super) async fn create_content_lock_for_authenticated_creator(
             creation_state.guarded_resources().as_ref(),
             creation_state.clock().as_ref(),
         );
-        use_case.execute(create_request).await
+        match request {
+            CreateContentLockPayload::V1(request) => use_case
+                .execute(CreateContentLockRequest {
+                    creator: authenticated_creator,
+                    primary_resource: request.primary_resource,
+                    secondary_resources: request.secondary_resources,
+                    criteria: request.criteria,
+                    lock_logic: request.lock_logic,
+                    access_policy: request.access_policy,
+                    lock_server: request.lock_server,
+                })
+                .await
+                .map(|created| locks_service::application::use_cases::create_content_lock::CreatedContentLockPayload {
+                    lock_id: created.lock_id,
+                    content_lock_path: created.content_lock_path,
+                    content_lock: created.content_lock.into(),
+                }),
+            CreateContentLockPayload::V2(request) => use_case
+                .execute_v2(CreateContentLockV2Request {
+                    creator: authenticated_creator,
+                    version: request.version,
+                    primary_resource: request.primary_resource,
+                    secondary_resources: request.secondary_resources,
+                    payment: request.payment,
+                    graph: request.graph,
+                    verification_window_seconds: request.verification_window_seconds,
+                    access_policy: request.access_policy,
+                    lock_server: request.lock_server,
+                })
+                .await,
+        }
     })
     .await
     .map_err(|error| {
@@ -823,8 +845,16 @@ fn validate_content_lock_limits(
     request: &AuthenticatedCreateContentLockHttpRequest,
     limits: crate::config::ContentLocksConfig,
 ) -> Result<(), ApiError> {
-    let primary_count = usize::from(request.primary_resource.is_some());
-    let resource_count = primary_count + request.secondary_resources.len();
+    let (primary_resource, secondary_resources) = match request {
+        CreateContentLockPayload::V1(request) => {
+            (&request.primary_resource, &request.secondary_resources)
+        }
+        CreateContentLockPayload::V2(request) => {
+            (&request.primary_resource, &request.secondary_resources)
+        }
+    };
+    let primary_count = usize::from(primary_resource.is_some());
+    let resource_count = primary_count + secondary_resources.len();
     if resource_count > limits.max_resources {
         return Err(ApiError::new(
             ApiErrorCode::InvalidRequest,
@@ -836,11 +866,11 @@ fn validate_content_lock_limits(
     }
 
     let mut total_size = 0_u64;
-    if let Some(primary_resource) = &request.primary_resource {
+    if let Some(primary_resource) = primary_resource {
         validate_descriptor_size(primary_resource.size, &limits)?;
         total_size = total_size.saturating_add(primary_resource.size);
     }
-    for secondary_resource in request.secondary_resources.values() {
+    for secondary_resource in secondary_resources.values() {
         validate_descriptor_size(secondary_resource.size, &limits)?;
         total_size = total_size.saturating_add(secondary_resource.size);
     }

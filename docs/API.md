@@ -406,7 +406,7 @@ Fixtures:
 - Request: `locks-server/tests/fixtures/creator_publishing/create_content_lock_request.json`
 - Response shape: `locks-server/tests/fixtures/creator_publishing/create_content_lock_response_shape.json`
 
-Creates or replaces a content lock from a resource set. A content lock may contain:
+Creates or replaces either an existing unversioned v1 content lock or an explicitly versioned v2 content lock from a resource set. Both versions use this route and response envelope. A content lock may contain:
 
 - `primary_resource`: optional full [`GuardedResource`](#success-response) descriptor.
 - `secondary_resources`: optional map keyed by full canonical private path. Values contain `hash`, `content_type`, and `size` only.
@@ -415,9 +415,41 @@ At least one resource is required. If a primary resource is present, its path mu
 
 With Pubky-backed repositories, this writes the public content lock JSON to the creator homeserver under its derived `content_lock_path`. Before external publication, Locks persists an opaque per-lock publication intent plus the complete canonical original lock (including its original `created_at`) under the same PostgreSQL fence used by graceful deletion and force-receipt establishment. Deletion cannot start while that intent exists; force therefore cannot report permanent deletion and then lose a race to a late Pubky write. Creator authority, session, grant, serialization, typed homeserver `401`/`403`, connect failures, and other failures proved to occur before external dispatch verify the exact uncompleted token and remove its intent; newly reserved ownership is removed, while ownership retained from an earlier completed publication stays `Reserved`. Cached grant sessions get one bounded reacquisition attempt. Publication bookkeeping gets three bounded attempts. HTTP handler cancellation does not cancel admitted publication work. A failure after possible dispatch, process termination, or exhausted bookkeeping attempts remains fail-closed and retains the intent. An authenticated identical retry is checked against the retained canonical original but returns `409 content_lock_path_conflict` until that original token has durably recorded write completion. It neither trusts public readback, which may predate the in-flight attempt, nor dispatches a replacement PUT, because the original write may still land. Changed requests cannot recover the intent. Ownership is never promoted and success is never returned while reconciliation remains incomplete. Exact replay also checks graceful jobs and force receipts under the same per-lock fence and returns `409 content_lock_deletion_in_progress` once deletion wins admission. Test-support composition may use in-memory repositories behind the same authenticated route contract.
 
-Operator recovery is deliberately offline. First quiesce publication for the creator and confirm no publication task or old process can still issue the PUT. Under the same `pg_advisory_xact_lock(hashtextextended('locks:proof-admission:v1:<creator>:<lock_id>', 0))` transaction fence, decode public JSON as a `ContentLock`, validate its creator and derived Lock ID, deserialize `original_content_lock` JSONB as the same type, and compare those typed canonical values. If they match, set `external_write_completed_at` on the exact retained intent and let an identical authenticated POST reconcile it. If the public path is absent and no write can still land, invoke the fenced `compensate_publication` operation: in one transaction it verifies the exact creator, Lock ID, token, and uncompleted state, removes only that lock's `Reserved` ownership rows, then removes the intent. Never delete only the intent for a first publication. A replaced, malformed, or uncertain public value stays fenced; do not clear it by readback alone.
+Operator recovery is deliberately offline. First quiesce publication for the creator and confirm no publication task or old process can still issue the PUT. Under the same `pg_advisory_xact_lock(hashtextextended('locks:proof-admission:v1:<creator>:<lock_id>', 0))` transaction fence, decode both public JSON and retained `original_content_lock` JSONB as the version-dispatched `ContentLockPayload` type (`V1(ContentLock)` or `V2(ContentLockV2)`). Reject unsupported versions and malformed policy shapes. Validate exact creator, derived Lock ID, canonical typed payload equality, and guarded paths. If they match, set `external_write_completed_at` only on the exact retained creator/Lock-ID/publication-token row, then let an identical authenticated POST perform token-fenced reconciliation and ownership promotion. If the public path is absent and no write can still land, invoke fenced `compensate_publication`: in one transaction it verifies exact creator, Lock ID, publication token, and uncompleted state, removes only that lock's `Reserved` ownership rows, then removes intent. Never decode v2 as v1, update by creator/Lock ID without exact token, or delete only intent for first publication. Replaced, malformed, version-mismatched, or uncertain public values stay fenced; readback alone cannot clear them.
 
 Every referenced guarded resource must currently exist for the same creator/path and must match hash, content type, and size. If the creator has overwritten or deleted a guarded resource path, content lock creation rejects the stale descriptor.
+
+#### Explicit v2 request
+
+V2 requires top-level `version: 2`, `verification_window_seconds` in `60..=604800`, and at least one of `payment` or `graph`. Payment-only, graph-only, and mixed payment+graph requests are accepted. Current payment policy is BTC-only: positive base-unit integer string amount, `minimum_confirmations` in `0..=6`, and session-derived creator equal to `recipient_pubky`. Graph policy contains one through eight closed predicates; one predicate omits `operator`, while two through eight require `and` or `or`.
+
+```json
+{
+  "version": 2,
+  "primary_resource": {
+    "path": "/priv/app.locks/content/post.json",
+    "hash": "<primary_hash>",
+    "content_type": "application/json",
+    "size": 123
+  },
+  "payment": {
+    "recipient_pubky": "pubky<authenticated_creator>",
+    "amount": "50000",
+    "asset": "BTC",
+    "minimum_confirmations": 1
+  },
+  "graph": {
+    "predicates": [
+      { "type": "follows", "follower": "reader", "followed": "creator" }
+    ]
+  },
+  "verification_window_seconds": 300,
+  "access_policy": { "requested_credential_ttl_seconds": 900 },
+  "lock_server": { "override": null }
+}
+```
+
+Graph-only omits `payment`; BTC payment-only omits `graph`. V2 rejects missing policy, unsupported version, USDT or unknown assets, invalid amount/confirmation/window/graph values, nested unknown fields, body `creator`, and any mixed v1 fields such as `criteria` or `lock_logic` with `400 invalid_request`. Unversioned v1 wire shape remains unchanged. V2 success returns same envelope shown below with `content_lock.version = 2`, exact canonical v2 payload, derived hash-backed `lock_id`, and matching `content_lock_path`.
 
 `paykit-payment` is the only active payment verifier wire value. Its v1 criterion params are exactly:
 

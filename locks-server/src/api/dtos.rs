@@ -1,12 +1,14 @@
 pub use locks_core::creator_publishing::{
-    CreateContentLockRequest as AuthenticatedCreateContentLockHttpRequest,
+    CreateContentLockPayload as AuthenticatedCreateContentLockHttpRequest,
     SetLockServicePointerRequest as AuthenticatedSetLockServicePointerHttpRequest,
 };
 use locks_core::ids::{
     BundleId, ClientReference, ContentLockPath, CreatorPubky, LockId, LockServerPubky,
     PubkyLockResource,
 };
-use locks_core::lock_policy::{ContentLock, GraphOperatorV2, GraphPredicateV2, GuardedResource};
+use locks_core::lock_policy::{
+    ContentLockPayload, GraphOperatorV2, GraphPredicateV2, GuardedResource,
+};
 use locks_core::lock_service_pointer::LockServicePointer;
 use locks_core::verification::{SatisfiedByV2, SubmittedProofBundlePayload};
 use locks_service::application::models::{
@@ -70,7 +72,7 @@ pub struct RegisterGuardedResourceHttpResponse {
 pub struct CreateContentLockHttpResponse {
     pub lock_id: LockId,
     pub content_lock_path: ContentLockPath,
-    pub content_lock: ContentLock,
+    pub content_lock: ContentLockPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

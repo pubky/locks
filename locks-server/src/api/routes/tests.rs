@@ -2150,7 +2150,12 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
     let publication_token = Uuid::new_v4();
     state
         .content_lock_deletions()
-        .begin_publication(&creator(), &lock_id, publication_token, &content_lock)
+        .begin_publication(
+            &creator(),
+            &lock_id,
+            publication_token,
+            &ContentLockPayload::V1(content_lock),
+        )
         .await
         .unwrap();
 
@@ -6295,6 +6300,261 @@ async fn creator_content_locks_create_lock_for_registered_guarded_resource() {
         .await
         .unwrap();
     assert!(stored.is_some());
+}
+
+#[tokio::test]
+async fn creator_content_locks_create_v2_graph_lock_on_common_route() {
+    let state = test_state_with_creator_publishing(true)
+        .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state.clone());
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = json!({
+        "version": 2,
+        "primary_resource": guarded_resource,
+        "graph": {
+            "predicates": [{
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            }]
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/content-locks",
+            request,
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["content_lock"]["version"], 2);
+    assert_eq!(
+        body["content_lock"]["graph"]["predicates"][0]["type"],
+        "follows"
+    );
+    assert!(body["content_lock"].get("criteria").is_none());
+    let lock_id = body["lock_id"].as_str().unwrap();
+    assert_eq!(
+        body["content_lock_path"],
+        format!("/pub/app.locks/{lock_id}.json")
+    );
+
+    let deleted = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}?force=true"),
+            json!(null),
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn creator_content_locks_v2_rejects_body_creator() {
+    let state = test_state_with_creator_publishing(true);
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = json!({
+        "version": 2,
+        "creator": other_creator().to_string(),
+        "primary_resource": guarded_resource,
+        "graph": {
+            "predicates": [{
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            }]
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/content-locks",
+            request,
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn creator_content_locks_create_v2_payment_and_mixed_locks_on_common_route() {
+    for with_graph in [false, true] {
+        let state = test_state_with_creator_publishing(true)
+            .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+        seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+        let app = router(state.clone());
+        let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+        let mut request = json!({
+            "version": 2,
+            "primary_resource": guarded_resource,
+            "payment": {
+                "recipient_pubky": creator().to_string(),
+                "amount": "50000",
+                "asset": "BTC",
+                "minimum_confirmations": 1
+            },
+            "verification_window_seconds": 300,
+            "access_policy": { "requested_credential_ttl_seconds": 900 },
+            "lock_server": { "override": null }
+        });
+        if with_graph {
+            request["graph"] = json!({
+                "predicates": [{
+                    "type": "follows",
+                    "follower": "reader",
+                    "followed": "creator"
+                }]
+            });
+        }
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/creator/content-locks",
+                request.clone(),
+                "frontend-session-secret",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["content_lock"]["version"], 2);
+        assert_eq!(body["content_lock"]["payment"]["asset"], "BTC");
+        assert_eq!(body["content_lock"].get("graph").is_some(), with_graph);
+        let lock_id = body["lock_id"].as_str().unwrap();
+        let path = body["content_lock_path"].as_str().unwrap();
+        assert_eq!(path, format!("/pub/app.locks/{lock_id}.json"));
+        assert_eq!(
+            state
+                .content_locks()
+                .get_content_lock_payload(&creator(), &path.parse().unwrap())
+                .await
+                .unwrap(),
+            Some(serde_json::from_value(body["content_lock"].clone()).unwrap())
+        );
+
+        let replay = app
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/creator/content-locks",
+                request,
+                "frontend-session-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["lock_id"], lock_id);
+    }
+}
+
+#[tokio::test]
+async fn creator_content_locks_v2_common_route_rejects_invalid_closed_shapes() {
+    let state = test_state_with_creator_publishing(true);
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let valid = json!({
+        "version": 2,
+        "primary_resource": guarded_resource,
+        "payment": {
+            "recipient_pubky": creator().to_string(),
+            "amount": "50000",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+    let invalid_requests = [
+        {
+            let mut value = valid.clone();
+            value["version"] = json!(3);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove("payment");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["asset"] = json!("USDT");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["amount"] = json!("0");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["unknown"] = json!(true);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove("payment");
+            value["graph"] = json!({
+                "predicates": [{
+                    "type": "follows",
+                    "follower": "reader",
+                    "followed": "reader"
+                }]
+            });
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["criteria"] = json!([]);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["creator"] = json!(other_creator().to_string());
+            value
+        },
+    ];
+
+    for request in invalid_requests {
+        let response = app
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/creator/content-locks",
+                request,
+                "frontend-session-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_request"
+        );
+    }
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ const files = {
   creator: join(examplesDir, 'creator-complete-flow.js'),
   creatorIdentity: join(examplesDir, 'creator-identity.js'),
   creatorPolicy: join(examplesDir, 'creator-lock-policy.js'),
+  creatorV2: join(examplesDir, 'creator-v2-publishing.js'),
   paykitSetup: join(examplesDir, 'paykit-setup.js'),
   readerHtml: join(examplesDir, 'reader.html'),
   readerApp: join(examplesDir, 'reader-app.js'),
@@ -183,6 +184,14 @@ const required = {
     'node --check scripts/receive-paykit-request.mjs',
     'node --check scripts/lib/creator-session-state.mjs',
     'node --check creator-identity.js',
+  ],
+  creatorV2: [
+    'CreateContentLockV2RequestBuilder',
+    'buildGraphOnlyV2',
+    'buildBtcPaymentOnlyV2',
+    'buildMixedV2',
+    "asset: 'BTC'",
+    'session.creator.createContentLock(request)',
   ],
   app: ["import './app-iframe.js'"],
   appIframe: [

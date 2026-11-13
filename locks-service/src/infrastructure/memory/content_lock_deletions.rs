@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use locks_core::ids::{CreatorPubky, LockId};
-use locks_core::lock_policy::{ContentLock, ContentLockPayload};
+use locks_core::lock_policy::ContentLockPayload;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -56,7 +56,7 @@ struct StoredJob {
 struct PublicationIntent {
     token: Uuid,
     write_completed: bool,
-    original_content_lock: ContentLock,
+    original_content_lock: ContentLockPayload,
 }
 
 /// In-memory deletion repository with the same lease-fencing semantics as PostgreSQL.
@@ -229,7 +229,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
-        original_content_lock: &ContentLock,
+        original_content_lock: &ContentLockPayload,
     ) -> Result<(), ApplicationError> {
         if !publication_intent_matches_request(
             creator,
@@ -357,7 +357,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        published_content_lock: &ContentLock,
+        published_content_lock: &ContentLockPayload,
         published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError> {
         if !publication_reconciliation_matches(
@@ -398,7 +398,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        requested_content_lock: &ContentLock,
+        requested_content_lock: &ContentLockPayload,
     ) -> Result<PublicationRecovery, ApplicationError> {
         let key = (creator.clone(), lock_id.clone());
         let mut intents = self.publication_intents.write().await;

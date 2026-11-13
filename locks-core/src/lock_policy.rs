@@ -309,6 +309,27 @@ impl ContentLockPayload {
         }
     }
 
+    /// Derives canonical public path for either supported version.
+    pub fn content_lock_path(&self) -> serde_json::Result<ContentLockPath> {
+        Ok(ContentLockPath::from_lock_id(self.lock_id()?))
+    }
+
+    /// Returns canonical creation time for either supported version.
+    pub fn created_at(&self) -> OffsetDateTime {
+        match self {
+            Self::V1(lock) => lock.created_at,
+            Self::V2(lock) => lock.created_at,
+        }
+    }
+
+    /// Replaces creation time when authenticating an otherwise exact retry.
+    pub fn set_created_at(&mut self, created_at: OffsetDateTime) {
+        match self {
+            Self::V1(lock) => lock.created_at = created_at,
+            Self::V2(lock) => lock.created_at = created_at,
+        }
+    }
+
     /// Validates guarded-resource invariants for either supported version.
     pub fn validate_resource_set(&self) -> Result<(), ContentLockValidationError> {
         match self {
@@ -441,24 +462,16 @@ impl<'de> Deserialize<'de> for ContentLockV2 {
 impl ContentLockV2 {
     /// Validates all closed v2 wire and policy invariants.
     pub fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
-        if self.version != CONTENT_LOCK_V2_VERSION {
-            return Err(ContentLockV2ValidationError::UnsupportedVersion(
-                self.version,
-            ));
-        }
-        if self.payment.is_none() && self.graph.is_none() {
-            return Err(ContentLockV2ValidationError::MissingPolicy);
-        }
-        if !(60..=604_800).contains(&self.verification_window_seconds) {
-            return Err(ContentLockV2ValidationError::InvalidVerificationWindow);
-        }
-        self.validate_resource_set()
-            .map_err(ContentLockV2ValidationError::InvalidResourceSet)?;
+        validate_v2_shape(
+            self.version,
+            &self.primary_resource,
+            &self.secondary_resources,
+            &self.payment,
+            &self.graph,
+            self.verification_window_seconds,
+        )?;
         if let Some(payment) = &self.payment {
-            payment.validate(&self.creator)?;
-        }
-        if let Some(graph) = &self.graph {
-            graph.validate()?;
+            payment.validate_recipient(&self.creator)?;
         }
         Ok(())
     }
@@ -501,7 +514,7 @@ fn validation_as_json_error(error: ContentLockV2ValidationError) -> serde_json::
     serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-fn validate_v2_resource_set(
+pub(crate) fn validate_v2_resource_set(
     primary_resource: &Option<GuardedResource>,
     secondary_resources: &BTreeMap<String, SecondaryGuardedResource>,
 ) -> Result<(), ContentLockValidationError> {
@@ -545,6 +558,34 @@ fn validate_v2_resource_set(
     Ok(())
 }
 
+pub(crate) fn validate_v2_shape(
+    version: u16,
+    primary_resource: &Option<GuardedResource>,
+    secondary_resources: &BTreeMap<String, SecondaryGuardedResource>,
+    payment: &Option<PaymentPolicyV2>,
+    graph: &Option<GraphPolicyV2>,
+    verification_window_seconds: u64,
+) -> Result<(), ContentLockV2ValidationError> {
+    if version != CONTENT_LOCK_V2_VERSION {
+        return Err(ContentLockV2ValidationError::UnsupportedVersion(version));
+    }
+    if payment.is_none() && graph.is_none() {
+        return Err(ContentLockV2ValidationError::MissingPolicy);
+    }
+    if !(60..=604_800).contains(&verification_window_seconds) {
+        return Err(ContentLockV2ValidationError::InvalidVerificationWindow);
+    }
+    validate_v2_resource_set(primary_resource, secondary_resources)
+        .map_err(ContentLockV2ValidationError::InvalidResourceSet)?;
+    if let Some(payment) = payment {
+        payment.validate_shape()?;
+    }
+    if let Some(graph) = graph {
+        graph.validate()?;
+    }
+    Ok(())
+}
+
 /// Closed v2 payment policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -556,10 +597,7 @@ pub struct PaymentPolicyV2 {
 }
 
 impl PaymentPolicyV2 {
-    fn validate(&self, creator: &CreatorPubky) -> Result<(), ContentLockV2ValidationError> {
-        if &self.recipient_pubky != creator {
-            return Err(ContentLockV2ValidationError::PaymentRecipientMustMatchCreator);
-        }
+    pub(crate) fn validate_shape(&self) -> Result<(), ContentLockV2ValidationError> {
         if self.amount.is_empty()
             || !self.amount.bytes().all(|byte| byte.is_ascii_digit())
             || self
@@ -575,6 +613,16 @@ impl PaymentPolicyV2 {
         }
         if self.minimum_confirmations > 6 {
             return Err(ContentLockV2ValidationError::InvalidMinimumConfirmations);
+        }
+        Ok(())
+    }
+
+    fn validate_recipient(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(), ContentLockV2ValidationError> {
+        if &self.recipient_pubky != creator {
+            return Err(ContentLockV2ValidationError::PaymentRecipientMustMatchCreator);
         }
         Ok(())
     }
@@ -648,7 +696,7 @@ pub struct GraphPolicyV2 {
 }
 
 impl GraphPolicyV2 {
-    fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), ContentLockV2ValidationError> {
         if !(1..=8).contains(&self.predicates.len()) {
             return Err(ContentLockV2ValidationError::InvalidGraphCardinality);
         }
