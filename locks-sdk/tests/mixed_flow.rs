@@ -245,3 +245,154 @@ fn mixed_creator_evidence_rejects_completion_without_live_bound_provider_status(
 
     assert!(CreatorLocks::parse_mixed_verification_evidence_response(impossible).is_err());
 }
+
+fn completed_usdt_evidence() -> serde_json::Value {
+    json!({
+        "creator": CREATOR,
+        "reader": READER,
+        "bundle_id": BUNDLE_ID,
+        "pubky_lock_resource": LOCK_RESOURCE,
+        "mode": "mixed",
+        "status": "completed",
+        "submitted_at": "2026-11-03T12:00:00Z",
+        "deadline_at": "2026-11-03T12:10:00Z",
+        "completed_at": "2026-11-03T12:01:00Z",
+        "satisfied_by": ["payment"],
+        "graph": {"predicates": [{
+            "index": 0,
+            "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+            "state": "pending"
+        }]},
+        "payment": {
+            "invoice": {
+                "status": "created",
+                "invoice_created_at": "2026-11-03T12:00:05Z",
+                "proposal_expires_at": "2026-11-03T12:05:00Z"
+            },
+            "provider_status": {
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "request_state": "accepted",
+                "payment_state": "confirmed",
+                "invoice_created_at": "2026-11-03T12:00:05Z",
+                "proposal_expires_at": "2026-11-03T12:05:00Z",
+                "deadline": "2026-11-03T12:10:00Z",
+                "asset": "USDT",
+                "minimum_confirmations": 6,
+                "current_sample": null,
+                "first_threshold_satisfied": null,
+                "bitcoin": {
+                    "confirmations": 6,
+                    "amount_matched": true,
+                    "paid_on_time": true
+                },
+                "usdt_arbitrum": {
+                    "confirmations": 1,
+                    "amount_matched": true,
+                    "paid_on_time": true,
+                    "finalized": false
+                }
+            },
+            "operational_failure_count": 0,
+            "operational_failure_total": 0
+        }
+    })
+}
+
+#[test]
+fn mixed_creator_evidence_accepts_completed_usdt_payment() {
+    let parsed =
+        CreatorLocks::parse_mixed_verification_evidence_response(completed_usdt_evidence())
+            .unwrap();
+    assert_eq!(
+        parsed.satisfied_by,
+        vec![locks_core::verification::SatisfiedByV2::Payment]
+    );
+}
+
+#[test]
+fn mixed_creator_evidence_accepts_pending_usdt_payment_with_explicit_null_rails() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["status"] = json!("in_progress");
+    evidence["satisfied_by"] = json!([]);
+    evidence.as_object_mut().unwrap().remove("completed_at");
+    evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+    evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+
+    CreatorLocks::parse_mixed_verification_evidence_response(evidence).unwrap();
+}
+
+#[test]
+fn mixed_creator_evidence_rejects_missing_or_malformed_usdt_rail_fields() {
+    for missing in ["bitcoin", "usdt_arbitrum"] {
+        let mut evidence = completed_usdt_evidence();
+        evidence["payment"]["provider_status"]
+            .as_object_mut()
+            .unwrap()
+            .remove(missing);
+        assert!(
+            CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err(),
+            "accepted USDT evidence missing {missing}"
+        );
+    }
+
+    let mut malformed = completed_usdt_evidence();
+    malformed["payment"]["provider_status"]["usdt_arbitrum"]
+        .as_object_mut()
+        .unwrap()
+        .remove("paid_on_time");
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(malformed).is_err());
+
+    let mut unknown = completed_usdt_evidence();
+    unknown["payment"]["provider_status"]["usdt_arbitrum"]["unsupported"] = json!(true);
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(unknown).is_err());
+
+    let mut invalid_asset = completed_usdt_evidence();
+    invalid_asset["payment"]["provider_status"]["asset"] = json!("usdt");
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(invalid_asset).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_never_uses_bitcoin_offer_to_qualify_usdt() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] = json!(0);
+    evidence["payment"]["provider_status"]["first_threshold_satisfied"] = json!({
+        "observed_at": "2026-11-03T12:00:30Z",
+        "status": "confirmed",
+        "outpoint": {
+            "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "vout": 0
+        },
+        "confirmations": 6,
+        "amount_matched": true
+    });
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_requires_qualifying_usdt_for_graph_eligibility() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["satisfied_by"] = json!(["zero_conf_graph"]);
+    evidence["graph"]["predicates"][0]["state"] = json!("satisfied");
+    evidence["graph"]["predicates"][0]["first_true_observation"] = json!({
+        "outcome": "true",
+        "observed_at": "2026-11-03T12:00:30Z",
+        "origin": "https://nexus.example",
+        "http_status": 200
+    });
+    evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+    evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_rejects_rail_fields_for_btc_status() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["payment"]["provider_status"]["asset"] = json!("BTC");
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
+}

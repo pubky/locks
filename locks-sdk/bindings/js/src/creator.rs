@@ -986,6 +986,115 @@ mod browser_tests {
         };
         assert_eq!(body["payment"]["asset"], "USDT");
     }
+
+    #[wasm_bindgen_test]
+    fn mixed_usdt_evidence_crosses_js_wasm_validation_boundary() {
+        let completed = serde_json::json!({
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "reader": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+            "bundle_id": "000G40R40M30E209185GR38E1W",
+            "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "mode": "mixed",
+            "status": "completed",
+            "submitted_at": "2026-11-03T12:00:00Z",
+            "deadline_at": "2026-11-03T12:10:00Z",
+            "completed_at": "2026-11-03T12:01:00Z",
+            "satisfied_by": ["payment"],
+            "graph": {"predicates": [{
+                "index": 0,
+                "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+                "state": "pending"
+            }]},
+            "payment": {
+                "invoice": {
+                    "status": "created",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z"
+                },
+                "provider_status": {
+                    "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                    "bundle_id": "000G40R40M30E209185GR38E1W",
+                    "request_state": "accepted",
+                    "payment_state": "confirmed",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z",
+                    "deadline": "2026-11-03T12:10:00Z",
+                    "asset": "USDT",
+                    "minimum_confirmations": 6,
+                    "current_sample": null,
+                    "first_threshold_satisfied": null,
+                    "bitcoin": {
+                        "confirmations": 6,
+                        "amount_matched": true,
+                        "paid_on_time": true
+                    },
+                    "usdt_arbitrum": {
+                        "confirmations": 1,
+                        "amount_matched": true,
+                        "paid_on_time": true,
+                        "finalized": false
+                    }
+                },
+                "operational_failure_count": 0,
+                "operational_failure_total": 0
+            }
+        });
+        validate_verification_evidence_response_for_tests(completed.clone()).unwrap();
+
+        let mut pending = completed.clone();
+        pending["status"] = serde_json::json!("in_progress");
+        pending["satisfied_by"] = serde_json::json!([]);
+        pending.as_object_mut().unwrap().remove("completed_at");
+        pending["payment"]["provider_status"]["payment_state"] = serde_json::json!("undetected");
+        pending["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        pending["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        validate_verification_evidence_response_for_tests(pending).unwrap();
+
+        for missing in ["bitcoin", "usdt_arbitrum"] {
+            let mut invalid = completed.clone();
+            invalid["payment"]["provider_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(validate_verification_evidence_response_for_tests(invalid).is_err());
+        }
+
+        let mut bitcoin_only = completed.clone();
+        bitcoin_only["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] =
+            serde_json::json!(0);
+        bitcoin_only["payment"]["provider_status"]["first_threshold_satisfied"] = serde_json::json!({
+            "observed_at": "2026-11-03T12:00:30Z",
+            "status": "confirmed",
+            "outpoint": {
+                "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vout": 0
+            },
+            "confirmations": 6,
+            "amount_matched": true
+        });
+        assert!(validate_verification_evidence_response_for_tests(bitcoin_only).is_err());
+
+        let mut graph_without_qualifying_usdt = completed;
+        graph_without_qualifying_usdt["satisfied_by"] = serde_json::json!(["zero_conf_graph"]);
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["state"] =
+            serde_json::json!("satisfied");
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["first_true_observation"] = serde_json::json!({
+            "outcome": "true",
+            "observed_at": "2026-11-03T12:00:30Z",
+            "origin": "https://nexus.example",
+            "http_status": 200
+        });
+        graph_without_qualifying_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        graph_without_qualifying_usdt["payment"]["provider_status"]["bitcoin"] =
+            serde_json::Value::Null;
+        graph_without_qualifying_usdt["payment"]["provider_status"]["usdt_arbitrum"] =
+            serde_json::Value::Null;
+        assert!(
+            validate_verification_evidence_response_for_tests(graph_without_qualifying_usdt)
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1583,6 +1692,86 @@ mod tests {
         assert_eq!(
             validate_verification_evidence_response_for_tests(evidence.clone()).unwrap(),
             evidence
+        );
+
+        let mut completed_usdt = evidence.clone();
+        completed_usdt["status"] = serde_json::json!("completed");
+        completed_usdt["completed_at"] = serde_json::json!("2026-11-03T12:01:00Z");
+        completed_usdt["satisfied_by"] = serde_json::json!(["payment"]);
+        completed_usdt["graph"]["predicates"][0]["state"] = serde_json::json!("pending");
+        completed_usdt["graph"]["predicates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("first_true_observation");
+        completed_usdt["payment"]["provider_status"]["asset"] = serde_json::json!("USDT");
+        completed_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("confirmed");
+        completed_usdt["payment"]["provider_status"]["bitcoin"] = serde_json::json!({
+            "confirmations": 6,
+            "amount_matched": true,
+            "paid_on_time": true
+        });
+        completed_usdt["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::json!({
+            "confirmations": 1,
+            "amount_matched": true,
+            "paid_on_time": true,
+            "finalized": false
+        });
+        validate_verification_evidence_response_for_tests(completed_usdt.clone()).unwrap();
+
+        let mut pending_usdt = completed_usdt.clone();
+        pending_usdt["status"] = serde_json::json!("in_progress");
+        pending_usdt["satisfied_by"] = serde_json::json!([]);
+        pending_usdt.as_object_mut().unwrap().remove("completed_at");
+        pending_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        pending_usdt["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        pending_usdt["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        validate_verification_evidence_response_for_tests(pending_usdt).unwrap();
+
+        for missing in ["bitcoin", "usdt_arbitrum"] {
+            let mut invalid = completed_usdt.clone();
+            invalid["payment"]["provider_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(validate_verification_evidence_response_for_tests(invalid).is_err());
+        }
+
+        let mut bitcoin_only = completed_usdt.clone();
+        bitcoin_only["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] =
+            serde_json::json!(0);
+        bitcoin_only["payment"]["provider_status"]["first_threshold_satisfied"] = serde_json::json!({
+            "observed_at": "2026-11-03T12:00:30Z",
+            "status": "confirmed",
+            "outpoint": {
+                "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vout": 0
+            },
+            "confirmations": 6,
+            "amount_matched": true
+        });
+        assert!(validate_verification_evidence_response_for_tests(bitcoin_only).is_err());
+
+        let mut graph_without_qualifying_usdt = completed_usdt;
+        graph_without_qualifying_usdt["satisfied_by"] = serde_json::json!(["zero_conf_graph"]);
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["state"] =
+            serde_json::json!("satisfied");
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["first_true_observation"] = serde_json::json!({
+            "outcome": "true",
+            "observed_at": "2026-11-03T12:00:30Z",
+            "origin": "https://nexus.example",
+            "http_status": 200
+        });
+        graph_without_qualifying_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        graph_without_qualifying_usdt["payment"]["provider_status"]["bitcoin"] =
+            serde_json::Value::Null;
+        graph_without_qualifying_usdt["payment"]["provider_status"]["usdt_arbitrum"] =
+            serde_json::Value::Null;
+        assert!(
+            validate_verification_evidence_response_for_tests(graph_without_qualifying_usdt)
+                .is_err()
         );
 
         let mut created_without_status = evidence.clone();
