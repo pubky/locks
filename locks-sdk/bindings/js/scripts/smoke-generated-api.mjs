@@ -247,6 +247,21 @@ const v2Request = new sdk.CreateContentLockV2RequestBuilder()
 if (v2Request.version !== 2 || !v2Request.payment || !v2Request.graph) {
   throw new Error('content lock v2 request builder lost version or policy fields');
 }
+const usdtRequest = new sdk.CreateContentLockV2RequestBuilder()
+  .primaryResource(primaryResource)
+  .payment({
+    recipient_pubky: 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+    amount: '5000001',
+    asset: 'USDT',
+    minimum_confirmations: 0,
+  })
+  .verificationWindowSeconds(300)
+  .accessPolicy({ requested_credential_ttl_seconds: 900 })
+  .lockServer({ override: null })
+  .build();
+if (usdtRequest.payment?.asset !== 'USDT' || usdtRequest.payment?.amount !== '5000001') {
+  throw new Error('content lock v2 builder changed USDT asset or millionths');
+}
 let unsupportedAssetAccepted = false;
 try {
   new sdk.CreateContentLockV2RequestBuilder()
@@ -254,7 +269,7 @@ try {
     .payment({
       recipient_pubky: 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
       amount: '50000',
-      asset: 'USDT',
+      asset: 'USD',
       minimum_confirmations: 1,
     })
     .verificationWindowSeconds(300)
@@ -263,10 +278,10 @@ try {
     .build();
   unsupportedAssetAccepted = true;
 } catch {
-  // Expected: current Content Lock v2 contract is BTC-only.
+  // Expected: Content Lock v2 asset set is closed to BTC and USDT.
 }
 if (unsupportedAssetAccepted) {
-  throw new Error('content lock v2 builder accepted unsupported USDT asset');
+  throw new Error('content lock v2 builder accepted unsupported USD asset');
 }
 
 console.log('generated package API smoke check passed');

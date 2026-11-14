@@ -5,7 +5,7 @@ Mixed Content Lock v2 combines one graph policy with one Paykit payment policy. 
 1. Locks durably admits or exact-replays payment obligation before evaluator work.
 2. Folded auth derives Reader server-side. Mixed submissions MUST omit wire `reader_pubky`.
 3. Each evaluation wave keeps payment evidence live and eligible. Payment unavailability, conflict, ineligibility, or expiry blocks Graph bypass.
-4. Timely payment threshold **or** Graph success paired with same-wave detected, amount-matched payment evidence (the `minimum_confirmations = 0` eligibility rule) can satisfy the lock. Accepted request state alone is never enough. Graph success never cancels, erases, or forgives payment.
+4. Timely qualifying payment evidence **or** Graph success paired with same-wave eligible payment evidence can satisfy the lock. BTC eligibility retains its `minimum_confirmations = 0` rule. USDT requires amount-matched, on-time verified Arbitrum inclusion; denomination, offered BTC conversion, and Bitcoin thresholds cannot qualify USDT. Accepted request state alone is never enough. Graph success never cancels, erases, or forgives payment.
 5. Canonical `satisfied_by` values are `payment`, `zero_conf_graph`, or `[payment, zero_conf_graph]` in that order.
 
 ## Lifecycle
@@ -48,7 +48,7 @@ Force deletion makes no Paykit or Nexus calls. It preserves completed work, bloc
 
 ## Runtime dependencies
 
-Paykit Server must support immutable provider-v2 create/status/drain contract (`v0.1.1-rc3`, commit `725a4cd6578cdc149b4f38c8577bb9937a81bbb6`). Nexus uses signed Locks HTTP client rules already documented for Graph Stage 1. Missing Nexus does not strand payment-satisfiable mixed tasks; it records Graph dependency unavailability. Missing Paykit prevents mixed admission.
+Paykit Server must support immutable BTC/USDT provider-v2 create/status/drain contract (approved commit `d2e1b55cbef5e705b0c11e6c7741598fce1158f9`). Nexus uses signed Locks HTTP client rules already documented for Graph Stage 1. Missing Nexus does not strand payment-satisfiable mixed tasks; it records Graph dependency unavailability. Missing Paykit prevents mixed admission.
 
 ## Verification
 

@@ -299,10 +299,15 @@ mod tests {
             "lock_server": { "override": null }
         });
 
+        let mut valid_usdt = valid.clone();
+        valid_usdt["payment"]["asset"] = json!("USDT");
+        valid_usdt["payment"]["amount"] = json!("5000001");
+        serde_json::from_value::<CreateContentLockV2Request>(valid_usdt).unwrap();
+
         for invalid in [
             {
                 let mut value = valid.clone();
-                value["payment"]["asset"] = json!("USDT");
+                value["payment"]["asset"] = json!("USD");
                 value
             },
             {

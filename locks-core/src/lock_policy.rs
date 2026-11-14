@@ -596,6 +596,34 @@ pub struct PaymentPolicyV2 {
     pub minimum_confirmations: u8,
 }
 
+/// Closed v2 payment denomination. Amounts use rail-native base units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentAssetV2 {
+    /// Bitcoin amount in satoshis.
+    #[serde(rename = "BTC")]
+    Btc,
+    /// Arbitrum USDT amount in millionths.
+    #[serde(rename = "USDT")]
+    Usdt,
+}
+
+impl PaymentAssetV2 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usdt => "USDT",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ContentLockV2ValidationError> {
+        match value {
+            "BTC" => Ok(Self::Btc),
+            "USDT" => Ok(Self::Usdt),
+            _ => Err(ContentLockV2ValidationError::InvalidPaymentAsset),
+        }
+    }
+}
+
 impl PaymentPolicyV2 {
     pub(crate) fn validate_shape(&self) -> Result<(), ContentLockV2ValidationError> {
         if self.amount.is_empty()
@@ -608,9 +636,7 @@ impl PaymentPolicyV2 {
         {
             return Err(ContentLockV2ValidationError::InvalidPaymentAmount);
         }
-        if self.asset != "BTC" {
-            return Err(ContentLockV2ValidationError::InvalidPaymentAsset);
-        }
+        PaymentAssetV2::parse(&self.asset)?;
         if self.minimum_confirmations > 6 {
             return Err(ContentLockV2ValidationError::InvalidMinimumConfirmations);
         }
@@ -729,7 +755,7 @@ pub enum ContentLockV2ValidationError {
     PaymentRecipientMustMatchCreator,
     #[error("payment amount must be a positive decimal integer string")]
     InvalidPaymentAmount,
-    #[error("payment asset must be non-empty and contain no control characters")]
+    #[error("payment asset must be exactly BTC or USDT")]
     InvalidPaymentAsset,
     #[error("minimum_confirmations must be in 0..=6")]
     InvalidMinimumConfirmations,

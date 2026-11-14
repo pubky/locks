@@ -1,9 +1,8 @@
-use time::OffsetDateTime;
-
 use crate::application::models::{
     PaymentRequestStateV2, PaymentRootState, PaymentStateV2, PaymentTaskSnapshotV1,
     VerificationTerminalReason,
 };
+use time::OffsetDateTime;
 
 pub fn reduce_payment_snapshot(
     snapshot: &mut PaymentTaskSnapshotV1,
@@ -24,7 +23,7 @@ pub fn reduce_payment_snapshot(
         return Ok(());
     };
 
-    let has_first = status.first_threshold_satisfied.is_some();
+    let has_qualifying_evidence = status.has_qualifying_evidence();
     let accepted_state = matches!(
         status.request_state,
         PaymentRequestStateV2::Accepted
@@ -32,7 +31,7 @@ pub fn reduce_payment_snapshot(
             | PaymentRequestStateV2::ActiveRecurring
     );
 
-    snapshot.root = if has_first {
+    snapshot.root = if has_qualifying_evidence {
         if accepted_state {
             PaymentRootState::Satisfied
         } else {

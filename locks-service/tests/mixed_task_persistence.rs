@@ -33,7 +33,7 @@ async fn memory_mixed_replay_conflict_claim_and_revision_fences_are_closed() {
 
     let mut changed = task.clone();
     changed.snapshot.as_v1_mut().payment.payment.amount = "50001".to_owned();
-    changed.snapshot.as_v1_mut().payment.payment.amount_sats = 50001;
+    changed.snapshot.as_v1_mut().payment.payment.amount_units = 50001;
     assert!(matches!(
         repository.insert_mixed_task(changed).await,
         Err(ApplicationError::VerificationTaskConflict)

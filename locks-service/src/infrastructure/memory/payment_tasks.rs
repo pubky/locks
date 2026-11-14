@@ -627,6 +627,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usdt_admission_replays_exactly_and_conflicts_when_asset_changes() {
+        let repository = InMemoryPaymentTaskRepository::new();
+        let mut usdt = request();
+        usdt.payment.amount = "5000001".to_owned();
+        usdt.payment.asset = "USDT".to_owned();
+
+        let admitted = repository.admit_payment_task(usdt.clone()).await.unwrap();
+        assert_eq!(
+            admitted.snapshot.as_v1().payment.asset,
+            PaymentAssetV2::Usdt
+        );
+        assert_eq!(admitted.snapshot.as_v1().payment.amount_units, 5_000_001);
+        assert_eq!(
+            repository.admit_payment_task(usdt.clone()).await,
+            Ok(admitted)
+        );
+
+        let mut changed = usdt;
+        changed.payment.asset = "BTC".to_owned();
+        assert_eq!(
+            repository.admit_payment_task(changed).await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+    }
+
+    #[tokio::test]
     async fn retry_clamped_to_reached_deadline_releases_claim() {
         let clock = Arc::new(MutableClock(Mutex::new(NOW)));
         let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
@@ -767,6 +793,8 @@ mod tests {
                 minimum_confirmations: 1,
                 current_sample: Some(sample.clone()),
                 first_threshold_satisfied: Some(sample.clone()),
+                bitcoin: None,
+                usdt_arbitrum: None,
             })
             .unwrap();
         reduce_payment_snapshot(state, sample.observed_at).unwrap();

@@ -299,6 +299,8 @@ async fn in_memory_force_after_deferred_payment_publication_preserves_fence() {
             minimum_confirmations: state.payment.minimum_confirmations,
             current_sample: Some(sample.clone()),
             first_threshold_satisfied: Some(sample.clone()),
+            bitcoin: None,
+            usdt_arbitrum: None,
         })
         .unwrap();
     reduce_payment_snapshot(state, sample.observed_at).unwrap();

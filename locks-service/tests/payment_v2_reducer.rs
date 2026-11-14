@@ -1,12 +1,12 @@
 use std::str::FromStr;
 
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource};
-use locks_core::lock_policy::PaymentPolicyV2;
+use locks_core::lock_policy::{PaymentAssetV2, PaymentPolicyV2};
 use locks_core::verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2};
 use locks_service::application::models::{
-    BitcoinOutpointV2, PaymentAssetV2, PaymentInvoiceState, PaymentProviderStatus,
+    BitcoinOutpointV2, PaymentInvoiceState, PaymentProviderStatus, PaymentRailEvidenceV2,
     PaymentRequestStateV2, PaymentRootState, PaymentSampleStatusV2, PaymentSampleV2,
-    PaymentStateV2, PaymentTaskSnapshotV1, VerificationTerminalReason,
+    PaymentStateV2, PaymentTaskSnapshotV1, UsdtArbitrumEvidenceV2, VerificationTerminalReason,
 };
 use locks_service::application::payment_v2_reducer::reduce_payment_snapshot;
 use time::macros::datetime;
@@ -87,6 +87,111 @@ fn status(
         minimum_confirmations: 1,
         current_sample: first.clone(),
         first_threshold_satisfied: first,
+        bitcoin: None,
+        usdt_arbitrum: None,
+    }
+}
+
+fn usdt_snapshot(evidence: Option<UsdtArbitrumEvidenceV2>) -> PaymentTaskSnapshotV1 {
+    let mut state = snapshot(6);
+    state.payment.asset = PaymentAssetV2::Usdt;
+    state.payment.amount = "5000001".to_owned();
+    state.payment.amount_units = 5_000_001;
+    state.invoice = PaymentInvoiceState::Created {
+        invoice_created_at: ACCEPTED + time::Duration::seconds(1),
+        proposal_expires_at: ACCEPTED + time::Duration::seconds(60),
+    };
+    state.provider_status = Some(PaymentProviderStatus {
+        creator: creator(),
+        bundle_id: bundle(),
+        request_state: PaymentRequestStateV2::Accepted,
+        payment_state: PaymentStateV2::Confirmed,
+        invoice_created_at: ACCEPTED + time::Duration::seconds(1),
+        proposal_expires_at: ACCEPTED + time::Duration::seconds(60),
+        deadline: DEADLINE,
+        asset: PaymentAssetV2::Usdt,
+        minimum_confirmations: 6,
+        current_sample: None,
+        first_threshold_satisfied: None,
+        bitcoin: None,
+        usdt_arbitrum: evidence,
+    });
+    state
+}
+
+#[test]
+fn verified_usdt_inclusion_qualifies_without_bitcoin_confirmation_threshold() {
+    let mut state = usdt_snapshot(Some(UsdtArbitrumEvidenceV2 {
+        confirmations: 1,
+        amount_matched: true,
+        paid_on_time: true,
+        finalized: false,
+    }));
+    let bitcoin_offer = sample(ACCEPTED + time::Duration::seconds(2), 6);
+    let status = state.provider_status.as_mut().unwrap();
+    status.current_sample = Some(bitcoin_offer.clone());
+    status.first_threshold_satisfied = Some(bitcoin_offer);
+
+    reduce_payment_snapshot(&mut state, ACCEPTED + time::Duration::seconds(30)).unwrap();
+    assert_eq!(state.root, PaymentRootState::Satisfied);
+}
+
+#[test]
+fn usdt_requires_confirmed_aggregate_payment_state_before_qualification() {
+    for (payment_state, expected) in [
+        (PaymentStateV2::Undetected, PaymentRootState::Pending),
+        (PaymentStateV2::Detected, PaymentRootState::Pending),
+        (
+            PaymentStateV2::Expired,
+            PaymentRootState::Expired(VerificationTerminalReason::PaymentDeadlineExpired),
+        ),
+    ] {
+        let mut state = usdt_snapshot(Some(UsdtArbitrumEvidenceV2 {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: true,
+            finalized: false,
+        }));
+        state.provider_status.as_mut().unwrap().payment_state = payment_state;
+
+        reduce_payment_snapshot(&mut state, ACCEPTED + time::Duration::seconds(30)).unwrap();
+        assert_eq!(state.root, expected);
+    }
+}
+
+#[test]
+fn usdt_does_not_qualify_from_bitcoin_offer_or_incomplete_arbitrum_evidence() {
+    let cases = [
+        None,
+        Some(UsdtArbitrumEvidenceV2 {
+            confirmations: 0,
+            amount_matched: true,
+            paid_on_time: true,
+            finalized: false,
+        }),
+        Some(UsdtArbitrumEvidenceV2 {
+            confirmations: 1,
+            amount_matched: false,
+            paid_on_time: true,
+            finalized: false,
+        }),
+        Some(UsdtArbitrumEvidenceV2 {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: false,
+            finalized: false,
+        }),
+    ];
+    for evidence in cases {
+        let mut state = usdt_snapshot(evidence);
+        state.provider_status.as_mut().unwrap().bitcoin = Some(PaymentRailEvidenceV2 {
+            confirmations: 6,
+            amount_matched: true,
+            paid_on_time: true,
+        });
+
+        reduce_payment_snapshot(&mut state, ACCEPTED + time::Duration::seconds(30)).unwrap();
+        assert_eq!(state.root, PaymentRootState::Pending);
     }
 }
 
@@ -252,6 +357,6 @@ fn exact_admission_binding_survives_mutable_payment_progress() {
 
     let mut changed = pristine;
     changed.payment.amount = "50001".to_owned();
-    changed.payment.amount_sats = 50_001;
+    changed.payment.amount_units = 50_001;
     assert!(!progressed.has_same_admission_binding(&changed));
 }

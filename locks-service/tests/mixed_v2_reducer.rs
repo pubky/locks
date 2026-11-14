@@ -12,7 +12,7 @@ use locks_service::application::models::{
     BitcoinOutpointV2, GraphObservationOutcome, MixedRootState, MixedTaskSnapshot,
     MixedTaskSnapshotV1, PaymentAssetV2, PaymentOperationalErrorCategory, PaymentProviderStatus,
     PaymentRequestStateV2, PaymentRootState, PaymentSampleStatusV2, PaymentSampleV2,
-    PaymentStateV2, PaymentTaskSnapshot, VerificationTerminalReason,
+    PaymentStateV2, PaymentTaskSnapshot, UsdtArbitrumEvidenceV2, VerificationTerminalReason,
 };
 use locks_service::application::ports::ProviderV2EvaluatorSnapshot;
 use time::macros::datetime;
@@ -61,6 +61,52 @@ fn graph_does_not_satisfy_with_accepted_but_undetected_payment() {
 
     assert_eq!(mixed.root, MixedRootState::Pending);
     assert!(mixed.satisfied_by.is_empty());
+}
+
+#[test]
+fn mixed_usdt_completes_only_from_qualifying_arbitrum_evidence() {
+    let mut mixed = snapshot();
+    mixed.payment.payment.asset = PaymentAssetV2::Usdt;
+    mixed.payment.payment.amount = "5000001".to_owned();
+    mixed.payment.payment.amount_units = 5_000_001;
+    mixed
+        .apply_create_response(
+            ACCEPTED + time::Duration::seconds(1),
+            ACCEPTED + time::Duration::seconds(60),
+            DEADLINE,
+        )
+        .unwrap();
+    let mut provider_status = status(
+        PaymentRequestStateV2::Accepted,
+        PaymentStateV2::Confirmed,
+        None,
+    );
+    provider_status.asset = PaymentAssetV2::Usdt;
+    let bitcoin_offer = PaymentSampleV2 {
+        observed_at: ACCEPTED + time::Duration::seconds(2),
+        status: PaymentSampleStatusV2::Confirmed,
+        outpoint: Some(BitcoinOutpointV2 {
+            txid: "14".repeat(32),
+            vout: 0,
+        }),
+        confirmations: 6,
+        amount_matched: true,
+    };
+    provider_status.current_sample = Some(bitcoin_offer.clone());
+    provider_status.first_threshold_satisfied = Some(bitcoin_offer);
+    provider_status.usdt_arbitrum = Some(UsdtArbitrumEvidenceV2 {
+        confirmations: 1,
+        amount_matched: true,
+        paid_on_time: true,
+        finalized: false,
+    });
+    mixed.apply_payment_status(provider_status).unwrap();
+
+    reduce_mixed_snapshot(&mut mixed, ACCEPTED + time::Duration::seconds(2)).unwrap();
+
+    assert_eq!(mixed.root, MixedRootState::Satisfied);
+    assert_eq!(mixed.satisfied_by, vec![SatisfiedByV2::Payment]);
+    assert_eq!(mixed.payment.root, PaymentRootState::Satisfied);
 }
 
 #[test]
@@ -496,6 +542,8 @@ fn status(
         minimum_confirmations: 1,
         current_sample: first.clone(),
         first_threshold_satisfied: first,
+        bitcoin: None,
+        usdt_arbitrum: None,
     }
 }
 

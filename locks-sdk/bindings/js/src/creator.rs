@@ -915,7 +915,7 @@ mod browser_tests {
     }
 
     #[wasm_bindgen_test]
-    fn v2_builder_feeds_common_creator_transport_and_rejects_usdt() {
+    fn v2_builder_feeds_common_creator_transport_for_btc_and_usdt() {
         let hash = serde_json::to_value(locks_core::ids::GuardedResourceHash::from_bytes([7; 32]))
             .unwrap();
         let builder = CreateContentLockV2RequestBuilder::new();
@@ -954,30 +954,37 @@ mod browser_tests {
         assert_eq!(body["version"], 2);
         assert_eq!(body["payment"]["asset"], "BTC");
 
-        let unsupported = CreateContentLockV2RequestBuilder::new();
-        unsupported
-            .primary_resource(js(serde_json::json!({
-                "path": "/priv/app.locks/content/example.txt",
-                "hash": hash,
-                "content_type": "text/plain",
-                "size": 13
-            })))
+        let usdt = CreateContentLockV2RequestBuilder::new();
+        usdt.primary_resource(js(serde_json::json!({
+            "path": "/priv/app.locks/content/example.txt",
+            "hash": hash,
+            "content_type": "text/plain",
+            "size": 13
+        })))
+        .unwrap()
+        .payment(js(serde_json::json!({
+            "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "amount": "5000001",
+            "asset": "USDT",
+            "minimum_confirmations": 1
+        })))
+        .unwrap()
+        .verification_window_seconds(300)
+        .access_policy(js(serde_json::json!({
+            "requested_credential_ttl_seconds": 900
+        })))
+        .unwrap()
+        .lock_server(js(serde_json::json!({ "override": null })))
+        .unwrap();
+        let body = js_value_to_json(usdt.build().unwrap(), "v2 request").unwrap();
+        let JsRequestBody::Json(body) = Creator::new(browser_session())
+            .create_build_content_lock_request(body)
             .unwrap()
-            .payment(js(serde_json::json!({
-                "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
-                "amount": "50000",
-                "asset": "USDT",
-                "minimum_confirmations": 1
-            })))
-            .unwrap()
-            .verification_window_seconds(300)
-            .access_policy(js(serde_json::json!({
-                "requested_credential_ttl_seconds": 900
-            })))
-            .unwrap()
-            .lock_server(js(serde_json::json!({ "override": null })))
-            .unwrap();
-        assert!(unsupported.build().is_err());
+            .body
+        else {
+            panic!("common creator transport must send JSON");
+        };
+        assert_eq!(body["payment"]["asset"], "USDT");
     }
 }
 
@@ -1258,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn create_content_lock_v2_builder_rejects_unsupported_payment_asset() {
+    fn create_content_lock_v2_builder_accepts_usdt_and_rejects_unsupported_asset() {
         let valid_hash =
             serde_json::to_value(locks_core::ids::GuardedResourceHash::from_bytes([7; 32]))
                 .unwrap()
@@ -1273,15 +1280,20 @@ mod tests {
         ));
         builder.state.borrow_mut().payment = Some(serde_json::json!({
             "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
-            "amount": "50000",
+            "amount": "5000001",
             "asset": "USDT",
-            "minimum_confirmations": 1
+            "minimum_confirmations": 0
         }));
         builder.state.borrow_mut().verification_window_seconds = Some(300);
         builder.state.borrow_mut().access_policy =
             Some(serde_json::json!({ "requested_credential_ttl_seconds": 900 }));
         builder.state.borrow_mut().lock_server = Some(serde_json::json!({ "override": null }));
 
+        let body = builder.build_value().unwrap();
+        assert_eq!(body["payment"]["asset"], "USDT");
+        assert_eq!(body["payment"]["amount"], "5000001");
+
+        builder.state.borrow_mut().payment.as_mut().unwrap()["asset"] = serde_json::json!("USD");
         assert!(builder.build_value().is_err());
     }
 

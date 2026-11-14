@@ -29,6 +29,17 @@ export function buildBtcPaymentOnlyV2({ creatorPubky, amountSats, minimumConfirm
     .build();
 }
 
+export function buildUsdtPaymentOnlyV2({ creatorPubky, amountMillionths, ...options }) {
+  return baseBuilder(options)
+    .payment({
+      recipient_pubky: creatorPubky,
+      amount: String(amountMillionths),
+      asset: 'USDT',
+      minimum_confirmations: 0,
+    })
+    .build();
+}
+
 export function buildMixedV2(options) {
   return baseBuilder(options)
     .payment({
@@ -36,6 +47,20 @@ export function buildMixedV2(options) {
       amount: String(options.amountSats),
       asset: 'BTC',
       minimum_confirmations: options.minimumConfirmations ?? 1,
+    })
+    .graph({
+      predicates: [{ type: 'follows', follower: 'reader', followed: 'creator' }],
+    })
+    .build();
+}
+
+export function buildUsdtMixedV2(options) {
+  return baseBuilder(options)
+    .payment({
+      recipient_pubky: options.creatorPubky,
+      amount: String(options.amountMillionths),
+      asset: 'USDT',
+      minimum_confirmations: 0,
     })
     .graph({
       predicates: [{ type: 'follows', follower: 'reader', followed: 'creator' }],

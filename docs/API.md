@@ -421,7 +421,7 @@ Every referenced guarded resource must currently exist for the same creator/path
 
 #### Explicit v2 request
 
-V2 requires top-level `version: 2`, `verification_window_seconds` in `60..=604800`, and at least one of `payment` or `graph`. Payment-only, graph-only, and mixed payment+graph requests are accepted. Current payment policy is BTC-only: positive base-unit integer string amount, `minimum_confirmations` in `0..=6`, and session-derived creator equal to `recipient_pubky`. Graph policy contains one through eight closed predicates; one predicate omits `operator`, while two through eight require `and` or `or`.
+V2 requires top-level `version: 2`, `verification_window_seconds` in `60..=604800`, and at least one of `payment` or `graph`. Payment-only, graph-only, and mixed payment+graph requests are accepted. Payment asset is exactly uppercase `BTC` or `USDT`; amount is a positive rail-native base-unit integer string (BTC satoshis, USDT millionths), `minimum_confirmations` is in `0..=6`, and session-derived creator equals `recipient_pubky`. BTC alone applies that confirmation threshold. USDT requires amount-matched, on-time verified Arbitrum inclusion and does not compare confirmation counts across rails. Graph policy contains one through eight closed predicates; one predicate omits `operator`, while two through eight require `and` or `or`.
 
 ```json
 {
@@ -449,7 +449,7 @@ V2 requires top-level `version: 2`, `verification_window_seconds` in `60..=60480
 }
 ```
 
-Graph-only omits `payment`; BTC payment-only omits `graph`. V2 rejects missing policy, unsupported version, USDT or unknown assets, invalid amount/confirmation/window/graph values, nested unknown fields, body `creator`, and any mixed v1 fields such as `criteria` or `lock_logic` with `400 invalid_request`. Unversioned v1 wire shape remains unchanged. V2 success returns same envelope shown below with `content_lock.version = 2`, exact canonical v2 payload, derived hash-backed `lock_id`, and matching `content_lock_path`.
+Graph-only omits `payment`; payment-only omits `graph`. V2 rejects missing policy, unsupported version, lowercase, `USD`, or unknown assets, invalid amount/confirmation/window/graph values, nested unknown fields, body `creator`, and any mixed v1 fields such as `criteria` or `lock_logic` with `400 invalid_request`. Unversioned v1 wire shape remains unchanged. V2 success returns same envelope shown below with `content_lock.version = 2`, exact canonical v2 payload, derived hash-backed `lock_id`, and matching `content_lock_path`.
 
 `paykit-payment` is the only active payment verifier wire value. Its v1 criterion params are exactly:
 
