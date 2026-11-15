@@ -437,7 +437,7 @@ impl GraphVerificationWorker {
     }
 }
 
-fn apply_observation(
+pub(crate) fn apply_observation(
     snapshot: &mut locks_service::application::models::GraphTaskSnapshotV1,
     index: usize,
     observation: NexusObservation,
@@ -533,7 +533,7 @@ fn apply_observation(
     }
 }
 
-fn next_due(
+pub(crate) fn next_due(
     snapshot: &locks_service::application::models::GraphTaskSnapshotV1,
     now: time::OffsetDateTime,
 ) -> time::OffsetDateTime {

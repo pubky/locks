@@ -74,6 +74,8 @@ For graph-only Content Lock v2, folded-auth polling, restart semantics, Nexus `a
 
 For payment-only Content Lock v2 policy bounds, provider/deadline semantics, and explicit Rust/JS payment lifecycle methods, see [`PAYMENT_ONLY_V2.md`](PAYMENT_ONLY_V2.md).
 
+For mixed Graph+payment semantics, exact replay, deletion behavior, and explicit Rust/JS mixed lifecycle methods, see [`MIXED_GRAPH_PAYMENT_V2.md`](MIXED_GRAPH_PAYMENT_V2.md).
+
 Run the static drift check:
 
 ```bash

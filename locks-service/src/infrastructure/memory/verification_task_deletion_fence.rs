@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::application::{
     models::{
-        GraphTaskRecord, PaymentRootState, PaymentTaskRecord, VerificationTaskStatus,
-        VerificationTerminalReason,
+        GraphTaskRecord, MixedTaskRecord, PaymentRootState, PaymentTaskRecord,
+        VerificationTaskStatus, VerificationTerminalReason,
     },
     ports::Clock,
 };
@@ -47,17 +47,19 @@ pub(crate) struct InMemoryVerificationTaskFenceRecord {
 
 pub(crate) type InMemoryStoredGraphTask = StoredEvaluatorTask<GraphTaskRecord>;
 pub(crate) type InMemoryStoredPaymentTask = StoredEvaluatorTask<PaymentTaskRecord>;
+pub(crate) type InMemoryStoredMixedTask = StoredEvaluatorTask<MixedTaskRecord>;
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 ///
 /// When several fields are needed, acquire them in this global order:
-/// `folded_auth_reservations` -> `records` -> `payment_records` ->
+/// `folded_auth_reservations` -> `records` -> `payment_records` -> `mixed_records` ->
 /// `current_statuses` -> `graph_records`. Per-lock admission does not serialize
 /// operations for different locks, so reversing this order can deadlock globally.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
     pub(crate) graph_records: RwLock<Vec<InMemoryStoredGraphTask>>,
     pub(crate) payment_records: RwLock<Vec<InMemoryStoredPaymentTask>>,
+    pub(crate) mixed_records: RwLock<Vec<InMemoryStoredMixedTask>>,
     pub(crate) current_statuses: RwLock<HashMap<TaskId, VerificationTaskStatus>>,
     pub(crate) deletion_cutoffs: RwLock<HashSet<LockKey>>,
     pub(crate) folded_auth_reservations: RwLock<HashSet<HandleKey>>,
@@ -73,6 +75,7 @@ impl fmt::Debug for InMemoryVerificationTaskDeletionFence {
             .field("records", &self.records)
             .field("graph_records", &self.graph_records)
             .field("payment_records", &self.payment_records)
+            .field("mixed_records", &self.mixed_records)
             .field("current_statuses", &self.current_statuses)
             .field("deletion_cutoffs", &self.deletion_cutoffs)
             .field("folded_auth_reservations", &self.folded_auth_reservations)
@@ -99,6 +102,7 @@ impl InMemoryVerificationTaskDeletionFence {
             records: RwLock::new(HashMap::new()),
             graph_records: RwLock::new(Vec::new()),
             payment_records: RwLock::new(Vec::new()),
+            mixed_records: RwLock::new(Vec::new()),
             current_statuses: RwLock::new(HashMap::new()),
             deletion_cutoffs: RwLock::new(HashSet::new()),
             folded_auth_reservations: RwLock::new(HashSet::new()),
@@ -155,10 +159,12 @@ impl InMemoryVerificationTaskDeletionFence {
     ) {
         let mut fence_records = self.records.write().await;
         let mut payment_records = self.payment_records.write().await;
+        let mut mixed_records = self.mixed_records.write().await;
         let mut current_statuses = self.current_statuses.write().await;
         Self::abandon_provider_v2_tasks_under_locks(
             &mut fence_records,
             &mut payment_records,
+            &mut mixed_records,
             &mut current_statuses,
             creator,
             lock_id,
@@ -167,9 +173,11 @@ impl InMemoryVerificationTaskDeletionFence {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn abandon_provider_v2_tasks_under_locks(
         fence_records: &mut HashMap<TaskId, InMemoryVerificationTaskFenceRecord>,
         payment_records: &mut [InMemoryStoredPaymentTask],
+        mixed_records: &mut [InMemoryStoredMixedTask],
         current_statuses: &mut HashMap<TaskId, VerificationTaskStatus>,
         creator: &CreatorPubky,
         lock_id: &LockId,
@@ -205,5 +213,113 @@ impl InMemoryVerificationTaskDeletionFence {
                 record.deletion_job_id = None;
             }
         }
+        for stored in mixed_records.iter_mut().filter(|stored| {
+            let snapshot = stored.task.snapshot.as_v1();
+            &snapshot.creator == creator
+                && snapshot.pubky_lock_resource.lock_id() == lock_id
+                && stored.task.status != VerificationTaskStatus::Completed
+                && !preserve_terminal.contains(&stored.task.task_id)
+        }) {
+            stored.task.status = VerificationTaskStatus::Expired;
+            stored.task.terminal_reason = Some(VerificationTerminalReason::ContentLockDeleted);
+            stored.task.evaluator_revision = stored.task.evaluator_revision.saturating_add(1);
+            stored.task.entitlement_to_publish = None;
+            stored.task.entitlement_publication_token = None;
+            stored.task.completed_at = Some(forced_at);
+            stored.claimed_by = None;
+            stored.claim_token = None;
+            stored.claim_expires_at = None;
+            stored.next_attempt_at = None;
+            current_statuses.insert(stored.task.task_id, VerificationTaskStatus::Expired);
+            if let Some(record) = fence_records.get_mut(&stored.task.task_id) {
+                record.status = VerificationTaskStatus::Expired;
+                record.entitlement_publication_claim_token = None;
+                record.deletion_job_id = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use locks_core::{
+        ids::{LockHash, PubkyLockResource},
+        lock_policy::{GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, PaymentPolicyV2},
+        verification::{SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2},
+    };
+    use time::macros::datetime;
+
+    use crate::application::models::{MixedTaskSnapshot, MixedTaskSnapshotV1};
+
+    use super::*;
+
+    const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+    const READER: &str = "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky";
+    const NOW: OffsetDateTime = datetime!(2026-11-10 12:00:00 UTC);
+
+    #[test]
+    fn force_abandonment_preserves_mixed_roots_and_branch_evidence() {
+        let creator = CreatorPubky::from_str(CREATOR).unwrap();
+        let reader = CreatorPubky::from_str(READER).unwrap();
+        let lock_id = LockId::from_hash(LockHash::from_bytes([0; 32]));
+        let resource =
+            PubkyLockResource::from_str(&format!("{creator}/pub/app.locks/{lock_id}.json"))
+                .unwrap();
+        let snapshot = MixedTaskSnapshotV1::new(
+            SubmittedProofBundleV2 {
+                version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                bundle_id: BundleId::from_bytes([7; 16]),
+                pubky_lock_resource: resource,
+                reader_pubky: None,
+            },
+            [0; 32],
+            reader,
+            GraphPolicyV2 {
+                operator: None,
+                predicates: vec![GraphPredicateV2::Follows {
+                    follower: GraphParticipantV2::Reader,
+                    followed: GraphParticipantV2::Creator,
+                }],
+            },
+            PaymentPolicyV2 {
+                recipient_pubky: creator.clone(),
+                amount: "1".to_owned(),
+                asset: "BTC".to_owned(),
+                minimum_confirmations: 0,
+            },
+            NOW,
+            300,
+        )
+        .unwrap();
+        let expected_snapshot = snapshot.clone();
+        let task_id = TaskId::from_str(&Uuid::new_v4().to_string()).unwrap();
+        let mut mixed_records = vec![StoredEvaluatorTask::new(MixedTaskRecord {
+            task_id,
+            snapshot: MixedTaskSnapshot::V1(snapshot),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        })];
+        let mut current_statuses = HashMap::from([(task_id, VerificationTaskStatus::Pending)]);
+
+        InMemoryVerificationTaskDeletionFence::abandon_provider_v2_tasks_under_locks(
+            &mut HashMap::new(),
+            &mut [],
+            &mut mixed_records,
+            &mut current_statuses,
+            &creator,
+            &lock_id,
+            NOW,
+            &HashSet::new(),
+        );
+
+        let abandoned = &mixed_records[0].task;
+        assert_eq!(abandoned.status, VerificationTaskStatus::Expired);
+        assert_eq!(abandoned.snapshot.as_v1(), &expected_snapshot);
     }
 }

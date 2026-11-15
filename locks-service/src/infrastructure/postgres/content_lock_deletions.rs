@@ -458,7 +458,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                   publication_token_at_cutoff, provider_reconciliation_state)
              SELECT $1, task_id, creator, bundle_id,
                     submitted_proof_bundle->>'pubky_lock_resource',
-                    CASE WHEN evaluator_mode = 'payment' THEN NULL ELSE
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN NULL ELSE
                         (SELECT proof->>'criterion_id'
                          FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
                          WHERE proof->>'verifier_type' = 'paykit-payment'
@@ -466,7 +466,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                     END,
                     status,
                     CASE
-                        WHEN evaluator_mode = 'payment' THEN TRUE
+                        WHEN evaluator_mode IN ('payment', 'mixed') THEN TRUE
                         ELSE EXISTS (
                             SELECT 1
                             FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
@@ -474,7 +474,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                         )
                     END,
                     CASE
-                        WHEN evaluator_mode = 'payment' THEN 'provider_v2'
+                        WHEN evaluator_mode IN ('payment', 'mixed') THEN 'provider_v2'
                         WHEN EXISTS (
                             SELECT 1
                             FROM jsonb_array_elements(COALESCE(submitted_proof_bundle->'proofs', '[]'::jsonb)) AS proof
@@ -482,12 +482,12 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                         ) THEN 'paykit_v1'
                         ELSE 'local'
                     END,
-                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_mode END,
-                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_revision END,
-                    CASE WHEN evaluator_mode = 'payment' THEN evaluator_snapshot END,
-                    CASE WHEN evaluator_mode = 'payment' THEN entitlement_to_publish END,
-                    CASE WHEN evaluator_mode = 'payment' THEN entitlement_publication_claim_token END,
-                    CASE WHEN evaluator_mode = 'payment' THEN 'pending' END
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN evaluator_mode END,
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN evaluator_revision END,
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN evaluator_snapshot END,
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN entitlement_to_publish END,
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN entitlement_publication_claim_token END,
+                    CASE WHEN evaluator_mode IN ('payment', 'mixed') THEN 'pending' END
              FROM verification_tasks
              WHERE creator = $2
                AND submitted_proof_bundle->>'pubky_lock_resource' = $3",
@@ -965,7 +965,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                      ELSE task.evaluator_snapshot
                  END,
                  evaluator_revision = CASE
-                     WHEN task.evaluator_mode = 'payment' THEN task.evaluator_revision + 1
+                     WHEN task.evaluator_mode IN ('payment', 'mixed') THEN task.evaluator_revision + 1
                      ELSE task.evaluator_revision
                  END,
                  claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
@@ -1235,7 +1235,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                      SELECT 1 FROM verification_tasks
                      WHERE creator = $1
                        AND submitted_proof_bundle->>'pubky_lock_resource' = $3
-                       AND evaluator_mode = 'payment'
+                       AND evaluator_mode IN ('payment', 'mixed')
                        AND (status = 'publishing_entitlement'
                             OR entitlement_publication_claim_token IS NOT NULL)
                  )",
@@ -1557,7 +1557,10 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                            AND snapshot.resolved_status IN ('completed', 'failed', 'expired'))
                      THEN task.evaluator_snapshot
                      WHEN snapshot.obligation_kind = 'provider_v2'
+                      AND snapshot.evaluator_mode_at_cutoff = 'payment'
                      THEN jsonb_set(snapshot.evaluator_snapshot_at_cutoff, '{root}', $3)
+                     WHEN snapshot.obligation_kind = 'provider_v2'
+                     THEN snapshot.evaluator_snapshot_at_cutoff
                      ELSE task.evaluator_snapshot END,
                  evaluator_revision = CASE
                      WHEN task.status <> 'completed'
@@ -1878,7 +1881,7 @@ async fn abandon_provider_v2_tasks_for_force(
              SELECT 1 FROM verification_tasks
              WHERE creator = $1
                AND submitted_proof_bundle->>'pubky_lock_resource' = $2
-               AND evaluator_mode = 'payment'
+               AND evaluator_mode IN ('payment', 'mixed')
          )",
     )
     .bind(creator.to_string())
@@ -1897,7 +1900,10 @@ async fn abandon_provider_v2_tasks_for_force(
         "UPDATE verification_tasks
          SET status = 'expired', started_at = COALESCE(started_at, $3), completed_at = $3,
              failure_message = NULL, terminal_reason = 'content_lock_deleted',
-             evaluator_snapshot = jsonb_set(evaluator_snapshot, '{root}', $4),
+             evaluator_snapshot = CASE
+                 WHEN evaluator_mode = 'payment' THEN jsonb_set(evaluator_snapshot, '{root}', $4)
+                 ELSE evaluator_snapshot
+             END,
              evaluator_revision = evaluator_revision + 1,
              entitlement_to_publish = NULL, claimed_by = NULL, claim_token = NULL,
              claim_expires_at = NULL, next_attempt_at = NULL, last_attempt_error = NULL,
@@ -1905,7 +1911,7 @@ async fn abandon_provider_v2_tasks_for_force(
              updated_at = $3
          WHERE creator = $1
            AND submitted_proof_bundle->>'pubky_lock_resource' = $2
-           AND evaluator_mode = 'payment'
+           AND evaluator_mode IN ('payment', 'mixed')
            AND status <> 'completed'
            AND entitlement_publication_claim_token IS NULL",
     )
@@ -3413,6 +3419,66 @@ mod tests {
             replay.snapshot.as_v1().root,
             PaymentRootState::Expired(VerificationTerminalReason::ContentLockDeleted)
         );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn force_preserves_mixed_roots_and_branch_evidence() {
+        let database = TestDatabase::create().await;
+        let lock = content_lock();
+        let lock_id = lock.lock_id().unwrap();
+        let payments = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let admitted = payments
+            .admit_payment_task(payment_task_request(&lock))
+            .await
+            .unwrap();
+        let payment_snapshot: serde_json::Value = sqlx::query_scalar(
+            "SELECT evaluator_snapshot FROM verification_tasks WHERE task_id = $1",
+        )
+        .bind(admitted.task_id.as_uuid())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let graph_evidence = serde_json::json!({"sticky": "graph-evidence"});
+        let mixed_snapshot = serde_json::json!({
+            "root": {"status": "pending"},
+            "graph": graph_evidence,
+            "payment": payment_snapshot,
+        });
+        sqlx::query(
+            "UPDATE verification_tasks
+             SET evaluator_mode = 'mixed', evaluator_snapshot = $2
+             WHERE task_id = $1",
+        )
+        .bind(admitted.task_id.as_uuid())
+        .bind(&mixed_snapshot)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+        let repository = PostgresContentLockDeletionRepository::new(database.pool().clone());
+        assert!(matches!(
+            repository
+                .prepare_force_deletion(&lock.creator, &lock_id)
+                .await
+                .unwrap(),
+            PrepareForceDeletionResult::Synchronous(None)
+        ));
+
+        let (status, reason, snapshot): (String, Option<String>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT status, terminal_reason, evaluator_snapshot
+                 FROM verification_tasks WHERE task_id = $1",
+            )
+            .bind(admitted.task_id.as_uuid())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(reason.as_deref(), Some("content_lock_deleted"));
+        assert_eq!(snapshot["root"], mixed_snapshot["root"]);
+        assert_eq!(snapshot["graph"], graph_evidence);
+        assert_eq!(snapshot["payment"], mixed_snapshot["payment"]);
         database.cleanup().await;
     }
 
@@ -6254,10 +6320,10 @@ mod tests {
             "INSERT INTO folded_auth_attempts
                  (creator, bundle_id, generation, state_hash, status,
                   submitted_proof_bundle, pubky_lock_resource, lock_hash,
-                  verification_window_seconds, graph_policy, created_at, expires_at,
+                  verification_window_seconds, graph_policy, evaluator_mode, created_at, expires_at,
                   terminal_at, purge_after, task_id)
              VALUES ($1, 'purge-folded-auth', 1, $2, 'accepted', '{}'::jsonb,
-                     'purge-resource', $3, 60, '{}'::jsonb, $4,
+                     'purge-resource', $3, 60, '{}'::jsonb, 'graph', $4,
                      $4 + INTERVAL '10 minutes', $4, $4 + INTERVAL '1 hour', $5)",
         )
         .bind(job.creator.to_string())

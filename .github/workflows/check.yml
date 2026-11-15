@@ -101,6 +101,15 @@ jobs:
           cargo nextest run --workspace --exclude locks-e2e --exclude locks-service --exclude locks-sdk-wasm
           cargo nextest run -p locks-service --lib -- --skip postgres
 
+      - name: Mixed evaluator and deletion integration tests
+        run: |
+          cargo nextest run -p locks-service --test evaluator_compatibility
+          cargo nextest run -p locks-service --test graph0conf_reducer
+          cargo nextest run -p locks-service --test payment_v2_reducer
+          cargo nextest run -p locks-service --test mixed_v2_reducer
+          cargo nextest run -p locks-service --test mixed_task_persistence
+          cargo nextest run -p locks-service --test content_lock_deletions
+
       - name: E2E tests
         run: |
           cargo nextest run -p locks-e2e --test creator_publishing_http

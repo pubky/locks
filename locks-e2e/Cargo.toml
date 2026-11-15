@@ -14,6 +14,7 @@ axum.workspace = true
 locks-core.workspace = true
 locks-server = { path = "../locks-server", features = ["test-support"] }
 locks-service.workspace = true
+pubky.workspace = true
 pubky-common.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
@@ -22,4 +23,5 @@ time.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tower.workspace = true
+url.workspace = true
 uuid.workspace = true

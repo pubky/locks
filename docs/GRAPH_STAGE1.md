@@ -1,6 +1,6 @@
 # Graph Stage 1
 
-Graph Stage 1 is bounded support for graph-only Content Lock v2 policies. It binds Reader identity through folded auth, evaluates selected Nexus `app_spec_v0_7` predicates, durably publishes entitlement, and exposes redacted lifecycle/evidence. It does not compose Graph with Paykit.
+Graph Stage 1 is bounded support for graph-only Content Lock v2 policies. It binds Reader identity through folded auth, evaluates selected Nexus `app_spec_v0_7` predicates, durably publishes entitlement, and exposes redacted lifecycle/evidence. Mixed Graph+Paykit support is additive and documented in [Mixed Graph + Payment v2](MIXED_GRAPH_PAYMENT_V2.md); graph-only wire and snapshot behavior remains unchanged.
 
 Architecture decisions: [ADR 0022](ADRs/0022-graph-stage1-folded-auth-nexus.md).
 
@@ -161,4 +161,4 @@ Record exact commands, counts, hashes, container/image receipts, and any unavail
 
 Included: graph-only Content Lock v2, folded auth, selected Nexus `app_spec_v0_7`, durable graph worker/publication, redacted evidence, deterministic fake-service E2E.
 
-Excluded: Stage 2 zero-confirmation Graph+Paykit composition, Stage 3 generalized policy/migration, live dependency smoke, Paykit changes, credential semantic changes, production deployment.
+Excluded from this Stage 1 lane: mixed Graph+Paykit evaluation, generalized policy migration, live dependency smoke, Paykit changes, credential semantic changes, production deployment. Historical roadmap naming called mixed Graph+Paykit composition Stage 2 and generalized policy/migration Stage 3; current mixed behavior is documented in [Mixed Graph + Payment v2](MIXED_GRAPH_PAYMENT_V2.md).

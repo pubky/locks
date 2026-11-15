@@ -1,6 +1,6 @@
 # Payment-only Content Lock v2
 
-Payment-only v2 supports one Bitcoin payment policy without Graph predicates. Mixed Graph+payment policies remain unsupported.
+Payment-only v2 supports one Bitcoin payment policy without Graph predicates. Mixed Graph+payment behavior is documented in [`MIXED_GRAPH_PAYMENT_V2.md`](MIXED_GRAPH_PAYMENT_V2.md).
 
 ## Closed policy and submission shapes
 

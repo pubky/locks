@@ -7,6 +7,7 @@ mod folded_auth;
 mod frontend_session;
 mod graph0conf;
 mod guarded_resource;
+mod mixed_v2;
 mod payment_v2;
 mod verification;
 
@@ -19,6 +20,7 @@ pub use folded_auth::*;
 pub use frontend_session::*;
 pub use graph0conf::*;
 pub use guarded_resource::*;
+pub use mixed_v2::*;
 pub use payment_v2::*;
 pub use verification::*;
 

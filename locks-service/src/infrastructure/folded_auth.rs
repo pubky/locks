@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    EncryptedFoldedAuthFlowSecret, FoldedAuthFlowSecret, FoldedAuthSecretContext,
+    EncryptedFoldedAuthFlowSecret, FoldedAuthFlowSecret, FoldedAuthPendingResponse,
+    FoldedAuthSecretContext,
 };
 use crate::infrastructure::runtime_master_key::RuntimeMasterKey;
 
@@ -37,6 +38,10 @@ impl fmt::Debug for FoldedAuthSecretCipher {
 struct PlaintextEnvelope {
     version: u16,
     flow_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 impl FoldedAuthSecretCipher {
@@ -53,9 +58,29 @@ impl FoldedAuthSecretCipher {
         context: &FoldedAuthSecretContext,
         secret: &FoldedAuthFlowSecret,
     ) -> Result<EncryptedFoldedAuthFlowSecret, ApplicationError> {
+        self.encrypt_inner(context, secret, None)
+    }
+
+    pub fn encrypt_with_pending_response(
+        &self,
+        context: &FoldedAuthSecretContext,
+        secret: &FoldedAuthFlowSecret,
+        pending: &FoldedAuthPendingResponse,
+    ) -> Result<EncryptedFoldedAuthFlowSecret, ApplicationError> {
+        self.encrypt_inner(context, secret, Some(pending))
+    }
+
+    fn encrypt_inner(
+        &self,
+        context: &FoldedAuthSecretContext,
+        secret: &FoldedAuthFlowSecret,
+        pending: Option<&FoldedAuthPendingResponse>,
+    ) -> Result<EncryptedFoldedAuthFlowSecret, ApplicationError> {
         let plaintext = serde_json::to_vec(&PlaintextEnvelope {
             version: PLAINTEXT_VERSION,
             flow_state: URL_SAFE_NO_PAD.encode(secret.expose_bytes()),
+            auth_url: pending.map(|value| value.auth_url.clone()),
+            state: pending.map(|value| value.state.clone()),
         })
         .map_err(|_| encrypt_error())?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.key));
@@ -82,6 +107,15 @@ impl FoldedAuthSecretCipher {
         context: &FoldedAuthSecretContext,
         encrypted: &EncryptedFoldedAuthFlowSecret,
     ) -> Result<FoldedAuthFlowSecret, ApplicationError> {
+        self.decrypt_with_pending_response(context, encrypted)
+            .map(|(secret, _)| secret)
+    }
+
+    pub fn decrypt_with_pending_response(
+        &self,
+        context: &FoldedAuthSecretContext,
+        encrypted: &EncryptedFoldedAuthFlowSecret,
+    ) -> Result<(FoldedAuthFlowSecret, Option<FoldedAuthPendingResponse>), ApplicationError> {
         let rest = encrypted
             .as_str()
             .strip_prefix(ENVELOPE_PREFIX)
@@ -116,7 +150,14 @@ impl FoldedAuthSecretCipher {
         if bytes.is_empty() {
             return Err(decrypt_error());
         }
-        Ok(FoldedAuthFlowSecret::new(bytes))
+        let pending = match (decoded.auth_url, decoded.state) {
+            (Some(auth_url), Some(state)) if !auth_url.is_empty() && !state.is_empty() => {
+                Some(FoldedAuthPendingResponse { auth_url, state })
+            }
+            (None, None) => None,
+            _ => return Err(decrypt_error()),
+        };
+        Ok((FoldedAuthFlowSecret::new(bytes), pending))
     }
 }
 

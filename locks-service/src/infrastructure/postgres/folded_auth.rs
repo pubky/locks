@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
-use locks_core::lock_policy::GraphPolicyV2;
+use locks_core::lock_policy::{GraphPolicyV2, PaymentPolicyV2};
 use locks_core::verification::SubmittedProofBundleV2;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -10,11 +10,11 @@ use time::OffsetDateTime;
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
     EncryptedFoldedAuthFlowSecret, FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL,
-    FOLDED_AUTH_TTL, FoldedAuthAttempt, FoldedAuthSecretContext, FoldedAuthStartDisposition,
-    FoldedAuthStartResult, FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord,
-    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
+    FOLDED_AUTH_TTL, FoldedAuthAttempt, FoldedAuthEvaluatorMode, FoldedAuthSecretContext,
+    FoldedAuthStartDisposition, FoldedAuthStartResult, FoldedAuthStateHash, FoldedAuthStatus,
+    GraphTaskRecord, MixedTaskRecord, RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
-use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository};
+use crate::application::ports::{FoldedAuthRepository, GraphTaskRepository, MixedTaskRepository};
 use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
 
 use super::proof_admission::{lock_proof_admission, lock_proof_handle_admission};
@@ -44,6 +44,8 @@ struct FoldedAuthRow {
     lock_hash: Vec<u8>,
     verification_window_seconds: i64,
     graph_policy: serde_json::Value,
+    evaluator_mode: String,
+    payment_policy: Option<serde_json::Value>,
     encrypted_flow_secret: Option<String>,
     created_at: OffsetDateTime,
     expires_at: OffsetDateTime,
@@ -55,7 +57,7 @@ struct FoldedAuthRow {
 
 const COLUMNS: &str = "creator, bundle_id, generation, state_hash, status,
     submitted_proof_bundle, pubky_lock_resource, lock_hash, verification_window_seconds,
-    graph_policy, encrypted_flow_secret, created_at, expires_at, poll_dispatched_at,
+    graph_policy, evaluator_mode, payment_policy, encrypted_flow_secret, created_at, expires_at, poll_dispatched_at,
     terminal_at, purge_after, task_id::text AS task_id";
 
 #[async_trait]
@@ -92,6 +94,21 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         }
         super::graph_tasks::PostgresGraphTaskRepository::new(self.pool.clone())
             .get_graph_task_by_handle(&attempt.creator, &attempt.bundle_id)
+            .await
+    }
+
+    async fn accepted_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
+        let Some(attempt) = self.get_by_state_hash(state_hash).await? else {
+            return Ok(None);
+        };
+        if attempt.status != FoldedAuthStatus::Accepted {
+            return Ok(None);
+        }
+        super::mixed_tasks::PostgresMixedTaskRepository::new(self.pool.clone())
+            .get_mixed_task_by_handle(&attempt.creator, &attempt.bundle_id)
             .await
     }
 
@@ -187,13 +204,23 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             pubky_lock_resource: request.pubky_lock_resource.clone(),
             lock_hash: request.lock_hash,
         };
-        let encrypted = self.cipher.encrypt(&context, &request.flow_secret)?;
+        let encrypted = self.cipher.encrypt_with_pending_response(
+            &context,
+            &request.flow_secret,
+            &request.pending_response,
+        )?;
         let generation_i64 = i64::try_from(generation)
             .map_err(|_| storage_message("folded auth generation exceeds Postgres BIGINT"))?;
         let bundle_json = serde_json::to_value(&request.submitted_proof_bundle)
             .map_err(|_| storage_message("failed to serialize folded auth bundle"))?;
         let graph_json = serde_json::to_value(&request.graph)
             .map_err(|_| storage_message("failed to serialize folded auth graph"))?;
+        let payment_json = request
+            .payment
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| storage_message("failed to serialize folded auth payment"))?;
         if let (Some((latest, _)), Some((status, purge_after))) = (&latest, previous_terminal) {
             let updated = sqlx::query(
                 "UPDATE folded_auth_attempts
@@ -216,9 +243,9 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             "INSERT INTO folded_auth_attempts (
                 creator, bundle_id, generation, state_hash, status,
                 submitted_proof_bundle, pubky_lock_resource, lock_hash,
-                verification_window_seconds, graph_policy, encrypted_flow_secret,
+                verification_window_seconds, graph_policy, evaluator_mode, payment_policy, encrypted_flow_secret,
                 created_at, expires_at
-             ) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12)
+             ) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              RETURNING {COLUMNS}"
         ))
         .bind(request.creator().to_string())
@@ -230,6 +257,8 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         .bind(request.lock_hash.as_slice())
         .bind(i64::try_from(request.verification_window_seconds).unwrap_or(i64::MAX))
         .bind(graph_json)
+        .bind(request.evaluator_mode.as_str())
+        .bind(payment_json)
         .bind(encrypted.as_str())
         .bind(database_now)
         .bind(expires_at)
@@ -270,11 +299,37 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         }
         let encrypted = encrypted
             .ok_or_else(|| invalid_state("pending folded auth attempt lacks flow secret"))?;
-        let flow_secret = self.cipher.decrypt(&attempt.context(), &encrypted)?;
+        let (flow_secret, pending_response) = self
+            .cipher
+            .decrypt_with_pending_response(&attempt.context(), &encrypted)?;
         Ok(Some(RestoredFoldedAuthAttempt {
             attempt,
             flow_secret,
+            pending_response,
         }))
+    }
+
+    async fn pending_response(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<crate::application::models::FoldedAuthPendingResponse>, ApplicationError>
+    {
+        let Some((attempt, encrypted)) = load_row(&self.pool, state_hash)
+            .await?
+            .map(row_to_stored)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        if attempt.status != FoldedAuthStatus::Pending {
+            return Ok(None);
+        }
+        let encrypted = encrypted
+            .ok_or_else(|| invalid_state("pending folded auth attempt lacks flow secret"))?;
+        let (_, pending) = self
+            .cipher
+            .decrypt_with_pending_response(&attempt.context(), &encrypted)?;
+        Ok(pending)
     }
 
     async fn mark_poll_dispatched(
@@ -431,6 +486,65 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(Some(task))
+    }
+
+    async fn accept_and_insert_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        task_id: TaskId,
+        reader: CreatorPubky,
+        _now: OffsetDateTime,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError> {
+        let generation = match i64::try_from(expected_generation) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let row = sqlx::query_as::<_, FoldedAuthRow>(&format!(
+            "SELECT {COLUMNS} FROM folded_auth_attempts WHERE state_hash=$1 AND generation=$2 AND status='pending' FOR UPDATE"
+        )).bind(state_hash.as_bytes().as_slice()).bind(generation).fetch_optional(&mut *transaction).await.map_err(storage_error)?;
+        let Some((attempt, _)) = row.map(row_to_stored).transpose()? else {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Ok(None);
+        };
+        lock_proof_admission(
+            &mut transaction,
+            &attempt.creator,
+            attempt.pubky_lock_resource.lock_id(),
+        )
+        .await?;
+        lock_proof_handle_admission(&mut transaction, &attempt.creator, &attempt.bundle_id).await?;
+        let database_now: OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if attempt.expires_at <= database_now {
+            terminalize_pending_tx(
+                &mut transaction,
+                state_hash,
+                generation,
+                FoldedAuthStatus::Expired,
+                database_now,
+            )
+            .await?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(None);
+        }
+        let task = attempt
+            .accepted_mixed_task(task_id, reader, database_now)
+            .map_err(invalid_state)?;
+        insert_mixed_task_tx(&mut transaction, &task).await?;
+        let purge_after = checked_purge_after(database_now)?;
+        let updated = sqlx::query(
+            "UPDATE folded_auth_attempts SET status='accepted', encrypted_flow_secret=NULL, poll_dispatched_at=NULL, terminal_at=$3, purge_after=$4, task_id=$5::uuid WHERE state_hash=$1 AND generation=$2 AND status='pending'"
+        ).bind(state_hash.as_bytes().as_slice()).bind(generation).bind(database_now).bind(purge_after).bind(task.task_id.to_string()).execute(&mut *transaction).await.map_err(storage_error)?;
         if updated.rows_affected() != 1 {
             transaction.rollback().await.map_err(storage_error)?;
             return Ok(None);
@@ -660,6 +774,40 @@ async fn insert_graph_task_tx(
     Ok(())
 }
 
+async fn insert_mixed_task_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    task: &MixedTaskRecord,
+) -> Result<(), ApplicationError> {
+    let snapshot = task.snapshot.as_v1();
+    let snapshot_json = task
+        .snapshot
+        .to_json()
+        .map_err(|_| storage_message("failed to serialize mixed task snapshot"))?;
+    let submitted = serde_json::to_value(&snapshot.submitted_proof_bundle)
+        .map_err(|_| storage_message("failed to serialize mixed submitted bundle"))?;
+    lock_proof_admission(
+        transaction,
+        &snapshot.creator,
+        snapshot.pubky_lock_resource.lock_id(),
+    )
+    .await?;
+    reject_deletion_cutoff(
+        transaction,
+        &snapshot.creator,
+        snapshot.pubky_lock_resource.lock_id(),
+    )
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO verification_tasks(task_id,creator,bundle_id,status,submitted_proof_bundle,submitted_at,invoice_admission_phase,evaluator_mode,evaluator_snapshot,evaluator_revision)
+         VALUES($1::uuid,$2,$3,'pending',$4,$5,'ready','mixed',$6,0) ON CONFLICT DO NOTHING"
+    ).bind(task.task_id.to_string()).bind(snapshot.creator.to_string()).bind(snapshot.bundle_id.to_string())
+      .bind(submitted).bind(snapshot.accepted_at).bind(snapshot_json).execute(&mut **transaction).await.map_err(storage_error)?;
+    if inserted.rows_affected() != 1 {
+        return Err(ApplicationError::VerificationTaskConflict);
+    }
+    Ok(())
+}
+
 async fn load_row(
     pool: &PgPool,
     state_hash: &FoldedAuthStateHash,
@@ -699,6 +847,13 @@ fn row_to_stored(
         .map_err(|_| invalid_state("invalid folded auth verification window"))?;
     let graph: GraphPolicyV2 = serde_json::from_value(row.graph_policy)
         .map_err(|_| invalid_state("invalid folded auth graph policy"))?;
+    let evaluator_mode = FoldedAuthEvaluatorMode::from_storage_value(&row.evaluator_mode)
+        .ok_or_else(|| invalid_state("invalid folded auth evaluator mode"))?;
+    let payment = row
+        .payment_policy
+        .map(serde_json::from_value::<PaymentPolicyV2>)
+        .transpose()
+        .map_err(|_| invalid_state("invalid folded auth payment policy"))?;
     let status = FoldedAuthStatus::from_storage_value(&row.status)
         .ok_or_else(|| invalid_state("invalid folded auth status"))?;
     let task_id = row
@@ -717,6 +872,8 @@ fn row_to_stored(
         lock_hash,
         verification_window_seconds,
         graph,
+        evaluator_mode,
+        payment,
         created_at: row.created_at,
         expires_at: row.expires_at,
         poll_dispatched: row.poll_dispatched_at.is_some(),
@@ -742,6 +899,10 @@ fn validate_stored(attempt: &FoldedAuthAttempt, has_secret: bool) -> Result<(), 
         || attempt.submitted_proof_bundle.bundle_id != attempt.bundle_id
         || attempt.submitted_proof_bundle.pubky_lock_resource != attempt.pubky_lock_resource
         || attempt.submitted_proof_bundle.reader_pubky.is_some()
+        || !matches!(
+            (attempt.evaluator_mode, &attempt.payment),
+            (FoldedAuthEvaluatorMode::Graph, None) | (FoldedAuthEvaluatorMode::Mixed, Some(_))
+        )
     {
         return Err(invalid_state("folded auth durable binding is invalid"));
     }
@@ -1709,7 +1870,13 @@ mod tests {
             lock_hash: *lock.lock_hash().unwrap().as_bytes(),
             verification_window_seconds: lock.verification_window_seconds,
             graph: lock.graph.clone().unwrap(),
+            evaluator_mode: crate::application::models::FoldedAuthEvaluatorMode::Graph,
+            payment: None,
             flow_secret: FoldedAuthFlowSecret::new(flow_secret.to_vec()),
+            pending_response: crate::application::models::FoldedAuthPendingResponse {
+                auth_url: "https://auth.example/approve".to_owned(),
+                state: "postgres-test-state".to_owned(),
+            },
             created_at,
         }
     }

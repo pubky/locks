@@ -202,6 +202,18 @@ impl ViewerLocks {
         )
     }
 
+    pub fn submit_mixed_proof_bundle(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundleV2,
+    ) -> SdkViewerRequest {
+        self.post_json(
+            "/proof-bundles",
+            SubmitGraphProofBundleRequest {
+                submitted_proof_bundle,
+            },
+        )
+    }
+
     pub fn poll_folded_auth(&self, request: FoldedAuthStatusRequest) -> SdkViewerRequest {
         self.post_json("/proof-bundles/auth-status", request)
     }
@@ -214,6 +226,13 @@ impl ViewerLocks {
     }
 
     pub fn lookup_payment_verification_task(
+        &self,
+        request: VerificationTaskHandleRequest,
+    ) -> SdkViewerRequest {
+        self.lookup_verification_task(request)
+    }
+
+    pub fn lookup_mixed_verification_task(
         &self,
         request: VerificationTaskHandleRequest,
     ) -> SdkViewerRequest {
@@ -294,6 +313,16 @@ impl ViewerLocks {
         crate::graph::parse_folded_auth_status_response(value)
     }
 
+    pub fn parse_mixed_submit_response(value: Value) -> Result<crate::mixed::MixedSubmitResponse> {
+        crate::mixed::parse_mixed_submit_response(value)
+    }
+
+    pub fn parse_mixed_folded_auth_status_response(
+        value: Value,
+    ) -> Result<crate::mixed::MixedFoldedAuthStatusResponse> {
+        crate::mixed::parse_mixed_folded_auth_status_response(value)
+    }
+
     pub fn parse_graph_lifecycle_response(
         value: Value,
     ) -> Result<GraphVerificationTaskLifecycleResponse> {
@@ -304,6 +333,12 @@ impl ViewerLocks {
         value: Value,
     ) -> Result<crate::payment::PaymentVerificationTaskLifecycleResponse> {
         crate::payment::parse_payment_lifecycle_response(value)
+    }
+
+    pub fn parse_mixed_lifecycle_response(
+        value: Value,
+    ) -> Result<crate::mixed::MixedVerificationTaskLifecycleResponse> {
+        crate::mixed::parse_mixed_lifecycle_response(value)
     }
 
     pub fn parse_paykit_connection_state_response(

@@ -1,11 +1,14 @@
 use std::fmt;
 
 use locks_core::ids::{BundleId, CreatorPubky, PubkyLockResource, TaskId};
-use locks_core::lock_policy::{GraphPolicyV2, GraphPredicateV2};
+use locks_core::lock_policy::{GraphPolicyV2, GraphPredicateV2, PaymentPolicyV2};
 use locks_core::verification::SubmittedProofBundleV2;
 use time::{Duration, OffsetDateTime};
 
-use super::{GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1, VerificationTaskStatus};
+use super::{
+    GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1, MixedTaskRecord, MixedTaskSnapshot,
+    MixedTaskSnapshotV1, VerificationTaskStatus,
+};
 
 pub const FOLDED_AUTH_TTL: Duration = Duration::minutes(10);
 pub const FOLDED_AUTH_TOMBSTONE_TTL: Duration = Duration::hours(24);
@@ -106,6 +109,29 @@ impl FoldedAuthStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldedAuthEvaluatorMode {
+    Graph,
+    Mixed,
+}
+
+impl FoldedAuthEvaluatorMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Graph => "graph",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "graph" => Some(Self::Graph),
+            "mixed" => Some(Self::Mixed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldedAuthAttempt {
     pub creator: CreatorPubky,
@@ -118,6 +144,8 @@ pub struct FoldedAuthAttempt {
     pub lock_hash: [u8; 32],
     pub verification_window_seconds: u64,
     pub graph: GraphPolicyV2,
+    pub evaluator_mode: FoldedAuthEvaluatorMode,
+    pub payment: Option<PaymentPolicyV2>,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
     /// Durable fact that approval polling may have consumed one-shot authority.
@@ -134,6 +162,8 @@ impl FoldedAuthAttempt {
             && self.lock_hash == request.lock_hash
             && self.verification_window_seconds == request.verification_window_seconds
             && self.graph == request.graph
+            && self.evaluator_mode == request.evaluator_mode
+            && self.payment == request.payment
     }
 
     pub fn context(&self) -> FoldedAuthSecretContext {
@@ -171,12 +201,80 @@ impl FoldedAuthAttempt {
             completed_at: None,
         })
     }
+
+    pub fn accepted_mixed_task(
+        &self,
+        task_id: TaskId,
+        reader: CreatorPubky,
+        accepted_at: OffsetDateTime,
+    ) -> Result<MixedTaskRecord, String> {
+        if self.evaluator_mode != FoldedAuthEvaluatorMode::Mixed {
+            return Err("folded auth attempt is not mixed".to_owned());
+        }
+        let payment = self
+            .payment
+            .clone()
+            .ok_or_else(|| "mixed folded auth attempt lacks payment policy".to_owned())?;
+        Ok(MixedTaskRecord {
+            task_id,
+            snapshot: MixedTaskSnapshot::V1(MixedTaskSnapshotV1::new(
+                self.submitted_proof_bundle.clone(),
+                self.lock_hash,
+                reader,
+                self.graph.clone(),
+                payment,
+                accepted_at,
+                self.verification_window_seconds,
+            )?),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredFoldedAuthAttempt {
     pub attempt: FoldedAuthAttempt,
     pub flow_secret: FoldedAuthFlowSecret,
+    pub pending_response: Option<FoldedAuthPendingResponse>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct FoldedAuthPendingResponse {
+    pub auth_url: String,
+    pub state: String,
+}
+
+impl std::fmt::Debug for FoldedAuthPendingResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FoldedAuthPendingResponse")
+            .field("auth_url", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::FoldedAuthPendingResponse;
+
+    #[test]
+    fn pending_response_debug_redacts_auth_url_and_state() {
+        let pending = FoldedAuthPendingResponse {
+            auth_url: "pubkyauth://secret-bearing-url".to_owned(),
+            state: "secret-bearing-state".to_owned(),
+        };
+
+        let debug = format!("{pending:?}");
+        assert!(!debug.contains("secret-bearing-url"));
+        assert!(!debug.contains("secret-bearing-state"));
+        assert_eq!(debug.matches("<redacted>").count(), 2);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,8 +284,11 @@ pub struct StartFoldedAuthAttempt {
     pub lock_hash: [u8; 32],
     pub verification_window_seconds: u64,
     pub graph: GraphPolicyV2,
+    pub evaluator_mode: FoldedAuthEvaluatorMode,
+    pub payment: Option<PaymentPolicyV2>,
     pub state_hash: FoldedAuthStateHash,
     pub flow_secret: FoldedAuthFlowSecret,
+    pub pending_response: FoldedAuthPendingResponse,
     pub created_at: OffsetDateTime,
 }
 
@@ -205,8 +306,11 @@ impl StartFoldedAuthAttempt {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.flow_secret.expose_bytes().is_empty() {
-            return Err("folded auth flow secret is empty".to_owned());
+        if self.flow_secret.expose_bytes().is_empty()
+            || self.pending_response.auth_url.is_empty()
+            || self.pending_response.state.is_empty()
+        {
+            return Err("folded auth flow secret or pending response is invalid".to_owned());
         }
         if self.submitted_proof_bundle.version != 2
             || self.submitted_proof_bundle.reader_pubky.is_some()
@@ -230,6 +334,10 @@ impl StartFoldedAuthAttempt {
             .collect::<std::collections::HashSet<&GraphPredicateV2>>();
         if unique.len() != self.graph.predicates.len() {
             return Err("folded auth graph policy contains duplicates".to_owned());
+        }
+        match (self.evaluator_mode, &self.payment) {
+            (FoldedAuthEvaluatorMode::Graph, None) | (FoldedAuthEvaluatorMode::Mixed, Some(_)) => {}
+            _ => return Err("folded auth evaluator policy shape is invalid".to_owned()),
         }
         Ok(())
     }

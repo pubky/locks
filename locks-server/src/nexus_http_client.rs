@@ -96,6 +96,38 @@ pub trait NexusGraphVerifier: Send + Sync {
     ) -> TimedNexusObservation;
 }
 
+#[derive(Clone)]
+pub struct UnavailableNexusGraphVerifier {
+    clock: Arc<dyn Clock>,
+}
+
+impl UnavailableNexusGraphVerifier {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self { clock }
+    }
+}
+
+#[async_trait]
+impl NexusGraphVerifier for UnavailableNexusGraphVerifier {
+    async fn verify_predicate(
+        &self,
+        _predicate: &GraphPredicateV2,
+        _creator: &CreatorPubky,
+        _reader: &CreatorPubky,
+        _not_after: time::OffsetDateTime,
+    ) -> TimedNexusObservation {
+        TimedNexusObservation {
+            observation: NexusObservation::Operational {
+                kind: NexusOperationalError::Transport,
+                origin: "nexus-unconfigured".to_owned(),
+                status: None,
+                retry_after_seconds: None,
+            },
+            observed_at: self.clock.now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedNexusObservation {
     pub observation: NexusObservation,

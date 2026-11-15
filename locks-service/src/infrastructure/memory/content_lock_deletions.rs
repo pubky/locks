@@ -741,6 +741,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 })
                 .collect::<HashSet<_>>();
             let mut payment_records = self.verification_task_fence.payment_records.write().await;
+            let mut mixed_records = self.verification_task_fence.mixed_records.write().await;
             let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
             let mut graph_records = self.verification_task_fence.graph_records.write().await;
             let mut deletion_cutoffs = self.verification_task_fence.deletion_cutoffs.write().await;
@@ -771,6 +772,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             fence_records.retain(|task_id, _| !task_ids.contains(task_id));
             graph_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
             payment_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
+            mixed_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
             current_statuses.retain(|task_id, _| !task_ids.contains(task_id));
             folded_auth_reservations.retain(|handle| !task_handles.contains(handle));
             intents.remove(&key);
@@ -1045,6 +1047,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             .await;
         let mut fence_records = self.verification_task_fence.records.write().await;
         let mut payment_records = self.verification_task_fence.payment_records.write().await;
+        let mut mixed_records = self.verification_task_fence.mixed_records.write().await;
         let mut current_statuses = self.verification_task_fence.current_statuses.write().await;
         let mut jobs = self.jobs.write().await;
         let mut receipts = self.force_receipts.write().await;
@@ -1061,6 +1064,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
         InMemoryVerificationTaskDeletionFence::abandon_provider_v2_tasks_under_locks(
             &mut fence_records,
             &mut payment_records,
+            &mut mixed_records,
             &mut current_statuses,
             &key.0,
             &key.1,

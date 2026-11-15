@@ -1,0 +1,100 @@
+name: locks-mixed-graph-payment-v2-e2e
+
+x-mixed-contract: &mixed-contract "locks-mixed-v2-paykit-server-v0.1.1-rc3-725a4cd6578cdc149b4f38c8577bb9937a81bbb6-tree-460e541fa10c8da8c761f71177407cd0959ca17d"
+
+services:
+  locks-postgres:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    environment:
+      POSTGRES_DB: locks
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d locks"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    tmpfs: [/var/lib/postgresql/data]
+
+  paykit-postgres:
+    image: postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    tmpfs: [/var/lib/postgresql/data]
+
+  graph-dependencies:
+    image: python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
+    network_mode: service:paykit
+    depends_on:
+      paykit: {condition: service_started}
+    working_dir: /workspace
+    volumes:
+      - ./scripts/graph-e2e-fake-dependencies.py:/workspace/fake-dependencies.py:ro
+    command: ["python", "/workspace/fake-dependencies.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=1)"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  paykit:
+    build:
+      context: .
+      dockerfile: docker/mixed-graph-payment-v2-paykit.Dockerfile
+      args:
+        PAYKIT_REV: 725a4cd6578cdc149b4f38c8577bb9937a81bbb6
+    depends_on:
+      paykit-postgres: {condition: service_healthy}
+    environment:
+      TEST_DATABASE_URL: postgres://postgres:postgres@paykit-postgres:5432/postgres
+      LOCKS_PAYKIT_COORD_DIR: /coord
+      MIXED_CONTRACT: *mixed-contract
+    volumes:
+      - coordination:/coord
+
+  mixed-e2e:
+    image: rust:1.91.1-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33
+    working_dir: /locks
+    network_mode: service:paykit
+    depends_on:
+      locks-postgres: {condition: service_healthy}
+      graph-dependencies: {condition: service_healthy}
+      paykit: {condition: service_started}
+    environment:
+      TEST_DATABASE_URL: postgres://postgres:postgres@locks-postgres:5432/locks
+      LOCKS_PAYKIT_COORD_DIR: /coord
+      PAYKIT_SERVER_URL: http://paykit:3001
+      GRAPH_FAKE_DEPENDENCY_URL: http://127.0.0.1:18080
+      GRAPH_FAKE_NEXUS_URL: http://127.0.0.1:18081
+      CARGO_HOME: /cargo
+      CARGO_TARGET_DIR: /target
+      RUSTUP_TOOLCHAIN: 1.91.1-x86_64-unknown-linux-gnu
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/locks:ro
+      - coordination:/coord
+      - locks-private:/private
+      - cargo-cache:/cargo
+      - target-cache:/target
+    command:
+      - sh
+      - -ec
+      - >-
+        cargo build --locked -p locks-server --bin locks-server &&
+        cargo test --locked -p locks-e2e --test mixed_graph_payment_v2_compose
+        mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexus
+        -- --exact --nocapture
+
+volumes:
+  coordination:
+  locks-private:
+  cargo-cache:
+  target-cache:

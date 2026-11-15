@@ -21,8 +21,8 @@ use crate::application::{
         ContentLockDeletionJob, ContentLockDeletionPhase, ContentLockDeletionState,
         DeletionReadAuthorization, EncryptedFinalCredential, FinalAccessWindows,
         FinalCredentialContext, FinalCredentialMaterialization, InitializeFinalAccessWindowsResult,
-        IssuedDeletionCredential, OrdinaryCredentialLookupResult, PaymentTaskSnapshot,
-        VerificationTaskStatus, VerificationTerminalReason,
+        IssuedDeletionCredential, OrdinaryCredentialLookupResult, VerificationTaskStatus,
+        VerificationTerminalReason,
     },
     ports::{
         AccessCredentialStore, FinalCredentialWorkerIssueRequest, InvoiceAdmissionRepository,
@@ -30,7 +30,7 @@ use crate::application::{
         PaymentDrainObligation, PaymentDrainObligationKind, PaymentDrainRepository,
         PaymentDrainStatus, PaymentDrainSummary, PaymentDrainTerminalTransition,
         PaymentProviderCreateResponse, ProviderV2DeletionReconciliation,
-        VerificationTaskRepository,
+        ProviderV2EvaluatorSnapshot, VerificationTaskRepository,
     },
 };
 use crate::infrastructure::{
@@ -120,7 +120,7 @@ struct FrozenPaykitV1Deletion {
 #[derive(Debug, Clone)]
 struct FrozenProviderV2Deletion {
     evaluator_revision: u64,
-    snapshot: PaymentTaskSnapshot,
+    snapshot: ProviderV2EvaluatorSnapshot,
     create_conflict: Option<bool>,
     create_response: Option<PaymentProviderCreateResponse>,
     provider_status: Option<crate::application::models::PaymentProviderStatus>,
@@ -294,7 +294,7 @@ impl InMemoryAccessCredentialStore {
             }
         }
         let provider_v2 = if let Some(fence) = &self.verification_task_deletion_fence {
-            fence
+            let mut snapshots = fence
                 .payment_records
                 .read()
                 .await
@@ -304,7 +304,9 @@ impl InMemoryAccessCredentialStore {
                         stored.task.task_id,
                         FrozenProviderV2Deletion {
                             evaluator_revision: stored.task.evaluator_revision,
-                            snapshot: stored.task.snapshot.clone(),
+                            snapshot: ProviderV2EvaluatorSnapshot::Payment(
+                                stored.task.snapshot.clone(),
+                            ),
                             create_conflict: None,
                             create_response: None,
                             provider_status: None,
@@ -313,7 +315,22 @@ impl InMemoryAccessCredentialStore {
                         },
                     )
                 })
-                .collect::<HashMap<_, _>>()
+                .collect::<HashMap<_, _>>();
+            snapshots.extend(fence.mixed_records.read().await.iter().map(|stored| {
+                (
+                    stored.task.task_id,
+                    FrozenProviderV2Deletion {
+                        evaluator_revision: stored.task.evaluator_revision,
+                        snapshot: ProviderV2EvaluatorSnapshot::Mixed(stored.task.snapshot.clone()),
+                        create_conflict: None,
+                        create_response: None,
+                        provider_status: None,
+                        status_checkpointed: false,
+                        reconciliation_terminal: false,
+                    },
+                )
+            }));
+            snapshots
         } else {
             HashMap::new()
         };
@@ -1088,6 +1105,7 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
                     (
                         provider
                             .snapshot
+                            .payment_snapshot()?
                             .as_v1()
                             .submitted_proof_bundle
                             .pubky_lock_resource
@@ -1337,8 +1355,8 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
                 "provider-v2 binding checkpoint has an invalid closed shape",
             ));
         }
-        let now = self.authoritative_winner_time();
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -1375,8 +1393,8 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         task_id: &TaskId,
         status: Option<&crate::application::models::PaymentProviderStatus>,
     ) -> Result<bool, ApplicationError> {
-        let now = self.authoritative_winner_time();
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -1418,15 +1436,16 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
         task_id: &TaskId,
         reconciliation: &ProviderV2DeletionReconciliation,
     ) -> Result<bool, ApplicationError> {
-        let now = self.authoritative_winner_time();
         let fence = self
             .verification_task_deletion_fence
             .as_ref()
             .ok_or_else(|| invalid_deletion_state("provider-v2 deletion fence is unavailable"))?;
         let mut fence_records = fence.records.write().await;
         let mut payment_records = fence.payment_records.write().await;
+        let mut mixed_records = fence.mixed_records.write().await;
         let mut current_statuses = fence.current_statuses.write().await;
         let mut state = self.state.write().await;
+        let now = self.authoritative_winner_time();
         let Some(deletion) = state.deletions.get_mut(&deletion_job_id) else {
             return Ok(false);
         };
@@ -1461,36 +1480,85 @@ impl PaymentDrainRepository for InMemoryAccessCredentialStore {
                 "provider-v2 terminalization requires matching durable binding and status checkpoints",
             ));
         }
-        let Some(stored) = payment_records
-            .iter_mut()
-            .find(|stored| stored.task.task_id == *task_id)
-        else {
-            return Err(invalid_deletion_state(
-                "frozen provider-v2 payment task is missing",
-            ));
-        };
-        if matches!(
-            stored.task.status,
-            VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
-        ) {
-            if stored.task.evaluator_revision != provider.evaluator_revision
-                || stored.task.snapshot != provider.snapshot
-                || stored.task.entitlement_publication_token.is_some()
-            {
-                return Ok(false);
+        let resolved_status = match (&provider.snapshot, &reconciliation.terminal_snapshot) {
+            (
+                ProviderV2EvaluatorSnapshot::Payment(frozen_snapshot),
+                ProviderV2EvaluatorSnapshot::Payment(terminal_snapshot),
+            ) => {
+                let Some(stored) = payment_records
+                    .iter_mut()
+                    .find(|stored| stored.task.task_id == *task_id)
+                else {
+                    return Err(invalid_deletion_state(
+                        "frozen provider-v2 payment task is missing",
+                    ));
+                };
+                if matches!(
+                    stored.task.status,
+                    VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
+                ) {
+                    if stored.task.evaluator_revision != provider.evaluator_revision
+                        || &stored.task.snapshot != frozen_snapshot
+                        || stored.task.entitlement_publication_token.is_some()
+                    {
+                        return Ok(false);
+                    }
+                    stored.task.status = VerificationTaskStatus::Expired;
+                    stored.task.snapshot = terminal_snapshot.clone();
+                    stored.task.evaluator_revision = provider.evaluator_revision.saturating_add(1);
+                    stored.task.entitlement_to_publish = None;
+                    stored.task.entitlement_publication_token = None;
+                    stored.task.completed_at = Some(now);
+                }
+                stored.claimed_by = None;
+                stored.claim_token = None;
+                stored.claim_expires_at = None;
+                stored.next_attempt_at = None;
+                stored.task.status
             }
-            stored.task.status = VerificationTaskStatus::Expired;
-            stored.task.snapshot = reconciliation.terminal_snapshot.clone();
-            stored.task.evaluator_revision = provider.evaluator_revision.saturating_add(1);
-            stored.task.entitlement_to_publish = None;
-            stored.task.entitlement_publication_token = None;
-            stored.task.completed_at = Some(now);
-        }
-        stored.claimed_by = None;
-        stored.claim_token = None;
-        stored.claim_expires_at = None;
-        stored.next_attempt_at = None;
-        let resolved_status = stored.task.status;
+            (
+                ProviderV2EvaluatorSnapshot::Mixed(frozen_snapshot),
+                ProviderV2EvaluatorSnapshot::Mixed(terminal_snapshot),
+            ) => {
+                let Some(stored) = mixed_records
+                    .iter_mut()
+                    .find(|stored| stored.task.task_id == *task_id)
+                else {
+                    return Err(invalid_deletion_state(
+                        "frozen provider-v2 mixed task is missing",
+                    ));
+                };
+                if matches!(
+                    stored.task.status,
+                    VerificationTaskStatus::Pending | VerificationTaskStatus::InProgress
+                ) {
+                    if stored.task.evaluator_revision != provider.evaluator_revision
+                        || &stored.task.snapshot != frozen_snapshot
+                        || stored.task.entitlement_publication_token.is_some()
+                    {
+                        return Ok(false);
+                    }
+                    stored.task.status = VerificationTaskStatus::Expired;
+                    stored.task.terminal_reason =
+                        Some(VerificationTerminalReason::ContentLockDeleted);
+                    stored.task.snapshot = terminal_snapshot.clone();
+                    stored.task.evaluator_revision = provider.evaluator_revision.saturating_add(1);
+                    stored.task.entitlement_to_publish = None;
+                    stored.task.entitlement_publication_token = None;
+                    stored.task.completed_at = Some(now);
+                }
+                stored.claimed_by = None;
+                stored.claim_token = None;
+                stored.claim_expires_at = None;
+                stored.next_attempt_at = None;
+                stored.task.status
+            }
+            _ => {
+                return Err(invalid_deletion_state(
+                    "provider-v2 evaluator mode changed during reconciliation",
+                ));
+            }
+        };
         current_statuses.insert(*task_id, resolved_status);
         if let Some(record) = fence_records.get_mut(task_id) {
             record.status = resolved_status;
@@ -2355,7 +2423,13 @@ fn revoke_job_read_claims(state: &mut StoreState, job_id: Uuid) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, str::FromStr, sync::Mutex as StdMutex};
+    use std::{
+        collections::BTreeMap,
+        future::{Future, poll_fn},
+        str::FromStr,
+        sync::Mutex as StdMutex,
+        task::Poll,
+    };
 
     use serde_json::json;
     use time::macros::datetime;
@@ -2496,9 +2570,14 @@ mod tests {
 
     #[tokio::test]
     async fn provider_v2_terminalization_records_the_post_transition_expired_status() {
-        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::new());
+        let clock = Arc::new(MutableClock::new(datetime!(2026-08-17 12:00:00 UTC)));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
         let payments = InMemoryPaymentTaskRepository::with_deletion_fence(Arc::clone(&fence));
-        let store = InMemoryAccessCredentialStore::with_deletion_fence(Arc::clone(&fence));
+        let store = Arc::new(InMemoryAccessCredentialStore::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
         let creator = record().creator;
         let lock_hash = LockHash::from_bytes([7; 32]);
         let lock_id = LockId::from_hash(lock_hash);
@@ -2541,7 +2620,7 @@ mod tests {
                 force_requested: false,
                 claimed_by: Some("worker".to_owned()),
                 claim_token: Some(claim_token),
-                claim_expires_at: Some(now + Duration::minutes(5)),
+                claim_expires_at: Some(now + Duration::seconds(1)),
                 issuance_started_at: None,
                 issuance_deadline: None,
                 read_deadline: None,
@@ -2563,17 +2642,139 @@ mod tests {
                         paykit_v1: None,
                         provider_v2: Some(FrozenProviderV2Deletion {
                             evaluator_revision: admitted.evaluator_revision,
-                            snapshot: admitted.snapshot.clone(),
-                            create_conflict: Some(false),
+                            snapshot: ProviderV2EvaluatorSnapshot::Payment(
+                                admitted.snapshot.clone(),
+                            ),
+                            create_conflict: None,
                             create_response: None,
                             provider_status: None,
-                            status_checkpointed: true,
+                            status_checkpointed: false,
                             reconciliation_terminal: false,
                         }),
                     },
                 )]),
             },
         );
+
+        let state_guard = store.state.write().await;
+        let mut blocked = Box::pin(store.persist_provider_v2_binding(
+            job_id,
+            "worker",
+            claim_token,
+            &task_id,
+            true,
+            None,
+        ));
+        poll_fn(|context| match blocked.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("provider checkpoint completed before state lock release: {result:?}")
+            }
+        })
+        .await;
+        clock.set(now + Duration::seconds(2));
+        drop(state_guard);
+        assert!(
+            !blocked.await.unwrap(),
+            "provider checkpoint must resample time after waiting for state lock"
+        );
+
+        {
+            let mut state_guard = store.state.write().await;
+            let deletion = state_guard.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::seconds(3));
+            deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap()
+                .create_conflict = Some(true);
+            let mut blocked_status = Box::pin(store.persist_provider_v2_status(
+                job_id,
+                "worker",
+                claim_token,
+                &task_id,
+                None,
+            ));
+            poll_fn(|context| match blocked_status.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("provider status completed before state lock release: {result:?}")
+                }
+            })
+            .await;
+            clock.set(now + Duration::seconds(4));
+            drop(state_guard);
+            assert!(
+                !blocked_status.await.unwrap(),
+                "provider status checkpoint must resample time after waiting for state lock"
+            );
+        }
+
+        {
+            let mut state = store.state.write().await;
+            let deletion = state.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::seconds(5));
+            let provider = deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap();
+            assert!(!provider.status_checkpointed);
+            provider.status_checkpointed = true;
+        }
+
+        let fence_guard = fence.records.write().await;
+        let blocked_snapshot = admitted.snapshot.clone();
+        let reconciliation = ProviderV2DeletionReconciliation {
+            create_conflict: true,
+            create_response: None,
+            status: None,
+            terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(blocked_snapshot),
+        };
+        let mut blocked_terminal = Box::pin(store.persist_provider_v2_terminal(
+            job_id,
+            "worker",
+            claim_token,
+            &task_id,
+            &reconciliation,
+        ));
+        poll_fn(|context| match blocked_terminal.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => {
+                panic!("provider terminalization completed before fence lock release: {result:?}")
+            }
+        })
+        .await;
+        clock.set(now + Duration::seconds(6));
+        drop(fence_guard);
+        assert!(
+            !blocked_terminal.await.unwrap(),
+            "provider terminalization must resample time after waiting for fence locks"
+        );
+
+        {
+            let mut state = store.state.write().await;
+            let deletion = state.deletions.get_mut(&job_id).unwrap();
+            deletion.claim_expires_at = Some(now + Duration::minutes(5));
+            let provider = deletion
+                .bundle_snapshots
+                .values_mut()
+                .next()
+                .unwrap()
+                .provider_v2
+                .as_mut()
+                .unwrap();
+            assert_eq!(provider.create_conflict, Some(true));
+            assert!(provider.status_checkpointed);
+            assert!(!provider.reconciliation_terminal);
+        }
 
         assert!(
             store
@@ -2583,10 +2784,10 @@ mod tests {
                     claim_token,
                     &task_id,
                     &ProviderV2DeletionReconciliation {
-                        create_conflict: false,
+                        create_conflict: true,
                         create_response: None,
                         status: None,
-                        terminal_snapshot: admitted.snapshot,
+                        terminal_snapshot: ProviderV2EvaluatorSnapshot::Payment(admitted.snapshot,),
                     },
                 )
                 .await

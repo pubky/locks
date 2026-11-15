@@ -5,16 +5,20 @@ use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode, header};
 use locks_core::ids::{
-    BundleId, ClientReference, CreatorPubky, GuardedResourceHash, LockServerPubky,
+    BundleId, ClientReference, ContentLockPath, CreatorPubky, GuardedResourceHash, LockServerPubky,
     PubkyLockResource,
 };
 use locks_core::lock_policy::{
-    AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    AccessPolicy, CONTENT_LOCK_V2_VERSION, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload,
+    ContentLockV2, Criterion, GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource,
+    LockLogic, LockServerConfig, PaymentPolicyV2, VerifierType,
 };
-use locks_core::verification::{Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle};
+use locks_core::verification::{
+    Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SatisfiedByV2, SubmittedProofBundle,
+    VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
+};
 use locks_server::testing::TestServerApp;
-use locks_service::application::models::VerificationTaskStatus;
+use locks_service::application::models::{GuardedResourceRecord, VerificationTaskStatus};
 use serde_json::{Value, json};
 use time::macros::datetime;
 use tower::ServiceExt;
@@ -135,6 +139,84 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
     assert_eq!(response_bytes(guarded_response).await, guarded_bytes);
 }
 
+#[tokio::test]
+async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
+    let test_app = TestServerApp::new_default_in_memory();
+    let content_lock = mixed_content_lock();
+    let lock_path = ContentLockPath::from_lock_id(content_lock.lock_id().unwrap());
+    let lock_resource = PubkyLockResource::new(content_lock.creator.clone(), lock_path.clone());
+    let guarded = content_lock.primary_resource.clone().unwrap();
+    let guarded_bytes = b"mixed entitlement bytes".to_vec();
+
+    test_app
+        .state()
+        .content_locks()
+        .upsert_content_lock_payload(
+            content_lock.creator.clone(),
+            lock_path,
+            ContentLockPayload::V2(content_lock.clone()),
+        )
+        .await
+        .unwrap();
+    test_app
+        .state()
+        .guarded_resources()
+        .upsert_guarded_resource(GuardedResourceRecord {
+            creator: content_lock.creator.clone(),
+            path: guarded.path.clone(),
+            hash: guarded.hash,
+            content_type: guarded.content_type.clone(),
+            size: guarded.size,
+            bytes: guarded_bytes.clone(),
+        })
+        .await
+        .unwrap();
+    test_app
+        .state()
+        .entitlements()
+        .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: content_lock.creator.clone(),
+            reader: CreatorPubky::from_str(
+                "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+            )
+            .unwrap(),
+            bundle_id: bundle_id(),
+            pubky_lock_resource: lock_resource,
+            verified_at: datetime!(2026-05-29 12:01:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph],
+        })
+        .await
+        .unwrap();
+    let router = test_app.router();
+
+    let credential_response = router
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/access-credentials",
+            json!({ "creator": creator(), "bundle_id": BUNDLE_ID }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(credential_response.status(), StatusCode::OK);
+    let credential = response_json(credential_response).await["credential"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let guarded_response = router
+        .oneshot(auth_request(
+            "GET",
+            "/priv-resources/content/mixed.txt",
+            &format!("Bearer {credential}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(guarded_response.status(), StatusCode::OK);
+    assert_eq!(response_bytes(guarded_response).await, guarded_bytes);
+}
+
 fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundle {
     SubmittedProofBundle {
         version: SUBMITTED_PROOF_BUNDLE_VERSION,
@@ -172,6 +254,46 @@ fn content_lock() -> ContentLock {
         lock_logic: LockLogic::All {
             criteria: vec!["criterion-1".to_owned()],
         },
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 900,
+        },
+        lock_server: LockServerConfig {
+            override_: Some(
+                LockServerPubky::from_str(
+                    "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+                )
+                .unwrap(),
+            ),
+        },
+        created_at: datetime!(2026-05-29 12:00:00 UTC),
+    }
+}
+
+fn mixed_content_lock() -> ContentLockV2 {
+    ContentLockV2 {
+        version: CONTENT_LOCK_V2_VERSION,
+        creator: creator(),
+        primary_resource: Some(GuardedResource {
+            path: "/priv/app.locks/content/mixed.txt".to_owned(),
+            hash: GuardedResourceHash::from_bytes([7; 32]),
+            content_type: "text/plain".to_owned(),
+            size: 23,
+        }),
+        secondary_resources: Default::default(),
+        payment: Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
+        graph: Some(GraphPolicyV2 {
+            operator: None,
+            predicates: vec![GraphPredicateV2::Follows {
+                follower: GraphParticipantV2::Reader,
+                followed: GraphParticipantV2::Creator,
+            }],
+        }),
+        verification_window_seconds: 300,
         access_policy: AccessPolicy {
             requested_credential_ttl_seconds: 900,
         },

@@ -11,8 +11,9 @@ use locks_core::lock_service_pointer::LockServicePointer;
 use locks_core::verification::{SatisfiedByV2, SubmittedProofBundlePayload};
 use locks_service::application::models::{
     AccessCredential, FrontendSessionCode, GraphObservationOutcome, GraphOperationalErrorCategory,
-    GraphPredicateObservation, GraphTaskRecord, PaymentTaskRecord, VerificationTaskStatus,
-    VerificationTerminalReason,
+    GraphPredicateObservation, GraphTaskRecord, MixedTaskRecord, PaymentInvoiceState,
+    PaymentOperationalErrorCategory, PaymentProviderStatus, PaymentTaskRecord,
+    VerificationTaskStatus, VerificationTerminalReason,
 };
 use locks_service::application::use_cases::exchange_frontend_session_code::{
     ExchangeFrontendSessionCodeRequest, ExchangeFrontendSessionCodeResponse,
@@ -265,6 +266,21 @@ impl From<&PaymentTaskRecord> for GraphVerificationTaskLifecycleHttpResponse {
     }
 }
 
+impl From<&MixedTaskRecord> for GraphVerificationTaskLifecycleHttpResponse {
+    fn from(task: &MixedTaskRecord) -> Self {
+        let snapshot = task.snapshot.as_v1();
+        Self {
+            creator: snapshot.creator.clone(),
+            bundle_id: snapshot.bundle_id.clone(),
+            status: task.status,
+            submitted_at: snapshot.accepted_at,
+            completed_at: task.completed_at,
+            admission_deadline_at: snapshot.deadline_at,
+            terminal_reason: task.terminal_reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationTaskHandleHttpRequest {
@@ -279,7 +295,14 @@ pub struct CreatorVerificationEvidenceHttpRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CreatorVerificationEvidenceHttpResponse {
+#[serde(untagged)]
+pub enum CreatorVerificationEvidenceHttpResponse {
+    Graph(Box<CreatorGraphVerificationEvidenceHttpResponse>),
+    Mixed(Box<CreatorMixedVerificationEvidenceHttpResponse>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreatorGraphVerificationEvidenceHttpResponse {
     pub creator: CreatorPubky,
     pub reader: CreatorPubky,
     pub bundle_id: BundleId,
@@ -303,6 +326,62 @@ pub struct CreatorVerificationEvidenceHttpResponse {
     pub terminal_reason: Option<VerificationTerminalReason>,
     pub satisfied_by: Vec<SatisfiedByV2>,
     pub graph: CreatorGraphEvidenceHttpResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreatorMixedVerificationEvidenceHttpResponse {
+    pub creator: CreatorPubky,
+    pub reader: CreatorPubky,
+    pub bundle_id: BundleId,
+    pub pubky_lock_resource: locks_core::ids::PubkyLockResource,
+    pub mode: &'static str,
+    #[serde(serialize_with = "serialize_mixed_evidence_task_status")]
+    pub status: VerificationTaskStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub submitted_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub deadline_at: OffsetDateTime,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_terminal_reason"
+    )]
+    pub terminal_reason: Option<VerificationTerminalReason>,
+    pub satisfied_by: Vec<SatisfiedByV2>,
+    pub graph: CreatorGraphEvidenceHttpResponse,
+    pub payment: CreatorPaymentEvidenceHttpResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreatorPaymentEvidenceHttpResponse {
+    pub invoice: PaymentInvoiceState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_status: Option<PaymentProviderStatus>,
+    pub operational_failure_count: u32,
+    pub operational_failure_total: u32,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub operational_first_failure_at: Option<OffsetDateTime>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub operational_last_failure_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operational_last_category: Option<PaymentOperationalErrorCategory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operational_last_http_status: Option<u16>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub next_due_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -424,7 +503,7 @@ impl From<GraphTaskRecord> for CreatorVerificationEvidenceHttpResponse {
                 }
             })
             .collect();
-        Self {
+        Self::Graph(Box::new(CreatorGraphVerificationEvidenceHttpResponse {
             creator: snapshot.creator.clone(),
             reader: snapshot.reader.clone(),
             bundle_id: snapshot.bundle_id.clone(),
@@ -440,7 +519,60 @@ impl From<GraphTaskRecord> for CreatorVerificationEvidenceHttpResponse {
                 operator: snapshot.operator,
                 predicates,
             },
-        }
+        }))
+    }
+}
+
+impl From<MixedTaskRecord> for CreatorVerificationEvidenceHttpResponse {
+    fn from(task: MixedTaskRecord) -> Self {
+        let terminal_reason = task.terminal_reason;
+        let payment = {
+            let value = &task.snapshot.as_v1().payment;
+            CreatorPaymentEvidenceHttpResponse {
+                invoice: value.invoice.clone(),
+                provider_status: value.provider_status.clone(),
+                operational_failure_count: value.operational_failure_count,
+                operational_failure_total: value.operational_failure_total,
+                operational_first_failure_at: value.operational_first_failure_at,
+                operational_last_failure_at: value.operational_last_failure_at,
+                operational_last_category: value.operational_last_category,
+                operational_last_http_status: value.operational_last_http_status,
+                next_due_at: value.next_due_at,
+            }
+        };
+        let graph_snapshot = task
+            .snapshot
+            .as_v1()
+            .graph_snapshot()
+            .expect("validated mixed snapshot contains valid graph projection");
+        let graph_task = GraphTaskRecord {
+            task_id: task.task_id,
+            snapshot: locks_service::application::models::GraphTaskSnapshot::V1(graph_snapshot),
+            evaluator_revision: task.evaluator_revision,
+            status: task.status,
+            entitlement_to_publish: task.entitlement_to_publish,
+            entitlement_publication_token: task.entitlement_publication_token,
+            completed_at: task.completed_at,
+        };
+        let CreatorVerificationEvidenceHttpResponse::Graph(graph_response) = Self::from(graph_task)
+        else {
+            unreachable!("graph task conversion returns graph evidence")
+        };
+        Self::Mixed(Box::new(CreatorMixedVerificationEvidenceHttpResponse {
+            creator: graph_response.creator,
+            reader: graph_response.reader,
+            bundle_id: graph_response.bundle_id,
+            pubky_lock_resource: graph_response.pubky_lock_resource,
+            mode: "mixed",
+            status: graph_response.status,
+            submitted_at: graph_response.submitted_at,
+            deadline_at: graph_response.deadline_at,
+            completed_at: graph_response.completed_at,
+            terminal_reason,
+            satisfied_by: graph_response.satisfied_by,
+            graph: graph_response.graph,
+            payment,
+        }))
     }
 }
 
@@ -544,6 +676,20 @@ where
     })
 }
 
+fn serialize_mixed_evidence_task_status<S>(
+    status: &VerificationTaskStatus,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *status == VerificationTaskStatus::PublishingEntitlement {
+        serializer.serialize_str("publishing_entitlement")
+    } else {
+        serialize_task_status(status, serializer)
+    }
+}
+
 fn serialize_optional_terminal_reason<S>(
     reason: &Option<VerificationTerminalReason>,
     serializer: S,
@@ -595,11 +741,29 @@ mod tests {
         GraphVerificationTaskLifecycleHttpResponse, IssueAccessCredentialHttpRequest,
         IssueAccessCredentialHttpResponse, SubmitProofBundleHttpRequest,
         VerificationTaskHandleHttpRequest, VerificationTaskLifecycleHttpResponse,
+        serialize_mixed_evidence_task_status,
     };
 
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const TASK_ID: &str = "018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+
+    #[test]
+    fn mixed_creator_evidence_preserves_publishing_status_on_wire() {
+        #[derive(serde::Serialize)]
+        struct WireStatus {
+            #[serde(serialize_with = "serialize_mixed_evidence_task_status")]
+            status: VerificationTaskStatus,
+        }
+
+        assert_eq!(
+            serde_json::to_value(WireStatus {
+                status: VerificationTaskStatus::PublishingEntitlement,
+            })
+            .unwrap(),
+            json!({"status": "publishing_entitlement"})
+        );
+    }
 
     #[test]
     fn folded_auth_pending_debug_redacts_auth_url_and_state() {

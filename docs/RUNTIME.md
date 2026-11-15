@@ -178,6 +178,8 @@ Every claimed verification task receives a fresh opaque claim token. Retry, comp
 
 Omitting `[paykit]` prevents creation of new payment lifecycle identities, invoice-admission worker startup, and connection-state lookup. In that state, non-payment verifier flows continue to run, every exact persisted `paykit-payment` replay still returns its existing lifecycle without calling Paykit, changed replay still conflicts, and a genuinely new `paykit-payment` submission returns `422 paykit_not_configured`. Staging deployments should omit `[paykit]` until a Paykit Server is deployed and reachable for that environment.
 
+Mixed Graph+payment v2 also requires `[paykit]`. Mixed tasks use one worker/CAS/publication lifecycle. When Nexus is not configured, the mixed worker continues payment evaluation and records Graph dependency unavailability; payment satisfaction can still complete, while Graph-only acceleration cannot bypass unavailable payment evidence. See [`MIXED_GRAPH_PAYMENT_V2.md`](MIXED_GRAPH_PAYMENT_V2.md).
+
 ## Client address behind reverse proxies
 
 Per-client rate limits for `POST /proof-bundles` and `POST /paykit-connection-state-lookups` are keyed by client IP. By default the client IP is the TCP peer address. Behind a reverse proxy or load balancer, the TCP peer is the proxy, so every client shares one key.

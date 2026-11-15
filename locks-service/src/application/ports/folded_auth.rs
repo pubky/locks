@@ -4,8 +4,9 @@ use time::OffsetDateTime;
 
 use crate::application::errors::ApplicationError;
 use crate::application::models::{
-    FoldedAuthAttempt, FoldedAuthFlowSecret, FoldedAuthStartResult, FoldedAuthStateHash,
-    GrantPopKeyId, GraphTaskRecord, RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
+    FoldedAuthAttempt, FoldedAuthFlowSecret, FoldedAuthPendingResponse, FoldedAuthStartResult,
+    FoldedAuthStateHash, GrantPopKeyId, GraphTaskRecord, MixedTaskRecord,
+    RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
 
 pub trait FoldedAuthFlowStarter: Send + Sync {
@@ -37,6 +38,16 @@ pub trait FoldedAuthRepository: Send + Sync {
         &self,
         state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<RestoredFoldedAuthAttempt>, ApplicationError>;
+
+    async fn pending_response(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<FoldedAuthPendingResponse>, ApplicationError> {
+        Ok(self
+            .restore_pending(state_hash)
+            .await?
+            .and_then(|restored| restored.pending_response))
+    }
 
     async fn mark_poll_dispatched(
         &self,
@@ -90,6 +101,15 @@ pub trait FoldedAuthRepository: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
 
+    async fn accept_and_insert_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        expected_generation: u64,
+        task_id: TaskId,
+        reader: CreatorPubky,
+        now: OffsetDateTime,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError>;
+
     async fn purge_terminal_before(&self, now: OffsetDateTime) -> Result<u64, ApplicationError>;
 
     async fn accepted_task_id(
@@ -106,6 +126,11 @@ pub trait FoldedAuthRepository: Send + Sync {
         &self,
         state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<GraphTaskRecord>, ApplicationError>;
+
+    async fn accepted_mixed_task(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<MixedTaskRecord>, ApplicationError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

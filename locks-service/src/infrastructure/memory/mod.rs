@@ -10,6 +10,7 @@ pub mod folded_auth;
 pub mod graph_tasks;
 pub mod guarded_resources;
 pub mod lock_service_pointers;
+pub mod mixed_tasks;
 pub mod payment_tasks;
 pub mod public_content_locks;
 pub mod verification_task_claims;

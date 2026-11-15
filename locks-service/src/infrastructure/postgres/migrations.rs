@@ -538,7 +538,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=32).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=33).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -579,7 +579,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=32).collect::<Vec<_>>()
+            (1..=33).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],
@@ -824,7 +824,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=32).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=33).collect::<Vec<_>>());
 
         sqlx::query(
             "CREATE TEMP TABLE migrated_legacy_snapshot AS
@@ -856,6 +856,139 @@ mod tests {
             synthesis_error.contains("content_lock_snapshot_provider_terminal_evidence_post_0032"),
             "unexpected synthesized legacy-shape error: {synthesis_error}"
         );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn populated_exact_0032_to_0033_preserves_evaluator_bytes_and_folded_auth_lifecycles() {
+        let database = TestDatabase::create_unmigrated().await;
+        let through_0032 = Migrator {
+            migrations: Cow::Owned(super::MIGRATOR.iter().take(32).cloned().collect()),
+            ignore_missing: false,
+            locking: false,
+            no_tx: false,
+        };
+        through_0032.run(database.pool()).await.unwrap();
+
+        let graph_task = uuid::Uuid::new_v4();
+        let payment_task = uuid::Uuid::new_v4();
+        for (task_id, mode, bundle, snapshot) in [
+            (
+                graph_task,
+                "graph",
+                "upgrade-graph-bundle",
+                serde_json::json!({"schema_version":1,"root":"pending","graph":{"z":1,"a":2}}),
+            ),
+            (
+                payment_task,
+                "payment",
+                "upgrade-payment-bundle",
+                serde_json::json!({"schema_version":1,"root":"pending","payment":{"z":1,"a":2}}),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO verification_tasks
+                     (task_id, creator, bundle_id, status, submitted_proof_bundle,
+                      submitted_at, evaluator_mode, evaluator_snapshot, evaluator_revision)
+                 VALUES ($1, $2, $3, 'pending', '{}'::jsonb, clock_timestamp(), $4, $5, 7)",
+            )
+            .bind(task_id)
+            .bind(format!("upgrade-{mode}-creator"))
+            .bind(bundle)
+            .bind(mode)
+            .bind(snapshot)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
+        let evaluator_before: Vec<(uuid::Uuid, Vec<u8>, String, i64)> = sqlx::query_as(
+            "SELECT task_id, convert_to(evaluator_snapshot::text, 'UTF8'), evaluator_mode,
+                    evaluator_revision
+             FROM verification_tasks ORDER BY task_id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+
+        let created = datetime!(2026-11-01 12:00:00 UTC);
+        let expires = created + time::Duration::minutes(10);
+        let purge = created + time::Duration::hours(24);
+        for (index, status) in ["pending", "accepted", "expired", "restart_required"]
+            .into_iter()
+            .enumerate()
+        {
+            let terminal = (status != "pending").then_some(created);
+            let purge_after = (status != "pending").then_some(purge);
+            let task_id = (status == "accepted").then_some(graph_task);
+            let secret = (status == "pending").then_some("encrypted-v1-fixture");
+            sqlx::query(
+                "INSERT INTO folded_auth_attempts
+                     (creator, bundle_id, generation, state_hash, status,
+                      submitted_proof_bundle, pubky_lock_resource, lock_hash,
+                      verification_window_seconds, graph_policy, encrypted_flow_secret,
+                      created_at, expires_at, terminal_at, purge_after, task_id)
+                 VALUES ($1, $2, 1, $3, $4, '{}'::jsonb, $5, $6, 300,
+                         '{}'::jsonb, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(format!("folded-{index}-creator"))
+            .bind(format!("folded-{index}-bundle"))
+            .bind(vec![u8::try_from(index + 1).unwrap(); 32])
+            .bind(status)
+            .bind(format!("folded-{index}-creator/pub/app.locks/lock.json"))
+            .bind(vec![u8::try_from(index + 10).unwrap(); 32])
+            .bind(secret)
+            .bind(created)
+            .bind(expires)
+            .bind(terminal)
+            .bind(purge_after)
+            .bind(task_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
+        type FoldedBefore = (String, String, Vec<u8>, Option<String>, Option<uuid::Uuid>);
+        let folded_before: Vec<FoldedBefore> = sqlx::query_as(
+            "SELECT bundle_id, status, state_hash, encrypted_flow_secret, task_id
+                 FROM folded_auth_attempts ORDER BY bundle_id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+
+        super::run_migrations(database.pool()).await.unwrap();
+
+        let evaluator_after: Vec<(uuid::Uuid, Vec<u8>, String, i64)> = sqlx::query_as(
+            "SELECT task_id, convert_to(evaluator_snapshot::text, 'UTF8'), evaluator_mode,
+                    evaluator_revision
+             FROM verification_tasks ORDER BY task_id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(evaluator_after, evaluator_before);
+        type FoldedAfter = (
+            String,
+            String,
+            Vec<u8>,
+            Option<String>,
+            Option<uuid::Uuid>,
+            String,
+            Option<serde_json::Value>,
+        );
+        let folded_after: Vec<FoldedAfter> = sqlx::query_as(
+            "SELECT bundle_id, status, state_hash, encrypted_flow_secret, task_id,
+                    evaluator_mode, payment_policy
+             FROM folded_auth_attempts ORDER BY bundle_id",
+        )
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(folded_after.len(), folded_before.len());
+        for (after, before) in folded_after.into_iter().zip(folded_before) {
+            assert_eq!((after.0, after.1, after.2, after.3, after.4), before);
+            assert_eq!(after.5, "graph");
+            assert_eq!(after.6, None);
+        }
         database.cleanup().await;
     }
 
@@ -944,7 +1077,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_after, (1..=32).collect::<Vec<_>>());
+        assert_eq!(applied_after, (1..=33).collect::<Vec<_>>());
 
         let pending_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
             "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,

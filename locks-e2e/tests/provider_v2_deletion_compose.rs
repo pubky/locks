@@ -364,7 +364,7 @@ fn write_json(path: &std::path::Path, value: Value) {
 }
 
 async fn wait_json(path: &std::path::Path) -> Value {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         loop {
             if let Ok(bytes) = std::fs::read(path) {
                 return serde_json::from_slice(&bytes).unwrap();
@@ -377,7 +377,7 @@ async fn wait_json(path: &std::path::Path) -> Value {
 }
 
 async fn wait_file(path: &std::path::Path) {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(600), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

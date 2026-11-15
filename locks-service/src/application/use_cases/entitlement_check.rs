@@ -1,6 +1,8 @@
 use locks_core::ids::{BundleId, ContentLockPath, CreatorPubky, LockId};
 use locks_core::lock_policy::{ContentLock, ContentLockPayload, ContentLockV2};
-use locks_core::verification::{SatisfiedByV2, VerifiedProofBundle, VerifiedProofBundlePayload};
+use locks_core::verification::{
+    VerifiedProofBundle, VerifiedProofBundlePayload, validate_verified_content_lock_publication,
+};
 
 use crate::application::entitlement_evaluator::evaluate_entitlement;
 use crate::application::errors::ApplicationError;
@@ -72,7 +74,6 @@ pub(super) async fn load_valid_entitlement(
             if &bundle.creator != creator
                 || &bundle.bundle_id != bundle_id
                 || bundle.pubky_lock_resource.creator() != creator
-                || bundle.satisfied_by != [SatisfiedByV2::Graph]
             {
                 return Err(ApplicationError::EntitlementNotSatisfied);
             }
@@ -86,16 +87,12 @@ pub(super) async fn load_valid_entitlement(
             let ContentLockPayload::V2(content_lock) = content_lock else {
                 return Err(ApplicationError::EntitlementNotSatisfied);
             };
-            if content_lock.creator != bundle.creator
-                || content_lock.payment.is_some()
-                || content_lock.graph.is_none()
-            {
-                return Err(ApplicationError::EntitlementNotSatisfied);
-            }
             let lock_id = verify_content_lock_v2_identity(
                 &content_lock,
                 bundle.pubky_lock_resource.content_lock_path(),
             )?;
+            validate_verified_content_lock_publication(&content_lock, &bundle)
+                .map_err(|_| ApplicationError::EntitlementNotSatisfied)?;
             Ok(ValidEntitlement {
                 content_lock: ContentLockPayload::V2(content_lock),
                 lock_id,

@@ -145,7 +145,7 @@ impl Viewer {
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
         if graph {
-            fetch_graph_submit_json(&request).await
+            fetch_graph_or_mixed_submit_json(&request).await
         } else {
             fetch_submit_proof_bundle_json(&request).await
         }
@@ -171,6 +171,25 @@ impl Viewer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = submitMixedProofBundle)]
+    pub async fn submit_mixed_proof_bundle(
+        &self,
+        submitted_proof_bundle: wasm_bindgen::JsValue,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let submitted_proof_bundle: Value = serde_wasm_bindgen::from_value(submitted_proof_bundle)
+            .map_err(|err| invalid_input(format!("invalid submitted proof bundle: {err}")))?;
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_submit_mixed_proof_bundle_request(submitted_proof_bundle)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_mixed_submit_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = pollFoldedAuth)]
     pub async fn poll_folded_auth(&self, state: String) -> JsResult<wasm_bindgen::JsValue> {
         let resolver = BrowserPkarrResolver::new_with_options(&self.options)
@@ -181,6 +200,19 @@ impl Viewer {
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
         fetch_folded_auth_status_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = pollMixedFoldedAuth)]
+    pub async fn poll_mixed_folded_auth(&self, state: String) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_poll_folded_auth_request(&state)
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_mixed_folded_auth_status_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -215,6 +247,23 @@ impl Viewer {
             .await
             .map_err(|err| invalid_input(err.to_string()))?;
         fetch_payment_lifecycle_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = lookupMixedVerificationTask)]
+    pub async fn lookup_mixed_verification_task(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_lookup_mixed_verification_task_request(options)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_mixed_lifecycle_json(&request).await
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -378,6 +427,20 @@ impl Viewer {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_submit_mixed_proof_bundle_request(
+        &self,
+        submitted_proof_bundle: Value,
+    ) -> Result<JsViewerRequestPlan, String> {
+        let bundle: locks_core::verification::SubmittedProofBundleV2 =
+            serde_json::from_value(submitted_proof_bundle)
+                .map_err(|err| format!("invalid mixed proof bundle: {err}"))?;
+        if bundle.reader_pubky.is_some() {
+            return Err("mixed proof bundle must omit reader_pubky".to_owned());
+        }
+        Ok(self.request_plan(self.inner.submit_mixed_proof_bundle(bundle)))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn build_poll_folded_auth_request(&self, state: &str) -> JsViewerRequestPlan {
         self.request_plan(
             self.inner
@@ -405,6 +468,17 @@ impl Viewer {
         Ok(self.request_plan(
             self.inner
                 .lookup_payment_verification_task(parse_handle_options(options)?),
+        ))
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_lookup_mixed_verification_task_request(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> Result<JsViewerRequestPlan, String> {
+        Ok(self.request_plan(
+            self.inner
+                .lookup_mixed_verification_task(parse_handle_options(options)?),
         ))
     }
 
@@ -546,9 +620,34 @@ fn validate_access_credential_response_for_tests(value: Value) -> Result<Value, 
     typed_response_json(&response)
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(test)]
 fn validate_graph_submit_response_for_tests(value: Value) -> Result<Value, String> {
     locks_sdk::ViewerLocks::parse_graph_submit_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_graph_or_mixed_submit_response_for_tests(value: Value) -> Result<Value, String> {
+    if locks_sdk::ViewerLocks::parse_graph_submit_response(value.clone()).is_ok()
+        || locks_sdk::ViewerLocks::parse_mixed_submit_response(value.clone()).is_ok()
+    {
+        Ok(value)
+    } else {
+        Err("response is neither a valid graph nor mixed submission".to_owned())
+    }
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_mixed_submit_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_mixed_submit_response(value.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_mixed_folded_auth_status_response_for_tests(value: Value) -> Result<Value, String> {
+    locks_sdk::ViewerLocks::parse_mixed_folded_auth_status_response(value.clone())
         .map_err(|err| err.to_string())?;
     Ok(value)
 }
@@ -570,6 +669,13 @@ fn validate_graph_lifecycle_response_for_tests(value: Value) -> Result<Value, St
 #[cfg(any(test, target_arch = "wasm32"))]
 fn validate_payment_lifecycle_response_for_tests(value: Value) -> Result<Value, String> {
     let response = locks_sdk::ViewerLocks::parse_payment_lifecycle_response(value)
+        .map_err(|err| err.to_string())?;
+    typed_response_json(&response)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_mixed_lifecycle_response_for_tests(value: Value) -> Result<Value, String> {
+    let response = locks_sdk::ViewerLocks::parse_mixed_lifecycle_response(value)
         .map_err(|err| err.to_string())?;
     typed_response_json(&response)
 }
@@ -596,13 +702,17 @@ async fn fetch_submit_proof_bundle_json(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_graph_submit_json(
+async fn fetch_graph_or_mixed_submit_json(
     request: &JsPreparedViewerRequest,
 ) -> JsResult<wasm_bindgen::JsValue> {
     let value = fetch_viewer_json_value(request).await?;
-    let validated = validate_graph_submit_response_for_tests(value).map_err(invalid_input)?;
-    to_plain_js_value(&validated)
-        .map_err(|err| invalid_input(format!("failed to encode graph submit response: {err:?}")))
+    let validated =
+        validate_graph_or_mixed_submit_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated).map_err(|err| {
+        invalid_input(format!(
+            "failed to encode graph or mixed submit response: {err:?}"
+        ))
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -613,6 +723,30 @@ async fn fetch_folded_auth_status_json(
     let validated = validate_folded_auth_status_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode folded auth response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_mixed_submit_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_mixed_submit_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode mixed submit response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_mixed_folded_auth_status_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated =
+        validate_mixed_folded_auth_status_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated).map_err(|err| {
+        invalid_input(format!(
+            "failed to encode mixed folded auth response: {err:?}"
+        ))
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -633,6 +767,16 @@ async fn fetch_payment_lifecycle_json(
     let validated = validate_payment_lifecycle_response_for_tests(value).map_err(invalid_input)?;
     to_plain_js_value(&validated)
         .map_err(|err| invalid_input(format!("failed to encode payment lifecycle: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_mixed_lifecycle_json(
+    request: &JsPreparedViewerRequest,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let value = fetch_viewer_json_value(request).await?;
+    let validated = validate_mixed_lifecycle_response_for_tests(value).map_err(invalid_input)?;
+    to_plain_js_value(&validated)
+        .map_err(|err| invalid_input(format!("failed to encode mixed lifecycle: {err:?}")))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -936,6 +1080,65 @@ mod tests {
     }
 
     #[test]
+    fn mixed_submit_lookup_and_validation_use_explicit_mixed_surface() {
+        let viewer = test_viewer();
+        let create = viewer
+            .build_submit_mixed_proof_bundle_request(graph_proof_bundle())
+            .unwrap();
+        assert_eq!(create.path, "/proof-bundles");
+        assert!(
+            viewer
+                .build_submit_mixed_proof_bundle_request(payment_proof_bundle())
+                .is_err()
+        );
+
+        let lookup = viewer
+            .build_lookup_mixed_verification_task_request(&handle_options())
+            .unwrap();
+        assert_eq!(lookup.path, "/verification-task-lookups");
+
+        let response = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "status": "completed",
+            "submitted_at": "2026-11-05T12:00:00Z",
+            "completed_at": "2026-11-05T12:01:00Z",
+            "admission_deadline_at": "2026-11-05T12:05:00Z"
+        });
+        let validated = validate_mixed_lifecycle_response_for_tests(response).unwrap();
+        assert_eq!(validated["status"], "completed");
+
+        let accepted = json!({
+            "status": "accepted",
+            "task": {
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "status": "expired",
+                "submitted_at": "2026-11-05T12:00:00Z",
+                "completed_at": "2026-11-05T12:01:00Z",
+                "admission_deadline_at": "2026-11-05T12:05:00Z",
+                "terminal_reason": "payment_deadline_expired"
+            }
+        });
+        assert_eq!(
+            validate_mixed_submit_response_for_tests(accepted.clone()).unwrap(),
+            accepted
+        );
+        assert_eq!(
+            validate_mixed_folded_auth_status_response_for_tests(accepted.clone()).unwrap(),
+            accepted
+        );
+        assert!(
+            validate_mixed_submit_response_for_tests(json!({
+                "status": "accepted",
+                "task": accepted["task"].clone(),
+                "state": "secret"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn graph_response_validation_is_closed_for_restart_status_and_omission() {
         let accepted = json!({
             "status":"accepted",
@@ -949,6 +1152,10 @@ mod tests {
         });
         assert_eq!(
             validate_graph_submit_response_for_tests(accepted.clone()).unwrap(),
+            accepted
+        );
+        assert_eq!(
+            validate_graph_or_mixed_submit_response_for_tests(accepted.clone()).unwrap(),
             accepted
         );
         let restart = json!({"status":"restart_required"});

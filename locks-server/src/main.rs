@@ -7,7 +7,8 @@ use locks_server::deletion_worker::{
 };
 use locks_server::folded_auth_cleanup::{FOLDED_AUTH_CLEANUP_INTERVAL, FoldedAuthCleanupWorker};
 use locks_server::graph_worker::{GraphVerificationWorker, OsGraphRetryJitter};
-use locks_server::nexus_http_client::NexusHttpClient;
+use locks_server::mixed_worker::MixedVerificationWorker;
+use locks_server::nexus_http_client::{NexusHttpClient, UnavailableNexusGraphVerifier};
 use locks_server::payment_worker::PaymentVerificationWorker;
 use locks_server::pkdns::LockServerKeyRepublisher;
 use locks_server::runtime::{
@@ -148,6 +149,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let graph = GraphVerificationWorker::new(
                             worker_state.graph_task_claimer().clone(),
                             worker_state.entitlements().clone(),
+                            graph_verifier.clone(),
+                            worker_state.clock().clone(),
+                            Arc::new(OsGraphRetryJitter),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
+                        let mixed = MixedVerificationWorker::new(
+                            worker_state.mixed_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
+                            paykit.clone(),
                             graph_verifier,
                             worker_state.clock().clone(),
                             Arc::new(OsGraphRetryJitter),
@@ -174,6 +187,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     worker_state.config().worker.poll_interval_ms,
                                 ),
                             ),
+                            mixed.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms,
+                                ),
+                            ),
                         )
                         .map(|_| ())
                         .map_err(anyhow::Error::from)
@@ -195,6 +214,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 worker_state.config().worker.claim_timeout_seconds as i64,
                             ),
                         );
+                        let mixed = MixedVerificationWorker::new(
+                            worker_state.mixed_task_claimer().clone(),
+                            worker_state.entitlements().clone(),
+                            paykit.clone(),
+                            Arc::new(UnavailableNexusGraphVerifier::new(
+                                worker_state.clock().clone(),
+                            )),
+                            worker_state.clock().clone(),
+                            Arc::new(OsGraphRetryJitter),
+                            worker_state.config().worker.worker_id.clone(),
+                            time::Duration::seconds(
+                                worker_state.config().worker.claim_timeout_seconds as i64,
+                            ),
+                        );
                         tokio::try_join!(
                             verification.run_until_shutdown_with_readiness(
                                 context.shutdown(),
@@ -202,6 +235,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ),
                             invoice.run_until_shutdown(context.shutdown()),
                             payment.run_until_shutdown(
+                                context.shutdown(),
+                                Duration::from_millis(
+                                    worker_state.config().worker.poll_interval_ms
+                                ),
+                            ),
+                            mixed.run_until_shutdown(
                                 context.shutdown(),
                                 Duration::from_millis(
                                     worker_state.config().worker.poll_interval_ms
