@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use locks_core::{
     content_lock_deletion::ContentLockDeletionTombstone,
     ids::{ContentLockPath, CreatorPubky, GuardedResourceHash, LockId},
-    lock_policy::{ContentLock, ContentLockPayload},
+    lock_policy::ContentLockPayload,
 };
 use time::{OffsetDateTime, macros::datetime};
 use uuid::Uuid;
@@ -498,7 +498,7 @@ impl ContentLockDeletionRepository for FakeDeletions {
         _: &CreatorPubky,
         _: &LockId,
         _: Uuid,
-        _: &ContentLock,
+        _: &ContentLockPayload,
     ) -> Result<(), ApplicationError> {
         unreachable!()
     }
@@ -530,7 +530,7 @@ impl ContentLockDeletionRepository for FakeDeletions {
         &self,
         _: &CreatorPubky,
         _: &LockId,
-        _: &ContentLock,
+        _: &ContentLockPayload,
         _: &[String],
     ) -> Result<bool, ApplicationError> {
         unreachable!()
@@ -539,7 +539,7 @@ impl ContentLockDeletionRepository for FakeDeletions {
         &self,
         _: &CreatorPubky,
         _: &LockId,
-        _: &ContentLock,
+        _: &ContentLockPayload,
     ) -> Result<crate::application::ports::PublicationRecovery, ApplicationError> {
         unreachable!()
     }

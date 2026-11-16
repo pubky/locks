@@ -527,6 +527,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usdt_admission_has_postgres_replay_and_conflict_parity() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresPaymentTaskRepository::new(database.pool().clone());
+        let mut usdt = request("123e4567-e89b-42d3-a456-426614174031");
+        usdt.payment.amount = "5000001".to_owned();
+        usdt.payment.asset = "USDT".to_owned();
+
+        let first = repository.admit_payment_task(usdt.clone()).await.unwrap();
+        assert_eq!(first.snapshot.as_v1().payment.asset, PaymentAssetV2::Usdt);
+        assert_eq!(first.snapshot.as_v1().payment.amount_units, 5_000_001);
+        let replay = repository.admit_payment_task(usdt.clone()).await.unwrap();
+        assert_eq!(replay.task_id, first.task_id);
+        assert_eq!(replay.snapshot, first.snapshot);
+
+        let mut changed = usdt;
+        changed.payment.asset = "BTC".to_owned();
+        assert_eq!(
+            repository.admit_payment_task(changed).await,
+            Err(ApplicationError::VerificationTaskConflict)
+        );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn payment_admission_replay_and_claim_are_mode_isolated_and_durable() {
         let database = TestDatabase::create().await;
         let repository = PostgresPaymentTaskRepository::new(database.pool().clone());
@@ -681,6 +705,8 @@ mod tests {
                 minimum_confirmations: 0,
                 current_sample: Some(sample.clone()),
                 first_threshold_satisfied: Some(sample.clone()),
+                bitcoin: None,
+                usdt_arbitrum: None,
             })
             .unwrap();
         reduce_payment_snapshot(state, sample.observed_at).unwrap();

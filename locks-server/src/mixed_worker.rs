@@ -1051,6 +1051,8 @@ mod tests {
             minimum_confirmations: 1,
             current_sample: None,
             first_threshold_satisfied: None,
+            bitcoin: None,
+            usdt_arbitrum: None,
         }
     }
 }

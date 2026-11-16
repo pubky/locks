@@ -241,7 +241,7 @@ impl MixedTaskSnapshotV1 {
                     | PaymentRequestStateV2::ProofSubmitted
                     | PaymentRequestStateV2::ActiveRecurring
             ) && status.payment_state != PaymentStateV2::Expired;
-            let payment_satisfied = status.first_threshold_satisfied.is_some();
+            let payment_satisfied = status.has_qualifying_evidence();
             let graph_satisfied = self.graph.root == GraphRootState::Satisfied;
             let path_has_payment = self.satisfied_by.contains(&SatisfiedByV2::Payment);
             let path_has_graph = self.satisfied_by.contains(&SatisfiedByV2::ZeroConfGraph);

@@ -103,6 +103,22 @@ where
             .await
     }
 
+    async fn upsert_content_lock_payload_classified(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLockPayload,
+    ) -> Result<(), ContentLockWriteError> {
+        let body = serde_json::to_value(content_lock).map_err(|error| {
+            ContentLockWriteError::NotStarted(ApplicationError::Storage {
+                message: format!("failed to serialize content lock for Pubky storage: {error}"),
+            })
+        })?;
+        self.client
+            .put_json_value_as_creator_classified(&creator, &content_lock_path.to_string(), body)
+            .await
+    }
+
     async fn get_content_lock(
         &self,
         creator: &CreatorPubky,

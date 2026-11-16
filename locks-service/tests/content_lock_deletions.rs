@@ -299,6 +299,8 @@ async fn in_memory_force_after_deferred_payment_publication_preserves_fence() {
             minimum_confirmations: state.payment.minimum_confirmations,
             current_sample: Some(sample.clone()),
             first_threshold_satisfied: Some(sample.clone()),
+            bitcoin: None,
+            usdt_arbitrum: None,
         })
         .unwrap();
     reduce_payment_snapshot(state, sample.observed_at).unwrap();
@@ -1113,7 +1115,7 @@ async fn in_memory_active_force_completion_is_exactly_fenced_and_permanently_blo
                 &job.creator,
                 &job.lock_id,
                 Uuid::new_v4(),
-                job.frozen_content_lock.as_v1().unwrap(),
+                &job.frozen_content_lock,
             )
             .await,
         Err(locks_service::application::errors::ApplicationError::ContentLockDeletionInProgress)

@@ -94,6 +94,10 @@ const requiredSnippets = [
   'secondaryResources(resources: any): CreateContentLockRequestBuilder;',
   'accessPolicy(access_policy: any): CreateContentLockRequestBuilder;',
   'build(): any;',
+  'export class CreateContentLockV2RequestBuilder',
+  'payment(payment: any): CreateContentLockV2RequestBuilder;',
+  'graph(graph: any): CreateContentLockV2RequestBuilder;',
+  'verificationWindowSeconds(seconds: number): CreateContentLockV2RequestBuilder;',
   'export class DeleteGuardedResourceOptions',
   'constructor(path: string);',
   'export class ConnectUrlOptions',
@@ -225,6 +229,59 @@ if (request.secondary_resources?.[secondaryResource.path]?.size !== secondaryRes
 }
 if (JSON.stringify(request).includes('{}') && Object.keys(request.secondary_resources ?? {}).length === 0) {
   throw new Error('content lock request lost secondary resource fields during JSON serialization');
+}
+
+const v2Request = new sdk.CreateContentLockV2RequestBuilder()
+  .primaryResource(primaryResource)
+  .payment({
+    recipient_pubky: 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+    amount: '50000',
+    asset: 'BTC',
+    minimum_confirmations: 1,
+  })
+  .graph({ predicates: [{ type: 'follows', follower: 'reader', followed: 'creator' }] })
+  .verificationWindowSeconds(300)
+  .accessPolicy({ requested_credential_ttl_seconds: 900 })
+  .lockServer({ override: null })
+  .build();
+if (v2Request.version !== 2 || !v2Request.payment || !v2Request.graph) {
+  throw new Error('content lock v2 request builder lost version or policy fields');
+}
+const usdtRequest = new sdk.CreateContentLockV2RequestBuilder()
+  .primaryResource(primaryResource)
+  .payment({
+    recipient_pubky: 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+    amount: '5000001',
+    asset: 'USDT',
+    minimum_confirmations: 0,
+  })
+  .verificationWindowSeconds(300)
+  .accessPolicy({ requested_credential_ttl_seconds: 900 })
+  .lockServer({ override: null })
+  .build();
+if (usdtRequest.payment?.asset !== 'USDT' || usdtRequest.payment?.amount !== '5000001') {
+  throw new Error('content lock v2 builder changed USDT asset or millionths');
+}
+let unsupportedAssetAccepted = false;
+try {
+  new sdk.CreateContentLockV2RequestBuilder()
+    .primaryResource(primaryResource)
+    .payment({
+      recipient_pubky: 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy',
+      amount: '50000',
+      asset: 'USD',
+      minimum_confirmations: 1,
+    })
+    .verificationWindowSeconds(300)
+    .accessPolicy({ requested_credential_ttl_seconds: 900 })
+    .lockServer({ override: null })
+    .build();
+  unsupportedAssetAccepted = true;
+} catch {
+  // Expected: Content Lock v2 asset set is closed to BTC and USDT.
+}
+if (unsupportedAssetAccepted) {
+  throw new Error('content lock v2 builder accepted unsupported USD asset');
 }
 
 console.log('generated package API smoke check passed');

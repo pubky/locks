@@ -3,6 +3,7 @@ use std::str::FromStr;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::verification::SubmittedProofBundleV2;
 use locks_sdk::{CreatorLocks, VerificationTaskHandleRequest, VerificationTaskStatus, ViewerLocks};
+use locks_server::api::dtos::CreatorPaymentEvidenceHttpResponse;
 use serde_json::json;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -244,4 +245,227 @@ fn mixed_creator_evidence_rejects_completion_without_live_bound_provider_status(
     });
 
     assert!(CreatorLocks::parse_mixed_verification_evidence_response(impossible).is_err());
+}
+
+fn completed_usdt_evidence() -> serde_json::Value {
+    json!({
+        "creator": CREATOR,
+        "reader": READER,
+        "bundle_id": BUNDLE_ID,
+        "pubky_lock_resource": LOCK_RESOURCE,
+        "mode": "mixed",
+        "status": "completed",
+        "submitted_at": "2026-11-03T12:00:00Z",
+        "deadline_at": "2026-11-03T12:10:00Z",
+        "completed_at": "2026-11-03T12:01:00Z",
+        "satisfied_by": ["payment"],
+        "graph": {"predicates": [{
+            "index": 0,
+            "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+            "state": "pending"
+        }]},
+        "payment": {
+            "invoice": {
+                "status": "created",
+                "invoice_created_at": "2026-11-03T12:00:05Z",
+                "proposal_expires_at": "2026-11-03T12:05:00Z"
+            },
+            "provider_status": {
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "request_state": "accepted",
+                "payment_state": "confirmed",
+                "invoice_created_at": "2026-11-03T12:00:05Z",
+                "proposal_expires_at": "2026-11-03T12:05:00Z",
+                "deadline": "2026-11-03T12:10:00Z",
+                "asset": "USDT",
+                "minimum_confirmations": 6,
+                "current_sample": null,
+                "first_threshold_satisfied": null,
+                "bitcoin": {
+                    "confirmations": 6,
+                    "amount_matched": true,
+                    "paid_on_time": true
+                },
+                "usdt_arbitrum": {
+                    "confirmations": 1,
+                    "amount_matched": true,
+                    "paid_on_time": true,
+                    "finalized": false
+                }
+            },
+            "operational_failure_count": 0,
+            "operational_failure_total": 0
+        }
+    })
+}
+
+fn serialize_server_payment(evidence: &mut serde_json::Value) {
+    let payment = CreatorPaymentEvidenceHttpResponse {
+        invoice: serde_json::from_value(evidence["payment"]["invoice"].clone()).unwrap(),
+        provider_status: Some(
+            serde_json::from_value(evidence["payment"]["provider_status"].clone()).unwrap(),
+        ),
+        operational_failure_count: 0,
+        operational_failure_total: 0,
+        operational_first_failure_at: None,
+        operational_last_failure_at: None,
+        operational_last_category: None,
+        operational_last_http_status: None,
+        next_due_at: None,
+    };
+    evidence["payment"] = serde_json::to_value(payment).unwrap();
+}
+
+#[test]
+fn mixed_creator_evidence_accepts_completed_usdt_payment() {
+    let parsed =
+        CreatorLocks::parse_mixed_verification_evidence_response(completed_usdt_evidence())
+            .unwrap();
+    assert_eq!(
+        parsed.satisfied_by,
+        vec![locks_core::verification::SatisfiedByV2::Payment]
+    );
+}
+
+#[test]
+fn mixed_creator_evidence_accepts_pending_usdt_payment_with_explicit_null_rails() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["status"] = json!("in_progress");
+    evidence["satisfied_by"] = json!([]);
+    evidence.as_object_mut().unwrap().remove("completed_at");
+    evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+    evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+
+    CreatorLocks::parse_mixed_verification_evidence_response(evidence).unwrap();
+}
+
+#[test]
+fn server_usdt_evidence_serialization_crosses_sdk_parser_with_nullable_rails() {
+    for pending in [true, false] {
+        let mut evidence = completed_usdt_evidence();
+        if pending {
+            evidence["status"] = json!("in_progress");
+            evidence["satisfied_by"] = json!([]);
+            evidence.as_object_mut().unwrap().remove("completed_at");
+            evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+            evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+            evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        } else {
+            evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        }
+
+        serialize_server_payment(&mut evidence);
+
+        assert_eq!(
+            evidence["payment"]["provider_status"]["bitcoin"],
+            serde_json::Value::Null
+        );
+        assert!(
+            evidence["payment"]["provider_status"]
+                .as_object()
+                .unwrap()
+                .contains_key("usdt_arbitrum")
+        );
+        CreatorLocks::parse_mixed_verification_evidence_response(evidence).unwrap();
+    }
+
+    let mut btc = completed_usdt_evidence();
+    btc["status"] = json!("in_progress");
+    btc["satisfied_by"] = json!([]);
+    btc.as_object_mut().unwrap().remove("completed_at");
+    btc["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    btc["payment"]["provider_status"]["asset"] = json!("BTC");
+    let provider = btc["payment"]["provider_status"].as_object_mut().unwrap();
+    provider.remove("bitcoin");
+    provider.remove("usdt_arbitrum");
+    serialize_server_payment(&mut btc);
+    assert!(
+        !btc["payment"]["provider_status"]
+            .as_object()
+            .unwrap()
+            .contains_key("bitcoin")
+    );
+    assert!(
+        !btc["payment"]["provider_status"]
+            .as_object()
+            .unwrap()
+            .contains_key("usdt_arbitrum")
+    );
+    CreatorLocks::parse_mixed_verification_evidence_response(btc).unwrap();
+}
+
+#[test]
+fn mixed_creator_evidence_rejects_missing_or_malformed_usdt_rail_fields() {
+    for missing in ["bitcoin", "usdt_arbitrum"] {
+        let mut evidence = completed_usdt_evidence();
+        evidence["payment"]["provider_status"]
+            .as_object_mut()
+            .unwrap()
+            .remove(missing);
+        assert!(
+            CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err(),
+            "accepted USDT evidence missing {missing}"
+        );
+    }
+
+    let mut malformed = completed_usdt_evidence();
+    malformed["payment"]["provider_status"]["usdt_arbitrum"]
+        .as_object_mut()
+        .unwrap()
+        .remove("paid_on_time");
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(malformed).is_err());
+
+    let mut unknown = completed_usdt_evidence();
+    unknown["payment"]["provider_status"]["usdt_arbitrum"]["unsupported"] = json!(true);
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(unknown).is_err());
+
+    let mut invalid_asset = completed_usdt_evidence();
+    invalid_asset["payment"]["provider_status"]["asset"] = json!("usdt");
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(invalid_asset).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_never_uses_bitcoin_offer_to_qualify_usdt() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] = json!(0);
+    evidence["payment"]["provider_status"]["first_threshold_satisfied"] = json!({
+        "observed_at": "2026-11-03T12:00:30Z",
+        "status": "confirmed",
+        "outpoint": {
+            "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "vout": 0
+        },
+        "confirmations": 6,
+        "amount_matched": true
+    });
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_requires_qualifying_usdt_for_graph_eligibility() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["satisfied_by"] = json!(["zero_conf_graph"]);
+    evidence["graph"]["predicates"][0]["state"] = json!("satisfied");
+    evidence["graph"]["predicates"][0]["first_true_observation"] = json!({
+        "outcome": "true",
+        "observed_at": "2026-11-03T12:00:30Z",
+        "origin": "https://nexus.example",
+        "http_status": 200
+    });
+    evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+    evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
+}
+
+#[test]
+fn mixed_creator_evidence_rejects_rail_fields_for_btc_status() {
+    let mut evidence = completed_usdt_evidence();
+    evidence["payment"]["provider_status"]["asset"] = json!("BTC");
+
+    assert!(CreatorLocks::parse_mixed_verification_evidence_response(evidence).is_err());
 }

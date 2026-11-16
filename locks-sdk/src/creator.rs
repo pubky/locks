@@ -1,4 +1,7 @@
-pub use locks_core::creator_publishing::{CreateContentLockRequest, SetLockServicePointerRequest};
+pub use locks_core::creator_publishing::{
+    CreateContentLockPayload, CreateContentLockRequest, CreateContentLockV2Request,
+    SetLockServicePointerRequest,
+};
 use locks_core::ids::{BundleId, LockId};
 pub use locks_core::lock_policy::PaykitPaymentAsset;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -156,8 +159,8 @@ impl CreatorLocks {
         self.post_json("/creator/content-locks", request)
     }
 
-    pub fn create_content_lock(&self, request: CreateContentLockRequest) -> SdkRequest {
-        self.create_content_lock_request(request)
+    pub fn create_content_lock(&self, request: impl Into<CreateContentLockPayload>) -> SdkRequest {
+        self.post_json("/creator/content-locks", request.into())
     }
 
     pub fn set_lock_service_pointer_request(
@@ -247,7 +250,8 @@ mod tests {
 
     use locks_core::ids::{GuardedResourceHash, LockServerPubky};
     use locks_core::lock_policy::{
-        AccessPolicy, GuardedResource, LockLogic, LockServerConfig, SecondaryGuardedResource,
+        AccessPolicy, CONTENT_LOCK_V2_VERSION, GraphParticipantV2, GraphPolicyV2, GraphPredicateV2,
+        GuardedResource, LockLogic, LockServerConfig, SecondaryGuardedResource,
     };
     use serde_json::json;
 
@@ -365,6 +369,36 @@ mod tests {
         assert!(body.get("primary_resource").is_some());
         assert!(body.get("secondary_resources").is_none());
         assert!(body.get("guarded_resource").is_none());
+    }
+
+    #[test]
+    fn create_content_lock_accepts_explicit_v2_request_on_common_surface() {
+        let creator = LocksSession::new("frontend-session-secret").creator();
+        let request = creator.create_content_lock(CreateContentLockV2Request {
+            version: CONTENT_LOCK_V2_VERSION,
+            primary_resource: Some(guarded_resource()),
+            secondary_resources: BTreeMap::new(),
+            payment: None,
+            graph: Some(GraphPolicyV2 {
+                predicates: vec![GraphPredicateV2::Follows {
+                    follower: GraphParticipantV2::Reader,
+                    followed: GraphParticipantV2::Creator,
+                }],
+                operator: None,
+            }),
+            verification_window_seconds: 300,
+            access_policy: AccessPolicy {
+                requested_credential_ttl_seconds: 900,
+            },
+            lock_server: LockServerConfig { override_: None },
+        });
+
+        let SdkRequestBody::Json(body) = request.body else {
+            panic!("create content lock should be JSON");
+        };
+        assert_eq!(body["version"], 2);
+        assert!(body.get("criteria").is_none());
+        assert!(body.get("graph").is_some());
     }
 
     #[test]

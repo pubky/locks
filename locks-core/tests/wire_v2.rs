@@ -322,23 +322,26 @@ fn content_lock_v2_presence_modes_and_payment_bounds_are_closed() {
 }
 
 #[test]
-fn payment_v2_requires_exact_btc_and_u64_amount_without_normalizing_lexeme() {
-    for amount in ["1", "0001", "18446744073709551615"] {
+fn payment_v2_requires_closed_asset_and_u64_amount_without_normalizing_lexeme() {
+    for (asset, amount) in [
+        ("BTC", "1"),
+        ("BTC", "0001"),
+        ("BTC", "18446744073709551615"),
+        ("USDT", "5000001"),
+    ] {
         let mut policy = payment(0);
+        policy.asset = asset.to_owned();
         policy.amount = amount.to_owned();
         let lock = content_lock_v2(Some(policy), None);
         let decoded = serde_json::from_value::<ContentLockV2>(serde_json::to_value(lock).unwrap())
-            .expect("valid bounded BTC amount");
+            .expect("valid bounded base-unit amount");
         assert_eq!(decoded.payment.unwrap().amount, amount);
     }
 
-    for asset in ["btc", "USDT", ""] {
-        let mut policy = payment(0);
-        policy.asset = asset.to_owned();
-        let lock = content_lock_v2(Some(policy), None);
-        assert!(
-            serde_json::from_value::<ContentLockV2>(serde_json::to_value(lock).unwrap()).is_err()
-        );
+    for asset in ["btc", "usdt", "USD", ""] {
+        let mut value = serde_json::to_value(content_lock_v2(Some(payment(0)), None)).unwrap();
+        value["payment"]["asset"] = json!(asset);
+        assert!(serde_json::from_value::<ContentLockV2>(value).is_err());
     }
 
     for amount in ["0", "000", "1.0", "+1", "18446744073709551616"] {
@@ -702,6 +705,18 @@ fn content_lock_v2_accepts_exact_confirmation_and_window_ranges() {
 }
 
 #[test]
+fn content_lock_v2_accepts_exact_btc_and_usdt_assets() {
+    for asset in ["BTC", "USDT"] {
+        let mut payment = payment(0);
+        payment.asset = asset.to_owned();
+        payment.amount = if asset == "BTC" { "21" } else { "5000001" }.to_owned();
+        let value = serde_json::to_value(content_lock_v2(Some(payment), None)).unwrap();
+        let parsed: ContentLockV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.payment.unwrap().asset, asset);
+    }
+}
+
+#[test]
 fn content_lock_v2_rejects_invalid_payment_fields() {
     let invalid_payments = [
         PaymentPolicyV2 {
@@ -716,18 +731,19 @@ fn content_lock_v2_rejects_invalid_payment_fields() {
             amount: "0.5".to_owned(),
             ..payment(0)
         },
-        PaymentPolicyV2 {
-            asset: String::new(),
-            ..payment(0)
-        },
-        PaymentPolicyV2 {
-            asset: "BTC\n".to_owned(),
-            ..payment(0)
-        },
     ];
     for invalid in invalid_payments {
         let value = serde_json::to_value(content_lock_v2(Some(invalid), None)).unwrap();
         assert!(serde_json::from_value::<ContentLockV2>(value).is_err());
+    }
+
+    for asset in ["", "btc", "usdt", "USD", "ETH", "BTC\n"] {
+        let mut value = serde_json::to_value(content_lock_v2(Some(payment(0)), None)).unwrap();
+        value["payment"]["asset"] = json!(asset);
+        assert!(
+            serde_json::from_value::<ContentLockV2>(value).is_err(),
+            "asset={asset:?}"
+        );
     }
 
     let mut unknown = serde_json::to_value(content_lock_v2(Some(payment(0)), None)).unwrap();

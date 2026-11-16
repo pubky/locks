@@ -732,8 +732,8 @@ mod tests {
     use locks_core::{
         ids::{CreatorPubky, GuardedResourceHash, LockId},
         lock_policy::{
-            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GuardedResource, LockLogic,
-            LockServerConfig,
+            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, GuardedResource,
+            LockLogic, LockServerConfig,
         },
     };
     use locks_service::application::{
@@ -1647,7 +1647,7 @@ mod tests {
             _: &CreatorPubky,
             _: &LockId,
             _: Uuid,
-            _: &ContentLock,
+            _: &ContentLockPayload,
         ) -> Result<(), ApplicationError> {
             unreachable!()
         }
@@ -1679,7 +1679,7 @@ mod tests {
             &self,
             _: &CreatorPubky,
             _: &LockId,
-            _: &ContentLock,
+            _: &ContentLockPayload,
             _: &[String],
         ) -> Result<bool, ApplicationError> {
             unreachable!()
@@ -1688,7 +1688,7 @@ mod tests {
             &self,
             _: &CreatorPubky,
             _: &LockId,
-            _: &ContentLock,
+            _: &ContentLockPayload,
         ) -> Result<locks_service::application::ports::PublicationRecovery, ApplicationError>
         {
             unreachable!()

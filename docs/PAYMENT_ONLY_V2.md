@@ -1,6 +1,6 @@
 # Payment-only Content Lock v2
 
-Payment-only v2 supports one Bitcoin payment policy without Graph predicates. Mixed Graph+payment behavior is documented in [`MIXED_GRAPH_PAYMENT_V2.md`](MIXED_GRAPH_PAYMENT_V2.md).
+Payment-only v2 supports one BTC or USDT payment policy without Graph predicates. Mixed Graph+payment behavior is documented in [`MIXED_GRAPH_PAYMENT_V2.md`](MIXED_GRAPH_PAYMENT_V2.md).
 
 ## Closed policy and submission shapes
 
@@ -20,8 +20,8 @@ Content Lock v2 payment mode contains exactly one `payment` object and no `graph
 
 Rules:
 
-- `asset` is exactly `BTC`.
-- `amount` is a non-zero canonical unsigned 64-bit decimal string.
+- `asset` is exactly uppercase `BTC` or `USDT`; lowercase, `USD`, and unknown values are rejected.
+- `amount` is a non-zero unsigned 64-bit decimal string. BTC uses satoshis; USDT uses millionths. The exact decimal lexeme is preserved.
 - `recipient_pubky` equals Content Lock creator.
 - `minimum_confirmations` is `0..=6`.
 - `verification_window_seconds` is `60..=604800`.
@@ -60,7 +60,7 @@ Locks classifies exact replay or conflict before mutable lock lookup. New admiss
 - `POST /v2/invoices`
 - `POST /v2/invoices/status`
 
-External calls may start only while `now < deadline`. Provider evidence with `observed_at == deadline` is timely even when response arrives later. `current_sample` can decrease or disappear after reorg. First threshold-satisfying evidence is immutable; later current-sample changes cannot revoke satisfaction.
+External calls may start only while `now < deadline`. BTC provider evidence with `observed_at == deadline` is timely even when response arrives later. BTC `current_sample` can decrease or disappear after reorg; first threshold-satisfying evidence is immutable. USDT satisfaction instead requires amount-matched, on-time verified Arbitrum inclusion with at least one Arbitrum confirmation. BTC confirmation thresholds are never compared with USDT confirmation counts. A USDT denomination, aggregate payment state, or offered BTC conversion is not USDT payment evidence.
 
 HTTP `400`, `401`, `403`, or malformed success data terminalize as `invalid_verifier_response`; `409` terminalizes as `verification_conflict`. `404`, `429`, `5xx`, and transport failures retry only until Locks deadline. Proposal expiry is distinct from Locks verification deadline.
 
@@ -68,7 +68,7 @@ Payment task claims, retries, snapshot writes, and publication use revision/leas
 
 ## Provider-v2 deletion
 
-Graceful deletion requires Paykit Server `v0.1.1-rc3` or newer. Locks freezes exact payment evaluator facts, posts/replays `/payment-request-drains`, then reconciles provider-v2 invoices only after drain acknowledgment and completion. Reconciliation uses exact `/v2/invoices` replay plus `/v2/invoices/status`; it never creates a fresh invoice or uses legacy payment status. Live provider status defers deletion. Conflict plus status `404` proves absence; conflict plus a found invoice, changed binding/timestamps, malformed success, or changed Paykit authority fails closed.
+Graceful deletion requires compatible Paykit Server provider-v2 support. Locks freezes exact payment evaluator facts, posts/replays `/payment-request-drains`, then reconciles provider-v2 invoices only after drain acknowledgment and completion. Reconciliation uses exact `/v2/invoices` replay plus `/v2/invoices/status`; it preserves frozen asset and rail-native amount and never creates a fresh invoice or uses legacy payment status. Live provider status defers deletion. Conflict plus status `404` proves absence; conflict plus a found invoice, changed binding/timestamps, malformed success, or changed Paykit authority fails closed.
 
 Deletion cutoff blocks unpublished entitlement effects. Completed published entitlement payloads remain unchanged. Graceful purge replays `/payment-request-drain-cleanups` with durable cleanup token under live deletion claim before operational state is removed; lost responses are safe to replay. Force deletion makes no provider call, abandons provider obligation, terminalizes unpublished task as `expired/content_lock_deleted`, preserves completed task, and leaves permanent same-resource task/publication fences. External invoice may remain active after force.
 

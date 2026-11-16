@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use locks_core::{
     ids::{CreatorPubky, LockId},
-    lock_policy::{ContentLock, ContentLockPayload},
+    lock_policy::ContentLockPayload,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -25,13 +25,13 @@ pub enum PublicationRecovery {
     /// Token owner recorded successful external write completion; reconciliation may proceed.
     WriteCompleted {
         publication_token: Uuid,
-        content_lock: ContentLock,
+        content_lock: ContentLockPayload,
     },
     /// Exact canonical material is retained, but write completion is still ambiguous.
     /// Callers must neither trust readback from an unknown attempt nor dispatch another write.
     Pending {
         publication_token: Uuid,
-        content_lock: ContentLock,
+        content_lock: ContentLockPayload,
     },
     /// Retained canonical publication material does not authenticate this retry.
     RequestMismatch,
@@ -46,7 +46,7 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
-        original_content_lock: &ContentLock,
+        original_content_lock: &ContentLockPayload,
     ) -> Result<(), ApplicationError>;
 
     /// Records that the exact token-owned external write has returned before local finalization.
@@ -86,7 +86,7 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        published_content_lock: &ContentLock,
+        published_content_lock: &ContentLockPayload,
         published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError>;
 
@@ -104,7 +104,7 @@ pub trait ContentLockDeletionRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        requested_content_lock: &ContentLock,
+        requested_content_lock: &ContentLockPayload,
     ) -> Result<PublicationRecovery, ApplicationError>;
 
     async fn insert_job(&self, job: ContentLockDeletionJob) -> Result<(), ApplicationError>;
@@ -251,10 +251,10 @@ pub trait ContentLockDeletionRepository: Send + Sync {
 pub(crate) fn publication_reconciliation_matches(
     creator: &CreatorPubky,
     lock_id: &LockId,
-    published_content_lock: &ContentLock,
+    published_content_lock: &ContentLockPayload,
     published_guarded_paths: &[String],
 ) -> bool {
-    if &published_content_lock.creator != creator
+    if published_content_lock.creator() != creator
         || !published_content_lock
             .lock_id()
             .is_ok_and(|published_lock_id| &published_lock_id == lock_id)
@@ -263,12 +263,12 @@ pub(crate) fn publication_reconciliation_matches(
     }
 
     let expected_paths = published_content_lock
-        .primary_resource
+        .primary_resource()
         .iter()
         .map(|resource| resource.path.as_str())
         .chain(
             published_content_lock
-                .secondary_resources
+                .secondary_resources()
                 .keys()
                 .map(String::as_str),
         )
@@ -283,10 +283,10 @@ pub(crate) fn publication_reconciliation_matches(
 pub(crate) fn publication_intent_matches_request(
     creator: &CreatorPubky,
     lock_id: &LockId,
-    original_content_lock: &ContentLock,
-    requested_content_lock: &ContentLock,
+    original_content_lock: &ContentLockPayload,
+    requested_content_lock: &ContentLockPayload,
 ) -> bool {
-    if &original_content_lock.creator != creator
+    if original_content_lock.creator() != creator
         || !original_content_lock
             .lock_id()
             .is_ok_and(|original_lock_id| &original_lock_id == lock_id)
@@ -295,15 +295,15 @@ pub(crate) fn publication_intent_matches_request(
     }
 
     let mut expected = requested_content_lock.clone();
-    expected.created_at = original_content_lock.created_at;
+    expected.set_created_at(original_content_lock.created_at());
     &expected == original_content_lock
 }
 
-pub(crate) fn publication_guarded_paths(content_lock: &ContentLock) -> Vec<String> {
+pub(crate) fn publication_guarded_paths(content_lock: &ContentLockPayload) -> Vec<String> {
     content_lock
-        .primary_resource
+        .primary_resource()
         .iter()
         .map(|resource| resource.path.clone())
-        .chain(content_lock.secondary_resources.keys().cloned())
+        .chain(content_lock.secondary_resources().keys().cloned())
         .collect()
 }

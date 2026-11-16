@@ -1207,8 +1207,7 @@ fn provider_v2_status_is_terminal(
             | PaymentRequestStateV2::ProofSubmitted
             | PaymentRequestStateV2::ActiveRecurring
     );
-    let satisfied_without_publication =
-        accepted_lifecycle && status.first_threshold_satisfied.is_some();
+    let satisfied_without_publication = accepted_lifecycle && status.has_qualifying_evidence();
     Ok(satisfied_without_publication
         || matches!(
             status.request_state,
@@ -1282,9 +1281,9 @@ mod tests {
 
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        BitcoinOutpointV2, PaymentAssetV2, PaymentProviderStatus, PaymentRequestStateV2,
-        PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2, VerificationTaskStatus,
-        VerificationTerminalReason,
+        BitcoinOutpointV2, PaymentAssetV2, PaymentProviderStatus, PaymentRailEvidenceV2,
+        PaymentRequestStateV2, PaymentSampleStatusV2, PaymentSampleV2, PaymentStateV2,
+        UsdtArbitrumEvidenceV2, VerificationTaskStatus, VerificationTerminalReason,
     };
     use crate::application::ports::{
         EntitlementRepository, PaymentDrainCleanupToken, PaymentDrainClientError,
@@ -1607,9 +1606,64 @@ mod tests {
                 minimum_confirmations: 0,
                 current_sample: None,
                 first_threshold_satisfied: None,
+                bitcoin: None,
+                usdt_arbitrum: None,
             };
             assert_eq!(provider_v2_status_is_terminal(&value), Ok(terminal));
         }
+    }
+
+    #[test]
+    fn provider_v2_reconciliation_requires_usdt_arbitrum_evidence_not_bitcoin_offer() {
+        let mut value = PaymentProviderStatus {
+            creator: CreatorPubky::from_str(
+                "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            )
+            .unwrap(),
+            bundle_id: BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap(),
+            request_state: PaymentRequestStateV2::Accepted,
+            payment_state: PaymentStateV2::Confirmed,
+            invoice_created_at: datetime!(2026-08-12 10:00:00 UTC),
+            proposal_expires_at: datetime!(2026-08-12 11:00:00 UTC),
+            deadline: datetime!(2026-08-13 10:00:00 UTC),
+            asset: PaymentAssetV2::Usdt,
+            minimum_confirmations: 6,
+            current_sample: Some(PaymentSampleV2 {
+                observed_at: datetime!(2026-08-12 12:00:00 UTC),
+                status: PaymentSampleStatusV2::Confirmed,
+                outpoint: Some(BitcoinOutpointV2 {
+                    txid: "14".repeat(32),
+                    vout: 0,
+                }),
+                confirmations: 6,
+                amount_matched: true,
+            }),
+            first_threshold_satisfied: Some(PaymentSampleV2 {
+                observed_at: datetime!(2026-08-12 12:00:00 UTC),
+                status: PaymentSampleStatusV2::Confirmed,
+                outpoint: Some(BitcoinOutpointV2 {
+                    txid: "14".repeat(32),
+                    vout: 0,
+                }),
+                confirmations: 6,
+                amount_matched: true,
+            }),
+            bitcoin: Some(PaymentRailEvidenceV2 {
+                confirmations: 6,
+                amount_matched: true,
+                paid_on_time: true,
+            }),
+            usdt_arbitrum: None,
+        };
+        assert_eq!(provider_v2_status_is_terminal(&value), Ok(false));
+
+        value.usdt_arbitrum = Some(UsdtArbitrumEvidenceV2 {
+            confirmations: 1,
+            amount_matched: true,
+            paid_on_time: true,
+            finalized: false,
+        });
+        assert_eq!(provider_v2_status_is_terminal(&value), Ok(true));
     }
 
     #[test]
@@ -1643,6 +1697,8 @@ mod tests {
                     confirmations: 0,
                     amount_matched: true,
                 }),
+                bitcoin: None,
+                usdt_arbitrum: None,
             };
             assert_eq!(provider_v2_status_is_terminal(&value), Ok(true));
 
@@ -1689,6 +1745,8 @@ mod tests {
                 confirmations: 0,
                 amount_matched: true,
             }),
+            bitcoin: None,
+            usdt_arbitrum: None,
         };
 
         assert_eq!(provider_v2_status_is_terminal(&value), Ok(false));
@@ -1737,6 +1795,8 @@ mod tests {
                     confirmations: 0,
                     amount_matched: true,
                 }),
+                bitcoin: None,
+                usdt_arbitrum: None,
             };
             assert!(provider_v2_status_is_terminal(&value).is_err());
         }

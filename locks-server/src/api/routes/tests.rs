@@ -19,7 +19,8 @@ use locks_core::ids::{
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
     GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
-    LockServerConfig, PaykitPaymentAsset, PaymentPolicyV2, SecondaryGuardedResource, VerifierType,
+    LockServerConfig, PaykitPaymentAsset, PaymentAssetV2, PaymentPolicyV2,
+    SecondaryGuardedResource, VerifierType,
 };
 use locks_core::verification::{
     Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
@@ -778,15 +779,15 @@ async fn graph_v2_submission_starts_folded_auth_then_polls_pending_without_secre
 }
 
 #[tokio::test]
-async fn mixed_v2_submission_accepts_folded_auth_into_one_invoice_pending_task() {
+async fn mixed_v2_usdt_submission_replays_into_one_invoice_pending_task() {
     let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
         Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
         vec!["https://pubky.app".to_owned()],
         None,
         Some(PaymentPolicyV2 {
             recipient_pubky: creator(),
-            amount: "50000".to_owned(),
-            asset: "BTC".to_owned(),
+            amount: "5000001".to_owned(),
+            asset: "USDT".to_owned(),
             minimum_confirmations: 1,
         }),
     )
@@ -860,6 +861,15 @@ async fn mixed_v2_submission_accepts_folded_auth_into_one_invoice_pending_task()
         task.snapshot.as_v1().payment.invoice,
         PaymentInvoiceState::Pending
     ));
+    assert_eq!(
+        task.snapshot.as_v1().payment.payment.asset,
+        PaymentAssetV2::Usdt
+    );
+    assert_eq!(task.snapshot.as_v1().payment.payment.amount, "5000001");
+    assert_eq!(
+        task.snapshot.as_v1().payment.payment.amount_units,
+        5_000_001
+    );
 
     let evidence = app
         .oneshot(authenticated_json_request(
@@ -892,6 +902,75 @@ async fn mixed_v2_submission_accepts_folded_auth_into_one_invoice_pending_task()
             "failure_message",
         ],
     );
+}
+
+#[tokio::test]
+async fn mixed_v2_changed_usdt_asset_conflicts_with_existing_handle() {
+    let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
+        Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
+        vec!["https://pubky.app".to_owned()],
+        None,
+        Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "5000001".to_owned(),
+            asset: "USDT".to_owned(),
+            minimum_confirmations: 1,
+        }),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let state = state.with_paykit_http_client(Some(paykit));
+    let original_path = bundle.pubky_lock_resource.content_lock_path().clone();
+    let mut changed_lock = match state
+        .content_locks()
+        .get_content_lock_payload(&creator(), &original_path)
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        ContentLockPayload::V2(lock) => lock,
+        ContentLockPayload::V1(_) => panic!("mixed fixture must use v2 content lock"),
+    };
+    changed_lock.payment.as_mut().unwrap().asset = "BTC".to_owned();
+    let changed_path = ContentLockPath::from_lock_id(changed_lock.lock_id().unwrap());
+    state
+        .content_locks()
+        .upsert_content_lock_payload(
+            creator(),
+            changed_path.clone(),
+            ContentLockPayload::V2(changed_lock),
+        )
+        .await
+        .unwrap();
+    let changed_bundle = SubmittedProofBundleV2 {
+        pubky_lock_resource: PubkyLockResource::new(creator(), changed_path),
+        ..bundle.clone()
+    };
+    let app = router(state);
+
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let conflict = app
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": changed_bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -2150,7 +2229,12 @@ async fn force_during_publication_intent_returns_redacted_conflict_without_recei
     let publication_token = Uuid::new_v4();
     state
         .content_lock_deletions()
-        .begin_publication(&creator(), &lock_id, publication_token, &content_lock)
+        .begin_publication(
+            &creator(),
+            &lock_id,
+            publication_token,
+            &ContentLockPayload::V1(content_lock),
+        )
         .await
         .unwrap();
 
@@ -3131,6 +3215,36 @@ async fn payment_only_v2_submission_returns_accepted_redacted_lifecycle_and_look
         .unwrap();
     assert_eq!(lookup.status(), StatusCode::OK);
     assert_eq!(response_json(lookup).await, submitted_body);
+}
+
+#[tokio::test]
+async fn payment_only_v2_usdt_submission_preserves_base_units_and_exact_replay() {
+    let (state, bundle) = payment_only_v2_test_state_with_asset("USDT", "5000001").await;
+    let app = router(state.clone());
+    let request = || {
+        json_request(
+            "POST",
+            "/proof-bundles",
+            json!({ "submitted_proof_bundle": bundle.clone() }),
+        )
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = response_json(first).await;
+    let replay = app.oneshot(request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(replay).await, first_body);
+
+    let task = state
+        .payment_tasks()
+        .get_payment_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.snapshot.as_v1().payment.asset, PaymentAssetV2::Usdt);
+    assert_eq!(task.snapshot.as_v1().payment.amount, "5000001");
+    assert_eq!(task.snapshot.as_v1().payment.amount_units, 5_000_001);
 }
 
 #[tokio::test]
@@ -6298,6 +6412,264 @@ async fn creator_content_locks_create_lock_for_registered_guarded_resource() {
 }
 
 #[tokio::test]
+async fn creator_content_locks_create_v2_graph_lock_on_common_route() {
+    let state = test_state_with_creator_publishing(true)
+        .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state.clone());
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = json!({
+        "version": 2,
+        "primary_resource": guarded_resource,
+        "graph": {
+            "predicates": [{
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            }]
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/content-locks",
+            request,
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["content_lock"]["version"], 2);
+    assert_eq!(
+        body["content_lock"]["graph"]["predicates"][0]["type"],
+        "follows"
+    );
+    assert!(body["content_lock"].get("criteria").is_none());
+    let lock_id = body["lock_id"].as_str().unwrap();
+    assert_eq!(
+        body["content_lock_path"],
+        format!("/pub/app.locks/{lock_id}.json")
+    );
+
+    let deleted = app
+        .oneshot(authenticated_json_request(
+            "DELETE",
+            &format!("/creator/content-locks/{lock_id}?force=true"),
+            json!(null),
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn creator_content_locks_v2_rejects_body_creator() {
+    let state = test_state_with_creator_publishing(true);
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let request = json!({
+        "version": 2,
+        "creator": other_creator().to_string(),
+        "primary_resource": guarded_resource,
+        "graph": {
+            "predicates": [{
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            }]
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+
+    let response = app
+        .oneshot(authenticated_json_request(
+            "POST",
+            "/creator/content-locks",
+            request,
+            "frontend-session-secret",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn creator_content_locks_create_v2_payment_and_mixed_locks_on_common_route() {
+    for (asset, amount) in [("BTC", "50000"), ("USDT", "5000001")] {
+        for with_graph in [false, true] {
+            let state = test_state_with_creator_publishing(true)
+                .with_clock(Arc::new(FixedClock(datetime!(2026-06-03 12:00:00 UTC))));
+            seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+            let app = router(state.clone());
+            let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+            let mut request = json!({
+                "version": 2,
+                "primary_resource": guarded_resource,
+                "payment": {
+                    "recipient_pubky": creator().to_string(),
+                    "amount": amount,
+                    "asset": asset,
+                    "minimum_confirmations": 1
+                },
+                "verification_window_seconds": 300,
+                "access_policy": { "requested_credential_ttl_seconds": 900 },
+                "lock_server": { "override": null }
+            });
+            if with_graph {
+                request["graph"] = json!({
+                    "predicates": [{
+                        "type": "follows",
+                        "follower": "reader",
+                        "followed": "creator"
+                    }]
+                });
+            }
+
+            let response = app
+                .clone()
+                .oneshot(authenticated_json_request(
+                    "POST",
+                    "/creator/content-locks",
+                    request.clone(),
+                    "frontend-session-secret",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["content_lock"]["version"], 2);
+            assert_eq!(body["content_lock"]["payment"]["asset"], asset);
+            assert_eq!(body["content_lock"]["payment"]["amount"], amount);
+            assert_eq!(body["content_lock"].get("graph").is_some(), with_graph);
+            let lock_id = body["lock_id"].as_str().unwrap();
+            let path = body["content_lock_path"].as_str().unwrap();
+            assert_eq!(path, format!("/pub/app.locks/{lock_id}.json"));
+            assert_eq!(
+                state
+                    .content_locks()
+                    .get_content_lock_payload(&creator(), &path.parse().unwrap())
+                    .await
+                    .unwrap(),
+                Some(serde_json::from_value(body["content_lock"].clone()).unwrap())
+            );
+
+            let replay = app
+                .oneshot(authenticated_json_request(
+                    "POST",
+                    "/creator/content-locks",
+                    request,
+                    "frontend-session-secret",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::OK);
+            assert_eq!(response_json(replay).await["lock_id"], lock_id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn creator_content_locks_v2_common_route_rejects_invalid_closed_shapes() {
+    let state = test_state_with_creator_publishing(true);
+    seed_frontend_session(&state, "frontend-session-secret", creator()).await;
+    let app = router(state);
+    let guarded_resource = register_guarded_resource_through_creator_route(&app).await;
+    let valid = json!({
+        "version": 2,
+        "primary_resource": guarded_resource,
+        "payment": {
+            "recipient_pubky": creator().to_string(),
+            "amount": "50000",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        },
+        "verification_window_seconds": 300,
+        "access_policy": { "requested_credential_ttl_seconds": 900 },
+        "lock_server": { "override": null }
+    });
+    let invalid_requests = [
+        {
+            let mut value = valid.clone();
+            value["version"] = json!(3);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove("payment");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["asset"] = json!("USD");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["amount"] = json!("0");
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["payment"]["unknown"] = json!(true);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value.as_object_mut().unwrap().remove("payment");
+            value["graph"] = json!({
+                "predicates": [{
+                    "type": "follows",
+                    "follower": "reader",
+                    "followed": "reader"
+                }]
+            });
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["criteria"] = json!([]);
+            value
+        },
+        {
+            let mut value = valid.clone();
+            value["creator"] = json!(other_creator().to_string());
+            value
+        },
+    ];
+
+    for request in invalid_requests {
+        let response = app
+            .clone()
+            .oneshot(authenticated_json_request(
+                "POST",
+                "/creator/content-locks",
+                request,
+                "frontend-session-secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_request"
+        );
+    }
+}
+
+#[tokio::test]
 async fn creator_content_locks_missing_guarded_resource_returns_stable_error() {
     let state = test_state_with_creator_publishing(true);
     seed_frontend_session(&state, "frontend-session-secret", creator()).await;
@@ -7508,6 +7880,10 @@ async fn folded_auth_test_state_with_runtime_and_payment(
 }
 
 fn payment_only_v2_lock() -> ContentLockV2 {
+    payment_only_v2_lock_with_asset("BTC", "50000")
+}
+
+fn payment_only_v2_lock_with_asset(asset: &str, amount: &str) -> ContentLockV2 {
     ContentLockV2 {
         version: 2,
         creator: creator(),
@@ -7523,8 +7899,8 @@ fn payment_only_v2_lock() -> ContentLockV2 {
         secondary_resources: BTreeMap::new(),
         payment: Some(PaymentPolicyV2 {
             recipient_pubky: creator(),
-            amount: "50000".to_owned(),
-            asset: "BTC".to_owned(),
+            amount: amount.to_owned(),
+            asset: asset.to_owned(),
             minimum_confirmations: 1,
         }),
         graph: None,
@@ -7538,7 +7914,14 @@ fn payment_only_v2_lock() -> ContentLockV2 {
 }
 
 async fn payment_only_v2_test_state() -> (AppState, SubmittedProofBundleV2) {
-    let lock = payment_only_v2_lock();
+    payment_only_v2_test_state_with_asset("BTC", "50000").await
+}
+
+async fn payment_only_v2_test_state_with_asset(
+    asset: &str,
+    amount: &str,
+) -> (AppState, SubmittedProofBundleV2) {
+    let lock = payment_only_v2_lock_with_asset(asset, amount);
     let path = ContentLockPath::from_lock_id(lock.lock_id().unwrap());
     let bundle = SubmittedProofBundleV2 {
         version: 2,

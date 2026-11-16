@@ -62,6 +62,25 @@ pub trait ContentLockRepository: Send + Sync {
             .map_err(ContentLockWriteError::Ambiguous)
     }
 
+    /// Writes either supported content-lock version while preserving dispatch classification.
+    async fn upsert_content_lock_payload_classified(
+        &self,
+        creator: CreatorPubky,
+        content_lock_path: ContentLockPath,
+        content_lock: ContentLockPayload,
+    ) -> Result<(), ContentLockWriteError> {
+        match content_lock {
+            ContentLockPayload::V1(lock) => {
+                self.upsert_content_lock_classified(creator, content_lock_path, lock)
+                    .await
+            }
+            payload @ ContentLockPayload::V2(_) => self
+                .upsert_content_lock_payload(creator, content_lock_path, payload)
+                .await
+                .map_err(ContentLockWriteError::Ambiguous),
+        }
+    }
+
     /// Loads a content lock by creator and canonical content lock path.
     ///
     /// Returns `Ok(None)` when the content lock is absent. Use cases decide how

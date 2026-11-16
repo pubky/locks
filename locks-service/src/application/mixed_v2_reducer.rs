@@ -33,7 +33,7 @@ pub fn reduce_mixed_snapshot(
             | PaymentRequestStateV2::ProofSubmitted
             | PaymentRequestStateV2::ActiveRecurring
     );
-    let has_threshold = status.first_threshold_satisfied.is_some();
+    let has_threshold = status.has_qualifying_evidence();
     let zero_conf_eligible = status.is_zero_conf_eligible();
 
     if has_threshold && !eligible {

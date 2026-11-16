@@ -9,8 +9,9 @@ mod viewer;
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 pub use creator::{
-    CreateContentLockRequestBuilder, Creator, DeleteContentLockMode, DeleteContentLockOptions,
-    DeleteGuardedResourceOptions, RegisterGuardedResourceOptions, SetLockServicePointerOptions,
+    CreateContentLockRequestBuilder, CreateContentLockV2RequestBuilder, Creator,
+    DeleteContentLockMode, DeleteContentLockOptions, DeleteGuardedResourceOptions,
+    RegisterGuardedResourceOptions, SetLockServicePointerOptions,
 };
 pub use locks::{
     ConnectCallback, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions, Locks, LocksOptions,

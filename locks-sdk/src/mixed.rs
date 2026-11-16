@@ -155,11 +155,7 @@ pub enum MixedPaymentInvoiceEvidence {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MixedPaymentAsset {
-    #[serde(rename = "BTC")]
-    Btc,
-}
+pub use locks_core::lock_policy::PaymentAssetV2 as MixedPaymentAsset;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +209,23 @@ pub struct MixedPaymentSample {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MixedPaymentRailEvidence {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MixedUsdtArbitrumEvidence {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MixedPaymentProviderStatus {
     pub creator: CreatorPubky,
     pub bundle_id: BundleId,
@@ -228,6 +241,10 @@ pub struct MixedPaymentProviderStatus {
     pub minimum_confirmations: u8,
     pub current_sample: Option<MixedPaymentSample>,
     pub first_threshold_satisfied: Option<MixedPaymentSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitcoin: Option<MixedPaymentRailEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usdt_arbitrum: Option<MixedUsdtArbitrumEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +319,7 @@ pub fn parse_creator_mixed_verification_evidence_response(
     value: Value,
 ) -> Result<CreatorMixedVerificationEvidenceResponse> {
     crate::viewer::reject_fields(&value, SECRET_BEARING_RESPONSE_FIELDS)?;
+    validate_provider_rail_field_presence(&value)?;
     let response: CreatorMixedVerificationEvidenceResponse =
         serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
     let canonical = matches!(
@@ -352,6 +370,12 @@ pub fn parse_creator_mixed_verification_evidence_response(
                 && provider.invoice_created_at < provider.proposal_expires_at
                 && provider.proposal_expires_at < provider.deadline
                 && provider.minimum_confirmations <= 6
+                && match provider.asset {
+                    MixedPaymentAsset::Btc => {
+                        provider.bitcoin.is_none() && provider.usdt_arbitrum.is_none()
+                    }
+                    MixedPaymentAsset::Usdt => true,
+                }
                 && provider.current_sample.as_ref().is_none_or(|sample| {
                     valid_payment_sample(sample)
                         && sample.observed_at >= provider.invoice_created_at
@@ -417,13 +441,16 @@ pub fn parse_creator_mixed_verification_evidence_response(
                     | MixedPaymentRequestState::ProofSubmitted
                     | MixedPaymentRequestState::ActiveRecurring
             ) && provider.payment_state != MixedPaymentState::Expired
+                && match provider.asset {
+                    MixedPaymentAsset::Btc => true,
+                    MixedPaymentAsset::Usdt => provider_has_qualifying_evidence(provider),
+                }
         });
     let payment_satisfied = response
         .payment
         .provider_status
         .as_ref()
-        .and_then(|provider| provider.first_threshold_satisfied.as_ref())
-        .is_some();
+        .is_some_and(provider_has_qualifying_evidence);
     let successful = matches!(
         response.status,
         VerificationTaskStatus::PublishingEntitlement | VerificationTaskStatus::Completed
@@ -502,6 +529,48 @@ fn valid_mixed_lifecycle_fields(
                 )
         }
     }
+}
+
+fn provider_has_qualifying_evidence(provider: &MixedPaymentProviderStatus) -> bool {
+    match provider.asset {
+        MixedPaymentAsset::Btc => provider.first_threshold_satisfied.is_some(),
+        MixedPaymentAsset::Usdt => {
+            provider.payment_state == MixedPaymentState::Confirmed
+                && provider.usdt_arbitrum.as_ref().is_some_and(|evidence| {
+                    evidence.confirmations > 0 && evidence.amount_matched && evidence.paid_on_time
+                })
+        }
+    }
+}
+
+fn validate_provider_rail_field_presence(value: &Value) -> Result<()> {
+    let Some(provider) = value
+        .get("payment")
+        .and_then(|payment| payment.get("provider_status"))
+    else {
+        return Ok(());
+    };
+    let Some(provider) = provider.as_object() else {
+        return Ok(());
+    };
+    match provider.get("asset").and_then(Value::as_str) {
+        Some("BTC") => {
+            if provider.contains_key("bitcoin") || provider.contains_key("usdt_arbitrum") {
+                return Err(invalid(
+                    "BTC provider status must omit rail evidence fields",
+                ));
+            }
+        }
+        Some("USDT") => {
+            if !provider.contains_key("bitcoin") || !provider.contains_key("usdt_arbitrum") {
+                return Err(invalid(
+                    "USDT provider status requires bitcoin and usdt_arbitrum fields",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn valid_payment_operational_aggregate(

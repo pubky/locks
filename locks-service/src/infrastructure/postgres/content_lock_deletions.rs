@@ -3,7 +3,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use locks_core::{
     ids::{ContentLockPath, CreatorPubky, LockId, PubkyLockResource},
-    lock_policy::{ContentLock, ContentLockPayload},
+    lock_policy::ContentLockPayload,
 };
 use sqlx::{FromRow, PgPool, Postgres, Row, Transaction};
 use time::OffsetDateTime;
@@ -93,7 +93,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         creator: &CreatorPubky,
         lock_id: &LockId,
         publication_token: Uuid,
-        original_content_lock: &ContentLock,
+        original_content_lock: &ContentLockPayload,
     ) -> Result<(), ApplicationError> {
         if !publication_intent_matches_request(
             creator,
@@ -185,8 +185,9 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
             original_content_lock.ok_or_else(|| ApplicationError::Storage {
                 message: "content lock publication intent lacks canonical material".to_owned(),
             })?;
-        let original_content_lock = serde_json::from_value::<ContentLock>(original_content_lock)
-            .map_err(storage_display)?;
+        let original_content_lock =
+            serde_json::from_value::<ContentLockPayload>(original_content_lock)
+                .map_err(storage_display)?;
         let guarded_paths = publication_guarded_paths(&original_content_lock);
         #[cfg(test)]
         if let Some((started, release)) = &self.compensation_barrier {
@@ -228,7 +229,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        published_content_lock: &ContentLock,
+        published_content_lock: &ContentLockPayload,
         published_guarded_paths: &[String],
     ) -> Result<bool, ApplicationError> {
         if !publication_reconciliation_matches(
@@ -255,8 +256,9 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         let Some((true, Some(original_content_lock))) = intent else {
             return Ok(false);
         };
-        let original_content_lock = serde_json::from_value::<ContentLock>(original_content_lock)
-            .map_err(storage_display)?;
+        let original_content_lock =
+            serde_json::from_value::<ContentLockPayload>(original_content_lock)
+                .map_err(storage_display)?;
         if original_content_lock != *published_content_lock {
             return Ok(false);
         }
@@ -309,7 +311,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
         &self,
         creator: &CreatorPubky,
         lock_id: &LockId,
-        requested_content_lock: &ContentLock,
+        requested_content_lock: &ContentLockPayload,
     ) -> Result<PublicationRecovery, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         lock_proof_admission(&mut transaction, creator, lock_id).await?;
@@ -346,7 +348,7 @@ impl ContentLockDeletionRepository for PostgresContentLockDeletionRepository {
                             .to_owned(),
                     })?;
                 let original_content_lock =
-                    serde_json::from_value::<ContentLock>(original_content_lock)
+                    serde_json::from_value::<ContentLockPayload>(original_content_lock)
                         .map_err(storage_display)?;
                 if !publication_intent_matches_request(
                     creator,
@@ -2161,9 +2163,9 @@ mod tests {
             PubkyLockResource, TaskId,
         },
         lock_policy::{
-            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, GraphParticipantV2, GraphPolicyV2,
-            GraphPredicateV2, GuardedResource, LockLogic, LockServerConfig, PaymentPolicyV2,
-            VerifierType,
+            AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload,
+            GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
+            LockServerConfig, PaymentPolicyV2, VerifierType,
         },
         verification::{
             CriterionVerificationResult, EntitlementLifetime, Proof,
@@ -2488,7 +2490,7 @@ mod tests {
                     &job.creator,
                     &job.lock_id,
                     Uuid::new_v4(),
-                    job.frozen_content_lock.as_v1().unwrap(),
+                    &job.frozen_content_lock,
                 )
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
@@ -3103,7 +3105,7 @@ mod tests {
                 &completed_lock.creator,
                 &completed_lock_id,
                 completed_token,
-                &completed_lock,
+                &ContentLockPayload::V1(completed_lock.clone()),
             )
             .await
             .unwrap();
@@ -3155,7 +3157,7 @@ mod tests {
                 &recoverable_lock.creator,
                 &recoverable_lock_id,
                 recoverable_token,
-                &recoverable_lock,
+                &ContentLockPayload::V1(recoverable_lock.clone()),
             )
             .await
             .unwrap();
@@ -3324,7 +3326,12 @@ mod tests {
         let token = Uuid::new_v4();
 
         repository
-            .begin_publication(&lock.creator, &lock_id, token, &lock)
+            .begin_publication(
+                &lock.creator,
+                &lock_id,
+                token,
+                &ContentLockPayload::V1(lock.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3355,7 +3362,12 @@ mod tests {
         );
         assert_eq!(
             repository
-                .begin_publication(&lock.creator, &lock_id, Uuid::new_v4(), &lock)
+                .begin_publication(
+                    &lock.creator,
+                    &lock_id,
+                    Uuid::new_v4(),
+                    &ContentLockPayload::V1(lock.clone()),
+                )
                 .await,
             Err(ApplicationError::ContentLockDeletionInProgress)
         );

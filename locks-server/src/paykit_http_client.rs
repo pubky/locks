@@ -7,9 +7,10 @@ use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::lock_policy::PaykitPaymentAsset;
 use locks_service::application::models::{
     BitcoinOutpointV2 as PaymentProviderOutpoint, PaymentAssetV2, PaymentProviderCreateRequest,
-    PaymentProviderStatus, PaymentRequestStateV2 as PaymentProviderRequestState,
+    PaymentProviderStatus, PaymentRailEvidenceV2,
+    PaymentRequestStateV2 as PaymentProviderRequestState,
     PaymentSampleStatusV2 as PaymentProviderSampleStatus, PaymentSampleV2 as PaymentProviderSample,
-    PaymentStateV2 as PaymentProviderPaymentState,
+    PaymentStateV2 as PaymentProviderPaymentState, UsdtArbitrumEvidenceV2,
 };
 use locks_service::application::ports::{
     PaykitAuthority, PaymentDrainCleanupToken, PaymentDrainClient, PaymentDrainClientError,
@@ -93,6 +94,46 @@ struct ProviderV2StatusWireResponse {
     minimum_confirmations: u8,
     current_sample: Option<ProviderV2SampleWire>,
     first_threshold_satisfied: Option<ProviderV2SampleWire>,
+    #[serde(default)]
+    bitcoin: ProviderV2NullableField<ProviderV2RailEvidenceWire>,
+    #[serde(default)]
+    usdt_arbitrum: ProviderV2NullableField<ProviderV2UsdtEvidenceWire>,
+}
+
+#[derive(Debug, Default)]
+enum ProviderV2NullableField<T> {
+    #[default]
+    Missing,
+    Present(Option<T>),
+}
+
+impl<'de, T> Deserialize<'de> for ProviderV2NullableField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2RailEvidenceWire {
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderV2UsdtEvidenceWire {
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+    finalized: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -669,7 +710,7 @@ impl PaymentProviderClient for PaykitHttpClient {
             payment: ProviderV2PaymentBody {
                 recipient_pubky: &recipient,
                 amount: &request.payment.amount,
-                asset: "BTC",
+                asset: request.payment.asset.as_str(),
                 minimum_confirmations: request.payment.minimum_confirmations,
             },
             deadline,
@@ -725,9 +766,38 @@ impl PaymentProviderClient for PaykitHttpClient {
             read_bounded_json(response, PAYMENT_PROVIDER_V2_BODY_LIMIT)
                 .await
                 .map_err(map_provider_body_error)?;
+        let asset = match wire.asset.as_str() {
+            "BTC" => PaymentAssetV2::Btc,
+            "USDT" => PaymentAssetV2::Usdt,
+            _ => return Err(invalid_provider_response()),
+        };
+        let (bitcoin, usdt_arbitrum) = match (asset, wire.bitcoin, wire.usdt_arbitrum) {
+            (
+                PaymentAssetV2::Btc,
+                ProviderV2NullableField::Missing,
+                ProviderV2NullableField::Missing,
+            ) => (None, None),
+            (
+                PaymentAssetV2::Usdt,
+                ProviderV2NullableField::Present(bitcoin),
+                ProviderV2NullableField::Present(usdt_arbitrum),
+            ) => (
+                bitcoin.map(|evidence| PaymentRailEvidenceV2 {
+                    confirmations: evidence.confirmations,
+                    amount_matched: evidence.amount_matched,
+                    paid_on_time: evidence.paid_on_time,
+                }),
+                usdt_arbitrum.map(|evidence| UsdtArbitrumEvidenceV2 {
+                    confirmations: evidence.confirmations,
+                    amount_matched: evidence.amount_matched,
+                    paid_on_time: evidence.paid_on_time,
+                    finalized: evidence.finalized,
+                }),
+            ),
+            _ => return Err(invalid_provider_response()),
+        };
         if wire.creator != creator_text
             || wire.bundle_id != bundle_text
-            || wire.asset != "BTC"
             || wire.minimum_confirmations > 6
         {
             return Err(invalid_provider_response());
@@ -740,7 +810,7 @@ impl PaymentProviderClient for PaykitHttpClient {
             invoice_created_at: parse_canonical_provider_time(&wire.invoice_created_at)?,
             proposal_expires_at: parse_canonical_provider_time(&wire.proposal_expires_at)?,
             deadline: parse_canonical_provider_time(&wire.deadline)?,
-            asset: PaymentAssetV2::Btc,
+            asset,
             minimum_confirmations: wire.minimum_confirmations,
             current_sample: wire
                 .current_sample
@@ -750,6 +820,8 @@ impl PaymentProviderClient for PaykitHttpClient {
                 .first_threshold_satisfied
                 .map(provider_sample_from_wire)
                 .transpose()?,
+            bitcoin,
+            usdt_arbitrum,
         };
         status.validate().map_err(|_| invalid_provider_response())?;
         Ok(status)
@@ -1354,6 +1426,170 @@ mod tests {
                 .await,
             Err(PaymentDrainClientError::Transport)
         );
+    }
+
+    #[tokio::test]
+    async fn provider_v2_create_preserves_usdt_asset_and_millionths() {
+        let captured = CapturedRequests::default();
+        let server_url = spawn_provider_v2_create_server(captured.clone()).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let request = PaymentProviderCreateRequest {
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+            lock_resource: locks_core::ids::PubkyLockResource::from_str(LOCK_RESOURCE).unwrap(),
+            reader: CreatorPubky::from_str(READER).unwrap(),
+            payment: locks_service::application::models::PaymentTermsV2 {
+                recipient_pubky: CreatorPubky::from_str(CREATOR).unwrap(),
+                amount: "5000001".to_owned(),
+                amount_units: 5_000_001,
+                asset: PaymentAssetV2::Usdt,
+                minimum_confirmations: 6,
+            },
+            deadline: datetime!(2026-09-25 12:00:00 UTC),
+        };
+
+        let response = PaymentProviderClient::create_invoice(&client, &request)
+            .await
+            .unwrap();
+        assert_eq!(response.deadline, request.deadline);
+        let captured = captured.single();
+        assert_eq!(captured.path, "/v2/invoices");
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["payment"]["asset"], "USDT");
+        assert_eq!(body["payment"]["amount"], "5000001");
+        assert_eq!(body["payment"]["minimum_confirmations"], 6);
+    }
+
+    #[tokio::test]
+    async fn provider_v2_status_parses_qualifying_usdt_arbitrum_evidence_independently() {
+        let body = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "request_state": "accepted",
+            "payment_state": "confirmed",
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "proposal_expires_at": "2026-09-25T11:30:00Z",
+            "deadline": "2026-09-25T12:00:00Z",
+            "asset": "USDT",
+            "minimum_confirmations": 6,
+            "current_sample": {
+                "observed_at": "2026-09-25T11:10:00Z",
+                "status": "confirmed",
+                "outpoint": {"txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "vout": 1},
+                "confirmations": 6,
+                "amount_matched": true
+            },
+            "first_threshold_satisfied": {
+                "observed_at": "2026-09-25T11:10:00Z",
+                "status": "confirmed",
+                "outpoint": {"txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "vout": 1},
+                "confirmations": 6,
+                "amount_matched": true
+            },
+            "bitcoin": {"confirmations": 6, "amount_matched": true, "paid_on_time": true},
+            "usdt_arbitrum": {"confirmations": 1, "amount_matched": true, "paid_on_time": true, "finalized": false}
+        });
+        let server_url =
+            spawn_provider_v2_status_server(Box::leak(body.to_string().into_boxed_str())).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+
+        let status = PaymentProviderClient::invoice_status(
+            &client,
+            &CreatorPubky::from_str(CREATOR).unwrap(),
+            &BundleId::from_str(BUNDLE_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.asset, PaymentAssetV2::Usdt);
+        assert!(status.current_sample.is_some());
+        assert!(status.first_threshold_satisfied.is_some());
+        assert_eq!(status.bitcoin.unwrap().confirmations, 6);
+        let usdt = status.usdt_arbitrum.unwrap();
+        assert_eq!(usdt.confirmations, 1);
+        assert!(usdt.amount_matched);
+        assert!(usdt.paid_on_time);
+        assert!(!usdt.finalized);
+    }
+
+    #[tokio::test]
+    async fn provider_v2_usdt_status_requires_both_rail_fields_even_when_null() {
+        let body = json!({
+            "creator": CREATOR,
+            "bundle_id": BUNDLE_ID,
+            "request_state": "accepted",
+            "payment_state": "undetected",
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "proposal_expires_at": "2026-09-25T11:30:00Z",
+            "deadline": "2026-09-25T12:00:00Z",
+            "asset": "USDT",
+            "minimum_confirmations": 6,
+            "current_sample": null,
+            "first_threshold_satisfied": null,
+            "bitcoin": null,
+            "usdt_arbitrum": null
+        });
+        let server_url =
+            spawn_provider_v2_status_server(Box::leak(body.to_string().into_boxed_str())).await;
+        let client = PaykitHttpClient::from_parts(
+            &server_url,
+            reqwest::Client::new(),
+            Keypair::from_secret(&[9_u8; 32]),
+        )
+        .unwrap();
+        let status = PaymentProviderClient::invoice_status(
+            &client,
+            &CreatorPubky::from_str(CREATOR).unwrap(),
+            &BundleId::from_str(BUNDLE_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(status.bitcoin.is_none());
+        assert!(status.usdt_arbitrum.is_none());
+
+        for missing in ["bitcoin", "usdt_arbitrum"] {
+            let mut body = json!({
+                "creator": CREATOR,
+                "bundle_id": BUNDLE_ID,
+                "request_state": "accepted",
+                "payment_state": "undetected",
+                "invoice_created_at": "2026-09-25T11:00:00Z",
+                "proposal_expires_at": "2026-09-25T11:30:00Z",
+                "deadline": "2026-09-25T12:00:00Z",
+                "asset": "USDT",
+                "minimum_confirmations": 6,
+                "current_sample": null,
+                "first_threshold_satisfied": null,
+                "bitcoin": null,
+                "usdt_arbitrum": null
+            });
+            body.as_object_mut().unwrap().remove(missing);
+            let server_url =
+                spawn_provider_v2_status_server(Box::leak(body.to_string().into_boxed_str())).await;
+            let client = PaykitHttpClient::from_parts(
+                &server_url,
+                reqwest::Client::new(),
+                Keypair::from_secret(&[9_u8; 32]),
+            )
+            .unwrap();
+
+            let error = PaymentProviderClient::invoice_status(
+                &client,
+                &CreatorPubky::from_str(CREATOR).unwrap(),
+                &BundleId::from_str(BUNDLE_ID).unwrap(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, PaymentProviderErrorKind::InvalidResponse);
+        }
     }
 
     #[test]
@@ -2163,6 +2399,34 @@ mod tests {
         body: Vec<u8>,
     }
 
+    async fn spawn_provider_v2_create_server(captured: CapturedRequests) -> String {
+        let app = Router::new()
+            .route("/v2/invoices", post(capture_provider_v2_create))
+            .with_state(captured);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_provider_v2_status_server(body: &'static str) -> String {
+        async fn provider_v2_status(State(body): State<&'static str>) -> impl IntoResponse {
+            (StatusCode::OK, body)
+        }
+
+        let app = Router::new()
+            .route("/v2/invoices/status", post(provider_v2_status))
+            .with_state(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     async fn spawn_test_server(captured: CapturedRequests) -> String {
         let app = Router::new()
             .route("/invoices", post(capture_invoice))
@@ -2407,6 +2671,26 @@ mod tests {
     async fn hang() -> impl IntoResponse {
         std::future::pending::<()>().await;
         axum::http::StatusCode::OK
+    }
+
+    async fn capture_provider_v2_create(
+        State(captured): State<CapturedRequests>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        captured.push(CapturedRequest {
+            path: "/v2/invoices".to_owned(),
+            signature: headers
+                .get(SIGNATURE_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            request_id: None,
+            body: body.to_vec(),
+        });
+        Json(json!({
+            "invoice_created_at": "2026-09-25T11:00:00Z",
+            "proposal_expires_at": "2026-09-25T11:30:00Z",
+            "deadline": "2026-09-25T12:00:00Z"
+        }))
     }
 
     async fn capture_invoice(

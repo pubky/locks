@@ -1,4 +1,5 @@
 use locks_core::ids::{BundleId, CreatorPubky, LockHash, LockId, PubkyLockResource, TaskId};
+pub use locks_core::lock_policy::PaymentAssetV2;
 use locks_core::lock_policy::PaymentPolicyV2;
 use locks_core::verification::{SubmittedProofBundleV2, VerifiedProofBundleV2};
 use serde::{Deserialize, Serialize};
@@ -177,17 +178,16 @@ impl PaymentTaskSnapshotV1 {
             .clone()
             .ok_or_else(|| "payment task requires reader".to_owned())?;
         let creator = submitted.pubky_lock_resource.creator().clone();
-        if payment.recipient_pubky != creator
-            || payment.asset != "BTC"
-            || payment.minimum_confirmations > 6
-        {
+        let asset = PaymentAssetV2::parse(&payment.asset)
+            .map_err(|_| "invalid payment task policy".to_owned())?;
+        if payment.recipient_pubky != creator || payment.minimum_confirmations > 6 {
             return Err("invalid payment task policy".to_owned());
         }
-        let amount_sats = payment
+        let amount_units = payment
             .amount
             .parse::<u64>()
             .map_err(|_| "invalid payment task amount".to_owned())?;
-        if amount_sats == 0 || !payment.amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        if amount_units == 0 || !payment.amount.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err("invalid payment task amount".to_owned());
         }
         let seconds = i64::try_from(verification_window_seconds)
@@ -209,8 +209,8 @@ impl PaymentTaskSnapshotV1 {
             payment: PaymentTermsV2 {
                 recipient_pubky: payment.recipient_pubky,
                 amount: payment.amount,
-                amount_sats,
-                asset: PaymentAssetV2::Btc,
+                amount_units,
+                asset,
                 minimum_confirmations: payment.minimum_confirmations,
             },
             accepted_at,
@@ -419,7 +419,11 @@ fn validate_timestamp(value: OffsetDateTime) -> Result<(), String> {
 pub struct PaymentTermsV2 {
     pub recipient_pubky: CreatorPubky,
     pub amount: String,
-    pub amount_sats: u64,
+    /// Exact rail-native amount: satoshis for BTC, millionths for USDT.
+    ///
+    /// Persisted snapshot v1 retains legacy `amount_sats` field name for BTC compatibility.
+    #[serde(rename = "amount_sats")]
+    pub amount_units: u64,
     pub asset: PaymentAssetV2,
     pub minimum_confirmations: u8,
 }
@@ -427,22 +431,15 @@ pub struct PaymentTermsV2 {
 impl PaymentTermsV2 {
     fn validate(&self, creator: &CreatorPubky) -> Result<(), String> {
         if &self.recipient_pubky != creator
-            || self.amount_sats == 0
-            || self.amount.parse::<u64>().ok() != Some(self.amount_sats)
+            || self.amount_units == 0
+            || self.amount.parse::<u64>().ok() != Some(self.amount_units)
             || !self.amount.bytes().all(|byte| byte.is_ascii_digit())
-            || self.asset != PaymentAssetV2::Btc
             || self.minimum_confirmations > 6
         {
             return Err("invalid persisted payment terms".to_owned());
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PaymentAssetV2 {
-    #[serde(rename = "BTC")]
-    Btc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,11 +551,46 @@ pub struct PaymentProviderStatus {
     pub minimum_confirmations: u8,
     pub current_sample: Option<PaymentSampleV2>,
     pub first_threshold_satisfied: Option<PaymentSampleV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitcoin: Option<PaymentRailEvidenceV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usdt_arbitrum: Option<UsdtArbitrumEvidenceV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct PaymentRailEvidenceV2 {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct UsdtArbitrumEvidenceV2 {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+    pub finalized: bool,
 }
 
 impl PaymentProviderStatus {
+    pub(crate) fn has_qualifying_evidence(&self) -> bool {
+        match self.asset {
+            PaymentAssetV2::Btc => self.first_threshold_satisfied.is_some(),
+            PaymentAssetV2::Usdt => {
+                self.payment_state == PaymentStateV2::Confirmed
+                    && self.usdt_arbitrum.as_ref().is_some_and(|evidence| {
+                        evidence.confirmations > 0
+                            && evidence.amount_matched
+                            && evidence.paid_on_time
+                    })
+            }
+        }
+    }
+
     pub(crate) fn is_zero_conf_eligible(&self) -> bool {
-        matches!(
+        let eligible_lifecycle = matches!(
             self.request_state,
             PaymentRequestStateV2::Accepted
                 | PaymentRequestStateV2::ProofSubmitted
@@ -566,14 +598,19 @@ impl PaymentProviderStatus {
         ) && matches!(
             self.payment_state,
             PaymentStateV2::Detected | PaymentStateV2::Confirmed
-        ) && self.current_sample.as_ref().is_some_and(|sample| {
-            matches!(
-                sample.status,
-                PaymentSampleStatusV2::Detected | PaymentSampleStatusV2::Confirmed
-            ) && sample.outpoint.is_some()
-                && sample.amount_matched
-                && sample.observed_at <= self.deadline
-        })
+        );
+        eligible_lifecycle
+            && match self.asset {
+                PaymentAssetV2::Btc => self.current_sample.as_ref().is_some_and(|sample| {
+                    matches!(
+                        sample.status,
+                        PaymentSampleStatusV2::Detected | PaymentSampleStatusV2::Confirmed
+                    ) && sample.outpoint.is_some()
+                        && sample.amount_matched
+                        && sample.observed_at <= self.deadline
+                }),
+                PaymentAssetV2::Usdt => self.has_qualifying_evidence(),
+            }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -587,9 +624,13 @@ impl PaymentProviderStatus {
         if self.invoice_created_at >= self.proposal_expires_at
             || self.proposal_expires_at >= self.deadline
             || self.minimum_confirmations > 6
-            || self.asset != PaymentAssetV2::Btc
         {
             return Err("invalid provider status envelope".to_owned());
+        }
+        if self.asset == PaymentAssetV2::Btc
+            && (self.bitcoin.is_some() || self.usdt_arbitrum.is_some())
+        {
+            return Err("BTC provider status contains foreign rail evidence".to_owned());
         }
         if let Some(current) = &self.current_sample {
             current.validate()?;
@@ -617,7 +658,7 @@ impl PaymentProviderStatus {
         if self.creator != snapshot.creator
             || self.bundle_id != snapshot.bundle_id
             || self.deadline != snapshot.deadline_at
-            || self.asset != PaymentAssetV2::Btc
+            || self.asset != snapshot.payment.asset
             || self.minimum_confirmations != snapshot.payment.minimum_confirmations
         {
             return Err("provider status binding mismatch".to_owned());

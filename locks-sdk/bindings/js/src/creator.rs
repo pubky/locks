@@ -275,6 +275,180 @@ impl CreateContentLockRequestBuilder {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CreateContentLockV2RequestBuilderState {
+    primary_resource: Option<serde_json::Value>,
+    secondary_resources: serde_json::Map<String, serde_json::Value>,
+    payment: Option<serde_json::Value>,
+    graph: Option<serde_json::Value>,
+    verification_window_seconds: Option<u64>,
+    access_policy: Option<serde_json::Value>,
+    lock_server: Option<serde_json::Value>,
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Default)]
+pub struct CreateContentLockV2RequestBuilder {
+    state: Rc<RefCell<CreateContentLockV2RequestBuilderState>>,
+}
+
+#[wasm_bindgen]
+impl CreateContentLockV2RequestBuilder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[wasm_bindgen(js_name = primaryResource)]
+    pub fn primary_resource(&self, resource: JsValue) -> crate::js_error::JsResult<Self> {
+        self.state.borrow_mut().primary_resource =
+            Some(js_value_to_json(resource, "primary resource")?);
+        Ok(self.clone())
+    }
+
+    #[wasm_bindgen(js_name = secondaryResource)]
+    pub fn secondary_resource(&self, resource: JsValue) -> crate::js_error::JsResult<Self> {
+        let resource = js_value_to_json(resource, "secondary resource")?;
+        self.add_secondary_resource(resource)
+            .map_err(crate::js_error::invalid_input)?;
+        Ok(self.clone())
+    }
+
+    #[wasm_bindgen(js_name = secondaryResources)]
+    pub fn secondary_resources(&self, resources: JsValue) -> crate::js_error::JsResult<Self> {
+        let resources = js_value_to_json(resources, "secondary resources")?;
+        let resources = resources.as_object().ok_or_else(|| {
+            crate::js_error::invalid_input("secondary resources must be an object")
+        })?;
+        self.state.borrow_mut().secondary_resources = resources.clone();
+        Ok(self.clone())
+    }
+
+    pub fn payment(&self, payment: JsValue) -> crate::js_error::JsResult<Self> {
+        self.state.borrow_mut().payment = Some(js_value_to_json(payment, "payment")?);
+        Ok(self.clone())
+    }
+
+    pub fn graph(&self, graph: JsValue) -> crate::js_error::JsResult<Self> {
+        self.state.borrow_mut().graph = Some(js_value_to_json(graph, "graph")?);
+        Ok(self.clone())
+    }
+
+    #[wasm_bindgen(js_name = verificationWindowSeconds)]
+    pub fn verification_window_seconds(&self, seconds: u32) -> Self {
+        self.state.borrow_mut().verification_window_seconds = Some(u64::from(seconds));
+        self.clone()
+    }
+
+    #[wasm_bindgen(js_name = accessPolicy)]
+    pub fn access_policy(&self, access_policy: JsValue) -> crate::js_error::JsResult<Self> {
+        self.state.borrow_mut().access_policy =
+            Some(js_value_to_json(access_policy, "access policy")?);
+        Ok(self.clone())
+    }
+
+    #[wasm_bindgen(js_name = lockServer)]
+    pub fn lock_server(&self, lock_server: JsValue) -> crate::js_error::JsResult<Self> {
+        self.state.borrow_mut().lock_server = Some(js_value_to_json(lock_server, "lock server")?);
+        Ok(self.clone())
+    }
+
+    pub fn build(&self) -> crate::js_error::JsResult<JsValue> {
+        to_plain_js_value(&self.build_value().map_err(crate::js_error::invalid_input)?).map_err(
+            |err| {
+                crate::js_error::invalid_input(format!("invalid content lock v2 request: {err:?}"))
+            },
+        )
+    }
+}
+
+impl CreateContentLockV2RequestBuilder {
+    fn add_secondary_resource(&self, resource: serde_json::Value) -> Result<(), String> {
+        let path = resource_path(&resource, "secondary resource")?;
+        let secondary = secondary_descriptor_from_resource(&resource)?;
+        let mut state = self.state.borrow_mut();
+        if state.secondary_resources.contains_key(&path) {
+            return Err(format!("duplicate secondary resource path: {path}"));
+        }
+        if state
+            .primary_resource
+            .as_ref()
+            .and_then(|primary| resource_path(primary, "primary resource").ok())
+            .as_deref()
+            == Some(path.as_str())
+        {
+            return Err(format!(
+                "primary resource path also appears as secondary resource: {path}"
+            ));
+        }
+        state.secondary_resources.insert(path, secondary);
+        Ok(())
+    }
+
+    fn build_value(&self) -> Result<serde_json::Value, String> {
+        let state = self.state.borrow();
+        let mut body = serde_json::Map::new();
+        body.insert("version".to_owned(), serde_json::json!(2));
+        let primary_path = match &state.primary_resource {
+            Some(primary_resource) => {
+                let path = resource_path(primary_resource, "primary resource")?;
+                body.insert("primary_resource".to_owned(), primary_resource.clone());
+                Some(path)
+            }
+            None => None,
+        };
+        if state.secondary_resources.is_empty() && primary_path.is_none() {
+            return Err("content lock request requires at least one resource".to_owned());
+        }
+        if let Some(primary_path) = &primary_path
+            && state.secondary_resources.contains_key(primary_path)
+        {
+            return Err(format!(
+                "primary resource path also appears as secondary resource: {primary_path}"
+            ));
+        }
+        if !state.secondary_resources.is_empty() {
+            body.insert(
+                "secondary_resources".to_owned(),
+                serde_json::Value::Object(state.secondary_resources.clone()),
+            );
+        }
+        if state.payment.is_none() && state.graph.is_none() {
+            return Err("content lock v2 request requires payment or graph".to_owned());
+        }
+        if let Some(payment) = &state.payment {
+            body.insert("payment".to_owned(), payment.clone());
+        }
+        if let Some(graph) = &state.graph {
+            body.insert("graph".to_owned(), graph.clone());
+        }
+        body.insert(
+            "verification_window_seconds".to_owned(),
+            serde_json::json!(state.verification_window_seconds.ok_or_else(|| {
+                "content lock v2 request requires verification window".to_owned()
+            })?),
+        );
+        body.insert(
+            "access_policy".to_owned(),
+            state
+                .access_policy
+                .clone()
+                .ok_or_else(|| "content lock v2 request requires access policy".to_owned())?,
+        );
+        body.insert(
+            "lock_server".to_owned(),
+            state
+                .lock_server
+                .clone()
+                .ok_or_else(|| "content lock v2 request requires lock server".to_owned())?,
+        );
+        let value = serde_json::Value::Object(body);
+        serde_json::from_value::<locks_sdk::CreateContentLockV2Request>(value.clone())
+            .map_err(|err| format!("invalid content lock v2 request: {err}"))?;
+        Ok(value)
+    }
+}
+
 fn resource_path(resource: &serde_json::Value, label: &str) -> Result<String, String> {
     resource
         .get("path")
@@ -660,7 +834,7 @@ impl Creator {
         &self,
         body: serde_json::Value,
     ) -> Result<JsAuthorizedRequestPlan, String> {
-        let request = serde_json::from_value::<locks_sdk::CreateContentLockRequest>(body)
+        let request = serde_json::from_value::<locks_sdk::CreateContentLockPayload>(body)
             .map_err(|err| format!("invalid content lock request: {err}"))?;
         Ok(self
             .authorized_request_plan(self.session.inner().creator().create_content_lock(request)))
@@ -714,6 +888,213 @@ fn validate_verification_evidence_response_for_tests(
         _ => return Err("invalid verification evidence mode".to_owned()),
     }
     Ok(value)
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod browser_tests {
+    use std::str::FromStr;
+
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    fn browser_session() -> Session {
+        let lock_server =
+            LockServerPubky::from_str("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo")
+                .unwrap();
+        let client = locks_sdk::LocksClient::for_server(lock_server);
+        Session::new(
+            client.restore_session("frontend-session-secret"),
+            client,
+            crate::locks::LocksOptions::new(),
+        )
+    }
+
+    fn js(value: serde_json::Value) -> JsValue {
+        serde_wasm_bindgen::to_value(&value).unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    fn v2_builder_feeds_common_creator_transport_for_btc_and_usdt() {
+        let hash = serde_json::to_value(locks_core::ids::GuardedResourceHash::from_bytes([7; 32]))
+            .unwrap();
+        let builder = CreateContentLockV2RequestBuilder::new();
+        builder
+            .primary_resource(js(serde_json::json!({
+                "path": "/priv/app.locks/content/example.txt",
+                "hash": hash,
+                "content_type": "text/plain",
+                "size": 13
+            })))
+            .unwrap()
+            .payment(js(serde_json::json!({
+                "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                "amount": "50000",
+                "asset": "BTC",
+                "minimum_confirmations": 1
+            })))
+            .unwrap()
+            .verification_window_seconds(300)
+            .access_policy(js(serde_json::json!({
+                "requested_credential_ttl_seconds": 900
+            })))
+            .unwrap()
+            .lock_server(js(serde_json::json!({ "override": null })))
+            .unwrap();
+
+        let body = js_value_to_json(builder.build().unwrap(), "v2 request").unwrap();
+        let plan = Creator::new(browser_session())
+            .create_build_content_lock_request(body)
+            .unwrap();
+        assert_eq!(plan.method, "POST");
+        assert_eq!(plan.path, "/creator/content-locks");
+        let JsRequestBody::Json(body) = plan.body else {
+            panic!("common creator transport must send JSON");
+        };
+        assert_eq!(body["version"], 2);
+        assert_eq!(body["payment"]["asset"], "BTC");
+
+        let usdt = CreateContentLockV2RequestBuilder::new();
+        usdt.primary_resource(js(serde_json::json!({
+            "path": "/priv/app.locks/content/example.txt",
+            "hash": hash,
+            "content_type": "text/plain",
+            "size": 13
+        })))
+        .unwrap()
+        .payment(js(serde_json::json!({
+            "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "amount": "5000001",
+            "asset": "USDT",
+            "minimum_confirmations": 1
+        })))
+        .unwrap()
+        .verification_window_seconds(300)
+        .access_policy(js(serde_json::json!({
+            "requested_credential_ttl_seconds": 900
+        })))
+        .unwrap()
+        .lock_server(js(serde_json::json!({ "override": null })))
+        .unwrap();
+        let body = js_value_to_json(usdt.build().unwrap(), "v2 request").unwrap();
+        let JsRequestBody::Json(body) = Creator::new(browser_session())
+            .create_build_content_lock_request(body)
+            .unwrap()
+            .body
+        else {
+            panic!("common creator transport must send JSON");
+        };
+        assert_eq!(body["payment"]["asset"], "USDT");
+    }
+
+    #[wasm_bindgen_test]
+    fn mixed_usdt_evidence_crosses_js_wasm_validation_boundary() {
+        let completed = serde_json::json!({
+            "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "reader": "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+            "bundle_id": "000G40R40M30E209185GR38E1W",
+            "pubky_lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            "mode": "mixed",
+            "status": "completed",
+            "submitted_at": "2026-11-03T12:00:00Z",
+            "deadline_at": "2026-11-03T12:10:00Z",
+            "completed_at": "2026-11-03T12:01:00Z",
+            "satisfied_by": ["payment"],
+            "graph": {"predicates": [{
+                "index": 0,
+                "predicate": {"type":"follows", "follower":"reader", "followed":"creator"},
+                "state": "pending"
+            }]},
+            "payment": {
+                "invoice": {
+                    "status": "created",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z"
+                },
+                "provider_status": {
+                    "creator": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+                    "bundle_id": "000G40R40M30E209185GR38E1W",
+                    "request_state": "accepted",
+                    "payment_state": "confirmed",
+                    "invoice_created_at": "2026-11-03T12:00:05Z",
+                    "proposal_expires_at": "2026-11-03T12:05:00Z",
+                    "deadline": "2026-11-03T12:10:00Z",
+                    "asset": "USDT",
+                    "minimum_confirmations": 6,
+                    "current_sample": null,
+                    "first_threshold_satisfied": null,
+                    "bitcoin": {
+                        "confirmations": 6,
+                        "amount_matched": true,
+                        "paid_on_time": true
+                    },
+                    "usdt_arbitrum": {
+                        "confirmations": 1,
+                        "amount_matched": true,
+                        "paid_on_time": true,
+                        "finalized": false
+                    }
+                },
+                "operational_failure_count": 0,
+                "operational_failure_total": 0
+            }
+        });
+        validate_verification_evidence_response_for_tests(completed.clone()).unwrap();
+
+        let mut pending = completed.clone();
+        pending["status"] = serde_json::json!("in_progress");
+        pending["satisfied_by"] = serde_json::json!([]);
+        pending.as_object_mut().unwrap().remove("completed_at");
+        pending["payment"]["provider_status"]["payment_state"] = serde_json::json!("undetected");
+        pending["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        pending["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        validate_verification_evidence_response_for_tests(pending).unwrap();
+
+        for missing in ["bitcoin", "usdt_arbitrum"] {
+            let mut invalid = completed.clone();
+            invalid["payment"]["provider_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(validate_verification_evidence_response_for_tests(invalid).is_err());
+        }
+
+        let mut bitcoin_only = completed.clone();
+        bitcoin_only["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] =
+            serde_json::json!(0);
+        bitcoin_only["payment"]["provider_status"]["first_threshold_satisfied"] = serde_json::json!({
+            "observed_at": "2026-11-03T12:00:30Z",
+            "status": "confirmed",
+            "outpoint": {
+                "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vout": 0
+            },
+            "confirmations": 6,
+            "amount_matched": true
+        });
+        assert!(validate_verification_evidence_response_for_tests(bitcoin_only).is_err());
+
+        let mut graph_without_qualifying_usdt = completed;
+        graph_without_qualifying_usdt["satisfied_by"] = serde_json::json!(["zero_conf_graph"]);
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["state"] =
+            serde_json::json!("satisfied");
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["first_true_observation"] = serde_json::json!({
+            "outcome": "true",
+            "observed_at": "2026-11-03T12:00:30Z",
+            "origin": "https://nexus.example",
+            "http_status": 200
+        });
+        graph_without_qualifying_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        graph_without_qualifying_usdt["payment"]["provider_status"]["bitcoin"] =
+            serde_json::Value::Null;
+        graph_without_qualifying_usdt["payment"]["provider_status"]["usdt_arbitrum"] =
+            serde_json::Value::Null;
+        assert!(
+            validate_verification_evidence_response_for_tests(graph_without_qualifying_usdt)
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1305,105 @@ mod tests {
         let err = builder.build_value().unwrap_err();
 
         assert!(format!("{err:?}").contains("at least one resource"));
+    }
+
+    #[test]
+    fn create_content_lock_v2_builder_builds_graph_payment_and_mixed_requests() {
+        let graph = serde_json::json!({
+            "predicates": [{
+                "type": "follows",
+                "follower": "reader",
+                "followed": "creator"
+            }]
+        });
+        let payment = serde_json::json!({
+            "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "amount": "50000",
+            "asset": "BTC",
+            "minimum_confirmations": 1
+        });
+        let valid_hash =
+            serde_json::to_value(locks_core::ids::GuardedResourceHash::from_bytes([7; 32]))
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+        for (payment, graph) in [
+            (None, Some(graph.clone())),
+            (Some(payment.clone()), None),
+            (Some(payment.clone()), Some(graph.clone())),
+        ] {
+            let builder = CreateContentLockV2RequestBuilder::new();
+            builder.state.borrow_mut().primary_resource = Some(resource(
+                "/priv/app.locks/content/example.txt",
+                &valid_hash,
+                13,
+            ));
+            builder.state.borrow_mut().payment = payment;
+            builder.state.borrow_mut().graph = graph;
+            builder.state.borrow_mut().verification_window_seconds = Some(300);
+            builder.state.borrow_mut().access_policy = Some(serde_json::json!({
+                "requested_credential_ttl_seconds": 900
+            }));
+            builder.state.borrow_mut().lock_server = Some(serde_json::json!({
+                "override": null
+            }));
+
+            let body = builder.build_value().unwrap();
+            assert_eq!(body["version"], 2);
+            assert!(body.get("criteria").is_none());
+            assert!(body.get("lock_logic").is_none());
+        }
+    }
+
+    #[test]
+    fn create_content_lock_v2_builder_rejects_missing_policy() {
+        let builder = CreateContentLockV2RequestBuilder::new();
+        builder.state.borrow_mut().primary_resource =
+            Some(resource("/priv/app.locks/content/example.txt", "hash", 13));
+        builder.state.borrow_mut().verification_window_seconds = Some(300);
+        builder.state.borrow_mut().access_policy = Some(serde_json::json!({
+            "requested_credential_ttl_seconds": 900
+        }));
+        builder.state.borrow_mut().lock_server = Some(serde_json::json!({
+            "override": null
+        }));
+
+        let err = builder.build_value().unwrap_err();
+        assert!(err.contains("payment or graph"));
+    }
+
+    #[test]
+    fn create_content_lock_v2_builder_accepts_usdt_and_rejects_unsupported_asset() {
+        let valid_hash =
+            serde_json::to_value(locks_core::ids::GuardedResourceHash::from_bytes([7; 32]))
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let builder = CreateContentLockV2RequestBuilder::new();
+        builder.state.borrow_mut().primary_resource = Some(resource(
+            "/priv/app.locks/content/example.txt",
+            &valid_hash,
+            13,
+        ));
+        builder.state.borrow_mut().payment = Some(serde_json::json!({
+            "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+            "amount": "5000001",
+            "asset": "USDT",
+            "minimum_confirmations": 0
+        }));
+        builder.state.borrow_mut().verification_window_seconds = Some(300);
+        builder.state.borrow_mut().access_policy =
+            Some(serde_json::json!({ "requested_credential_ttl_seconds": 900 }));
+        builder.state.borrow_mut().lock_server = Some(serde_json::json!({ "override": null }));
+
+        let body = builder.build_value().unwrap();
+        assert_eq!(body["payment"]["asset"], "USDT");
+        assert_eq!(body["payment"]["amount"], "5000001");
+
+        builder.state.borrow_mut().payment.as_mut().unwrap()["asset"] = serde_json::json!("USD");
+        assert!(builder.build_value().is_err());
     }
 
     #[test]
@@ -1212,6 +1692,86 @@ mod tests {
         assert_eq!(
             validate_verification_evidence_response_for_tests(evidence.clone()).unwrap(),
             evidence
+        );
+
+        let mut completed_usdt = evidence.clone();
+        completed_usdt["status"] = serde_json::json!("completed");
+        completed_usdt["completed_at"] = serde_json::json!("2026-11-03T12:01:00Z");
+        completed_usdt["satisfied_by"] = serde_json::json!(["payment"]);
+        completed_usdt["graph"]["predicates"][0]["state"] = serde_json::json!("pending");
+        completed_usdt["graph"]["predicates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("first_true_observation");
+        completed_usdt["payment"]["provider_status"]["asset"] = serde_json::json!("USDT");
+        completed_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("confirmed");
+        completed_usdt["payment"]["provider_status"]["bitcoin"] = serde_json::json!({
+            "confirmations": 6,
+            "amount_matched": true,
+            "paid_on_time": true
+        });
+        completed_usdt["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::json!({
+            "confirmations": 1,
+            "amount_matched": true,
+            "paid_on_time": true,
+            "finalized": false
+        });
+        validate_verification_evidence_response_for_tests(completed_usdt.clone()).unwrap();
+
+        let mut pending_usdt = completed_usdt.clone();
+        pending_usdt["status"] = serde_json::json!("in_progress");
+        pending_usdt["satisfied_by"] = serde_json::json!([]);
+        pending_usdt.as_object_mut().unwrap().remove("completed_at");
+        pending_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        pending_usdt["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        pending_usdt["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        validate_verification_evidence_response_for_tests(pending_usdt).unwrap();
+
+        for missing in ["bitcoin", "usdt_arbitrum"] {
+            let mut invalid = completed_usdt.clone();
+            invalid["payment"]["provider_status"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(validate_verification_evidence_response_for_tests(invalid).is_err());
+        }
+
+        let mut bitcoin_only = completed_usdt.clone();
+        bitcoin_only["payment"]["provider_status"]["usdt_arbitrum"]["confirmations"] =
+            serde_json::json!(0);
+        bitcoin_only["payment"]["provider_status"]["first_threshold_satisfied"] = serde_json::json!({
+            "observed_at": "2026-11-03T12:00:30Z",
+            "status": "confirmed",
+            "outpoint": {
+                "txid": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vout": 0
+            },
+            "confirmations": 6,
+            "amount_matched": true
+        });
+        assert!(validate_verification_evidence_response_for_tests(bitcoin_only).is_err());
+
+        let mut graph_without_qualifying_usdt = completed_usdt;
+        graph_without_qualifying_usdt["satisfied_by"] = serde_json::json!(["zero_conf_graph"]);
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["state"] =
+            serde_json::json!("satisfied");
+        graph_without_qualifying_usdt["graph"]["predicates"][0]["first_true_observation"] = serde_json::json!({
+            "outcome": "true",
+            "observed_at": "2026-11-03T12:00:30Z",
+            "origin": "https://nexus.example",
+            "http_status": 200
+        });
+        graph_without_qualifying_usdt["payment"]["provider_status"]["payment_state"] =
+            serde_json::json!("undetected");
+        graph_without_qualifying_usdt["payment"]["provider_status"]["bitcoin"] =
+            serde_json::Value::Null;
+        graph_without_qualifying_usdt["payment"]["provider_status"]["usdt_arbitrum"] =
+            serde_json::Value::Null;
+        assert!(
+            validate_verification_evidence_response_for_tests(graph_without_qualifying_usdt)
+                .is_err()
         );
 
         let mut created_without_status = evidence.clone();

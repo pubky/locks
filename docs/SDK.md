@@ -349,6 +349,50 @@ const contentLock = await session.creator.createContentLock(contentLockRequest);
 
 The builder accepts an optional primary resource and any number of secondary resources. Secondary resources are passed as full uploaded `GuardedResource` descriptors; the builder keys them by full private path and strips them to `{ hash, content_type, size }` values. It rejects empty resource sets and duplicate primary/secondary paths. The returned request is a plain JS object backed by the Rust SDK/core request contract.
 
+For v2, use the dedicated `CreateContentLockV2RequestBuilder`. V2 requires explicit version 2 on wire (added by builder), at least one payment or graph policy, verification window, access policy, and lock-server config. Payment asset is exactly `BTC` or `USDT`; amounts use satoshis or millionths respectively.
+
+```ts
+import { CreateContentLockV2RequestBuilder } from "locks-sdk-wasm";
+
+const common = () => new CreateContentLockV2RequestBuilder()
+  .primaryResource(registered.guarded_resource)
+  .verificationWindowSeconds(300)
+  .accessPolicy({ requested_credential_ttl_seconds: 3600 })
+  .lockServer({ override: lockServer });
+
+// Graph-only.
+const graphOnly = common()
+  .graph({ predicates: [{ type: "follows", follower: "reader", followed: "creator" }] })
+  .build();
+
+// BTC payment-only. recipient_pubky must equal authenticated creator.
+const paymentOnly = common()
+  .payment({
+    recipient_pubky: creatorPubky,
+    amount: "50000",
+    asset: "BTC",
+    minimum_confirmations: 1,
+  })
+  .build();
+
+// Mixed USDT payment + graph.
+const mixed = common()
+  .payment({
+    recipient_pubky: creatorPubky,
+    amount: "5000001",
+    asset: "USDT",
+    minimum_confirmations: 0,
+  })
+  .graph({ predicates: [{ type: "follows", follower: "reader", followed: "creator" }] })
+  .build();
+
+await session.creator.createContentLock(graphOnly);
+await session.creator.createContentLock(paymentOnly);
+await session.creator.createContentLock(mixed);
+```
+
+Executable versions live in `examples/js-sdk/creator-v2-publishing.js`.
+
 ### Set Lock Service Pointer
 
 ```ts
