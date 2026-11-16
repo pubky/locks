@@ -826,13 +826,14 @@ mod tests {
                 .unwrap();
         assert_eq!(applied_versions, (1..=33).collect::<Vec<_>>());
 
+        let mut connection = database.pool().acquire().await.unwrap();
         sqlx::query(
             "CREATE TEMP TABLE migrated_legacy_snapshot AS
              SELECT * FROM content_lock_deletion_task_snapshot
              WHERE deletion_job_id = $1",
         )
         .bind(job_id)
-        .execute(database.pool())
+        .execute(&mut *connection)
         .await
         .unwrap();
         sqlx::query(
@@ -840,14 +841,14 @@ mod tests {
              WHERE deletion_job_id = $1",
         )
         .bind(job_id)
-        .execute(database.pool())
+        .execute(&mut *connection)
         .await
         .unwrap();
         let synthesized = sqlx::query(
             "INSERT INTO content_lock_deletion_task_snapshot
              SELECT * FROM migrated_legacy_snapshot",
         )
-        .execute(database.pool())
+        .execute(&mut *connection)
         .await;
         let synthesis_error = synthesized
             .expect_err("post-0032 rows must not synthesize the rc3 terminal-evidence exemption")
