@@ -361,7 +361,10 @@ pub struct CreatorMixedVerificationEvidenceHttpResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreatorPaymentEvidenceHttpResponse {
     pub invoice: PaymentInvoiceState,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_payment_provider_status"
+    )]
     pub provider_status: Option<PaymentProviderStatus>,
     pub operational_failure_count: u32,
     pub operational_failure_total: u32,
@@ -703,6 +706,31 @@ where
         Some(reason) => serializer.serialize_some(reason.as_str()),
         None => serializer.serialize_none(),
     }
+}
+
+fn serialize_optional_payment_provider_status<S>(
+    status: &Option<PaymentProviderStatus>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let Some(status) = status else {
+        return serializer.serialize_none();
+    };
+    if status.asset != locks_core::lock_policy::PaymentAssetV2::Usdt {
+        return status.serialize(serializer);
+    }
+
+    let mut value = serde_json::to_value(status).map_err(serde::ser::Error::custom)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        serde::ser::Error::custom("payment provider status must serialize as an object")
+    })?;
+    object.entry("bitcoin").or_insert(serde_json::Value::Null);
+    object
+        .entry("usdt_arbitrum")
+        .or_insert(serde_json::Value::Null);
+    value.serialize(serializer)
 }
 
 fn serialize_access_credential<S>(

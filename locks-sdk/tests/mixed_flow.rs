@@ -3,6 +3,7 @@ use std::str::FromStr;
 use locks_core::ids::{BundleId, CreatorPubky};
 use locks_core::verification::SubmittedProofBundleV2;
 use locks_sdk::{CreatorLocks, VerificationTaskHandleRequest, VerificationTaskStatus, ViewerLocks};
+use locks_server::api::dtos::CreatorPaymentEvidenceHttpResponse;
 use serde_json::json;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -299,6 +300,23 @@ fn completed_usdt_evidence() -> serde_json::Value {
     })
 }
 
+fn serialize_server_payment(evidence: &mut serde_json::Value) {
+    let payment = CreatorPaymentEvidenceHttpResponse {
+        invoice: serde_json::from_value(evidence["payment"]["invoice"].clone()).unwrap(),
+        provider_status: Some(
+            serde_json::from_value(evidence["payment"]["provider_status"].clone()).unwrap(),
+        ),
+        operational_failure_count: 0,
+        operational_failure_total: 0,
+        operational_first_failure_at: None,
+        operational_last_failure_at: None,
+        operational_last_category: None,
+        operational_last_http_status: None,
+        next_due_at: None,
+    };
+    evidence["payment"] = serde_json::to_value(payment).unwrap();
+}
+
 #[test]
 fn mixed_creator_evidence_accepts_completed_usdt_payment() {
     let parsed =
@@ -321,6 +339,61 @@ fn mixed_creator_evidence_accepts_pending_usdt_payment_with_explicit_null_rails(
     evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
 
     CreatorLocks::parse_mixed_verification_evidence_response(evidence).unwrap();
+}
+
+#[test]
+fn server_usdt_evidence_serialization_crosses_sdk_parser_with_nullable_rails() {
+    for pending in [true, false] {
+        let mut evidence = completed_usdt_evidence();
+        if pending {
+            evidence["status"] = json!("in_progress");
+            evidence["satisfied_by"] = json!([]);
+            evidence.as_object_mut().unwrap().remove("completed_at");
+            evidence["payment"]["provider_status"]["payment_state"] = json!("undetected");
+            evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+            evidence["payment"]["provider_status"]["usdt_arbitrum"] = serde_json::Value::Null;
+        } else {
+            evidence["payment"]["provider_status"]["bitcoin"] = serde_json::Value::Null;
+        }
+
+        serialize_server_payment(&mut evidence);
+
+        assert_eq!(
+            evidence["payment"]["provider_status"]["bitcoin"],
+            serde_json::Value::Null
+        );
+        assert!(
+            evidence["payment"]["provider_status"]
+                .as_object()
+                .unwrap()
+                .contains_key("usdt_arbitrum")
+        );
+        CreatorLocks::parse_mixed_verification_evidence_response(evidence).unwrap();
+    }
+
+    let mut btc = completed_usdt_evidence();
+    btc["status"] = json!("in_progress");
+    btc["satisfied_by"] = json!([]);
+    btc.as_object_mut().unwrap().remove("completed_at");
+    btc["payment"]["provider_status"]["payment_state"] = json!("undetected");
+    btc["payment"]["provider_status"]["asset"] = json!("BTC");
+    let provider = btc["payment"]["provider_status"].as_object_mut().unwrap();
+    provider.remove("bitcoin");
+    provider.remove("usdt_arbitrum");
+    serialize_server_payment(&mut btc);
+    assert!(
+        !btc["payment"]["provider_status"]
+            .as_object()
+            .unwrap()
+            .contains_key("bitcoin")
+    );
+    assert!(
+        !btc["payment"]["provider_status"]
+            .as_object()
+            .unwrap()
+            .contains_key("usdt_arbitrum")
+    );
+    CreatorLocks::parse_mixed_verification_evidence_response(btc).unwrap();
 }
 
 #[test]
