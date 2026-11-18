@@ -203,7 +203,7 @@ async fn mixed_graph_payment_v2_compose_exercises_locks_http_paykit_rc3_and_nexu
     );
     let pop_key_id = GrantPopKeyId::new("mixed-compose-creator".to_owned());
     let authorization_url = grant_client
-        .start_grant_creator_connect_flow(&requested_scopes, &pop_key_id)
+        .start_grant_creator_connect_flow(&requested_scopes, &pop_key_id, None)
         .await
         .unwrap();
     write_json(

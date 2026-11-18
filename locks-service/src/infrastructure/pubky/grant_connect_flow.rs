@@ -150,6 +150,7 @@ impl GrantCreatorConnectFlowClient for PubkyGrantCreatorConnectFlowClient {
         &self,
         requested_scopes: &[String],
         pop_key_id: &GrantPopKeyId,
+        expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         let capabilities = requested_scopes_to_capabilities(requested_scopes)?;
         let mut builder = PubkyGrantAuthFlow::builder(
@@ -165,6 +166,11 @@ impl GrantCreatorConnectFlowClient for PubkyGrantCreatorConnectFlowClient {
         );
         if let Some(auth_relay) = &self.auth_relay {
             builder = builder.relay(auth_relay.clone());
+        }
+        if let Some(creator) = expected_creator {
+            let public_key = PublicKey::try_from(creator.to_string())
+                .map_err(|_| grant_error("invalid expected creator"))?;
+            builder = builder.expected_signer(public_key);
         }
         let flow = builder
             .start()
@@ -419,6 +425,7 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use locks_core::ids::CreatorPubky;
     use pubky::{
         Capability, ClientId, DelegatedGrantCredentialState, GRANT_JWS_TYP, GrantClaims, GrantId,
         Keypair, POP_JWS_TYP, PopNonce, PopProofClaims, PublicKey,
@@ -432,7 +439,9 @@ mod tests {
         sign_pop_signing_input,
     };
     use crate::application::errors::ApplicationError;
-    use crate::application::models::{CreatorAuthoritySecret, CreatorConnectFlowId, GrantPopKeyId};
+    use crate::application::models::{
+        CreatorAuthoritySecret, CreatorConnectAuthorizationUrl, CreatorConnectFlowId, GrantPopKeyId,
+    };
     use crate::application::ports::GrantCreatorConnectFlowClient;
     use crate::infrastructure::pubky::creator_identity::requested_scopes_to_capabilities;
 
@@ -796,7 +805,7 @@ mod tests {
 
         let grant_url = Url::parse(
             grant
-                .start_grant_creator_connect_flow(&scopes, &key_id())
+                .start_grant_creator_connect_flow(&scopes, &key_id(), None)
                 .await
                 .unwrap()
                 .expose_url(),
@@ -826,6 +835,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_connect_link_names_the_expected_creator() {
+        let grant = PubkyGrantCreatorConnectFlowClient::new(
+            pubky::PubkyHttpClient::testnet().unwrap(),
+            Some("http://localhost:15412/inbox/".parse().unwrap()),
+            ClientId::new(CLIENT_ID).unwrap(),
+            keys(),
+        );
+        let user = Keypair::random().public_key();
+        let creator = CreatorPubky::from_str(&user.to_string()).unwrap();
+        let scopes = vec!["/pub/locks.app/:rw".to_owned()];
+        let spk = |url: CreatorConnectAuthorizationUrl| -> Vec<String> {
+            Url::parse(url.expose_url())
+                .unwrap()
+                .query_pairs()
+                .filter(|(key, _)| key == "spk")
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        };
+
+        let named = grant
+            .start_grant_creator_connect_flow(&scopes, &key_id(), Some(&creator))
+            .await
+            .unwrap();
+        let unnamed = grant
+            .start_grant_creator_connect_flow(&scopes, &key_id(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(spk(named), vec![user.z32()]);
+        assert!(spk(unnamed).is_empty());
+    }
+
+    #[tokio::test]
     async fn grant_connect_rejects_invalid_requested_scope_before_starting_flow() {
         let grant = PubkyGrantCreatorConnectFlowClient::new(
             pubky::PubkyHttpClient::testnet().unwrap(),
@@ -835,7 +877,7 @@ mod tests {
         );
 
         let error = grant
-            .start_grant_creator_connect_flow(&["relative-scope:rw".to_owned()], &key_id())
+            .start_grant_creator_connect_flow(&["relative-scope:rw".to_owned()], &key_id(), None)
             .await
             .unwrap_err();
 

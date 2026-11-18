@@ -170,10 +170,13 @@ pub trait FrontendSessionTokenGenerator: Send + Sync {
 /// Object-safe seam for delegated grant creator connect flows.
 #[async_trait]
 pub trait GrantCreatorConnectFlowClient: Send + Sync {
+    /// `expected_creator`, when the embedding app already knows its signed-in creator, names that
+    /// creator in the request (`spk`) so the signer opens that key; the approval must then come from it.
     async fn start_grant_creator_connect_flow(
         &self,
         requested_scopes: &[String],
         pop_key_id: &GrantPopKeyId,
+        expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError>;
 
     async fn await_grant_creator_connect_flow_approval(

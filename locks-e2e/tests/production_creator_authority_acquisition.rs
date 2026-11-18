@@ -303,6 +303,7 @@ impl GrantCreatorConnectFlowClient for FakeGrantConnectFlowClient {
         &self,
         requested_scopes: &[String],
         _pop_key_id: &GrantPopKeyId,
+        _expected_creator: Option<&CreatorPubky>,
     ) -> Result<CreatorConnectAuthorizationUrl, ApplicationError> {
         assert_eq!(
             requested_scopes,

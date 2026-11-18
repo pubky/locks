@@ -79,13 +79,21 @@ pub struct Locks {
 pub struct ConnectUrlOptions {
     return_to: String,
     state: String,
+    creator: Option<String>,
 }
 
 #[wasm_bindgen]
 impl ConnectUrlOptions {
+    /// `creator` is optional: pass the signed-in creator's pubky when the app already knows it, so
+    /// the connect link names it and Pubky Ring opens that key instead of its picker. The Lock
+    /// Server then refuses an approval from any other key.
     #[wasm_bindgen(constructor)]
-    pub fn new(return_to: String, state: String) -> Self {
-        Self { return_to, state }
+    pub fn new(return_to: String, state: String, creator: Option<String>) -> Self {
+        Self {
+            return_to,
+            state,
+            creator,
+        }
     }
 
     #[wasm_bindgen(getter, js_name = returnTo)]
@@ -96,6 +104,11 @@ impl ConnectUrlOptions {
     #[wasm_bindgen(getter)]
     pub fn state(&self) -> String {
         self.state.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn creator(&self) -> Option<String> {
+        self.creator.clone()
     }
 }
 
@@ -368,9 +381,13 @@ impl Locks {
     #[wasm_bindgen(js_name = createConnectUrl)]
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_connect_url(&self, options: &ConnectUrlOptions) -> JsResult<String> {
-        self.build_connect_url(&options.return_to, &options.state)
-            .map(|url| url.to_string())
-            .map_err(invalid_input)
+        self.build_connect_url(
+            &options.return_to,
+            &options.state,
+            options.creator.as_deref(),
+        )
+        .map(|url| url.to_string())
+        .map_err(invalid_input)
     }
 
     #[wasm_bindgen(js_name = createConnectUrl)]
@@ -378,10 +395,16 @@ impl Locks {
     pub async fn create_connect_url(&self, options: &ConnectUrlOptions) -> JsResult<String> {
         let resolver = BrowserPkarrResolver::new_with_options(&self.options)
             .map_err(|err| invalid_input(err.to_string()))?;
-        self.build_resolved_connect_url(&options.return_to, &options.state, &resolver, None)
-            .await
-            .map(|url| url.to_string())
-            .map_err(|err| invalid_input(err.to_string()))
+        self.build_resolved_connect_url(
+            &options.return_to,
+            &options.state,
+            options.creator.as_deref(),
+            &resolver,
+            None,
+        )
+        .await
+        .map(|url| url.to_string())
+        .map_err(|err| invalid_input(err.to_string()))
     }
 
     #[wasm_bindgen(js_name = parseConnectCallback)]
@@ -460,7 +483,12 @@ impl Locks {
         self.options.pkarr_relay_urls().to_vec()
     }
 
-    fn build_connect_url(&self, return_to: &str, state: &str) -> Result<Url, String> {
+    fn build_connect_url(
+        &self,
+        return_to: &str,
+        state: &str,
+        creator: Option<&str>,
+    ) -> Result<Url, String> {
         if return_to.is_empty() {
             return Err("returnTo must not be empty".to_owned());
         }
@@ -475,6 +503,11 @@ impl Locks {
         url.query_pairs_mut()
             .append_pair("return_to", return_to)
             .append_pair("state", state);
+        if let Some(creator) = creator {
+            let creator = pubky::PublicKey::try_from(creator)
+                .map_err(|_| "creator must be a pubky".to_owned())?;
+            url.query_pairs_mut().append_pair("creator", &creator.z32());
+        }
         Ok(url)
     }
 
@@ -544,11 +577,12 @@ impl Locks {
         &self,
         return_to: &str,
         state: &str,
+        creator: Option<&str>,
         endpoint: &locks_sdk::transport::BrowserEndpoint,
         testnet_host: Option<&str>,
     ) -> locks_sdk::Result<Url> {
         let url = self
-            .build_connect_url(return_to, state)
+            .build_connect_url(return_to, state, creator)
             .map_err(|_| locks_sdk::LocksSdkError::InvalidTransportUrl)?;
         let browser_request =
             locks_sdk::transport::rewrite_browser_request(url.as_str(), endpoint, testnet_host)?;
@@ -560,18 +594,19 @@ impl Locks {
         &self,
         return_to: &str,
         state: &str,
+        creator: Option<&str>,
         resolver: &BrowserPkarrResolver,
         testnet_host: Option<&str>,
     ) -> locks_sdk::Result<Url> {
         let url = self
-            .build_connect_url(return_to, state)
+            .build_connect_url(return_to, state, creator)
             .map_err(|_| locks_sdk::LocksSdkError::InvalidTransportUrl)?;
         let qname = url
             .host_str()
             .and_then(|host| host.strip_prefix("_pubky."))
             .ok_or(locks_sdk::LocksSdkError::InvalidTransportUrl)?;
         let endpoint = resolver.resolve_browser_endpoint(qname).await?;
-        self.build_connect_url_for_endpoint(return_to, state, &endpoint, testnet_host)
+        self.build_connect_url_for_endpoint(return_to, state, creator, &endpoint, testnet_host)
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
@@ -1186,7 +1221,7 @@ mod tests {
             Locks::for_server("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo").unwrap();
 
         let url = locks
-            .build_connect_url("https://pubky.app/locks/callback", "opaque-state")
+            .build_connect_url("https://pubky.app/locks/callback", "opaque-state", None)
             .unwrap();
 
         assert_eq!(url.path(), "/connect");
@@ -1195,6 +1230,30 @@ mod tests {
             Some("return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=opaque-state")
         );
         assert!(!url.as_str().contains("authorization_url"));
+    }
+
+    #[test]
+    fn connect_url_names_the_signed_in_creator_when_given() {
+        let locks =
+            Locks::for_server("pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo").unwrap();
+        let z32 = "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+        for creator in [z32.to_owned(), format!("pubky{z32}")] {
+            let url = locks
+                .build_connect_url("https://pubky.app/locks/callback", "s", Some(&creator))
+                .unwrap();
+            assert_eq!(
+                url.query(),
+                Some(&*format!(
+                    "return_to=https%3A%2F%2Fpubky.app%2Flocks%2Fcallback&state=s&creator={z32}"
+                ))
+            );
+        }
+        assert!(
+            locks
+                .build_connect_url("https://pubky.app/locks/callback", "s", Some("not-a-pubky"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1211,6 +1270,7 @@ mod tests {
             .build_connect_url_for_endpoint(
                 "https://pubky.app/locks/callback",
                 "opaque-state",
+                None,
                 &endpoint,
                 None,
             )
