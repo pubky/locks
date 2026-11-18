@@ -29,8 +29,8 @@ import { assertCargoLockPackageVersions } from './lib/release-version-contract.m
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-const locksReleaseVersion = '0.1.0';
-const locksServerReleaseVersion = '0.1.1-rc1';
+const locksReleaseVersion = '0.1.1-rc5';
+const locksServerReleaseVersion = '0.1.1-rc5';
 assert.equal(PAYKIT_SERVER_REF, 'cf90f86734b616b48ce4d6c1582c0ebd37ef2080');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
