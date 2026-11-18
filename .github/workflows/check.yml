@@ -123,6 +123,9 @@ jobs:
       - name: Staging config tests
         run: npm --prefix examples/js-sdk run test:staging-config
 
+      - name: Release version contract
+        run: npm --prefix examples/js-sdk run test:release-version-contract
+
       - name: JS example behavior tests
         run: |
           npm --prefix examples/js-sdk run test:reader-load-state

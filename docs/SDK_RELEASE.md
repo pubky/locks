@@ -44,13 +44,30 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-5. Publish from an authenticated account with `@synonymdev` package permission:
+5. Confirm the manifest version and dist-tag match the release type. Release candidates must have a prerelease version and `publishConfig.tag = "rc"`; stable releases must have a stable version and `publishConfig.tag = "latest"`:
 
 ```bash
-npm publish ./locks-sdk/bindings/js --access public --tag latest
+PACKAGE_VERSION=$(node -p "require('./locks-sdk/bindings/js/package.json').version")
+DIST_TAG=$(node -p "require('./locks-sdk/bindings/js/package.json').publishConfig.tag")
+printf 'Publishing %s with npm dist-tag %s\n' "$PACKAGE_VERSION" "$DIST_TAG"
 ```
 
-6. Read back registry metadata and verify package version, public access, and `latest` dist-tag.
+6. Publish from an authenticated account with `@synonymdev` package permission. Do not pass `--tag`; npm must use the reviewed `publishConfig.tag` from the manifest:
+
+```bash
+npm publish ./locks-sdk/bindings/js --access public
+```
+
+7. Read back registry metadata and verify both the exact package version and the manifest-selected dist-tag:
+
+```bash
+PACKAGE_VERSION=$(node -p "require('./locks-sdk/bindings/js/package.json').version")
+DIST_TAG=$(node -p "require('./locks-sdk/bindings/js/package.json').publishConfig.tag")
+PUBLISHED_VERSION=$(npm view "@synonymdev/locks-sdk@${PACKAGE_VERSION}" version)
+TAGGED_VERSION=$(npm view @synonymdev/locks-sdk "dist-tags.${DIST_TAG}")
+test "$PUBLISHED_VERSION" = "$PACKAGE_VERSION"
+test "$TAGGED_VERSION" = "$PACKAGE_VERSION"
+```
 
 ## Explicit non-goals
 

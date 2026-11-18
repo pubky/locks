@@ -4,6 +4,14 @@ Browser JS/WASM SDK for Pubky Locks.
 
 ## Install
 
+Release candidates use the `rc` dist-tag:
+
+```bash
+npm install @synonymdev/locks-sdk@rc
+```
+
+Stable releases use the default `latest` dist-tag:
+
 ```bash
 npm install @synonymdev/locks-sdk
 ```

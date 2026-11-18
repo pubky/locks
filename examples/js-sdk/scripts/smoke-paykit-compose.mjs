@@ -25,12 +25,9 @@ import {
   DEFAULT_PAYKIT_SERVER_CONTEXT,
   PAYKIT_SERVER_REF,
 } from './lib/paykit-server-source.mjs';
-import { assertCargoLockPackageVersions } from './lib/release-version-contract.mjs';
 
 const lockServerPubky = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 const creatorPubky = 'pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy';
-const locksReleaseVersion = '0.1.1-rc5';
-const locksServerReleaseVersion = '0.1.1-rc5';
 assert.equal(PAYKIT_SERVER_REF, 'cf90f86734b616b48ce4d6c1582c0ebd37ef2080');
 assert.equal(
   DEFAULT_PAYKIT_SERVER_CONTEXT,
@@ -78,9 +75,6 @@ await assert.rejects(
 assert.equal(oversizedSourceCancelled, true);
 const composeSource = await readFile(join(repoRoot, 'compose.paykit-local-demo.yaml'), 'utf8');
 const defaultComposeSource = await readFile(join(repoRoot, 'docker-compose.yml'), 'utf8');
-const cargoManifestSource = await readFile(join(repoRoot, 'Cargo.toml'), 'utf8');
-const cargoLockSource = await readFile(join(repoRoot, 'Cargo.lock'), 'utf8');
-const jsPackage = JSON.parse(await readFile(join(repoRoot, 'locks-sdk/bindings/js/package.json'), 'utf8'));
 const bitcoinBootstrapSource = await readFile(join(repoRoot, 'docker/bitcoin-bootstrap.sh'), 'utf8');
 const creatorAppSource = await readFile(join(repoRoot, 'examples/js-sdk/app-iframe.js'), 'utf8');
 const creatorServerSource = await readFile(join(repoRoot, 'examples/js-sdk/scripts/start-demo-server.mjs'), 'utf8');
@@ -89,16 +83,6 @@ const paykitHttpClientSource = await readFile(join(repoRoot, 'locks-server/src/p
 const checkWorkflowSource = await readFile(join(repoRoot, '.github/workflows/check.yml'), 'utf8');
 assert.match(composeSource, /^# Local development and demonstration only;/);
 assert.match(composeSource, /^name: pubky-locks-paykit-demo$/m);
-assert.match(cargoManifestSource, new RegExp(`^version = "${locksReleaseVersion}"$`, 'm'));
-assert.equal(jsPackage.version, locksReleaseVersion);
-assertCargoLockPackageVersions(cargoLockSource, new Map([
-  ['locks-core', locksReleaseVersion],
-  ['locks-e2e', locksReleaseVersion],
-  ['locks-sdk', locksReleaseVersion],
-  ['locks-sdk-wasm', locksReleaseVersion],
-  ['locks-server', locksServerReleaseVersion],
-  ['locks-service', locksReleaseVersion],
-]));
 assert.match(creatorAppSource, /hasExactKeys\(event\.data, \['type', 'state', 'code'\]\)/);
 assert.match(creatorAppSource, /body: JSON\.stringify\(\{ level \}\)/);
 assert.match(creatorAppSource, /\[result\.authorizationUrl, result\.command\]\.filter\(Boolean\)/);
@@ -571,7 +555,7 @@ for (const [script, description] of [
   assert.ok(script.includes("['compose', '-f', COMPOSE_FILE"), `${description} script must pass the local demo Compose file explicitly`);
 }
 assert.equal(packageJson.scripts['validate:paykit-compose'], 'node scripts/validate-paykit-compose.mjs');
-assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.16.2');
+assert.equal(packageJson.dependencies['@synonymdev/pubky'], '^0.18.0');
 assert.equal(
   packageJson.scripts['check:paykit-setup-contract'],
   'node scripts/check-paykit-setup-contract.mjs',
