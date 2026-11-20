@@ -398,9 +398,16 @@ fn map_grant_restore_sdk_error(error: pubky::Error) -> ApplicationError {
     let (error_class, status) = match &error {
         pubky::Error::Authentication(_) => ("authentication", None),
         pubky::Error::Request(pubky::errors::RequestError::Server {
-            status: status @ (pubky::StatusCode::UNAUTHORIZED | pubky::StatusCode::FORBIDDEN),
+            status: pubky::StatusCode::UNAUTHORIZED,
             ..
-        }) => ("unauthorized", Some(status.as_u16())),
+        }) => (
+            "unauthorized",
+            Some(pubky::StatusCode::UNAUTHORIZED.as_u16()),
+        ),
+        pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::FORBIDDEN,
+            ..
+        }) => ("permission", Some(pubky::StatusCode::FORBIDDEN.as_u16())),
         pubky::Error::Request(pubky::errors::RequestError::Server { status, .. }) => {
             ("server", Some(status.as_u16()))
         }
@@ -744,6 +751,21 @@ mod tests {
                 ApplicationError::CreatorAuthorityUnavailable
             );
         }
+    }
+
+    #[test]
+    fn grant_restore_keeps_permission_failures_retryable() {
+        let forbidden = pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::FORBIDDEN,
+            message: "permission check unavailable".to_owned(),
+        });
+
+        assert_eq!(
+            super::map_grant_restore_sdk_error(forbidden),
+            ApplicationError::CreatorAuthoritySecret {
+                message: "failed to restore grant creator authority".to_owned()
+            }
+        );
     }
 
     #[test]

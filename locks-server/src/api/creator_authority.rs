@@ -61,16 +61,25 @@ pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let session_token = parse_frontend_session_token(&headers)?;
-    let status = get_creator_authority_status(
-        state.frontend_sessions().as_ref(),
-        state.creator_authority_manager().as_ref(),
-        state.clock().as_ref(),
-        GetCreatorAuthorityStatusRequest { session_token },
-    )
-    .await?;
+    let result = async {
+        let session_token = parse_frontend_session_token(&headers)?;
+        let status = get_creator_authority_status(
+            state.frontend_sessions().as_ref(),
+            state.creator_authority_manager().as_ref(),
+            state.clock().as_ref(),
+            GetCreatorAuthorityStatusRequest { session_token },
+        )
+        .await?;
+        Ok::<Response, ApiError>(
+            Json(CreatorAuthorityStatusHttpResponse::from(status)).into_response(),
+        )
+    }
+    .await;
 
-    let mut response = Json(CreatorAuthorityStatusHttpResponse::from(status)).into_response();
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

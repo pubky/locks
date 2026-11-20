@@ -6773,6 +6773,7 @@ async fn creator_authority_status_route_requires_frontend_session_bearer() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body = response_json(response).await;
     assert_eq!(body["error"]["code"], "frontend_session_unavailable");
     assert!(!body.to_string().contains("frontend-session-token"));
@@ -6932,6 +6933,7 @@ async fn creator_authority_status_route_preserves_authority_on_live_check_failur
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(manager.revalidation_calls.load(Ordering::SeqCst), 1);
     let body = response_json(response).await;
     assert_eq!(body["error"]["code"], "creator_authority_unavailable");

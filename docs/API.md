@@ -30,7 +30,7 @@ The Lock Server has one non-production route family and one authenticated creato
 - Creator authority status route: `GET /creator/authority-status`
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives creator from the Locks-local frontend session.
-  - Live-revalidates the cached grant session. Confirmed missing, revoked, expired, or wrong-kind authority returns secret-free `200` with `authorized: false`; an operational live-check failure returns secret-free `503 creator_authority_unavailable`.
+  - Live-revalidates the cached grant session. Confirmed missing, revoked (`401`), expired, or wrong-kind authority returns secret-free `200` with `authorized: false`. Permission (`403`) and other operational live/restore failures return secret-free `503 creator_authority_unavailable`; every response carries `Cache-Control: no-store`.
 - Paykit setup readiness route: `GET /creator/paykit/setup-status`
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.

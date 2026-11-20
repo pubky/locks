@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
@@ -12,6 +13,8 @@ use crate::infrastructure::pubky::creator_identity::creator_from_pubky_public_ke
 use crate::infrastructure::pubky::storage_client::{ImportedPubkySession, PubkySessionImporter};
 
 type RestoreResult<T> = Result<T, ApplicationError>;
+
+const LIVE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone)]
 pub struct CachedGrantSession<T> {
@@ -198,10 +201,7 @@ where
                             error_class = "capacity_in_flight",
                             "creator grant session restore failed"
                         );
-                        return Err(ApplicationError::CreatorAuthoritySecret {
-                            message: "creator grant session cache is temporarily unavailable"
-                                .to_owned(),
-                        });
+                        return Err(ApplicationError::CreatorAuthorityUnavailable);
                     }
                 }
                 state.next_generation = state.next_generation.wrapping_add(1);
@@ -295,6 +295,20 @@ where
         creator: &CreatorPubky,
         expected_secret: &crate::application::models::CreatorAuthoritySecret,
     ) -> Result<(), ApplicationError> {
+        self.revalidate_session_for_creator_with_timeout(
+            creator,
+            expected_secret,
+            LIVE_REVALIDATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn revalidate_session_for_creator_with_timeout(
+        &self,
+        creator: &CreatorPubky,
+        expected_secret: &crate::application::models::CreatorAuthoritySecret,
+        timeout: Duration,
+    ) -> Result<(), ApplicationError> {
         for attempt in 0..2 {
             let cached = self.session_for_creator(creator).await?;
             if cached.record.secret.expose_secret() != expected_secret.expose_secret() {
@@ -309,7 +323,12 @@ where
                 });
             }
             let fingerprint = authority_fingerprint(&cached.record);
-            match cached.session.revalidate().await? {
+            let live = tokio::time::timeout(timeout, cached.session.revalidate())
+                .await
+                .map_err(|_| ApplicationError::CreatorAuthoritySecret {
+                    message: "creator authority live revalidation timed out".to_owned(),
+                })??;
+            match live {
                 true if self
                     .is_current_generation(creator, cached.generation, fingerprint)
                     .await =>
@@ -323,6 +342,22 @@ where
                     });
                 }
                 false => {
+                    let persisted = match self.load_current_grant(creator).await {
+                        Ok(record) => record,
+                        Err(ApplicationError::CreatorAuthorityUnavailable) => {
+                            self.invalidate_generation(creator, cached.generation).await;
+                            return Err(ApplicationError::CreatorAuthorityUnavailable);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if authority_fingerprint(&persisted) != fingerprint {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(ApplicationError::CreatorAuthoritySecret {
+                            message: "creator authority changed during revalidation".to_owned(),
+                        });
+                    }
                     let invalidated = self.invalidate_generation(creator, cached.generation).await;
                     if invalidated {
                         return Err(ApplicationError::CreatorAuthorityUnavailable);
@@ -730,6 +765,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_revalidation_times_out_without_invalidating_newer_generation() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = GenerationRaceImporter::new(true);
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let stalled = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator_with_timeout(
+                        &creator_a(),
+                        &secret,
+                        Duration::from_millis(25),
+                    )
+                    .await
+            })
+        };
+        importer.old_check_started.notified().await;
+        cache.invalidate(&creator_a()).await;
+        cache.session_for_creator(&creator_a()).await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(250), stalled)
+            .await
+            .expect("stalled live revalidation must be bounded")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApplicationError::CreatorAuthoritySecret { .. }
+        ));
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            importer.import_calls(),
+            2,
+            "timed-out old generation must preserve the replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_revocation_result_does_not_deny_persisted_rotated_authority() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = GenerationRaceImporter::new(false);
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let check = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &secret)
+                    .await
+            })
+        };
+        importer.old_check_started.notified().await;
+        store.put(record(creator_a(), "grant-a-rotated")).await;
+        importer.release_old_check.notify_one();
+
+        assert!(matches!(
+            check.await.unwrap(),
+            Err(ApplicationError::CreatorAuthoritySecret { .. })
+        ));
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
+        assert_eq!(importer.import_calls(), 2);
+    }
+
+    #[tokio::test]
     async fn stale_live_results_retry_against_the_reconnected_generation() {
         for old_result in [false, true] {
             let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
@@ -952,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cache_saturation_reports_secret_safe_diagnostic() {
+    async fn cache_saturation_is_retryable_and_reports_secret_safe_diagnostic() {
         let events = RecordedEvents::default();
         let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
         let store = MutableAuthorityStore::with_records([
@@ -969,9 +1075,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        let capacity_error = cache.session_for_creator(&creator_b()).await.unwrap_err();
         assert!(matches!(
-            cache.session_for_creator(&creator_b()).await,
-            Err(ApplicationError::CreatorAuthoritySecret { .. })
+            &capacity_error,
+            ApplicationError::CreatorAuthorityUnavailable
         ));
         in_flight.abort();
         in_flight.await.unwrap_err();
