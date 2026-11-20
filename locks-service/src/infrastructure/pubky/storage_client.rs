@@ -290,11 +290,13 @@ pub trait CreatorScopedPubkyStorageProvider: Send + Sync {
     async fn invalidate_creator_session(&self, _creator: &CreatorPubky, _generation: u64) {}
 }
 
-/// Minimal imported Pubky session surface needed by the storage provider.
+/// Minimal imported Pubky session surface needed by storage and live authority checks.
+#[async_trait]
 pub trait ImportedPubkySession: Send + Sync {
     type Storage: CreatorScopedPubkyStorage + 'static;
 
     fn public_key_z32(&self) -> String;
+    async fn revalidate(&self) -> Result<bool, ApplicationError>;
     fn into_grant_storage(self) -> Self::Storage;
 }
 
@@ -417,11 +419,22 @@ impl std::fmt::Debug for PubkyImportedSession {
     }
 }
 
+#[async_trait]
 impl ImportedPubkySession for PubkyImportedSession {
     type Storage = SdkCreatorScopedPubkyStorage;
 
     fn public_key_z32(&self) -> String {
         self.0.info().public_key().z32()
+    }
+
+    async fn revalidate(&self) -> Result<bool, ApplicationError> {
+        self.0
+            .revalidate()
+            .await
+            .map(|session| session.is_some())
+            .map_err(|_| ApplicationError::CreatorAuthoritySecret {
+                message: "failed to revalidate grant creator authority".to_owned(),
+            })
     }
 
     fn into_grant_storage(self) -> Self::Storage {
@@ -2730,11 +2743,16 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ImportedPubkySession for FakeImportedPubkySession {
         type Storage = FakeCreatorScopedPubkyStorage;
 
         fn public_key_z32(&self) -> String {
             self.public_key_z32.clone()
+        }
+
+        async fn revalidate(&self) -> Result<bool, ApplicationError> {
+            Ok(true)
         }
 
         fn into_grant_storage(self) -> Self::Storage {

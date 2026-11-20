@@ -2,7 +2,7 @@ pub use locks_core::creator_publishing::{
     CreateContentLockPayload, CreateContentLockRequest, CreateContentLockV2Request,
     SetLockServicePointerRequest,
 };
-use locks_core::ids::{BundleId, LockId};
+use locks_core::ids::{BundleId, CreatorPubky, LockId};
 pub use locks_core::lock_policy::PaykitPaymentAsset;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,24 @@ pub enum PaykitSetupStatusKind {
 #[serde(deny_unknown_fields)]
 pub struct PaykitSetupStatus {
     pub status: PaykitSetupStatusKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreatorAuthorityAuthKind {
+    LegacyCookie,
+    Grant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatorAuthorityStatus {
+    pub creator: CreatorPubky,
+    pub authorized: bool,
+    pub auth_kind: Option<CreatorAuthorityAuthKind>,
+    pub granted_scopes: Vec<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub session_expires_at: Option<time::OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +206,20 @@ impl CreatorLocks {
         self.paykit_setup_status_request(asset)
     }
 
+    pub fn authority_status_request(&self) -> SdkRequest {
+        SdkRequest {
+            method: "GET",
+            path: "/creator/authority-status".to_owned(),
+            authorization: self.session.authorization_header_value(),
+            content_type: String::new(),
+            body: SdkRequestBody::Empty,
+        }
+    }
+
+    pub fn authority_status(&self) -> SdkRequest {
+        self.authority_status_request()
+    }
+
     pub fn verification_evidence(&self, bundle_id: BundleId) -> SdkRequest {
         self.post_json(
             "/creator/verification-evidence",
@@ -211,6 +243,27 @@ impl CreatorLocks {
         serde_json::from_value(value).map_err(|_| {
             crate::LocksSdkError::InvalidResponse("invalid paykit setup status response".to_owned())
         })
+    }
+
+    pub fn parse_authority_status_response(value: Value) -> crate::Result<CreatorAuthorityStatus> {
+        let status: CreatorAuthorityStatus = serde_json::from_value(value).map_err(|_| {
+            crate::LocksSdkError::InvalidResponse(
+                "invalid creator authority status response".to_owned(),
+            )
+        })?;
+        let canonical = if status.authorized {
+            status.auth_kind.is_some()
+        } else {
+            status.auth_kind.is_none()
+                && status.granted_scopes.is_empty()
+                && status.session_expires_at.is_none()
+        };
+        if !canonical {
+            return Err(crate::LocksSdkError::InvalidResponse(
+                "invalid creator authority status response".to_owned(),
+            ));
+        }
+        Ok(status)
     }
 
     fn post_json(&self, path: &'static str, body: impl Serialize) -> SdkRequest {
@@ -418,6 +471,53 @@ mod tests {
             request.body,
             SdkRequestBody::Json(json!({ "default_lock_server": lock_server }))
         );
+    }
+
+    #[test]
+    fn creator_authority_status_request_uses_authenticated_empty_get() {
+        let creator = LocksSession::new("frontend-session-secret").creator();
+
+        let request = creator.authority_status_request();
+
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/creator/authority-status");
+        assert_eq!(request.authorization, "Bearer frontend-session-secret");
+        assert_eq!(request.content_type, "");
+        assert_eq!(request.body, SdkRequestBody::Empty);
+    }
+
+    #[test]
+    fn creator_authority_status_response_accepts_only_canonical_shapes() {
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let authorized = CreatorLocks::parse_authority_status_response(json!({
+            "creator": creator,
+            "authorized": true,
+            "auth_kind": "grant",
+            "granted_scopes": ["/pub/app.locks/:rw"],
+            "session_expires_at": "2026-11-03T12:00:00Z"
+        }))
+        .unwrap();
+        assert!(authorized.authorized);
+        assert_eq!(authorized.auth_kind, Some(CreatorAuthorityAuthKind::Grant));
+
+        let unavailable = CreatorLocks::parse_authority_status_response(json!({
+            "creator": creator,
+            "authorized": false,
+            "auth_kind": null,
+            "granted_scopes": [],
+            "session_expires_at": null
+        }))
+        .unwrap();
+        assert!(!unavailable.authorized);
+
+        for invalid in [
+            json!({"creator": creator, "authorized": false, "auth_kind": "grant", "granted_scopes": [], "session_expires_at": null}),
+            json!({"creator": creator, "authorized": false, "auth_kind": null, "granted_scopes": ["/pub/app.locks/:rw"], "session_expires_at": null}),
+            json!({"creator": creator, "authorized": true, "auth_kind": "future", "granted_scopes": [], "session_expires_at": null}),
+            json!({"creator": creator, "authorized": false, "auth_kind": null, "granted_scopes": [], "session_expires_at": null, "secret": "rejected"}),
+        ] {
+            assert!(CreatorLocks::parse_authority_status_response(invalid).is_err());
+        }
     }
 
     #[test]

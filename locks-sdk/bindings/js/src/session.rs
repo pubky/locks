@@ -401,6 +401,27 @@ pub(crate) async fn fetch_authorized_json(
 }
 
 #[cfg(target_arch = "wasm32")]
+pub(crate) async fn fetch_authorized_json_with_status(
+    request: &JsPreparedAuthorizedRequest,
+    expected_status: u16,
+) -> JsResult<wasm_bindgen::JsValue> {
+    let response = fetch_authorized(request).await?;
+    if response.status() != expected_status {
+        return Err(invalid_input(format!(
+            "Lock Server request failed with HTTP {}",
+            response.status()
+        )));
+    }
+    wasm_bindgen_futures::JsFuture::from(
+        response
+            .json()
+            .map_err(|err| invalid_input(format!("failed to read JSON response: {err:?}")))?,
+    )
+    .await
+    .map_err(|err| invalid_input(format!("failed to parse JSON response: {err:?}")))
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn fetch_authorized(request: &JsPreparedAuthorizedRequest) -> JsResult<web_sys::Response> {
     use wasm_bindgen::JsCast;
 

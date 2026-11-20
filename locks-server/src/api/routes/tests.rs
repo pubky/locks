@@ -40,10 +40,10 @@ use locks_service::application::models::{
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
     ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
-    ContentLockDeletionRepository, ContentLockRepository, FoldedAuthApprovalPoll,
-    FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthFlowStarter,
-    FoldedAuthPollCall, FoldedAuthRepository, GrantCreatorConnectFlowClient,
-    GuardedResourceRepository,
+    ContentLockDeletionRepository, ContentLockRepository, CreatorAuthorityManager,
+    CreatorAuthorityStatus, FoldedAuthApprovalPoll, FoldedAuthApprovalPollError,
+    FoldedAuthApprovalPoller, FoldedAuthFlowStarter, FoldedAuthPollCall, FoldedAuthRepository,
+    GrantCreatorConnectFlowClient, GuardedResourceRepository,
 };
 
 use pubky_common::crypto::Keypair;
@@ -6821,6 +6821,7 @@ async fn creator_authority_status_route_returns_missing_status_without_secret_fi
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body = response_json(response).await;
     assert_eq!(
         body["creator"],
@@ -6883,6 +6884,77 @@ async fn creator_authority_status_route_returns_authorized_status_without_secret
             "code",
             "database_url",
         ],
+    );
+}
+
+#[derive(Debug)]
+struct OperationalFailureAuthorityManager {
+    revalidation_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CreatorAuthorityManager for OperationalFailureAuthorityManager {
+    async fn revalidate_creator_authority(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+        self.revalidation_calls.fetch_add(1, Ordering::SeqCst);
+        Err(ApplicationError::CreatorAuthoritySecret {
+            message: "injected live revalidation failure".to_owned(),
+        })
+    }
+
+    async fn require_creator_authority(
+        &self,
+        _creator: &CreatorPubky,
+    ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+        panic!("status route must use live revalidation")
+    }
+}
+
+#[tokio::test]
+async fn creator_authority_status_route_preserves_authority_on_live_check_failure() {
+    let manager = Arc::new(OperationalFailureAuthorityManager {
+        revalidation_calls: AtomicUsize::new(0),
+    });
+    let state = test_state().with_creator_authority_manager(manager.clone());
+    seed_frontend_session(&state, "frontend-session-token", creator()).await;
+    seed_creator_authority(&state).await;
+    let app = router(state.clone());
+
+    let response = app
+        .oneshot(auth_request(
+            "GET",
+            "/creator/authority-status",
+            "Bearer frontend-session-token",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(manager.revalidation_calls.load(Ordering::SeqCst), 1);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["code"], "creator_authority_unavailable");
+    assert_ne!(body["authorized"], false);
+    assert_no_keys(
+        &body,
+        &[
+            "secret",
+            "token",
+            "frontend_session_token",
+            "authorization_url",
+            "code",
+            "database_url",
+        ],
+    );
+    assert!(
+        state
+            .creator_authorities()
+            .get_creator_authority(&creator())
+            .await
+            .unwrap()
+            .is_some(),
+        "temporary live-check failure must preserve persisted authority"
     );
 }
 

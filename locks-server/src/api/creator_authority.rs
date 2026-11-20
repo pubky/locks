@@ -60,7 +60,7 @@ fn required_grant_connect_flow_client(
 pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CreatorAuthorityStatusHttpResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let session_token = parse_frontend_session_token(&headers)?;
     let status = get_creator_authority_status(
         state.frontend_sessions().as_ref(),
@@ -70,7 +70,11 @@ pub(super) async fn creator_authority_status_route(
     )
     .await?;
 
-    Ok(Json(CreatorAuthorityStatusHttpResponse::from(status)))
+    let mut response = Json(CreatorAuthorityStatusHttpResponse::from(status)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// Postmessage message `type` published to embedding apps. Embedders MUST validate this string.

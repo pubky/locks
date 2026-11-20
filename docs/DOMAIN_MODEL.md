@@ -615,7 +615,7 @@ Lock-Server-owned protocol that starts the Pubky grant auth flow, completes it a
 
 ### GetCreatorAuthorityStatus
 
-Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, and asks the runtime-selected authority manager to revalidate the current authority before returning a secret-free status. Missing, revoked, expired, wrong-kind, or otherwise unavailable authority is represented as `authorized = false`; a retained legacy record from an older version is therefore never reported as connected.
+Read-only use case for `GET /creator/authority-status`. It validates a Locks-local frontend session, derives the creator from that session, and asks the runtime-selected authority manager to live-revalidate the current cached grant session before returning a secret-free status. Confirmed missing, revoked, expired, or wrong-kind authority is represented as `authorized = false`; a retained legacy record from an older version is therefore never reported as connected. Transport, server, permission, and decoding failures remain operationally unavailable instead of being reported as revoked. Ordinary creator Pubky reads and writes continue to use the cached session without this extra live status round trip.
 
 ### FrontendSessionExchange
 

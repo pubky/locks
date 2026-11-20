@@ -1082,6 +1082,15 @@ impl AppState {
         &self.creator_authority_manager
     }
 
+    #[cfg(test)]
+    pub fn with_creator_authority_manager(
+        mut self,
+        manager: Arc<dyn CreatorAuthorityManager>,
+    ) -> Self {
+        self.creator_authority_manager = manager;
+        self
+    }
+
     pub fn grant_creator_connect_flow_client(
         &self,
     ) -> Option<&Arc<dyn GrantCreatorConnectFlowClient>> {

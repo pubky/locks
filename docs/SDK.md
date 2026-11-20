@@ -297,6 +297,17 @@ Authorization: Bearer <frontend_session_token>
 
 Authenticated creator calls derive the creator identity from the frontend session. Request bodies intentionally omit `creator`.
 
+### Check creator authority
+
+```ts
+const status = await session.creator.creatorAuthorityStatus();
+if (!status.authorized) {
+  // Grant is conclusively missing, revoked, or expired. Reconnect creator authority.
+}
+```
+
+`creatorAuthorityStatus()` takes no creator argument. Lock Server derives creator from current frontend session and performs a live homeserver grant check. Only a canonical `200` status body resolves; `503` dependency failures, non-2xx responses, and malformed response fields reject rather than fabricating `authorized: false`.
+
 ### Register guarded resource
 
 ```ts
