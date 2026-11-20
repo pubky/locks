@@ -182,6 +182,7 @@ type CreatorAuthRuntime<S> = (
     Arc<dyn CreatorAuthorityManager>,
     Option<Arc<dyn GrantCreatorConnectFlowClient>>,
     Option<Arc<GrantSessionCache<S, PubkyGrantSessionImporter>>>,
+    Arc<dyn CreatorAuthorityStore>,
 );
 
 fn creator_auth_runtime<S>(
@@ -196,10 +197,10 @@ where
     // server without one has no way to acquire or restore creator authority: it fails closed.
     let Some(grant) = config.creator_authority_acquisition.grant_connect.as_ref() else {
         let manager = Arc::new(GrantCreatorAuthorityManager::new(
-            store,
+            store.clone(),
             UnavailableGrantCredentialRevalidator,
         ));
-        return (manager, None, None);
+        return (manager, None, None, Arc::new(store));
     };
     let keypair = load_lock_server_signing_keypair(&config.credentials)
         .expect("grant-connect requires keypair-seed Lock Server secret");
@@ -213,8 +214,9 @@ where
         default_requested_scopes(),
     );
     let session_cache = Arc::new(GrantSessionCache::new(store.clone(), importer, 256));
+    let fenced_store = session_cache.as_ref().clone();
     let manager = Arc::new(GrantCreatorAuthorityManager::new(
-        store,
+        fenced_store.clone(),
         Arc::clone(&session_cache),
     ));
     let grant_client = config.creator_authority_acquisition.enabled.then(|| {
@@ -225,7 +227,12 @@ where
             keys,
         )) as Arc<dyn GrantCreatorConnectFlowClient>
     });
-    (manager, grant_client, Some(session_cache))
+    (
+        manager,
+        grant_client,
+        Some(session_cache),
+        Arc::new(fenced_store),
+    )
 }
 
 #[derive(Clone)]
@@ -644,10 +651,13 @@ impl AppState {
             as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), creator_authority_cipher);
-        let creator_authorities = Arc::new(creator_authority_store.clone());
         let pubky_http_client = build_pubky_http_client(&config.pubky);
-        let (creator_authority_manager, grant_creator_connect_flow_client, grant_session_cache) =
-            creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
+        let (
+            creator_authority_manager,
+            grant_creator_connect_flow_client,
+            grant_session_cache,
+            creator_authorities,
+        ) = creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
         let creator_repositories = CreatorRepositoryAdapters::pubky_homeserver(grant_session_cache);
 
         let private_runtime = PrivateRuntimeAdapters {
@@ -757,10 +767,13 @@ impl AppState {
             as Arc<dyn PaymentDrainRepository>;
         let creator_authority_store =
             PostgresCreatorAuthorityStore::new_encrypted(pool.clone(), ciphers.creator_authority);
-        let creator_authorities = Arc::new(creator_authority_store.clone());
         let pubky_http_client = build_pubky_http_client(&config.pubky);
-        let (creator_authority_manager, grant_creator_connect_flow_client, _grant_session_cache) =
-            creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
+        let (
+            creator_authority_manager,
+            grant_creator_connect_flow_client,
+            _grant_session_cache,
+            creator_authorities,
+        ) = creator_auth_runtime(&config, creator_authority_store, &pubky_http_client);
         let creator_repositories = CreatorRepositoryAdapters::new(
             content_locks,
             content_lock_tombstones,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, watch};
@@ -342,6 +343,8 @@ where
                     });
                 }
                 false => {
+                    let authority_load_gate = self.authority_load_gate(creator).await;
+                    let _authority_load_guard = authority_load_gate.lock().await;
                     let persisted = match self.load_current_grant(creator).await {
                         Ok(record) => record,
                         Err(ApplicationError::CreatorAuthorityUnavailable) => {
@@ -516,6 +519,44 @@ where
             return Err(ApplicationError::CreatorAuthorityUnavailable);
         }
         Ok(session)
+    }
+}
+
+#[async_trait]
+impl<S, I> CreatorAuthorityStore for GrantSessionCache<S, I>
+where
+    S: CreatorAuthorityStore,
+    I: PubkySessionImporter,
+    I::Session: Clone,
+{
+    async fn upsert_creator_authority(
+        &self,
+        authority: CreatorAuthorityRecord,
+    ) -> Result<(), ApplicationError> {
+        let creator = authority.creator.clone();
+        let authority_load_gate = self.authority_load_gate(&creator).await;
+        let _authority_load_guard = authority_load_gate.lock().await;
+        self.store.upsert_creator_authority(authority).await?;
+        self.state.lock().await.entries.remove(&creator);
+        Ok(())
+    }
+
+    async fn get_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+        self.store.get_creator_authority(creator).await
+    }
+
+    async fn delete_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(), ApplicationError> {
+        let authority_load_gate = self.authority_load_gate(creator).await;
+        let _authority_load_guard = authority_load_gate.lock().await;
+        self.store.delete_creator_authority(creator).await?;
+        self.state.lock().await.entries.remove(creator);
+        Ok(())
     }
 }
 
@@ -830,6 +871,58 @@ mod tests {
             check.await.unwrap(),
             Err(ApplicationError::CreatorAuthoritySecret { .. })
         ));
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
+        assert_eq!(importer.import_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_stale_revocation_decision_and_preserves_rotated_authority() {
+        let store = DelayedNthLookupStore::new(record(creator_a(), "grant-a"), 3);
+        let importer = LiveCheckImporter::new([Ok(false), Ok(true)]);
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let old_secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let stale_check = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &old_secret)
+                    .await
+            })
+        };
+        store.delayed_lookup_captured.notified().await;
+
+        let mut reconnect = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .upsert_creator_authority(record(creator_a(), "grant-a-rotated"))
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut reconnect)
+                .await
+                .is_err(),
+            "reconnect must not commit between the stale persisted read and its decision"
+        );
+
+        store.release_delayed_lookup.notify_one();
+        assert_eq!(
+            stale_check.await.unwrap(),
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        reconnect.await.unwrap().unwrap();
+
+        cache
+            .revalidate_session_for_creator(
+                &creator_a(),
+                &CreatorAuthoritySecret::new("grant-a-rotated"),
+            )
+            .await
+            .unwrap();
         let current = cache.session_for_creator(&creator_a()).await.unwrap();
         assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
         assert_eq!(importer.import_calls(), 2);
@@ -1308,6 +1401,57 @@ mod tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_lookup_captured.notify_one();
                 self.release_first_lookup.notified().await;
+            }
+            Ok((record.creator == *creator).then_some(record))
+        }
+
+        async fn delete_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by delayed lookup test")
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedNthLookupStore {
+        record: Arc<RwLock<CreatorAuthorityRecord>>,
+        calls: Arc<AtomicUsize>,
+        delayed_call: usize,
+        delayed_lookup_captured: Arc<Notify>,
+        release_delayed_lookup: Arc<Notify>,
+    }
+
+    impl DelayedNthLookupStore {
+        fn new(record: CreatorAuthorityRecord, delayed_call: usize) -> Self {
+            Self {
+                record: Arc::new(RwLock::new(record)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                delayed_call,
+                delayed_lookup_captured: Arc::new(Notify::new()),
+                release_delayed_lookup: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CreatorAuthorityStore for DelayedNthLookupStore {
+        async fn upsert_creator_authority(
+            &self,
+            authority: CreatorAuthorityRecord,
+        ) -> Result<(), ApplicationError> {
+            *self.record.write().await = authority;
+            Ok(())
+        }
+
+        async fn get_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+            let record = self.record.read().await.clone();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == self.delayed_call {
+                self.delayed_lookup_captured.notify_one();
+                self.release_delayed_lookup.notified().await;
             }
             Ok((record.creator == *creator).then_some(record))
         }
