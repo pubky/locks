@@ -444,6 +444,9 @@ fn application_error_class(error: &ApplicationError) -> &'static str {
         ApplicationError::FoldedAuthSecret { .. } => "folded_auth_secret",
         ApplicationError::InvalidFoldedAuthState { .. } => "invalid_folded_auth_state",
         ApplicationError::CreatorAuthorityUnavailable => "creator_authority_unavailable",
+        ApplicationError::CreatorAuthorityDependencyUnavailable => {
+            "creator_authority_dependency_unavailable"
+        }
         ApplicationError::CreatorAuthoritySecret { .. } => "creator_authority_secret",
         ApplicationError::InvalidCreatorAuthorityAuthKind { .. } => {
             "invalid_creator_authority_auth_kind"

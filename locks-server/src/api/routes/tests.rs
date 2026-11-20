@@ -6900,9 +6900,7 @@ impl CreatorAuthorityManager for OperationalFailureAuthorityManager {
         _creator: &CreatorPubky,
     ) -> Result<CreatorAuthorityStatus, ApplicationError> {
         self.revalidation_calls.fetch_add(1, Ordering::SeqCst);
-        Err(ApplicationError::CreatorAuthoritySecret {
-            message: "injected live revalidation failure".to_owned(),
-        })
+        Err(ApplicationError::CreatorAuthorityDependencyUnavailable)
     }
 
     async fn require_creator_authority(

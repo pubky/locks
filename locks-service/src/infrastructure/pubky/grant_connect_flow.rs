@@ -420,8 +420,20 @@ fn map_grant_restore_sdk_error(error: pubky::Error) -> ApplicationError {
         status,
         "creator grant session exchange failed"
     );
-    match error_class {
-        "authentication" | "unauthorized" => ApplicationError::CreatorAuthorityUnavailable,
+    match &error {
+        pubky::Error::Authentication(_)
+        | pubky::Error::Request(pubky::errors::RequestError::Server {
+            status: pubky::StatusCode::UNAUTHORIZED,
+            ..
+        }) => ApplicationError::CreatorAuthorityUnavailable,
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+            if *status == pubky::StatusCode::FORBIDDEN || status.is_server_error() =>
+        {
+            ApplicationError::CreatorAuthorityDependencyUnavailable
+        }
+        pubky::Error::Request(pubky::errors::RequestError::Transport(_)) => {
+            ApplicationError::CreatorAuthorityDependencyUnavailable
+        }
         _ => grant_restore_error(),
     }
 }
@@ -429,6 +441,7 @@ fn map_grant_restore_sdk_error(error: pubky::Error) -> ApplicationError {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::time::Duration;
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -754,30 +767,56 @@ mod tests {
     }
 
     #[test]
-    fn grant_restore_keeps_permission_failures_retryable() {
-        let forbidden = pubky::Error::Request(pubky::errors::RequestError::Server {
-            status: pubky::StatusCode::FORBIDDEN,
-            message: "permission check unavailable".to_owned(),
+    fn grant_restore_maps_operational_exchange_failures_to_dependency_unavailable() {
+        for error in [
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status: pubky::StatusCode::FORBIDDEN,
+                message: "permission check unavailable".to_owned(),
+            }),
+            pubky::Error::Request(pubky::errors::RequestError::Server {
+                status: pubky::StatusCode::INTERNAL_SERVER_ERROR,
+                message: "homeserver unavailable".to_owned(),
+            }),
+        ] {
+            assert_eq!(
+                super::map_grant_restore_sdk_error(error),
+                ApplicationError::CreatorAuthorityDependencyUnavailable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_restore_maps_transport_failure_to_dependency_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
         });
+        let transport = reqwest::Client::builder()
+            .timeout(Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
 
         assert_eq!(
-            super::map_grant_restore_sdk_error(forbidden),
-            ApplicationError::CreatorAuthoritySecret {
-                message: "failed to restore grant creator authority".to_owned()
-            }
+            super::map_grant_restore_sdk_error(pubky::Error::Request(
+                pubky::errors::RequestError::Transport(transport),
+            )),
+            ApplicationError::CreatorAuthorityDependencyUnavailable
         );
     }
 
     #[test]
-    fn grant_restore_keeps_dependency_response_failures_typed() {
-        let error = pubky::Error::Request(pubky::errors::RequestError::DecodeJson {
-            message: "malformed homeserver response".to_owned(),
-        });
-
+    fn grant_restore_keeps_terminal_bad_state_distinct_from_operational_failures() {
         assert_eq!(
-            super::map_grant_restore_sdk_error(error),
+            decode_grant_state(&CreatorAuthoritySecret::new("corrupt grant")).unwrap_err(),
             ApplicationError::CreatorAuthoritySecret {
-                message: "failed to restore grant creator authority".to_owned()
+                message: "invalid stored grant creator authority".to_owned()
             }
         );
     }

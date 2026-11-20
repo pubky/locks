@@ -130,6 +130,9 @@ pub enum ApplicationError {
     /// Creator-granted homeserver authority is missing, expired, revoked, or unusable.
     #[error("creator authority unavailable")]
     CreatorAuthorityUnavailable,
+    /// Creator authority exchange could not complete because its remote dependency is unavailable.
+    #[error("creator authority dependency unavailable")]
+    CreatorAuthorityDependencyUnavailable,
     /// Creator authority secret material could not be imported, restored, or used.
     #[error("creator authority secret error: {message}")]
     CreatorAuthoritySecret {
