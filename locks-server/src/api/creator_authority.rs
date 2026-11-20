@@ -60,17 +60,30 @@ fn required_grant_connect_flow_client(
 pub(super) async fn creator_authority_status_route(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<CreatorAuthorityStatusHttpResponse>, ApiError> {
-    let session_token = parse_frontend_session_token(&headers)?;
-    let status = get_creator_authority_status(
-        state.frontend_sessions().as_ref(),
-        state.creator_authority_manager().as_ref(),
-        state.clock().as_ref(),
-        GetCreatorAuthorityStatusRequest { session_token },
-    )
-    .await?;
+) -> Result<Response, ApiError> {
+    let result = async {
+        let session_token = parse_frontend_session_token(&headers)?;
+        let status = get_creator_authority_status(
+            state.frontend_sessions().as_ref(),
+            state.creator_authority_manager().as_ref(),
+            state.clock().as_ref(),
+            GetCreatorAuthorityStatusRequest { session_token },
+        )
+        .await?;
+        Ok::<Response, ApiError>(
+            Json(CreatorAuthorityStatusHttpResponse::from(status)).into_response(),
+        )
+    }
+    .await;
 
-    Ok(Json(CreatorAuthorityStatusHttpResponse::from(status)))
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// Postmessage message `type` published to embedding apps. Embedders MUST validate this string.

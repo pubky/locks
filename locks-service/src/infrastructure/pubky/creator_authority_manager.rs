@@ -22,6 +22,14 @@ pub trait GrantCredentialRevalidator: Send + Sync {
         creator: &CreatorPubky,
         secret: &CreatorAuthoritySecret,
     ) -> Result<(), ApplicationError>;
+
+    async fn require_grant_credential(
+        &self,
+        creator: &CreatorPubky,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError> {
+        self.revalidate_grant_credential(creator, secret).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +84,14 @@ where
     I::Session: Clone,
 {
     async fn revalidate_grant_credential(
+        &self,
+        creator: &CreatorPubky,
+        secret: &CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError> {
+        self.revalidate_session_for_creator(creator, secret).await
+    }
+
+    async fn require_grant_credential(
         &self,
         creator: &CreatorPubky,
         secret: &CreatorAuthoritySecret,
@@ -135,7 +151,18 @@ where
         &self,
         creator: &CreatorPubky,
     ) -> Result<CreatorAuthorityStatus, ApplicationError> {
-        self.revalidate_creator_authority(creator).await
+        let record = self
+            .store
+            .get_creator_authority(creator)
+            .await?
+            .ok_or(ApplicationError::CreatorAuthorityUnavailable)?;
+        if record.auth_kind != CreatorAuthorityAuthKind::Grant {
+            return Err(ApplicationError::CreatorAuthorityUnavailable);
+        }
+        self.revalidator
+            .require_grant_credential(creator, &record.secret)
+            .await?;
+        Ok(record_to_authorized_status(record))
     }
 }
 

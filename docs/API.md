@@ -26,11 +26,11 @@ The Lock Server has one non-production route family and one authenticated creato
   - Derive creator identity from the frontend session. Request-body `creator` is rejected for authenticated routes.
   - A guarded path can be owned by only one managed Content Lock for that creator. Creating a different Lock ID for an owned path returns `409 content_lock_path_conflict`.
   - Missing/unknown/expired frontend sessions use the JSON error envelope (`401 frontend_session_unavailable` or `401 frontend_session_expired`).
-  - Missing/revoked creator-granted homeserver authority remains a separate operational error (`503 creator_authority_unavailable`).
+  - Ordinary creator Pubky reads and writes use cached creator-granted homeserver authority without a live status round trip. Unavailable cached authority remains a separate operational error (`503 creator_authority_unavailable`).
 - Creator authority status route: `GET /creator/authority-status`
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives creator from the Locks-local frontend session.
-  - Returns secret-free missing/present creator authority status.
+  - Live-revalidates the cached grant session. Confirmed missing, revoked (`401`), expired, or wrong-kind authority returns secret-free `200` with `authorized: false`. Permission (`403`) and other operational live/restore failures return secret-free `503 creator_authority_unavailable`; every response carries `Cache-Control: no-store`.
 - Paykit setup readiness route: `GET /creator/paykit/setup-status`
   - Requires `Authorization: Bearer <frontend_session_token>`.
   - Derives Creator identity from the Locks frontend session and sends no browser-supplied Creator.
@@ -60,7 +60,7 @@ Gated-off routes are plain Axum `404 Not Found` responses because the route is i
 | `POST /frontend-sessions` | `200` JSON frontend session token handoff | No bearer auth. Requires one-time `code` plus matching `state`. | Response intentionally contains raw `session_token` exactly once; no creator authority secret, authorization URL, or one-time code reuse. | `400 invalid_request`, `400 frontend_session_state_mismatch`, `404 frontend_session_code_unavailable`, `410 frontend_session_code_expired`, `410 frontend_session_code_already_consumed`, `404` when route gated off |
 | `DELETE /frontend-sessions/current` | `204` empty response | Requires `Authorization: Bearer <frontend_session_token>`. Mounted with creator authority acquisition. | Token is request-only and is deleted from the frontend session store. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` when route gated off |
 | `GET /.well-known/locks-server` | `200` JSON service identity | Public. Always mounted. CORS-enabled. | No secrets. Used by browser SDK to verify service, API version, and Lock Server Pubky identity. | n/a |
-| `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `404` only if route absent in older deployments |
+| `GET /creator/authority-status` | `200` JSON secret-free authority status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the frontend session. | Response contains only creator, boolean status, auth kind, scopes, and optional expiry; no tokens, codes, authorization URLs, secrets, or DB/config values. | `401 frontend_session_unavailable`, `401 frontend_session_expired`, `503 creator_authority_unavailable`, `404` only if route absent in older deployments |
 | `GET /creator/paykit/setup-status` | `200` JSON coarse Paykit setup status | Requires `Authorization: Bearer <frontend_session_token>`. Creator is derived from the session; query/body Creator input is rejected. | Response contains only `status`; Paykit URL, HTTP status, authority details, credentials, and internal failures are never exposed. | `401 frontend_session_unavailable`, `401 frontend_session_expired`; authenticated Paykit failures return `200 {"status":"unavailable"}` |
 | `POST /proof-bundles` | `200` payment-v1 lifecycle or accepted graph/mixed replay; `202` payment-v2 lifecycle or new graph/mixed `auth_pending` | Public viewer route. Graph-only and mixed v2 begin folded auth; payment v1 and payment-only v2 use durable worker-owned provider admission. Mixed omits wire Reader and binds it after auth. | No folded-auth secret, bearer credential, invoice data, connection state, or raw proof material. | `400 invalid_request`, `409 task_state_conflict`, `409 content_lock_deletion_in_progress`, `422 unsupported_verifier_type`, `422 paykit_not_configured`, `429 rate_limited` |
 | `POST /proof-bundles/auth-status` | `200` graph or mixed auth status | Public folded-auth route; body is public `state`. | Returns only `pending`, `accepted`, `restart_required`, or `expired`; no flow secret or Reader before approval. | `400 invalid_request`, `404 folded_auth_state_not_found` |
@@ -265,12 +265,13 @@ Authorized response:
 }
 ```
 
-The response must not include creator authority secrets, frontend session tokens, one-time codes, authorization URLs, or database configuration. This route is a read model only; it does not revalidate the underlying Pubky session. Pubky I/O paths still revalidate before writes/reads.
+The response must not include creator authority secrets, frontend session tokens, one-time codes, authorization URLs, or database configuration. Each status read live-revalidates the cached grant session with the homeserver and returns `Cache-Control: no-store`. Confirmed missing, revoked, expired, or wrong-kind authority returns `authorized: false`; transport, server, permission, or decoding failures remain operational failures rather than being reported as revoked. Ordinary creator Pubky reads and writes keep using the cached session without this extra status round trip.
 
 Error cases:
 
 - Missing/malformed frontend session bearer: `401 frontend_session_unavailable`.
 - Expired frontend session: `401 frontend_session_expired`.
+- Live authority check unavailable: `503 creator_authority_unavailable`.
 
 ## Paykit setup readiness route
 

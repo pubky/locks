@@ -182,6 +182,7 @@ impl From<ApplicationError> for ApiError {
                 "expired access credential",
             ),
             ApplicationError::CreatorAuthorityUnavailable
+            | ApplicationError::CreatorAuthorityDependencyUnavailable
             | ApplicationError::CreatorAuthoritySecret { .. }
             | ApplicationError::InvalidCreatorAuthorityAuthKind { .. } => Self::new(
                 ApiErrorCode::CreatorAuthorityUnavailable,

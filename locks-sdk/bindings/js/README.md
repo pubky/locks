@@ -34,6 +34,10 @@ The package targets browsers and loads its bundled WebAssembly module through th
 
 API and integration documentation: <https://github.com/pubky/locks/blob/master/docs/SDK.md>
 
+Authenticated creator sessions expose `creatorAuthorityStatus()` for a live, secret-free grant
+status check. Operational homeserver failures reject; only confirmed missing/revoked/expired grants
+resolve with `authorized: false`.
+
 ## License
 
 MIT
