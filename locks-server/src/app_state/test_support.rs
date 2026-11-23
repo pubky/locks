@@ -24,7 +24,7 @@ use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     ContentLockDeletionPhase, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret,
+    CreatorAuthoritySecret, CreatorConnectFlowId, GrantPopKeyId,
 };
 use locks_service::application::ports::{
     ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
@@ -33,7 +33,9 @@ use locks_service::application::ports::{
     TombstoneReadback, VerificationTaskIdGenerator,
 };
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
+use locks_service::infrastructure::folded_auth::FoldedAuthSecretCipher;
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
+use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 
 #[test]
 fn in_memory_state_uses_in_memory_private_runtime_adapters() {
@@ -234,14 +236,11 @@ async fn postgres_state_wires_connect_flow_runtime_state() {
     assert!(Arc::strong_count(state.creator_authority_manager()) >= 1);
 }
 
-#[tokio::test]
-async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configured() {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://locks:***@localhost/locks_test")
-        .unwrap();
-    let secret_dir = tempfile::tempdir().unwrap();
+const CONFIGURED_AUTH_RELAY: &str = "https://relay.shop.example/inbox";
+
+fn grant_connect_config(secret_dir: &std::path::Path) -> LockServerRuntimeConfig {
     let mut config = test_config();
-    config.credentials.lock_server_secret_key = write_keypair_seed_secret(secret_dir.path());
+    config.credentials.lock_server_secret_key = write_keypair_seed_secret(secret_dir);
     config.credentials.lock_server_public_key = LockServerPubky::from_str(
         &pubky_common::crypto::Keypair::from_secret(&[9; 32])
             .public_key()
@@ -254,15 +253,73 @@ async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configure
             client_id: "locks.example".to_owned(),
             allowed_return_origins: vec!["https://pubky.app".to_owned()],
         });
+    config.pubky.auth_relay = Some(CONFIGURED_AUTH_RELAY.parse().unwrap());
+    config
+}
+
+fn auth_relay_of(authorization_url: &str) -> String {
+    url::Url::parse(authorization_url)
+        .unwrap()
+        .query_pairs()
+        .find(|(name, _)| name == "relay")
+        .map(|(_, relay)| relay.into_owned())
+        .expect("authorization URL names its AUTH relay")
+}
+
+#[tokio::test]
+async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configured() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
+        .unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
 
     let state = AppState::new_with_postgres_runtime(
-        config,
+        grant_connect_config(secret_dir.path()),
         pool,
         test_creator_authority_cipher(),
         test_final_credential_cipher(),
     );
 
-    assert!(state.grant_creator_connect_flow_client().is_some());
+    let authorization_url = state
+        .grant_creator_connect_flow_client()
+        .expect("grant connect is configured")
+        .start_grant_creator_connect_flow(
+            &super::default_requested_scopes(),
+            &GrantPopKeyId::for_connect_flow(&CreatorConnectFlowId::new("flow-relay")),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        auth_relay_of(authorization_url.expose_url()),
+        CONFIGURED_AUTH_RELAY
+    );
+}
+
+#[tokio::test]
+async fn postgres_folded_auth_state_starts_flows_on_the_configured_auth_relay() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
+        .unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
+
+    let state = AppState::new_with_postgres_runtime_and_folded_auth(
+        grant_connect_config(secret_dir.path()),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+        FoldedAuthSecretCipher::from_runtime_master_key(
+            &RuntimeMasterKey::from_base64url("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap(),
+        ),
+    );
+
+    let (authorization_url, _) = state
+        .folded_auth_flow_starter()
+        .expect("folded auth is wired when grant connect is configured")
+        .start(&GrantPopKeyId::new("folded-relay".to_owned()))
+        .unwrap();
+    assert_eq!(auth_relay_of(&authorization_url), CONFIGURED_AUTH_RELAY);
 }
 
 #[tokio::test]
