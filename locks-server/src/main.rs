@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tasks = tasks.with_verification_worker(Box::new(move |context| {
             Box::pin(async move {
                 let verification = VerificationWorker::from_state(&worker_state);
-                let paykit = worker_state.paykit_http_client().cloned();
+                let paykit = worker_state.paykit_router().cloned();
                 let graph_verifier = worker_state
                     .nexus_endpoint_source()
                     .cloned()

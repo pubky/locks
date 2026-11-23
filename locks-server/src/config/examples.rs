@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use base64::Engine;
-use locks_core::ids::LockServerPubky;
+use locks_core::ids::{CreatorPubky, LockServerPubky};
 use tempfile::tempdir;
 
 use crate::config::{
@@ -243,6 +243,114 @@ fn parses_optional_paykit_runtime_config() {
     let paykit = config.paykit.expect("paykit config is present");
     assert_eq!(paykit.server_url, "http://127.0.0.1:3001");
     assert_eq!(paykit.minimum_confirmations, 0);
+}
+
+fn paykit_config_with_creator_server_urls(
+    secret_path: &std::path::Path,
+    public_key: &LockServerPubky,
+    entries: &str,
+) -> String {
+    minimal_config(secret_path, public_key, "production").replace(
+        "[content_locks]",
+        &format!(
+            "[paykit]\nserver_url = \"https://paykit.default.example\"\nminimum_confirmations = 0\n\n[paykit.creator_server_urls]\n{entries}\n\n[content_locks]"
+        ),
+    )
+}
+
+fn creator_pubky(seed: u8) -> String {
+    pubky_common::crypto::Keypair::from_secret(&[seed; 32])
+        .public_key()
+        .to_string()
+}
+
+#[test]
+fn parses_operator_set_paykit_server_urls_per_creator() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let creator = creator_pubky(1);
+    let config = paykit_config_with_creator_server_urls(
+        &secret_path,
+        &public_key,
+        &format!("\"{creator}\" = \"https://paykit.creator.example\""),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let paykit = load_existing_config_from_path(&config_path)
+        .unwrap()
+        .paykit
+        .expect("paykit config is present");
+
+    assert_eq!(paykit.server_url, "https://paykit.default.example");
+    assert_eq!(paykit.creator_server_urls.len(), 1);
+    assert_eq!(
+        paykit.creator_server_urls[&CreatorPubky::from_str(&creator).unwrap()],
+        "https://paykit.creator.example"
+    );
+}
+
+#[test]
+fn paykit_creator_server_urls_default_to_empty() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let config = minimal_config(&secret_path, &public_key, "development").replace(
+        "[content_locks]",
+        "[paykit]\nserver_url = \"http://127.0.0.1:3001\"\nminimum_confirmations = 0\n\n[content_locks]",
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let paykit = load_existing_config_from_path(&config_path)
+        .unwrap()
+        .paykit
+        .expect("paykit config is present");
+
+    assert!(paykit.creator_server_urls.is_empty());
+}
+
+#[test]
+fn rejects_invalid_paykit_creator_server_urls() {
+    let temp_dir = tempdir().unwrap();
+    let secret_path = temp_dir.path().join("secret.sess");
+    let public_key = test_identity(&secret_path);
+    let config_path = temp_dir.path().join("config.toml");
+    let creator = creator_pubky(1);
+    let unprefixed = creator.trim_start_matches("pubky").to_owned();
+    for (key, server_url) in [
+        ("not-a-pubky", "https://paykit.creator.example"),
+        (unprefixed.as_str(), "https://paykit.creator.example"),
+        (creator.as_str(), "ftp://paykit.creator.example"),
+        (
+            creator.as_str(),
+            "https://user:password@paykit.creator.example",
+        ),
+        (creator.as_str(), "https://paykit.creator.example/"),
+        (creator.as_str(), "https://paykit.creator.example/path"),
+        (
+            creator.as_str(),
+            "https://paykit.creator.example?secret=query",
+        ),
+        (creator.as_str(), "https://paykit.creator.example#fragment"),
+    ] {
+        let config = paykit_config_with_creator_server_urls(
+            &secret_path,
+            &public_key,
+            &format!("\"{key}\" = \"{server_url}\""),
+        );
+        std::fs::write(&config_path, config).unwrap();
+        let message = load_existing_config_from_path(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            "paykit.creator_server_urls keys must be canonical creator pubkys and values exact HTTP(S) origins without credentials",
+            "{key} = {server_url}"
+        );
+        assert!(!message.contains(server_url));
+    }
 }
 
 #[test]

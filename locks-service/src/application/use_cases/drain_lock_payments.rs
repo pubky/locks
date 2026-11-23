@@ -140,13 +140,13 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
         if claim.job.phase != ContentLockDeletionPhase::PurgeOperationalState {
             return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::FatalFailure);
         }
-        let authority = match self.paykit.authority() {
+        let lock_resource = lock_resource(&claim);
+        let authority = match self.paykit.authority_for(&lock_resource) {
             Some(authority) => authority,
             None => {
                 return DeletionPhaseExecution::new(DeletionPhaseExecutionOutcome::FatalFailure);
             }
         };
-        let lock_resource = lock_resource(&claim);
         let preparation = match self
             .drains
             .prepare_payment_drain_cleanup(
@@ -290,7 +290,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             )
         });
         if has_provider_v2 {
-            let authority = self.paykit.authority().ok_or_else(|| {
+            let authority = self.paykit.authority_for(&lock_resource).ok_or_else(|| {
                 ApplicationError::InvalidContentLockDeletionState {
                     message: "provider-v2 deletion requires a normalized Paykit authority"
                         .to_owned(),
@@ -355,7 +355,7 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             }
         }
         if has_provider_v2 {
-            let authority = self.paykit.authority().ok_or_else(|| {
+            let authority = self.paykit.authority_for(&lock_resource).ok_or_else(|| {
                 ApplicationError::InvalidContentLockDeletionState {
                     message: "provider-v2 deletion requires a normalized Paykit authority"
                         .to_owned(),
@@ -415,12 +415,12 @@ impl<'a> DrainLockPaymentsUseCase<'a> {
             )
         });
         if has_provider_v2 {
-            let authority = self.paykit.authority().ok_or_else(|| {
+            let lock_resource = lock_resource(&claim);
+            let authority = self.paykit.authority_for(&lock_resource).ok_or_else(|| {
                 ApplicationError::InvalidContentLockDeletionState {
                     message: "provider-v2 deletion requires the frozen Paykit authority".to_owned(),
                 }
             })?;
-            let lock_resource = lock_resource(&claim);
             if !self
                 .drains
                 .store_provider_v2_fence(

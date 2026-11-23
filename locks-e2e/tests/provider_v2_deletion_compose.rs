@@ -341,6 +341,7 @@ fn build_state(
     config.paykit = Some(PaykitConfig {
         server_url: paykit_url.to_owned(),
         minimum_confirmations: 1,
+        creator_server_urls: Default::default(),
     });
     AppState::new_with_postgres_runtime_and_creator_repositories(
         config,

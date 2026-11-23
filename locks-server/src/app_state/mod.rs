@@ -94,7 +94,8 @@ pub use crate::app_state::readiness::{
 };
 use crate::config::{LockServerRuntimeConfig, load_lock_server_signing_keypair};
 use crate::nexus_http_client::{LiveNexusEndpoint, NexusEndpoint};
-use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
+use crate::paykit_http_client::PaykitSetupStatusProvider;
+use crate::paykit_router::PaykitRouter;
 use crate::rate_limit::{
     InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryReaderAuthRateLimiter,
     InMemoryVerificationSubmissionRateLimiter, READER_AUTH_MAX_IN_FLIGHT,
@@ -270,7 +271,7 @@ pub struct AppState {
     creator_authority_manager: Arc<dyn CreatorAuthorityManager>,
     grant_creator_connect_flow_client: Option<Arc<dyn GrantCreatorConnectFlowClient>>,
     dev_static_verifier: Arc<DevStaticVerifier>,
-    paykit_payment_verifier: Option<Arc<PaykitPaymentVerifier<Arc<PaykitHttpClient>>>>,
+    paykit_payment_verifier: Option<Arc<PaykitPaymentVerifier<Arc<PaykitRouter>>>>,
     task_ids: Arc<OsRandomTaskIdGenerator>,
     credential_generator: Arc<OsRandomAccessCredentialGenerator>,
     creator_connect_flow_id_generator: Arc<OsRandomCreatorConnectFlowIdGenerator>,
@@ -285,7 +286,7 @@ pub struct AppState {
     reader_auth_rate_limiter: Arc<InMemoryReaderAuthRateLimiter>,
     reader_auth_semaphore: Arc<Semaphore>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
-    paykit_http_client: Option<Arc<PaykitHttpClient>>,
+    paykit_router: Option<Arc<PaykitRouter>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
     payment_drain_client: Option<Arc<dyn PaymentDrainClient>>,
     folded_auth: Option<Arc<dyn FoldedAuthRepository>>,
@@ -857,14 +858,14 @@ impl AppState {
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
             client: build_pubky_client(&config.pubky),
         });
-        let paykit_http_client = config.paykit.as_ref().map(|paykit| {
+        let paykit_router = config.paykit.as_ref().map(|paykit| {
             Arc::new(
-                PaykitHttpClient::new(&paykit.server_url, &config.credentials)
-                    .expect("validated paykit config must produce a signed Paykit HTTP client"),
+                PaykitRouter::from_config(paykit, &config.credentials)
+                    .expect("validated paykit config must produce signed Paykit HTTP clients"),
             )
         });
         let paykit_payment_verifier = config.paykit.as_ref().and_then(|paykit| {
-            paykit_http_client.as_ref().map(|client| {
+            paykit_router.as_ref().map(|client| {
                 Arc::new(PaykitPaymentVerifier::new(
                     Arc::clone(client),
                     paykit.minimum_confirmations,
@@ -872,10 +873,10 @@ impl AppState {
             })
         });
         let payment_drains = Some(private_runtime.payment_drains.clone());
-        let payment_drain_client = paykit_http_client
+        let payment_drain_client = paykit_router
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaymentDrainClient>);
-        let paykit_setup_status_provider = paykit_http_client
+        let paykit_setup_status_provider = paykit_router
             .as_ref()
             .map(|client| Arc::clone(client) as Arc<dyn PaykitSetupStatusProvider>);
         let nexus_endpoint_source = config.nexus.as_ref().map(|nexus| {
@@ -947,7 +948,7 @@ impl AppState {
             reader_auth_rate_limiter,
             reader_auth_semaphore,
             reader_pubky_resolver,
-            paykit_http_client,
+            paykit_router,
             paykit_setup_status_provider,
             payment_drain_client,
             folded_auth: None,
@@ -1144,7 +1145,7 @@ impl AppState {
 
     pub fn paykit_payment_verifier(
         &self,
-    ) -> Option<&Arc<PaykitPaymentVerifier<Arc<PaykitHttpClient>>>> {
+    ) -> Option<&Arc<PaykitPaymentVerifier<Arc<PaykitRouter>>>> {
         self.paykit_payment_verifier.as_ref()
     }
 
@@ -1262,13 +1263,16 @@ impl AppState {
         &self.reader_pubky_resolver
     }
 
-    pub fn paykit_http_client(&self) -> Option<&Arc<PaykitHttpClient>> {
-        self.paykit_http_client.as_ref()
+    pub fn paykit_router(&self) -> Option<&Arc<PaykitRouter>> {
+        self.paykit_router.as_ref()
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn with_paykit_http_client(mut self, client: Option<Arc<PaykitHttpClient>>) -> Self {
-        self.paykit_http_client = client;
+    pub fn with_paykit_http_client(
+        mut self,
+        client: Option<Arc<crate::paykit_http_client::PaykitHttpClient>>,
+    ) -> Self {
+        self.paykit_router = client.map(|client| Arc::new(PaykitRouter::single(client)));
         self
     }
 

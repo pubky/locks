@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use locks_core::ids::LockServerPubky;
+use locks_core::ids::{CreatorPubky, LockServerPubky};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -154,28 +155,44 @@ impl RawNexusConfig {
 struct RawPaykitConfig {
     server_url: String,
     minimum_confirmations: u32,
+    #[serde(default)]
+    creator_server_urls: BTreeMap<String, String>,
 }
 
 impl RawPaykitConfig {
     fn into_paykit_config(self) -> Result<PaykitConfig, ConfigError> {
-        let parsed =
-            Url::parse(&self.server_url).map_err(|_| ConfigError::InvalidPaykitServerUrl)?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || parsed.host_str().is_none()
-            || parsed.cannot_be_a_base()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || parsed.origin().ascii_serialization() != self.server_url
-        {
+        if !is_exact_paykit_origin(&self.server_url) {
             return Err(ConfigError::InvalidPaykitServerUrl);
+        }
+        let mut creator_server_urls = HashMap::with_capacity(self.creator_server_urls.len());
+        for (creator, server_url) in self.creator_server_urls {
+            let parsed = CreatorPubky::from_str(&creator)
+                .map_err(|_| ConfigError::InvalidPaykitCreatorServerUrl)?;
+            if parsed.to_string() != creator || !is_exact_paykit_origin(&server_url) {
+                return Err(ConfigError::InvalidPaykitCreatorServerUrl);
+            }
+            creator_server_urls.insert(parsed, server_url);
         }
         Ok(PaykitConfig {
             server_url: self.server_url,
             minimum_confirmations: self.minimum_confirmations,
+            creator_server_urls,
         })
     }
+}
+
+fn is_exact_paykit_origin(server_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(server_url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && !parsed.cannot_be_a_base()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.origin().ascii_serialization() == server_url
 }
 
 #[derive(Debug, Deserialize)]

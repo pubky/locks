@@ -1,5 +1,6 @@
 mod support;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -476,19 +477,30 @@ async fn creator_publishing_http_rejects_ambiguous_paykit_payment_policies() {
 #[tokio::test]
 async fn creator_publishing_http_bitcoin_checkout_unlocks_each_supported_denomination() {
     for asset in ["BTC", "USD", "USDT"] {
-        paykit_checkout(asset, false).await;
+        paykit_checkout(asset, false, false).await;
     }
 }
 
 #[tokio::test]
 async fn creator_publishing_http_usdt_checkout_unlocks_each_supported_denomination() {
     for asset in ["BTC", "USD", "USDT"] {
-        paykit_checkout(asset, true).await;
+        paykit_checkout(asset, true, false).await;
     }
 }
 
-async fn paykit_checkout(asset: &str, use_usdt: bool) {
+#[tokio::test]
+async fn creator_publishing_http_checkout_uses_the_operator_set_creator_paykit_server() {
+    paykit_checkout("BTC", false, true).await;
+    paykit_checkout("USDT", true, true).await;
+}
+
+async fn paykit_checkout(asset: &str, use_usdt: bool, creator_mapped: bool) {
     let fake_paykit = FakePaykitServer::start(use_usdt).await;
+    let default_paykit = if creator_mapped {
+        Some(FakePaykitServer::start(use_usdt).await)
+    } else {
+        None
+    };
     let temp_dir = tempfile::tempdir().unwrap();
     let secret_path = temp_dir.path().join("lock-server.keypair-seed");
     let public_key = FilesystemLockServerIdentityProvider
@@ -498,8 +510,17 @@ async fn paykit_checkout(asset: &str, use_usdt: bool) {
     config.credentials.lock_server_secret_key = secret_path;
     config.credentials.lock_server_public_key = public_key;
     config.paykit = Some(PaykitConfig {
-        server_url: fake_paykit.server_url.clone(),
+        server_url: default_paykit
+            .as_ref()
+            .unwrap_or(&fake_paykit)
+            .server_url
+            .clone(),
         minimum_confirmations: if use_usdt { 6 } else { 0 },
+        creator_server_urls: if creator_mapped {
+            HashMap::from([(creator(), fake_paykit.server_url.clone())])
+        } else {
+            HashMap::new()
+        },
     });
     let state = AppState::new_empty_in_memory_with_creator_repositories(
         config,
@@ -602,7 +623,7 @@ async fn paykit_checkout(asset: &str, use_usdt: bool) {
         test_app.state(),
         test_app
             .state()
-            .paykit_http_client()
+            .paykit_router()
             .expect("Paykit client is configured")
             .as_ref(),
         &jitter,
@@ -661,6 +682,9 @@ async fn paykit_checkout(asset: &str, use_usdt: bool) {
         .unwrap();
     assert_eq!(proxy_response.status(), StatusCode::OK);
     assert_eq!(response_bytes(proxy_response).await, GUARDED_BYTES);
+    if let Some(default_paykit) = default_paykit {
+        default_paykit.assert_untouched().await;
+    }
 }
 
 async fn creator_publishing_client() -> (TestServerApp, LocalCreatorPublishingClient) {
@@ -896,6 +920,13 @@ impl FakePaykitServer {
         assert_eq!(state.invoice_body, None);
         assert_eq!(state.invoice_signature, None);
         assert_eq!(state.invoice_count, 0);
+    }
+
+    async fn assert_untouched(&self) {
+        self.assert_no_invoice_created().await;
+        let state = self.state.lock().await;
+        assert_eq!(state.connection_body, None);
+        assert_eq!(state.status_body, None);
     }
 
     async fn assert_invoice_count(&self, expected: usize) {

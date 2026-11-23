@@ -277,7 +277,7 @@ async fn start_v2_verification(
     };
     match (lock.graph.as_ref(), lock.payment.as_ref()) {
         (None, Some(payment)) => {
-            if state.paykit_http_client().is_none() {
+            if state.paykit_router().is_none() {
                 return Err(ApiError::new(
                     ApiErrorCode::PaykitNotConfigured,
                     "paykit is not configured",
@@ -304,7 +304,7 @@ async fn start_v2_verification(
                 .into_response())
         }
         (Some(graph), payment) => {
-            if payment.is_some() && state.paykit_http_client().is_none() {
+            if payment.is_some() && state.paykit_router().is_none() {
                 return Err(ApiError::new(
                     ApiErrorCode::PaykitNotConfigured,
                     "paykit is not configured",
@@ -631,7 +631,7 @@ async fn maybe_prepare_paykit_submission(
             return Err(error.into());
         }
     };
-    let paykit = state.paykit_http_client().ok_or_else(|| {
+    let paykit = state.paykit_router().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::PaykitNotConfigured,
             "paykit is not configured",
@@ -769,7 +769,7 @@ pub(super) async fn lookup_paykit_connection_state(
         ));
     }
 
-    let paykit = state.paykit_http_client().ok_or_else(|| {
+    let paykit = state.paykit_router().ok_or_else(|| {
         ApiError::new(
             ApiErrorCode::PaykitNotConfigured,
             "paykit is not configured",
