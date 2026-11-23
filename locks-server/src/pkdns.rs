@@ -258,6 +258,7 @@ mod tests {
             network: crate::config::PubkyNetwork::Mainnet,
             resolution: crate::config::PubkyResolution::RelayOnly,
             pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+            auth_relay: None,
         };
         let mut builder = pkarr::Client::builder();
 
@@ -275,6 +276,7 @@ mod tests {
             network: crate::config::PubkyNetwork::Testnet,
             resolution: crate::config::PubkyResolution::Default,
             pkarr_relays: None,
+            auth_relay: None,
         };
         let mut builder = pkarr::Client::builder();
 

@@ -64,6 +64,8 @@ On `testnet`, omitting it preserves the Pubky SDK's local testnet relay (`http:/
 
 `resolution = "relay-only"` still disables Mainline DHT while retaining either configured relays or these defaults. The same relay list is used to publish and republish the Lock Server's own PKARR record.
 
+`pubky.auth_relay` is an optional Pubky AUTH relay inbox URL, separate from the PKARR relays. Creator grant-connect and reader folded-auth URLs carry it, and the approving signer posts its response there, so it must be reachable from the signer. It must use `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]`, without credentials, query strings, or fragments. Omitting it keeps the network default: the Pubky SDK default relay on `mainnet` and `http://127.0.0.1:15412/inbox/` on `testnet`.
+
 ## Runtime environment and route gates
 
 ```toml

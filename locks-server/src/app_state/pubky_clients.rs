@@ -77,8 +77,11 @@ pub(super) fn build_pubky_client(config: &PubkyConfig) -> pubky::Pubky {
     pubky::Pubky::with_client(build_pubky_http_client(config))
 }
 
-pub(super) fn pubky_auth_relay_for_network(network: PubkyNetwork) -> Option<url::Url> {
-    match network {
+pub(super) fn pubky_auth_relay(config: &PubkyConfig) -> Option<url::Url> {
+    if let Some(relay) = &config.auth_relay {
+        return Some(relay.clone());
+    }
+    match config.network {
         PubkyNetwork::Mainnet => None,
         PubkyNetwork::Testnet => Some(
             "http://127.0.0.1:15412/inbox/"

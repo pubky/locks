@@ -131,6 +131,8 @@ struct RawPubkyConfig {
     resolution: PubkyResolution,
     #[serde(default)]
     pkarr_relays: Option<Vec<String>>,
+    #[serde(default)]
+    auth_relay: Option<String>,
 }
 
 impl Default for RawPubkyConfig {
@@ -139,6 +141,7 @@ impl Default for RawPubkyConfig {
             network: default_pubky_network(),
             resolution: PubkyResolution::default(),
             pkarr_relays: None,
+            auth_relay: None,
         }
     }
 }
@@ -156,10 +159,17 @@ impl RawPubkyConfig {
             None => None,
         };
 
+        let auth_relay = self
+            .auth_relay
+            .as_deref()
+            .map(parse_pubky_auth_relay_url)
+            .transpose()?;
+
         Ok(PubkyConfig {
             network: self.network,
             resolution: self.resolution,
             pkarr_relays,
+            auth_relay,
         })
     }
 }
@@ -188,6 +198,7 @@ resolution = "relay-only"
                 network: PubkyNetwork::Mainnet,
                 resolution: PubkyResolution::RelayOnly,
                 pkarr_relays: None,
+                auth_relay: None,
             }
         );
     }
@@ -260,6 +271,56 @@ pkarr_relays = ["not-a-url"]
             assert!(!display.contains("sentinel"));
         }
     }
+
+    #[test]
+    fn parses_configured_pubky_auth_relay() {
+        for relay in [
+            "https://relay.example/inbox",
+            "https://relay.example:8443/link/inbox/",
+            "http://localhost:15412/inbox/",
+            "http://127.0.0.1:15412/inbox/",
+        ] {
+            let raw: RawPubkyConfig = toml::from_str(&format!("auth_relay = {relay:?}")).unwrap();
+
+            assert_eq!(
+                raw.into_pubky_config()
+                    .unwrap()
+                    .auth_relay
+                    .unwrap()
+                    .as_str(),
+                relay
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_pubky_auth_relay_keeps_the_network_default() {
+        let raw: RawPubkyConfig = toml::from_str("network = \"mainnet\"").unwrap();
+
+        assert_eq!(raw.into_pubky_config().unwrap().auth_relay, None);
+    }
+
+    #[test]
+    fn rejects_insecure_or_secret_bearing_pubky_auth_relays_without_echoing_values() {
+        for relay in [
+            "",
+            "relay.example/inbox",
+            "http://relay.example/inbox",
+            "wss://relay.example/inbox",
+            "https://sentinel-user:sentinel-password@relay.example/inbox",
+            "https://relay.example/inbox?token=sentinel-query",
+            "https://relay.example/inbox#sentinel-fragment",
+        ] {
+            let raw: RawPubkyConfig = toml::from_str(&format!("auth_relay = {relay:?}")).unwrap();
+
+            let error = raw.into_pubky_config().unwrap_err();
+            assert!(
+                matches!(error, ConfigError::InvalidPubkyAuthRelayUrl),
+                "{relay}"
+            );
+            assert!(!error.to_string().contains("sentinel"));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +378,22 @@ fn normalize_pubky_pkarr_relay_url(value: String) -> Result<String, ConfigError>
         .relays(std::slice::from_ref(&value))
         .map_err(|_| ConfigError::InvalidPubkyPkarrRelayUrl)?;
     Ok(parsed.to_string())
+}
+
+fn parse_pubky_auth_relay_url(value: &str) -> Result<Url, ConfigError> {
+    let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidPubkyAuthRelayUrl)?;
+    let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (parsed.scheme() != "https" && !(local && parsed.scheme() == "http"))
+        || parsed.cannot_be_a_base()
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidPubkyAuthRelayUrl);
+    }
+    Ok(parsed)
 }
 
 fn default_pkdns_public_ip() -> IpAddr {

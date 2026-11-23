@@ -9,7 +9,7 @@ use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
 
 use crate::app_state::pubky_clients::{
-    PubkyHttpClientConstructor, configure_pkarr_builder, pubky_auth_relay_for_network,
+    PubkyHttpClientConstructor, configure_pkarr_builder, pubky_auth_relay,
     pubky_http_client_constructor,
 };
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
@@ -489,6 +489,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::Default,
         pkarr_relays: None,
+        auth_relay: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet),
@@ -499,6 +500,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: None,
+        auth_relay: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet_relay_only),
@@ -518,6 +520,7 @@ fn relay_only_pkarr_builder_keeps_default_relays_when_not_configured() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: None,
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -535,6 +538,7 @@ fn configured_pubky_pkarr_relays_replace_defaults_without_disabling_dht() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::Default,
         pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -553,6 +557,7 @@ fn configured_relay_only_pkarr_builder_replaces_defaults_and_disables_dht() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -567,13 +572,28 @@ fn configured_relay_only_pkarr_builder_replaces_defaults_and_disables_dht() {
 
 #[test]
 fn testnet_creator_connect_uses_local_pubky_auth_relay() {
-    assert!(pubky_auth_relay_for_network(PubkyNetwork::Mainnet).is_none());
+    let mainnet = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        ..PubkyConfig::default()
+    };
+    assert!(pubky_auth_relay(&mainnet).is_none());
     assert_eq!(
-        pubky_auth_relay_for_network(PubkyNetwork::Testnet)
-            .unwrap()
-            .as_str(),
+        pubky_auth_relay(&PubkyConfig::default()).unwrap().as_str(),
         "http://127.0.0.1:15412/inbox/"
     );
+}
+
+#[test]
+fn configured_pubky_auth_relay_replaces_the_network_default() {
+    let relay: url::Url = "https://relay.shop.example/inbox".parse().unwrap();
+    for network in [PubkyNetwork::Mainnet, PubkyNetwork::Testnet] {
+        let config = PubkyConfig {
+            network,
+            auth_relay: Some(relay.clone()),
+            ..PubkyConfig::default()
+        };
+        assert_eq!(pubky_auth_relay(&config), Some(relay.clone()));
+    }
 }
 
 #[test]
