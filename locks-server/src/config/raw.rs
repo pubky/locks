@@ -147,7 +147,10 @@ impl Default for RawPubkyConfig {
 }
 
 impl RawPubkyConfig {
-    fn into_pubky_config(self) -> Result<PubkyConfig, ConfigError> {
+    fn into_pubky_config(
+        self,
+        environment: RuntimeEnvironment,
+    ) -> Result<PubkyConfig, ConfigError> {
         let pkarr_relays = match self.pkarr_relays {
             Some(relays) if relays.is_empty() => return Err(ConfigError::EmptyPubkyPkarrRelays),
             Some(relays) => Some(
@@ -162,7 +165,7 @@ impl RawPubkyConfig {
         let auth_relay = self
             .auth_relay
             .as_deref()
-            .map(parse_pubky_auth_relay_url)
+            .map(|relay| parse_pubky_auth_relay_url(relay, environment))
             .transpose()?;
 
         Ok(PubkyConfig {
@@ -193,7 +196,8 @@ resolution = "relay-only"
         .unwrap();
 
         assert_eq!(
-            raw.into_pubky_config().unwrap(),
+            raw.into_pubky_config(RuntimeEnvironment::Development)
+                .unwrap(),
             PubkyConfig {
                 network: PubkyNetwork::Mainnet,
                 resolution: PubkyResolution::RelayOnly,
@@ -215,7 +219,9 @@ pkarr_relays = ["https://relay.example", "http://127.0.0.1:15411"]
         .unwrap();
 
         assert_eq!(
-            raw.into_pubky_config().unwrap().pkarr_relays,
+            raw.into_pubky_config(RuntimeEnvironment::Development)
+                .unwrap()
+                .pkarr_relays,
             Some(vec![
                 "https://relay.example/".to_owned(),
                 "http://127.0.0.1:15411/".to_owned(),
@@ -235,7 +241,7 @@ pkarr_relays = []
         .unwrap();
 
         assert!(matches!(
-            raw.into_pubky_config(),
+            raw.into_pubky_config(RuntimeEnvironment::Development),
             Err(ConfigError::EmptyPubkyPkarrRelays)
         ));
     }
@@ -250,7 +256,7 @@ pkarr_relays = ["not-a-url"]
         .unwrap();
 
         assert!(matches!(
-            raw.into_pubky_config(),
+            raw.into_pubky_config(RuntimeEnvironment::Development),
             Err(ConfigError::InvalidPubkyPkarrRelayUrl)
         ));
     }
@@ -265,7 +271,9 @@ pkarr_relays = ["not-a-url"]
             let raw: RawPubkyConfig =
                 toml::from_str(&format!("pkarr_relays = [{relay:?}]")).unwrap();
 
-            let error = raw.into_pubky_config().unwrap_err();
+            let error = raw
+                .into_pubky_config(RuntimeEnvironment::Development)
+                .unwrap_err();
             assert!(matches!(error, ConfigError::InvalidPubkyPkarrRelayUrl));
             let display = error.to_string();
             assert!(!display.contains("sentinel"));
@@ -279,11 +287,12 @@ pkarr_relays = ["not-a-url"]
             "https://relay.example:8443/link/inbox/",
             "http://localhost:15412/inbox/",
             "http://127.0.0.1:15412/inbox/",
+            "http://[::1]:15412/inbox/",
         ] {
             let raw: RawPubkyConfig = toml::from_str(&format!("auth_relay = {relay:?}")).unwrap();
 
             assert_eq!(
-                raw.into_pubky_config()
+                raw.into_pubky_config(RuntimeEnvironment::Development)
                     .unwrap()
                     .auth_relay
                     .unwrap()
@@ -297,7 +306,41 @@ pkarr_relays = ["not-a-url"]
     fn omitted_pubky_auth_relay_keeps_the_network_default() {
         let raw: RawPubkyConfig = toml::from_str("network = \"mainnet\"").unwrap();
 
-        assert_eq!(raw.into_pubky_config().unwrap().auth_relay, None);
+        assert_eq!(
+            raw.into_pubky_config(RuntimeEnvironment::Development)
+                .unwrap()
+                .auth_relay,
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_loopback_http_pubky_auth_relay_outside_development() {
+        for environment in [RuntimeEnvironment::Staging, RuntimeEnvironment::Production] {
+            for relay in [
+                "http://localhost:15412/inbox/",
+                "http://127.0.0.1:15412/inbox/",
+                "http://[::1]:15412/inbox/",
+            ] {
+                let raw: RawPubkyConfig =
+                    toml::from_str(&format!("auth_relay = {relay:?}")).unwrap();
+
+                assert!(
+                    matches!(
+                        raw.into_pubky_config(environment),
+                        Err(ConfigError::InvalidPubkyAuthRelayUrl)
+                    ),
+                    "{environment:?} {relay}"
+                );
+            }
+
+            let raw: RawPubkyConfig =
+                toml::from_str("auth_relay = \"https://relay.example/inbox\"").unwrap();
+            assert!(
+                raw.into_pubky_config(environment).is_ok(),
+                "{environment:?}"
+            );
+        }
     }
 
     #[test]
@@ -313,7 +356,9 @@ pkarr_relays = ["not-a-url"]
         ] {
             let raw: RawPubkyConfig = toml::from_str(&format!("auth_relay = {relay:?}")).unwrap();
 
-            let error = raw.into_pubky_config().unwrap_err();
+            let error = raw
+                .into_pubky_config(RuntimeEnvironment::Development)
+                .unwrap_err();
             assert!(
                 matches!(error, ConfigError::InvalidPubkyAuthRelayUrl),
                 "{relay}"
@@ -380,9 +425,13 @@ fn normalize_pubky_pkarr_relay_url(value: String) -> Result<String, ConfigError>
     Ok(parsed.to_string())
 }
 
-fn parse_pubky_auth_relay_url(value: &str) -> Result<Url, ConfigError> {
+fn parse_pubky_auth_relay_url(
+    value: &str,
+    environment: RuntimeEnvironment,
+) -> Result<Url, ConfigError> {
     let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidPubkyAuthRelayUrl)?;
-    let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    let local = environment.is_development()
+        && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if (parsed.scheme() != "https" && !(local && parsed.scheme() == "http"))
         || parsed.cannot_be_a_base()
         || parsed.host_str().is_none()
@@ -1064,7 +1113,7 @@ impl RawConfig {
             .into_creator_authority_acquisition_config(runtime.environment)?;
         let secrets = self.secrets.into_secrets_config()?;
         let logging = self.logging.into_logging_config()?;
-        let pubky = self.pubky.into_pubky_config()?;
+        let pubky = self.pubky.into_pubky_config(runtime.environment)?;
         let pkdns = self.pkdns.into_pkdns_config()?;
         let rate_limits = self.rate_limits.into_rate_limits_config()?;
         let content_locks = self.content_locks.into_content_locks_config()?;

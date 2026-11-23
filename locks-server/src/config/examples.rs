@@ -227,6 +227,32 @@ fn insecure_loopback_nexus_is_development_only() {
 }
 
 #[test]
+fn loopback_http_pubky_auth_relay_is_development_only() {
+    let relay = "http://127.0.0.1:15412/inbox/";
+    for environment in ["staging", "production", "development"] {
+        let temp_dir = tempdir().unwrap();
+        let secret_path = temp_dir.path().join("secret.sess");
+        let public_key = test_identity(&secret_path);
+        let config_path = temp_dir.path().join("config.toml");
+        let config = minimal_config(&secret_path, &public_key, environment).replace(
+            "network = \"testnet\"",
+            &format!("network = \"testnet\"\nauth_relay = {relay:?}"),
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        let loaded = load_existing_config_from_path(&config_path);
+        if environment == "development" {
+            assert_eq!(loaded.unwrap().pubky.auth_relay.unwrap().as_str(), relay);
+        } else {
+            assert!(
+                matches!(loaded, Err(ConfigError::InvalidPubkyAuthRelayUrl)),
+                "{environment}"
+            );
+        }
+    }
+}
+
+#[test]
 fn parses_optional_paykit_runtime_config() {
     let temp_dir = tempdir().unwrap();
     let secret_path = temp_dir.path().join("secret.sess");

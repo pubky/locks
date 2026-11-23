@@ -44,8 +44,9 @@ level = "info"
 ```toml
 [pubky]
 network = "testnet"
-# Optional override; omit to preserve Pubky/Pkarr defaults.
+# Optional overrides; omit to preserve Pubky/Pkarr defaults.
 pkarr_relays = ["http://127.0.0.1:15411"]
+auth_relay = "http://127.0.0.1:15412/inbox/"
 ```
 
 Supported values:
@@ -64,7 +65,7 @@ On `testnet`, omitting it preserves the Pubky SDK's local testnet relay (`http:/
 
 `resolution = "relay-only"` still disables Mainline DHT while retaining either configured relays or these defaults. The same relay list is used to publish and republish the Lock Server's own PKARR record.
 
-`pubky.auth_relay` is an optional Pubky AUTH relay inbox URL, separate from the PKARR relays. Creator grant-connect and reader folded-auth URLs carry it, and the approving signer posts its response there, so it must be reachable from the signer. It must use `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]`, without credentials, query strings, or fragments. Omitting it keeps the network default: the Pubky SDK default relay on `mainnet` and `http://127.0.0.1:15412/inbox/` on `testnet`.
+`pubky.auth_relay` is an optional Pubky AUTH relay inbox URL, separate from the PKARR relays. Creator grant-connect and reader folded-auth URLs carry it, and the approving signer posts its response there, so it must be reachable from the signer. It must use `https`, without credentials, query strings, or fragments; `http` is accepted only on `localhost`, `127.0.0.1` or `[::1]` and only when `runtime.environment = "development"`. Omitting it keeps the network default: the Pubky SDK default relay on `mainnet` and `http://127.0.0.1:15412/inbox/` on `testnet`.
 
 ## Runtime environment and route gates
 
@@ -326,6 +327,8 @@ This development shape mounts authenticated Pubky-backed creator publishing rout
 network = "mainnet"
 resolution = "relay-only"
 pkarr_relays = ["https://pkarr.pubky.app", "https://pkarr.pubky.org"]
+# Optional; omit to keep the Pubky SDK default AUTH relay.
+# auth_relay = "https://auth-relay.example/inbox/"
 
 [runtime]
 environment = "staging" # or "production"

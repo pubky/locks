@@ -472,7 +472,7 @@ pub enum ConfigError {
     )]
     InvalidPubkyPkarrRelayUrl,
     #[error(
-        "pubky.auth_relay must be an https URL, or http on localhost, without credentials, query, or fragment"
+        "pubky.auth_relay must be an https URL, or http on localhost in development, without credentials, query, or fragment"
     )]
     InvalidPubkyAuthRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
