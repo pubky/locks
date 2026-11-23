@@ -1821,4 +1821,503 @@ mod tests {
             usdt_arbitrum: None,
         }
     }
+
+    mod paykit_authority_routing {
+        use std::str::FromStr;
+        use std::sync::Mutex;
+
+        use async_trait::async_trait;
+        use time::OffsetDateTime;
+        use time::macros::datetime;
+        use uuid::Uuid;
+
+        use locks_core::ids::{
+            BundleId, CreatorPubky, LockId, LockServerPubky, PubkyLockResource, TaskId,
+        };
+        use locks_core::lock_policy::{ContentLockPayload, PaymentPolicyV2};
+        use locks_core::verification::{
+            SUBMITTED_PROOF_BUNDLE_V2_VERSION, SubmittedProofBundleV2, VerifiedProofBundle,
+        };
+
+        use crate::application::errors::ApplicationError;
+        use crate::application::models::{
+            AdvanceContentLockDeletionPhaseResult, ClaimedContentLockDeletionJob,
+            ContentLockDeletionFailureCode, ContentLockDeletionJob, ContentLockDeletionPhase,
+            PaymentTaskSnapshot, PaymentTaskSnapshotV1, PrepareForceDeletionResult,
+            VerificationTaskStatus,
+        };
+        use crate::application::ports::{
+            Clock, ContentLockDeletionRepository, PaykitAuthority, PaymentDrainCleanupPreparation,
+            PaymentDrainClient, PaymentDrainClientError, PaymentDrainObligation,
+            PaymentDrainObligationKind, PaymentDrainRepository, PaymentDrainStatus,
+            PaymentDrainSummary, PaymentDrainTerminalTransition, PaymentRequestStatus,
+            ProviderV2DeletionReconciliation, ProviderV2EvaluatorSnapshot, PublicationRecovery,
+        };
+        use crate::application::use_cases::deletion_test_fixtures::claimed_deletion_job;
+        use crate::application::use_cases::execute_content_lock_deletion_phase::DeletionPhaseExecutionOutcome;
+
+        use super::super::DrainLockPaymentsUseCase;
+        use super::{DuplicateEntitlementRepository, entitlement, summary};
+
+        const NOW: OffsetDateTime = datetime!(2026-01-01 00:00:00 UTC);
+
+        fn authority(host: &str) -> PaykitAuthority {
+            PaykitAuthority {
+                scheme: "https".to_owned(),
+                host: host.to_owned(),
+                port: 443,
+                base_path: "/".to_owned(),
+            }
+        }
+
+        /// Routes the deleted lock's creator to its own Paykit Server, away from the default.
+        struct MappedCreatorPaykit {
+            creator: CreatorPubky,
+        }
+
+        #[async_trait]
+        impl PaymentDrainClient for MappedCreatorPaykit {
+            fn authority(&self) -> Option<PaykitAuthority> {
+                Some(authority("default-paykit.example"))
+            }
+
+            fn authority_for(&self, lock_resource: &PubkyLockResource) -> Option<PaykitAuthority> {
+                (lock_resource.creator() == &self.creator)
+                    .then(|| authority("creator-paykit.example"))
+            }
+
+            async fn start_payment_drain(
+                &self,
+                _: &PubkyLockResource,
+            ) -> Result<PaymentDrainSummary, PaymentDrainClientError> {
+                Ok(summary(PaymentDrainStatus::Active, 1, 0, 0, 1))
+            }
+
+            async fn lookup_payment_drain(
+                &self,
+                _: &PubkyLockResource,
+            ) -> Result<Option<PaymentDrainSummary>, PaymentDrainClientError> {
+                unreachable!()
+            }
+
+            async fn payment_request_status(
+                &self,
+                _: &CreatorPubky,
+                _: &BundleId,
+            ) -> Result<Option<PaymentRequestStatus>, PaymentDrainClientError> {
+                unreachable!()
+            }
+        }
+
+        struct PaykitSnapshotDeletions;
+
+        #[async_trait]
+        impl ContentLockDeletionRepository for PaykitSnapshotDeletions {
+            async fn expire_unresolved_non_paykit_tasks(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+            ) -> Result<bool, ApplicationError> {
+                Ok(true)
+            }
+
+            async fn has_paykit_snapshots(&self, _: Uuid) -> Result<bool, ApplicationError> {
+                Ok(true)
+            }
+
+            async fn begin_publication(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: Uuid,
+                _: &ContentLockPayload,
+            ) -> Result<(), ApplicationError> {
+                unreachable!()
+            }
+
+            async fn mark_publication_written(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: Uuid,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn abandon_publication(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: Uuid,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn compensate_publication(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: Uuid,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn reconcile_publication(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: &ContentLockPayload,
+                _: &[String],
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn publication_in_progress(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn recover_publication(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: &ContentLockPayload,
+            ) -> Result<PublicationRecovery, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn insert_job(&self, _: ContentLockDeletionJob) -> Result<(), ApplicationError> {
+                unreachable!()
+            }
+
+            async fn get_job(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+            ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn claim_next(
+                &self,
+                _: &str,
+                _: time::Duration,
+            ) -> Result<Option<ClaimedContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn schedule_retry(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: time::Duration,
+            ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn defer(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: time::Duration,
+            ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn advance_phase(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: ContentLockDeletionPhase,
+            ) -> Result<AdvanceContentLockDeletionPhaseResult, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn finish(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: Option<ContentLockDeletionFailureCode>,
+            ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn resume_failed_job(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+                _: OffsetDateTime,
+            ) -> Result<Option<ContentLockDeletionJob>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn prepare_force_deletion(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+            ) -> Result<PrepareForceDeletionResult, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn complete_force_deletion(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn has_force_receipt(
+                &self,
+                _: &CreatorPubky,
+                _: &LockId,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+        }
+
+        /// Records every authority the use case asks to freeze, then stops the phase there.
+        struct RecordingDrains {
+            obligation: PaymentDrainObligation,
+            frozen: Mutex<Vec<(&'static str, PaykitAuthority)>>,
+        }
+
+        impl RecordingDrains {
+            fn record(&self, step: &'static str, authority: &PaykitAuthority) {
+                self.frozen.lock().unwrap().push((step, authority.clone()));
+            }
+        }
+
+        #[async_trait]
+        impl PaymentDrainRepository for RecordingDrains {
+            async fn list_obligations(
+                &self,
+                _: Uuid,
+            ) -> Result<Vec<PaymentDrainObligation>, ApplicationError> {
+                Ok(vec![self.obligation.clone()])
+            }
+
+            async fn prepare_provider_v2_fence(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &PubkyLockResource,
+                authority: &PaykitAuthority,
+            ) -> Result<bool, ApplicationError> {
+                self.record("start: prepare fence", authority);
+                Ok(true)
+            }
+
+            async fn store_payment_drain(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &PaymentDrainSummary,
+            ) -> Result<bool, ApplicationError> {
+                Ok(true)
+            }
+
+            async fn store_provider_v2_fence(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &PubkyLockResource,
+                authority: &PaykitAuthority,
+            ) -> Result<bool, ApplicationError> {
+                self.record("store fence", authority);
+                Ok(false)
+            }
+
+            async fn prepare_payment_drain_cleanup(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &PubkyLockResource,
+                authority: &PaykitAuthority,
+            ) -> Result<PaymentDrainCleanupPreparation, ApplicationError> {
+                self.record("cleanup", authority);
+                Ok(PaymentDrainCleanupPreparation::ClaimLost)
+            }
+
+            async fn get_payment_drain(
+                &self,
+                _: Uuid,
+            ) -> Result<Option<PaymentDrainSummary>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn reconcile_payment_drain(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &PaymentDrainSummary,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn begin_entitlement_publication(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &TaskId,
+                _: &VerifiedProofBundle,
+            ) -> Result<Option<Uuid>, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn persist_terminal_obligation(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &TaskId,
+                _: PaymentDrainTerminalTransition,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn persist_provider_v2_terminal(
+                &self,
+                _: Uuid,
+                _: &str,
+                _: Uuid,
+                _: &TaskId,
+                _: &ProviderV2DeletionReconciliation,
+            ) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+
+            async fn all_obligations_terminal(&self, _: Uuid) -> Result<bool, ApplicationError> {
+                unreachable!()
+            }
+        }
+
+        struct FixedClock;
+
+        impl Clock for FixedClock {
+            fn now(&self) -> OffsetDateTime {
+                NOW
+            }
+        }
+
+        fn provider_v2_obligation(claim: &ClaimedContentLockDeletionJob) -> PaymentDrainObligation {
+            let lock_resource = PubkyLockResource::from_str(&format!(
+                "{}/pub/app.locks/{}.json",
+                claim.job.creator, claim.job.lock_id
+            ))
+            .unwrap();
+            let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+            let snapshot = PaymentTaskSnapshotV1::new(
+                SubmittedProofBundleV2 {
+                    version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                    bundle_id: bundle_id.clone(),
+                    pubky_lock_resource: lock_resource.clone(),
+                    reader_pubky: Some(
+                        CreatorPubky::from_str(
+                            "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+                        )
+                        .unwrap(),
+                    ),
+                },
+                *claim
+                    .job
+                    .frozen_content_lock
+                    .lock_hash()
+                    .unwrap()
+                    .as_bytes(),
+                PaymentPolicyV2 {
+                    recipient_pubky: claim.job.creator.clone(),
+                    amount: "1".to_owned(),
+                    asset: "BTC".to_owned(),
+                    minimum_confirmations: 0,
+                },
+                NOW,
+                300,
+            )
+            .unwrap();
+            PaymentDrainObligation {
+                task_id: TaskId::from_str(&Uuid::new_v4().to_string()).unwrap(),
+                creator: claim.job.creator.clone(),
+                bundle_id,
+                lock_resource,
+                kind: PaymentDrainObligationKind::ProviderV2 {
+                    evaluator_revision: 1,
+                    snapshot: Box::new(ProviderV2EvaluatorSnapshot::Payment(
+                        PaymentTaskSnapshot::V1(snapshot),
+                    )),
+                    reconciliation_terminal: false,
+                },
+                status: VerificationTaskStatus::Pending,
+                entitlement_to_publish: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn deletion_freezes_the_mapped_creators_paykit_authority_at_every_step() {
+            let start =
+                claimed_deletion_job(NOW, ContentLockDeletionPhase::StartPaymentDrain, false);
+            let drain = claimed_deletion_job(NOW, ContentLockDeletionPhase::DrainPayments, false);
+            let cleanup =
+                claimed_deletion_job(NOW, ContentLockDeletionPhase::PurgeOperationalState, false);
+            let paykit = MappedCreatorPaykit {
+                creator: start.job.creator.clone(),
+            };
+            let drains = RecordingDrains {
+                obligation: provider_v2_obligation(&start),
+                frozen: Mutex::new(Vec::new()),
+            };
+            let entitlements = DuplicateEntitlementRepository(entitlement());
+            let use_case = DrainLockPaymentsUseCase::new(
+                &PaykitSnapshotDeletions,
+                &drains,
+                &paykit,
+                &entitlements,
+                &FixedClock,
+                LockServerPubky::from_str(
+                    "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
+                )
+                .unwrap(),
+                0,
+            );
+
+            assert!(!use_case.execute_claimed(start, "worker").await.unwrap());
+            assert!(matches!(
+                use_case.execute_claimed(drain, "worker").await,
+                Err(ApplicationError::InvalidContentLockDeletionState { .. })
+            ));
+            assert_eq!(
+                use_case
+                    .cleanup_claimed_with_evidence(cleanup, "worker")
+                    .await
+                    .outcome,
+                DeletionPhaseExecutionOutcome::ClaimLost
+            );
+
+            let creator_paykit = authority("creator-paykit.example");
+            assert_eq!(
+                *drains.frozen.lock().unwrap(),
+                [
+                    ("start: prepare fence", creator_paykit.clone()),
+                    ("store fence", creator_paykit.clone()),
+                    ("store fence", creator_paykit.clone()),
+                    ("cleanup", creator_paykit),
+                ]
+            );
+        }
+    }
 }
