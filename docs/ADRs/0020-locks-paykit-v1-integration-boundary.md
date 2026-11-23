@@ -116,6 +116,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
 - Configured Paykit `server_url` is a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash; endpoint paths are appended only after validation.
 - `[paykit.creator_server_urls]` optionally maps a canonical creator pubky to that creator's own Paykit Server origin, under the same origin rules. Locks routes every Paykit call by the creator of the lock or task; creators without an entry use `server_url`. Origins come only from this runtime configuration, never from creator data. Every configured Paykit Server receives requests signed with the same Lock Server keypair and must trust its public key.
+- A Paykit Server authorizes each trusted key for every signed route and every creator it serves. A mapped Paykit Server must therefore trust this Lock Server's key for all of its creators, and a mapping is safe only when every creator on that Paykit Server accepts this Lock Server's operator.
 - Deletion persists the normalized authority of the creator's Paykit Server; a changed `server_url` or creator entry during a deletion fails closed.
 
 ## Consequences
