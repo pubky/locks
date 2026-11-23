@@ -4,7 +4,10 @@ use std::rc::Rc;
 use crate::json::to_plain_js_value;
 use crate::session::Session;
 #[cfg(target_arch = "wasm32")]
-use crate::session::{BrowserPkarrResolver, fetch_authorized_empty, fetch_authorized_json};
+use crate::session::{
+    BrowserPkarrResolver, fetch_authorized_empty, fetch_authorized_json,
+    fetch_authorized_json_with_status,
+};
 #[cfg(any(test, target_arch = "wasm32"))]
 use crate::session::{JsAuthorizedRequestPlan, JsRequestBody};
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -96,6 +99,22 @@ impl DeleteContentLockOptions {
 const DELETE_CONTENT_LOCK_TYPESCRIPT: &str = r#"
 export interface Creator {
   deleteContentLock(lock_id: string, options?: DeleteContentLockOptions | null): Promise<any>;
+}
+"#;
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(typescript_custom_section)]
+const CREATOR_AUTHORITY_STATUS_TYPESCRIPT: &str = r#"
+export interface CreatorAuthorityStatus {
+  creator: string;
+  authorized: boolean;
+  auth_kind: "legacy_cookie" | "grant" | null;
+  granted_scopes: string[];
+  session_expires_at: string | null;
+}
+
+export interface Creator {
+  creatorAuthorityStatus(): Promise<CreatorAuthorityStatus>;
 }
 "#;
 
@@ -675,6 +694,29 @@ impl Creator {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = creatorAuthorityStatus, skip_typescript)]
+    pub async fn creator_authority_status(
+        &self,
+    ) -> crate::js_error::JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(self.session.options())
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let request = self
+            .build_authority_status_request()
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| crate::js_error::invalid_input(err.to_string()))?;
+        let value = fetch_authorized_json_with_status(&request, 200).await?;
+        let value = serde_wasm_bindgen::from_value(value).map_err(|_| {
+            crate::js_error::invalid_input("invalid creator authority status response")
+        })?;
+        let validated = validate_authority_status_response_for_tests(value)
+            .map_err(crate::js_error::invalid_input)?;
+        to_plain_js_value(&validated).map_err(|_| {
+            crate::js_error::invalid_input("invalid creator authority status response")
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = verificationEvidence)]
     pub async fn verification_evidence(
         &self,
@@ -814,6 +856,12 @@ impl Creator {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn build_authority_status_request(&self) -> JsAuthorizedRequestPlan {
+        self.authorized_request_plan(self.session.inner().creator().authority_status())
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn build_verification_evidence_request(
         &self,
         bundle_id: &str,
@@ -872,6 +920,15 @@ fn validate_paykit_setup_status_response_for_tests(
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
+fn validate_authority_status_response_for_tests(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let status = locks_sdk::CreatorLocks::parse_authority_status_response(value)
+        .map_err(|_| "invalid creator authority status response".to_owned())?;
+    serde_json::to_value(status).map_err(|_| "invalid creator authority status response".to_owned())
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
 #[cfg_attr(test, allow(dead_code))]
 fn validate_verification_evidence_response_for_tests(
     value: serde_json::Value,
@@ -912,6 +969,48 @@ mod browser_tests {
 
     fn js(value: serde_json::Value) -> JsValue {
         serde_wasm_bindgen::to_value(&value).unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn creator_authority_status_transport_accepts_only_http_200() {
+        let request = Creator::new(browser_session()).build_authority_status_request();
+        let prepared = request
+            .prepare_for_browser_endpoint(
+                &locks_sdk::transport::BrowserEndpoint {
+                    domain: Some("locks.example".to_owned()),
+                    port: None,
+                    params: std::collections::BTreeMap::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let window = web_sys::window().unwrap();
+        let original_fetch =
+            js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("fetch")).unwrap();
+        let canonical = r#"{"creator":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy","authorized":false,"auth_kind":null,"granted_scopes":[],"session_expires_at":null}"#;
+
+        for (status, accepted) in [(200, true), (201, false), (503, false)] {
+            let fetch = js_sys::Function::new_no_args(&format!(
+                "return Promise.resolve(new Response({canonical:?}, {{ status: {status}, headers: {{ 'content-type': 'application/json' }} }}));"
+            ));
+            js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("fetch"), fetch.as_ref())
+                .unwrap();
+
+            assert_eq!(
+                fetch_authorized_json_with_status(&prepared, 200)
+                    .await
+                    .is_ok(),
+                accepted,
+                "unexpected authority-status result for HTTP {status}"
+            );
+        }
+
+        js_sys::Reflect::set(
+            window.as_ref(),
+            &JsValue::from_str("fetch"),
+            &original_fetch,
+        )
+        .unwrap();
     }
 
     #[wasm_bindgen_test]
@@ -1517,6 +1616,43 @@ mod tests {
             })
         );
         assert!(body.get("creator").is_none());
+    }
+
+    #[test]
+    fn creator_authority_status_request_uses_current_session_without_creator_argument() {
+        let creator = Creator::new(test_session());
+        let request = creator.build_authority_status_request();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/creator/authority-status");
+        assert_eq!(request.authorization, "Bearer frontend-session-secret");
+        assert_eq!(request.content_type, None);
+        assert_eq!(request.body, JsRequestBody::Empty);
+    }
+
+    #[test]
+    fn creator_authority_status_response_projects_closed_secret_free_shape() {
+        let creator = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let canonical = serde_json::json!({
+            "creator": creator,
+            "authorized": false,
+            "auth_kind": null,
+            "granted_scopes": [],
+            "session_expires_at": null
+        });
+        assert_eq!(
+            validate_authority_status_response_for_tests(canonical.clone()).unwrap(),
+            canonical
+        );
+        assert!(
+            validate_authority_status_response_for_tests(serde_json::json!({
+                "creator": creator,
+                "authorized": false,
+                "auth_kind": null,
+                "granted_scopes": ["/pub/app.locks/:rw"],
+                "session_expires_at": null
+            }))
+            .is_err()
+        );
     }
 
     #[test]

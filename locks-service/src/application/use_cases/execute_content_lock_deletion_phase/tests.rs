@@ -259,6 +259,16 @@ async fn tombstone_dependency_errors_are_transient_but_internal_errors_are_fatal
             DeletionPhaseExecutionOutcome::TransientDependencyFailure,
         ),
         (
+            ApplicationError::CreatorAuthorityDependencyUnavailable,
+            DeletionPhaseExecutionOutcome::TransientDependencyFailure,
+        ),
+        (
+            ApplicationError::CreatorAuthoritySecret {
+                message: "corrupt persisted grant".to_owned(),
+            },
+            DeletionPhaseExecutionOutcome::FatalFailure,
+        ),
+        (
             ApplicationError::MissingRecord {
                 record: "content_lock_tombstone",
             },

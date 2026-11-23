@@ -439,6 +439,7 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::FoldedAuthSecret { .. }
         | ApplicationError::InvalidFoldedAuthState { .. }
         | ApplicationError::CreatorAuthorityUnavailable
+        | ApplicationError::CreatorAuthorityDependencyUnavailable
         | ApplicationError::CreatorAuthoritySecret { .. }
         | ApplicationError::InvalidCreatorAuthorityAuthKind { .. }
         | ApplicationError::CreatorConnectFlowUnavailable

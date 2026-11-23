@@ -87,6 +87,8 @@ const requiredSnippets = [
   'deleteGuardedResource(options: DeleteGuardedResourceOptions): Promise<void>;',
   'setLockServicePointer(options: SetLockServicePointerOptions): Promise<void>;',
   'paykitSetupStatus(asset: string): Promise<any>;',
+  'creatorAuthorityStatus(): Promise<CreatorAuthorityStatus>;',
+  'export interface CreatorAuthorityStatus',
   'verificationEvidence(bundle_id: string): Promise<any>;',
   'export class CreateContentLockRequestBuilder',
   'primaryResource(resource: any): CreateContentLockRequestBuilder;',
@@ -143,6 +145,12 @@ if (typeof sdk.Creator.prototype.paykitSetupStatus !== 'function') {
 }
 if (sdk.Creator.prototype.paykitSetupStatus.length !== 1) {
   throw new Error('paykitSetupStatus accepts only an invoice denomination');
+}
+if (typeof sdk.Creator.prototype.creatorAuthorityStatus !== 'function') {
+  throw new Error('generated Creator missing creatorAuthorityStatus');
+}
+if (sdk.Creator.prototype.creatorAuthorityStatus.length !== 0) {
+  throw new Error('creatorAuthorityStatus must not accept creator input');
 }
 if (sdk.Creator.prototype.deleteContentLock.toString().includes('__destroy_into_raw')) {
   throw new Error('deleteContentLock consumes reusable DeleteContentLockOptions');

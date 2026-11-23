@@ -211,6 +211,26 @@ mod tests {
         assert!(status.granted_scopes.is_empty());
     }
 
+    #[tokio::test]
+    async fn get_creator_authority_status_preserves_operational_failure() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let error = get_creator_authority_status(
+            &SessionStore::with_record(session_record(now)),
+            &OperationalFailureAuthorityManager,
+            &FixedClock(now),
+            GetCreatorAuthorityStatusRequest {
+                session_token: FrontendSessionToken::new("frontend-session-token"),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplicationError::CreatorAuthoritySecret { .. }
+        ));
+    }
+
     fn session_record(now: OffsetDateTime) -> FrontendSessionRecord {
         FrontendSessionRecord {
             token: FrontendSessionToken::new("frontend-session-token"),
@@ -338,6 +358,27 @@ mod tests {
             _creator: &CreatorPubky,
         ) -> Result<CreatorAuthorityStatus, ApplicationError> {
             Err(ApplicationError::CreatorAuthorityUnavailable)
+        }
+
+        async fn require_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            self.revalidate_creator_authority(creator).await
+        }
+    }
+
+    struct OperationalFailureAuthorityManager;
+
+    #[async_trait]
+    impl CreatorAuthorityManager for OperationalFailureAuthorityManager {
+        async fn revalidate_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<CreatorAuthorityStatus, ApplicationError> {
+            Err(ApplicationError::CreatorAuthoritySecret {
+                message: "live authority check failed".to_owned(),
+            })
         }
 
         async fn require_creator_authority(

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use locks_core::ids::CreatorPubky;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, watch};
@@ -11,7 +13,30 @@ use crate::application::ports::CreatorAuthorityStore;
 use crate::infrastructure::pubky::creator_identity::creator_from_pubky_public_key_z32;
 use crate::infrastructure::pubky::storage_client::{ImportedPubkySession, PubkySessionImporter};
 
-type RestoreResult<T> = Result<T, ApplicationError>;
+type RestoreResult<T> = Result<T, GrantSessionRestoreError>;
+
+#[derive(Debug, Clone)]
+enum GrantSessionRestoreError {
+    Application(ApplicationError),
+    SupersededByRotation,
+}
+
+impl From<ApplicationError> for GrantSessionRestoreError {
+    fn from(error: ApplicationError) -> Self {
+        Self::Application(error)
+    }
+}
+
+impl GrantSessionRestoreError {
+    fn into_application_error(self) -> ApplicationError {
+        match self {
+            Self::Application(error) => error,
+            Self::SupersededByRotation => ApplicationError::CreatorAuthorityDependencyUnavailable,
+        }
+    }
+}
+
+const LIVE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone)]
 pub struct CachedGrantSession<T> {
@@ -106,6 +131,15 @@ where
         &self,
         creator: &CreatorPubky,
     ) -> Result<CachedGrantSession<I::Session>, ApplicationError> {
+        self.session_for_creator_attempt(creator)
+            .await
+            .map_err(GrantSessionRestoreError::into_application_error)
+    }
+
+    async fn session_for_creator_attempt(
+        &self,
+        creator: &CreatorPubky,
+    ) -> RestoreResult<CachedGrantSession<I::Session>> {
         let authority_load_gate = self.authority_load_gate(creator).await;
         let authority_load_guard = authority_load_gate.lock().await;
         let observation = {
@@ -116,15 +150,17 @@ where
         let record = match self.load_current_grant(creator).await {
             Ok(record) => record,
             Err(error) => {
-                let mut state = self.state.lock().await;
-                let superseded = state
-                    .entries
-                    .get(creator)
-                    .is_some_and(|entry| observation_is_newer(entry.observed_at, observation));
-                if !superseded {
-                    state.entries.remove(creator);
+                if matches!(error, ApplicationError::CreatorAuthorityUnavailable) {
+                    let mut state = self.state.lock().await;
+                    let superseded = state
+                        .entries
+                        .get(creator)
+                        .is_some_and(|entry| observation_is_newer(entry.observed_at, observation));
+                    if !superseded {
+                        state.entries.remove(creator);
+                    }
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         let fingerprint = authority_fingerprint(&record);
@@ -196,7 +232,7 @@ where
                             error_class = "capacity_in_flight",
                             "creator grant session restore failed"
                         );
-                        return Err(ApplicationError::CreatorAuthorityUnavailable);
+                        return Err(ApplicationError::CreatorAuthorityDependencyUnavailable.into());
                     }
                 }
                 state.next_generation = state.next_generation.wrapping_add(1);
@@ -219,7 +255,7 @@ where
         drop(authority_load_gate);
 
         match action {
-            Action::Retry => Box::pin(self.session_for_creator(creator)).await,
+            Action::Retry => Box::pin(self.session_for_creator_attempt(creator)).await,
             Action::Ready {
                 generation,
                 session,
@@ -241,7 +277,7 @@ where
                 }
                 if receiver.changed().await.is_err() {
                     self.invalidate_generation(creator, generation).await;
-                    return Box::pin(self.session_for_creator(creator)).await;
+                    return Box::pin(self.session_for_creator_attempt(creator)).await;
                 }
             },
             Action::Restore { generation, sender } => {
@@ -269,7 +305,7 @@ where
                         error_class = "superseded_generation",
                         "creator grant session restore failed"
                     );
-                    Err(ApplicationError::CreatorAuthorityUnavailable)
+                    Err(GrantSessionRestoreError::SupersededByRotation)
                 };
                 let _ = sender.send(Some(result.clone()));
                 result.map(|session| CachedGrantSession {
@@ -285,7 +321,130 @@ where
         self.state.lock().await.entries.remove(creator);
     }
 
-    pub(crate) async fn invalidate_generation(&self, creator: &CreatorPubky, generation: u64) {
+    pub async fn revalidate_session_for_creator(
+        &self,
+        creator: &CreatorPubky,
+        expected_secret: &crate::application::models::CreatorAuthoritySecret,
+    ) -> Result<(), ApplicationError> {
+        self.revalidate_session_for_creator_with_timeout(
+            creator,
+            expected_secret,
+            LIVE_REVALIDATION_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn revalidate_session_for_creator_with_timeout(
+        &self,
+        creator: &CreatorPubky,
+        expected_secret: &crate::application::models::CreatorAuthoritySecret,
+        timeout: Duration,
+    ) -> Result<(), ApplicationError> {
+        let mut saw_restore_supersession = false;
+        for attempt in 0..2 {
+            let cached = match self.session_for_creator_attempt(creator).await {
+                Ok(cached) => cached,
+                Err(GrantSessionRestoreError::SupersededByRotation) if attempt == 0 => {
+                    saw_restore_supersession = true;
+                    continue;
+                }
+                Err(GrantSessionRestoreError::SupersededByRotation) => {
+                    return Err(ApplicationError::CreatorAuthorityDependencyUnavailable);
+                }
+                Err(GrantSessionRestoreError::Application(error)) => return Err(error),
+            };
+            if cached.record.secret.expose_secret() != expected_secret.expose_secret() {
+                tracing::warn!(
+                    creator = %creator,
+                    stage = "manager_record_validate",
+                    error_class = "stale_manager_record",
+                    "creator grant session revalidation unavailable"
+                );
+                return if saw_restore_supersession {
+                    Err(ApplicationError::CreatorAuthorityDependencyUnavailable)
+                } else {
+                    Err(ApplicationError::CreatorAuthoritySecret {
+                        message: "creator authority changed during revalidation".to_owned(),
+                    })
+                };
+            }
+            let fingerprint = authority_fingerprint(&cached.record);
+            let live = tokio::time::timeout(timeout, cached.session.revalidate())
+                .await
+                .map_err(|_| ApplicationError::CreatorAuthoritySecret {
+                    message: "creator authority live revalidation timed out".to_owned(),
+                })??;
+            match live {
+                true if self
+                    .is_current_generation(creator, cached.generation, fingerprint)
+                    .await =>
+                {
+                    return Ok(());
+                }
+                true if attempt == 0 => continue,
+                true => {
+                    return Err(ApplicationError::CreatorAuthoritySecret {
+                        message: "creator authority changed during revalidation".to_owned(),
+                    });
+                }
+                false => {
+                    let authority_load_gate = self.authority_load_gate(creator).await;
+                    let _authority_load_guard = authority_load_gate.lock().await;
+                    let persisted = match self.load_current_grant(creator).await {
+                        Ok(record) => record,
+                        Err(ApplicationError::CreatorAuthorityUnavailable) => {
+                            self.invalidate_generation(creator, cached.generation).await;
+                            return Err(ApplicationError::CreatorAuthorityUnavailable);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if authority_fingerprint(&persisted) != fingerprint {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(ApplicationError::CreatorAuthoritySecret {
+                            message: "creator authority changed during revalidation".to_owned(),
+                        });
+                    }
+                    let invalidated = self.invalidate_generation(creator, cached.generation).await;
+                    if invalidated {
+                        return Err(ApplicationError::CreatorAuthorityUnavailable);
+                    }
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(ApplicationError::CreatorAuthoritySecret {
+                        message: "creator authority changed during revalidation".to_owned(),
+                    });
+                }
+            }
+        }
+        unreachable!("bounded revalidation loop returns from every branch")
+    }
+
+    async fn is_current_generation(
+        &self,
+        creator: &CreatorPubky,
+        generation: u64,
+        fingerprint: [u8; 32],
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .entries
+            .get(creator)
+            .is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.fingerprint == fingerprint
+                    && matches!(entry.value, CacheValue::Ready(_))
+            })
+    }
+
+    pub(crate) async fn invalidate_generation(
+        &self,
+        creator: &CreatorPubky,
+        generation: u64,
+    ) -> bool {
         let mut state = self.state.lock().await;
         if state
             .entries
@@ -293,6 +452,9 @@ where
             .is_some_and(|entry| entry.generation == generation)
         {
             state.entries.remove(creator);
+            true
+        } else {
+            false
         }
     }
 
@@ -389,7 +551,7 @@ where
                 error_class = "identity_mismatch",
                 "creator grant session restore failed"
             );
-            return Err(ApplicationError::CreatorAuthorityUnavailable);
+            return Err(ApplicationError::CreatorAuthorityUnavailable.into());
         }
         let current = self.load_current_grant(creator).await?;
         if authority_fingerprint(&current) != fingerprint {
@@ -399,9 +561,47 @@ where
                 error_class = "stale_exchange",
                 "creator grant session restore failed"
             );
-            return Err(ApplicationError::CreatorAuthorityUnavailable);
+            return Err(GrantSessionRestoreError::SupersededByRotation);
         }
         Ok(session)
+    }
+}
+
+#[async_trait]
+impl<S, I> CreatorAuthorityStore for GrantSessionCache<S, I>
+where
+    S: CreatorAuthorityStore,
+    I: PubkySessionImporter,
+    I::Session: Clone,
+{
+    async fn upsert_creator_authority(
+        &self,
+        authority: CreatorAuthorityRecord,
+    ) -> Result<(), ApplicationError> {
+        let creator = authority.creator.clone();
+        let authority_load_gate = self.authority_load_gate(&creator).await;
+        let _authority_load_guard = authority_load_gate.lock().await;
+        self.store.upsert_creator_authority(authority).await?;
+        self.state.lock().await.entries.remove(&creator);
+        Ok(())
+    }
+
+    async fn get_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+        self.store.get_creator_authority(creator).await
+    }
+
+    async fn delete_creator_authority(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(), ApplicationError> {
+        let authority_load_gate = self.authority_load_gate(creator).await;
+        let _authority_load_guard = authority_load_gate.lock().await;
+        self.store.delete_creator_authority(creator).await?;
+        self.state.lock().await.entries.remove(creator);
+        Ok(())
     }
 }
 
@@ -430,6 +630,9 @@ fn observation_is_newer(candidate: u64, reference: u64) -> bool {
 fn application_error_class(error: &ApplicationError) -> &'static str {
     match error {
         ApplicationError::CreatorAuthorityUnavailable => "authority_unavailable",
+        ApplicationError::CreatorAuthorityDependencyUnavailable => {
+            "authority_dependency_unavailable"
+        }
         ApplicationError::CreatorAuthoritySecret { .. } => "authority_secret",
         ApplicationError::Storage { .. } => "storage",
         _ => "application",
@@ -442,13 +645,13 @@ mod tests {
     use std::fmt;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use locks_core::ids::CreatorPubky;
     use time::{Duration as TimeDuration, OffsetDateTime};
-    use tokio::sync::{Notify, RwLock};
+    use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::{Layer, Registry};
@@ -468,6 +671,9 @@ mod tests {
         GrantCreatorScopedPubkyStorageProvider, ImportedPubkySession, PubkyBytesResource,
         PubkyResourceMetadata, PubkySessionImporter,
     };
+
+    static TRACING_SUBSCRIBER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static RECORDED_EVENTS: OnceLock<RecordedEvents> = OnceLock::new();
 
     #[tokio::test]
     async fn concurrent_and_sequential_reads_share_one_grant_exchange() {
@@ -531,6 +737,362 @@ mod tests {
         authority.unwrap();
         storage.unwrap();
         assert_eq!(importer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_revalidation_checks_the_cached_session_live() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = LiveCheckImporter::new([Ok(true)]);
+        let cache = GrantSessionCache::new(store, importer.clone(), 8);
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        cache
+            .revalidate_session_for_creator(&creator_a(), &CreatorAuthoritySecret::new("grant-a"))
+            .await
+            .unwrap();
+
+        assert_eq!(importer.import_calls(), 1, "live check must reuse cache");
+        assert_eq!(importer.revalidation_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_revalidates_live_while_ordinary_authority_reuses_cache() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = LiveCheckImporter::new([Ok(true)]);
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let manager = GrantCreatorAuthorityManager::new(store, Arc::clone(&cache));
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        manager
+            .require_creator_authority(&creator_a())
+            .await
+            .unwrap();
+        assert_eq!(importer.import_calls(), 1);
+        assert_eq!(importer.revalidation_calls(), 0);
+
+        manager
+            .revalidate_creator_authority(&creator_a())
+            .await
+            .unwrap();
+        assert_eq!(importer.import_calls(), 1);
+        assert_eq!(importer.revalidation_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn confirmed_revocation_evicts_the_checked_generation() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = LiveCheckImporter::new([Ok(false)]);
+        let cache = GrantSessionCache::new(store, importer.clone(), 8);
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            cache
+                .revalidate_session_for_creator(&creator_a(), &secret)
+                .await,
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(importer.import_calls(), 2);
+        assert_eq!(importer.revalidation_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn operational_revalidation_failure_preserves_cached_session() {
+        let operational = ApplicationError::CreatorAuthoritySecret {
+            message: "live authority check failed".to_owned(),
+        };
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = LiveCheckImporter::new([Err(operational.clone()), Ok(true)]);
+        let cache = GrantSessionCache::new(store, importer.clone(), 8);
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            cache
+                .revalidate_session_for_creator(&creator_a(), &secret)
+                .await,
+            Err(operational)
+        );
+        cache
+            .revalidate_session_for_creator(&creator_a(), &secret)
+            .await
+            .unwrap();
+        assert_eq!(importer.import_calls(), 1);
+        assert_eq!(importer.revalidation_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_live_status_check_does_not_deadlock_concurrent_checks() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = CancellableLiveCheckImporter::default();
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+        let secret = CreatorAuthoritySecret::new("grant-a");
+        cache.session_for_creator(&creator_a()).await.unwrap();
+
+        let cancelled = {
+            let cache = Arc::clone(&cache);
+            let secret = secret.clone();
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &secret)
+                    .await
+            })
+        };
+        importer.first_check_started.notified().await;
+        cancelled.abort();
+        cancelled.await.unwrap_err();
+
+        let creator = creator_a();
+        let first = cache.revalidate_session_for_creator(&creator, &secret);
+        let second = cache.revalidate_session_for_creator(&creator, &secret);
+        let (first, second) = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("concurrent checks must finish after a prior check is cancelled");
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(importer.revalidation_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn stalled_revalidation_times_out_without_invalidating_newer_generation() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = GenerationRaceImporter::new(true);
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let stalled = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator_with_timeout(
+                        &creator_a(),
+                        &secret,
+                        Duration::from_millis(25),
+                    )
+                    .await
+            })
+        };
+        importer.old_check_started.notified().await;
+        cache.invalidate(&creator_a()).await;
+        cache.session_for_creator(&creator_a()).await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(250), stalled)
+            .await
+            .expect("stalled live revalidation must be bounded")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApplicationError::CreatorAuthoritySecret { .. }
+        ));
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(
+            importer.import_calls(),
+            2,
+            "timed-out old generation must preserve the replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_revocation_result_does_not_deny_persisted_rotated_authority() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = GenerationRaceImporter::new(false);
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let check = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &secret)
+                    .await
+            })
+        };
+        importer.old_check_started.notified().await;
+        store.put(record(creator_a(), "grant-a-rotated")).await;
+        importer.release_old_check.notify_one();
+
+        assert!(matches!(
+            check.await.unwrap(),
+            Err(ApplicationError::CreatorAuthoritySecret { .. })
+        ));
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
+        assert_eq!(importer.import_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_stale_revocation_decision_and_preserves_rotated_authority() {
+        let store = DelayedNthLookupStore::new(record(creator_a(), "grant-a"), 3);
+        let importer = LiveCheckImporter::new([Ok(false), Ok(true)]);
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let old_secret = CreatorAuthoritySecret::new("grant-a");
+
+        cache.session_for_creator(&creator_a()).await.unwrap();
+        let stale_check = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &old_secret)
+                    .await
+            })
+        };
+        store.delayed_lookup_captured.notified().await;
+
+        let mut reconnect = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .upsert_creator_authority(record(creator_a(), "grant-a-rotated"))
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut reconnect)
+                .await
+                .is_err(),
+            "reconnect must not commit between the stale persisted read and its decision"
+        );
+
+        store.release_delayed_lookup.notify_one();
+        assert_eq!(
+            stale_check.await.unwrap(),
+            Err(ApplicationError::CreatorAuthorityUnavailable)
+        );
+        reconnect.await.unwrap().unwrap();
+
+        cache
+            .revalidate_session_for_creator(
+                &creator_a(),
+                &CreatorAuthoritySecret::new("grant-a-rotated"),
+            )
+            .await
+            .unwrap();
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
+        assert_eq!(importer.import_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_live_results_retry_against_the_reconnected_generation() {
+        for old_result in [false, true] {
+            let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+            let importer = GenerationRaceImporter::new(old_result);
+            let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+            let secret = CreatorAuthoritySecret::new("grant-a");
+
+            cache.session_for_creator(&creator_a()).await.unwrap();
+            let check = {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    cache
+                        .revalidate_session_for_creator(&creator_a(), &secret)
+                        .await
+                })
+            };
+            importer.old_check_started.notified().await;
+            cache.invalidate(&creator_a()).await;
+            cache.session_for_creator(&creator_a()).await.unwrap();
+            importer.release_old_check.notify_one();
+
+            check.await.unwrap().unwrap();
+            cache.session_for_creator(&creator_a()).await.unwrap();
+            assert_eq!(importer.import_calls(), 2);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_restore_owner_and_waiter_retry_rotation_without_reporting_revocation() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let importer = BlockingFirstImporter::default();
+        let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
+        let old_secret = CreatorAuthoritySecret::new("grant-a");
+
+        let owner = {
+            let cache = Arc::clone(&cache);
+            let old_secret = old_secret.clone();
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &old_secret)
+                    .await
+            })
+        };
+        importer.first_import_started.notified().await;
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(&creator_a(), &old_secret)
+                    .await
+            })
+        };
+        store.wait_for_lookups(2).await;
+
+        cache
+            .upsert_creator_authority(record(creator_a(), "grant-a-rotated"))
+            .await
+            .unwrap();
+        importer.release_first_import.notify_one();
+
+        for result in [owner.await.unwrap(), waiter.await.unwrap()] {
+            assert_eq!(
+                result,
+                Err(ApplicationError::CreatorAuthorityDependencyUnavailable),
+                "rotation during cold restore is indeterminate, not revoked"
+            );
+        }
+        assert_eq!(
+            importer.calls(),
+            2,
+            "owner and waiter must share one retry against the rotated grant"
+        );
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-a-rotated");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_cold_restore_supersession_is_bounded_and_indeterminate() {
+        let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
+        let (importer, mut imports) = BlockingImports::new(2);
+        let cache = Arc::new(GrantSessionCache::new(store, importer.clone(), 8));
+        let status = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .revalidate_session_for_creator(
+                        &creator_a(),
+                        &CreatorAuthoritySecret::new("grant-a"),
+                    )
+                    .await
+            })
+        };
+
+        assert_eq!(imports.recv().await, Some(0));
+        cache
+            .upsert_creator_authority(record(creator_a(), "grant-b"))
+            .await
+            .unwrap();
+        importer.release_one();
+        assert_eq!(imports.recv().await, Some(1));
+        cache
+            .upsert_creator_authority(record(creator_a(), "grant-c"))
+            .await
+            .unwrap();
+        importer.release_one();
+
+        assert_eq!(
+            status.await.unwrap(),
+            Err(ApplicationError::CreatorAuthorityDependencyUnavailable)
+        );
+        assert_eq!(importer.calls(), 2, "status retries at most once");
+        let current = cache.session_for_creator(&creator_a()).await.unwrap();
+        assert_eq!(current.record.secret.expose_secret(), "grant-c");
     }
 
     #[tokio::test]
@@ -599,19 +1161,19 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn revalidation_rejects_authority_rotated_after_manager_lookup() {
-        let events = RecordedEvents::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
+        let _subscriber_test_guard = TRACING_SUBSCRIBER_TEST_LOCK.lock().await;
+        let events = recorded_events();
         let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a-rotated")]);
         let importer = RecordingImporter::successful(Duration::ZERO);
         let cache = Arc::new(GrantSessionCache::new(store, importer, 8));
         let stale_secret = CreatorAuthoritySecret::new("grant-a");
 
-        assert_eq!(
+        assert!(matches!(
             cache
                 .revalidate_grant_credential(&creator_a(), &stale_secret)
                 .await,
-            Err(ApplicationError::CreatorAuthorityUnavailable)
-        );
+            Err(ApplicationError::CreatorAuthoritySecret { .. })
+        ));
         events.assert_secret_safe_diagnostic(
             "manager_record_validate",
             "stale_manager_record",
@@ -621,8 +1183,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn late_exchange_cannot_install_rotated_authority() {
-        let events = RecordedEvents::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
+        let _subscriber_test_guard = TRACING_SUBSCRIBER_TEST_LOCK.lock().await;
+        let events = recorded_events();
         let store = MutableAuthorityStore::with_records([record(creator_a(), "grant-a")]);
         let importer = RecordingImporter::successful(Duration::from_millis(60));
         let cache = Arc::new(GrantSessionCache::new(store.clone(), importer.clone(), 8));
@@ -639,7 +1201,7 @@ mod tests {
 
         assert_eq!(
             old.await.unwrap().unwrap_err(),
-            ApplicationError::CreatorAuthorityUnavailable
+            ApplicationError::CreatorAuthorityDependencyUnavailable
         );
         current.unwrap();
         cache.session_for_creator(&creator_a()).await.unwrap();
@@ -679,7 +1241,7 @@ mod tests {
 
         assert_eq!(
             stale.await.unwrap().unwrap_err(),
-            ApplicationError::CreatorAuthorityUnavailable
+            ApplicationError::CreatorAuthorityDependencyUnavailable
         );
         replacement.await.unwrap().unwrap();
         waiter.await.unwrap().unwrap();
@@ -728,9 +1290,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cache_saturation_reports_secret_safe_diagnostic() {
-        let events = RecordedEvents::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(events.clone()));
+    async fn cache_saturation_is_retryable_and_reports_secret_safe_diagnostic() {
+        let _subscriber_test_guard = TRACING_SUBSCRIBER_TEST_LOCK.lock().await;
+        let events = recorded_events();
         let store = MutableAuthorityStore::with_records([
             record(creator_a(), "grant-a"),
             record(creator_b(), "grant-b"),
@@ -745,10 +1307,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        assert_eq!(
-            cache.session_for_creator(&creator_b()).await.unwrap_err(),
-            ApplicationError::CreatorAuthorityUnavailable
-        );
+        let capacity_error = cache.session_for_creator(&creator_b()).await.unwrap_err();
+        assert!(matches!(
+            &capacity_error,
+            ApplicationError::CreatorAuthorityDependencyUnavailable
+        ));
         in_flight.abort();
         in_flight.await.unwrap_err();
         events.assert_secret_safe_diagnostic(
@@ -888,6 +1451,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct MutableAuthorityStore {
         records: Arc<RwLock<HashMap<CreatorPubky, CreatorAuthorityRecord>>>,
+        lookup_calls: Arc<AtomicUsize>,
+        lookup_observed: Arc<Notify>,
     }
 
     impl MutableAuthorityStore {
@@ -899,6 +1464,8 @@ mod tests {
                         .map(|record| (record.creator.clone(), record))
                         .collect(),
                 )),
+                lookup_calls: Arc::new(AtomicUsize::new(0)),
+                lookup_observed: Arc::new(Notify::new()),
             }
         }
 
@@ -907,6 +1474,12 @@ mod tests {
                 .write()
                 .await
                 .insert(record.creator.clone(), record);
+        }
+
+        async fn wait_for_lookups(&self, expected: usize) {
+            while self.lookup_calls.load(Ordering::SeqCst) < expected {
+                self.lookup_observed.notified().await;
+            }
         }
     }
 
@@ -924,7 +1497,10 @@ mod tests {
             &self,
             creator: &CreatorPubky,
         ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
-            Ok(self.records.read().await.get(creator).cloned())
+            let record = self.records.read().await.get(creator).cloned();
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            self.lookup_observed.notify_waiters();
+            Ok(record)
         }
 
         async fn delete_creator_authority(
@@ -933,6 +1509,83 @@ mod tests {
         ) -> Result<(), ApplicationError> {
             self.records.write().await.remove(creator);
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingFirstImporter {
+        calls: Arc<AtomicUsize>,
+        first_import_started: Arc<Notify>,
+        release_first_import: Arc<Notify>,
+    }
+
+    impl BlockingFirstImporter {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for BlockingFirstImporter {
+        type Session = FakeImportedSession;
+
+        async fn import_grant_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_import_started.notify_one();
+                self.release_first_import.notified().await;
+            }
+            Ok(FakeImportedSession::for_creator(&creator_a()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingImports {
+        calls: Arc<AtomicUsize>,
+        block_count: usize,
+        started: mpsc::UnboundedSender<usize>,
+        releases: Arc<Semaphore>,
+    }
+
+    impl BlockingImports {
+        fn new(block_count: usize) -> (Self, mpsc::UnboundedReceiver<usize>) {
+            let (started, receiver) = mpsc::unbounded_channel();
+            (
+                Self {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    block_count,
+                    started,
+                    releases: Arc::new(Semaphore::new(0)),
+                },
+                receiver,
+            )
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn release_one(&self) {
+            self.releases.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for BlockingImports {
+        type Session = FakeImportedSession;
+
+        async fn import_grant_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.block_count {
+                self.started.send(call).unwrap();
+                self.releases.acquire().await.unwrap().forget();
+            }
+            Ok(FakeImportedSession::for_creator(&creator_a()))
         }
     }
 
@@ -977,6 +1630,57 @@ mod tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_lookup_captured.notify_one();
                 self.release_first_lookup.notified().await;
+            }
+            Ok((record.creator == *creator).then_some(record))
+        }
+
+        async fn delete_creator_authority(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("not needed by delayed lookup test")
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedNthLookupStore {
+        record: Arc<RwLock<CreatorAuthorityRecord>>,
+        calls: Arc<AtomicUsize>,
+        delayed_call: usize,
+        delayed_lookup_captured: Arc<Notify>,
+        release_delayed_lookup: Arc<Notify>,
+    }
+
+    impl DelayedNthLookupStore {
+        fn new(record: CreatorAuthorityRecord, delayed_call: usize) -> Self {
+            Self {
+                record: Arc::new(RwLock::new(record)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                delayed_call,
+                delayed_lookup_captured: Arc::new(Notify::new()),
+                release_delayed_lookup: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CreatorAuthorityStore for DelayedNthLookupStore {
+        async fn upsert_creator_authority(
+            &self,
+            authority: CreatorAuthorityRecord,
+        ) -> Result<(), ApplicationError> {
+            *self.record.write().await = authority;
+            Ok(())
+        }
+
+        async fn get_creator_authority(
+            &self,
+            creator: &CreatorPubky,
+        ) -> Result<Option<CreatorAuthorityRecord>, ApplicationError> {
+            let record = self.record.read().await.clone();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == self.delayed_call {
+                self.delayed_lookup_captured.notify_one();
+                self.release_delayed_lookup.notified().await;
             }
             Ok((record.creator == *creator).then_some(record))
         }
@@ -1080,6 +1784,210 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct GenerationRaceImporter {
+        old_result: bool,
+        import_calls: Arc<AtomicUsize>,
+        old_check_started: Arc<Notify>,
+        release_old_check: Arc<Notify>,
+    }
+
+    impl GenerationRaceImporter {
+        fn new(old_result: bool) -> Self {
+            Self {
+                old_result,
+                import_calls: Arc::new(AtomicUsize::new(0)),
+                old_check_started: Arc::new(Notify::new()),
+                release_old_check: Arc::new(Notify::new()),
+            }
+        }
+
+        fn import_calls(&self) -> usize {
+            self.import_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for GenerationRaceImporter {
+        type Session = GenerationRaceSession;
+
+        async fn import_grant_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            let generation = self.import_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GenerationRaceSession {
+                old_result: self.old_result,
+                generation,
+                old_check_started: Arc::clone(&self.old_check_started),
+                release_old_check: Arc::clone(&self.release_old_check),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct GenerationRaceSession {
+        old_result: bool,
+        generation: usize,
+        old_check_started: Arc<Notify>,
+        release_old_check: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ImportedPubkySession for GenerationRaceSession {
+        type Storage = FakeStorage;
+
+        fn public_key_z32(&self) -> String {
+            creator_a()
+                .to_string()
+                .trim_start_matches("pubky")
+                .to_owned()
+        }
+
+        async fn revalidate(&self) -> Result<bool, ApplicationError> {
+            if self.generation == 0 {
+                self.old_check_started.notify_one();
+                self.release_old_check.notified().await;
+                Ok(self.old_result)
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn into_grant_storage(self) -> Self::Storage {
+            FakeStorage
+        }
+    }
+
+    #[derive(Clone)]
+    struct LiveCheckImporter {
+        results: Arc<Mutex<VecDeque<Result<bool, ApplicationError>>>>,
+        import_calls: Arc<AtomicUsize>,
+        revalidation_calls: Arc<AtomicUsize>,
+    }
+
+    impl LiveCheckImporter {
+        fn new(results: impl IntoIterator<Item = Result<bool, ApplicationError>>) -> Self {
+            Self {
+                results: Arc::new(Mutex::new(results.into_iter().collect())),
+                import_calls: Arc::new(AtomicUsize::new(0)),
+                revalidation_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn import_calls(&self) -> usize {
+            self.import_calls.load(Ordering::SeqCst)
+        }
+
+        fn revalidation_calls(&self) -> usize {
+            self.revalidation_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for LiveCheckImporter {
+        type Session = LiveCheckSession;
+
+        async fn import_grant_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            self.import_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LiveCheckSession {
+                results: Arc::clone(&self.results),
+                revalidation_calls: Arc::clone(&self.revalidation_calls),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct LiveCheckSession {
+        results: Arc<Mutex<VecDeque<Result<bool, ApplicationError>>>>,
+        revalidation_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ImportedPubkySession for LiveCheckSession {
+        type Storage = FakeStorage;
+
+        fn public_key_z32(&self) -> String {
+            creator_a()
+                .to_string()
+                .trim_start_matches("pubky")
+                .to_owned()
+        }
+
+        async fn revalidate(&self) -> Result<bool, ApplicationError> {
+            self.revalidation_calls.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("configured live revalidation result")
+        }
+
+        fn into_grant_storage(self) -> Self::Storage {
+            FakeStorage
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CancellableLiveCheckImporter {
+        revalidation_calls: Arc<AtomicUsize>,
+        first_check_started: Arc<Notify>,
+    }
+
+    impl CancellableLiveCheckImporter {
+        fn revalidation_calls(&self) -> usize {
+            self.revalidation_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PubkySessionImporter for CancellableLiveCheckImporter {
+        type Session = CancellableLiveCheckSession;
+
+        async fn import_grant_session(
+            &self,
+            _secret: &CreatorAuthoritySecret,
+        ) -> Result<Self::Session, ApplicationError> {
+            Ok(CancellableLiveCheckSession {
+                revalidation_calls: Arc::clone(&self.revalidation_calls),
+                first_check_started: Arc::clone(&self.first_check_started),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancellableLiveCheckSession {
+        revalidation_calls: Arc<AtomicUsize>,
+        first_check_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ImportedPubkySession for CancellableLiveCheckSession {
+        type Storage = FakeStorage;
+
+        fn public_key_z32(&self) -> String {
+            creator_a()
+                .to_string()
+                .trim_start_matches("pubky")
+                .to_owned()
+        }
+
+        async fn revalidate(&self) -> Result<bool, ApplicationError> {
+            if self.revalidation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_check_started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(true)
+        }
+
+        fn into_grant_storage(self) -> Self::Storage {
+            FakeStorage
+        }
+    }
+
+    #[derive(Clone)]
     struct RecordingImporter {
         results: Arc<Mutex<VecDeque<Result<FakeImportedSession, ApplicationError>>>>,
         calls: Arc<AtomicUsize>,
@@ -1158,11 +2066,16 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ImportedPubkySession for FakeImportedSession {
         type Storage = FakeStorage;
 
         fn public_key_z32(&self) -> String {
             self.creator_z32.clone()
+        }
+
+        async fn revalidate(&self) -> Result<bool, ApplicationError> {
+            Ok(true)
         }
 
         fn into_grant_storage(self) -> Self::Storage {
@@ -1220,6 +2133,19 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordedEvents(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    fn recorded_events() -> RecordedEvents {
+        let events = RECORDED_EVENTS
+            .get_or_init(|| {
+                let events = RecordedEvents::default();
+                tracing::subscriber::set_global_default(Registry::default().with(events.clone()))
+                    .expect("test tracing subscriber must only be installed once");
+                events
+            })
+            .clone();
+        events.0.lock().unwrap().clear();
+        events
+    }
 
     impl RecordedEvents {
         fn assert_secret_safe_diagnostic(
