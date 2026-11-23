@@ -222,6 +222,36 @@ pub enum ApplicationError {
     /// Referenced guarded resource cannot be loaded for proxy read.
     #[error("guarded resource unavailable")]
     GuardedResourceUnavailable,
+    /// Reader auth challenge is missing or no longer usable.
+    #[error("reader auth challenge unavailable")]
+    ReaderAuthChallengeUnavailable,
+    /// Reader auth challenge has expired.
+    #[error("reader auth challenge expired")]
+    ReaderAuthChallengeExpired,
+    /// Reader auth challenge was already consumed.
+    #[error("reader auth challenge already consumed")]
+    ReaderAuthChallengeAlreadyConsumed,
+    /// Reader session is missing or no longer usable.
+    #[error("reader session unavailable")]
+    ReaderSessionUnavailable,
+    /// Reader session has expired (idle or absolute).
+    #[error("reader session expired")]
+    ReaderSessionExpired,
+    /// Reader session was invalidated (logout or renewal).
+    #[error("reader session invalidated")]
+    ReaderSessionInvalidated,
+    /// Reader session renewal lost to a concurrent renewal.
+    #[error("reader session renewal conflict")]
+    ReaderSessionRenewalConflict,
+    /// Custom PoP verification failed.
+    #[error("reader auth pop verification failed: {message}")]
+    ReaderAuthPopVerificationFailed {
+        /// Secret-free verification failure detail.
+        message: String,
+    },
+    /// Reader identity conflicts with an immutable Reader on an existing task.
+    #[error("reader identity conflict")]
+    ReaderIdentityConflict,
     /// Guarded resource descriptor or bytes failed validation.
     #[error("invalid guarded resource: {message}")]
     InvalidGuardedResource {

@@ -10,6 +10,25 @@ use url::Url;
 
 pub const LOCKS_SERVER_SERVICE: &str = "pubky-locks-server";
 pub const SUPPORTED_API_VERSION: &str = "0.1";
+pub const CUSTOM_POP_READER_SESSION_V1: &str = "custom-pop-session-v1";
+pub const FOLDED_AUTH_V2: &str = "folded-auth-v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderAuthMode {
+    /// Prefer a Reader session when the browser can create a supported direct-grant Custom PoP.
+    /// Folded auth remains an explicit compatibility path when separately advertised. A failed
+    /// presented Reader bearer must never be retried without it.
+    ReaderSessionPreferred,
+    /// The Reader-session capability was absent, so use the existing folded-auth flow.
+    LegacyFoldedAuth,
+}
+
+/// Grant-chain shape supported by the advertised Reader-session protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderSessionGrantSupport {
+    /// Current Custom PoP contains one root-signed grant and cannot prove a parent/child chain.
+    DirectOnly,
+}
 
 pub fn creator_lock_service_pointer_url(creator: &CreatorPubky) -> Result<Url> {
     Url::parse(&format!(
@@ -69,6 +88,8 @@ pub struct WellKnownLocksServer {
     pub service: String,
     pub api_version: String,
     pub lock_server: LockServerPubky,
+    #[serde(default)]
+    pub reader_auth: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +119,32 @@ impl CreatorLockServicePointer {
 }
 
 impl WellKnownLocksServer {
+    pub fn supports_reader_sessions(&self) -> bool {
+        self.reader_auth
+            .iter()
+            .any(|capability| capability == CUSTOM_POP_READER_SESSION_V1)
+    }
+
+    pub fn reader_auth_mode(&self) -> ReaderAuthMode {
+        if self.supports_reader_sessions() {
+            ReaderAuthMode::ReaderSessionPreferred
+        } else {
+            ReaderAuthMode::LegacyFoldedAuth
+        }
+    }
+
+    pub fn supports_folded_auth(&self) -> bool {
+        self.reader_auth
+            .iter()
+            .any(|capability| capability == FOLDED_AUTH_V2)
+            || self.reader_auth.is_empty()
+    }
+
+    pub fn reader_session_grant_support(&self) -> Option<ReaderSessionGrantSupport> {
+        self.supports_reader_sessions()
+            .then_some(ReaderSessionGrantSupport::DirectOnly)
+    }
+
     pub fn validate_value(
         value: serde_json::Value,
         expected_lock_server: &LockServerPubky,
@@ -154,6 +201,50 @@ mod tests {
         assert_eq!(discovery.service, "pubky-locks-server");
         assert_eq!(discovery.api_version, "0.1");
         assert_eq!(discovery.lock_server, lock_server);
+    }
+
+    #[test]
+    fn discovery_exposes_reader_auth_capabilities_and_absence_is_legacy_fallback() {
+        let lock_server = lock_server();
+        let capable = WellKnownLocksServer::validate_value(
+            json!({
+                "service": "pubky-locks-server",
+                "api_version": "0.1",
+                "lock_server": lock_server,
+                "reader_auth": ["custom-pop-session-v1", "folded-auth-v2"]
+            }),
+            &lock_server,
+        )
+        .unwrap();
+        assert!(capable.supports_reader_sessions());
+        assert_eq!(
+            capable.reader_auth_mode(),
+            ReaderAuthMode::ReaderSessionPreferred
+        );
+        assert_eq!(
+            capable.reader_auth,
+            vec!["custom-pop-session-v1", "folded-auth-v2"]
+        );
+
+        let legacy = WellKnownLocksServer::validate_value(
+            json!({
+                "service": "pubky-locks-server",
+                "api_version": "0.1",
+                "lock_server": lock_server
+            }),
+            &lock_server,
+        )
+        .unwrap();
+        assert!(!legacy.supports_reader_sessions());
+        assert_eq!(legacy.reader_auth_mode(), ReaderAuthMode::LegacyFoldedAuth);
+        assert!(capable.supports_folded_auth());
+        assert!(legacy.supports_folded_auth());
+        assert_eq!(
+            capable.reader_session_grant_support(),
+            Some(ReaderSessionGrantSupport::DirectOnly)
+        );
+        assert_eq!(legacy.reader_session_grant_support(), None);
+        assert!(legacy.reader_auth.is_empty());
     }
 
     #[test]

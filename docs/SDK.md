@@ -4,6 +4,8 @@
 
 The browser SDK foundation exists in two layers:
 
+The Reader SDK flow for `custom-pop-session-v1`, including offline-revocation limits, token privacy, and `folded-auth-v2` compatibility, is specified in [Reader authentication and sessions](READER_AUTH.md).
+
 - `locks-sdk`: Rust SDK core and canonical request planner for deterministic request construction, `.well-known` validation, viewer/access request helpers, session export/restore, and browser transport rewrite helpers.
 - `locks-sdk/bindings/js`: `wasm-bindgen` JS/WASM wrapper crate exposing browser-facing `Locks`, `Viewer`, `Session`, and `Creator` APIs by wrapping the Rust SDK request planners rather than duplicating route/method/body construction.
 
@@ -70,7 +72,7 @@ They are application examples, not operator scripts. Use them when integrating t
 
 For a focused, copyable Paykit viewer flow plus exact request/response and terminal-state handling, see [`SDK_PAYKIT_VIEWER.md`](SDK_PAYKIT_VIEWER.md) and [`examples/js-sdk/paykit-viewer-flow.js`](../examples/js-sdk/paykit-viewer-flow.js). The signed Paykit lifecycle integration adds no new SDK export; that flow composes existing public viewer calls.
 
-For graph-only Content Lock v2, folded-auth polling, restart semantics, Nexus `app_spec_v0_7`, Rust/JS method names, browser secret handling, and deterministic Compose verification, see [`GRAPH_STAGE1.md`](GRAPH_STAGE1.md). Public JS uses `submitProofBundle`, `pollFoldedAuth`, and `lookupGraphVerificationTask`; Creator evidence uses `verificationEvidence`. These wrap canonical Rust planners and closed parsers rather than duplicating route shapes.
+For graph-only Content Lock v2, preferred Reader-session admission, direct-grant-only Custom PoP capability, folded-auth child/delegated-grant fallback, restart semantics, Nexus `app_spec_v0_7`, browser secret handling, and deterministic Compose verification, see [`READER_AUTH.md`](READER_AUTH.md) and [`GRAPH_STAGE1.md`](GRAPH_STAGE1.md). Public JS uses `createReaderSession`, memory-only `restoreReaderSession`, session-scoped submission/credential methods, and explicit `submitProofBundle` / `pollFoldedAuth` fallback; Creator evidence uses `verificationEvidence`. These wrap canonical Rust planners and closed parsers rather than duplicating route shapes. Failed Reader authentication never retries as folded auth.
 
 For payment-only Content Lock v2 policy bounds, provider/deadline semantics, and explicit Rust/JS payment lifecycle methods, see [`PAYMENT_ONLY_V2.md`](PAYMENT_ONLY_V2.md).
 

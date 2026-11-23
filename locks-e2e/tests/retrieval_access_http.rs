@@ -18,10 +18,15 @@ use locks_core::verification::{
     VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
 };
 use locks_server::testing::TestServerApp;
-use locks_service::application::models::{GuardedResourceRecord, VerificationTaskStatus};
+use locks_service::application::models::{
+    GuardedResourceRecord, ReaderAuthChallengeHash, ReaderSessionRecord, ReaderSessionToken,
+    ReaderSessionTokenHash, VerificationTaskStatus,
+};
+use locks_service::application::ports::ExchangeReaderSession;
 use serde_json::{Value, json};
 use time::macros::datetime;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 const CLIENT_REFERENCE: &str = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU";
@@ -141,7 +146,9 @@ async fn retrieval_access_http_flow_returns_seeded_guarded_resource_bytes() {
 
 #[tokio::test]
 async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
-    let test_app = TestServerApp::new_default_in_memory();
+    let mut config = TestServerApp::default_in_memory_config();
+    config.reader_auth.allowed_origins = vec!["https://pubky.app".to_owned()];
+    let test_app = TestServerApp::new_in_memory(config);
     let content_lock = mixed_content_lock();
     let lock_path = ContentLockPath::from_lock_id(content_lock.lock_id().unwrap());
     let lock_resource = PubkyLockResource::new(content_lock.creator.clone(), lock_path.clone());
@@ -171,16 +178,16 @@ async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
         })
         .await
         .unwrap();
+    let reader =
+        CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+            .unwrap();
     test_app
         .state()
         .entitlements()
         .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
             version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
             creator: content_lock.creator.clone(),
-            reader: CreatorPubky::from_str(
-                "pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky",
-            )
-            .unwrap(),
+            reader: reader.clone(),
             bundle_id: bundle_id(),
             pubky_lock_resource: lock_resource,
             verified_at: datetime!(2026-05-29 12:01:00 UTC),
@@ -188,14 +195,16 @@ async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
         })
         .await
         .unwrap();
+    const READER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    seed_reader_session(test_app.state(), READER_TOKEN, reader).await;
     let router = test_app.router();
 
     let credential_response = router
         .clone()
-        .oneshot(json_request(
-            "POST",
+        .oneshot(reader_auth_request(
             "/access-credentials",
             json!({ "creator": creator(), "bundle_id": BUNDLE_ID }),
+            READER_TOKEN,
         ))
         .await
         .unwrap();
@@ -215,6 +224,74 @@ async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
         .unwrap();
     assert_eq!(guarded_response.status(), StatusCode::OK);
     assert_eq!(response_bytes(guarded_response).await, guarded_bytes);
+}
+
+async fn seed_reader_session(
+    state: &locks_server::app_state::AppState,
+    token: &str,
+    reader: CreatorPubky,
+) {
+    let now = state.clock().now();
+    let challenge_id = Uuid::new_v4();
+    let challenge_hash = ReaderAuthChallengeHash::derive(challenge_id.as_bytes());
+    state
+        .reader_auth()
+        .unwrap()
+        .create_challenge(
+            locks_service::application::ports::CreateReaderAuthChallenge {
+                challenge_id,
+                challenge_hash: challenge_hash.clone(),
+                browser_origin: "https://pubky.app".to_owned(),
+                ttl_seconds: 120,
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .reader_auth()
+        .unwrap()
+        .exchange_session(ExchangeReaderSession {
+            challenge_id,
+            challenge_hash,
+            browser_origin: "https://pubky.app".to_owned(),
+            previous_token_hash: None,
+            session: ReaderSessionRecord {
+                session_id: Uuid::new_v4(),
+                reader,
+                token_hash: ReaderSessionTokenHash::derive(&ReaderSessionToken::new(token)),
+                challenge_id,
+                grant_id: Uuid::new_v4().to_string(),
+                grant_client_id: "pubky.app".to_owned(),
+                proof_nonce: Uuid::new_v4().to_string(),
+                lock_server_pubky: state
+                    .config()
+                    .credentials
+                    .lock_server_public_key
+                    .to_string(),
+                lock_server_origin: state.canonical_lock_server_origin().unwrap().to_owned(),
+                browser_origin: "https://pubky.app".to_owned(),
+                grant_expires_at: now + time::Duration::hours(2),
+                idle_expires_at: now + time::Duration::minutes(15),
+                absolute_expires_at: now + time::Duration::hours(1),
+                created_at: now,
+                renewed_from_session_id: None,
+                invalidated_at: None,
+            },
+        })
+        .await
+        .unwrap();
+}
+
+fn reader_auth_request(uri: &str, body: Value, token: &str) -> Request<Body> {
+    let mut request = json_request("POST", uri, body);
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    request
 }
 
 fn submitted_proof_bundle_for(content_lock: &ContentLock) -> SubmittedProofBundle {

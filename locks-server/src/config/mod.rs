@@ -14,9 +14,10 @@ pub use schema::{
     GrantConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
     LoggingConfig, MAX_TRUSTED_PROXY_HOPS, NexusConfig, PAYKIT_CONNECT_TIMEOUT_SECONDS,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
-    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, ReaderAuthConfig,
+    RuntimeConfig, RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig,
+    WorkerConfig,
 };
 pub use secrets::{FilesystemLockServerIdentityProvider, LockServerIdentityProvider};
 pub(crate) use secrets::{LockServerSigningKeyError, load_lock_server_signing_keypair};
-pub(crate) use validation::canonical_grant_origin;
+pub(crate) use validation::{canonical_grant_origin, canonical_lock_server_origin};

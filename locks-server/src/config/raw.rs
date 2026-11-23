@@ -21,8 +21,9 @@ use super::schema::{
     GrantConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
     LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS, MAX_TRUSTED_PROXY_HOPS, NexusConfig,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
-    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, ReaderAuthConfig,
+    RuntimeConfig, RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig,
+    WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,8 @@ pub(super) struct RawConfig {
     runtime: RawRuntimeConfig,
     #[serde(default)]
     creator_authority_acquisition: RawCreatorAuthorityAcquisitionConfig,
+    #[serde(default)]
+    reader_auth: RawReaderAuthConfig,
     #[serde(default)]
     secrets: RawSecretsConfig,
     #[serde(default)]
@@ -55,6 +58,30 @@ pub(super) struct RawConfig {
     paykit: Option<RawPaykitConfig>,
     #[serde(default)]
     nexus: Option<RawNexusConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReaderAuthConfig {
+    #[serde(default)]
+    allowed_origins: Vec<String>,
+}
+
+impl RawReaderAuthConfig {
+    fn into_reader_auth_config(self) -> Result<ReaderAuthConfig, ConfigError> {
+        let mut allowed_origins = Vec::with_capacity(self.allowed_origins.len());
+        for origin in self.allowed_origins {
+            let canonical = super::validation::canonical_grant_origin(&origin)
+                .ok_or_else(|| ConfigError::InvalidReaderAuthOrigin(origin.clone()))?;
+            if canonical != origin {
+                return Err(ConfigError::InvalidReaderAuthOrigin(origin));
+            }
+            if !allowed_origins.contains(&canonical) {
+                allowed_origins.push(canonical);
+            }
+        }
+        Ok(ReaderAuthConfig { allowed_origins })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -985,6 +1012,7 @@ impl RawConfig {
         let creator_authority_acquisition = self
             .creator_authority_acquisition
             .into_creator_authority_acquisition_config(runtime.environment)?;
+        let reader_auth = self.reader_auth.into_reader_auth_config()?;
         let secrets = self.secrets.into_secrets_config()?;
         let logging = self.logging.into_logging_config()?;
         let pubky = self.pubky.into_pubky_config()?;
@@ -1038,6 +1066,7 @@ impl RawConfig {
             },
             runtime,
             creator_authority_acquisition,
+            reader_auth,
             secrets,
             logging,
             pubky,

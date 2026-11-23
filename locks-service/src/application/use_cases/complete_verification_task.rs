@@ -455,7 +455,16 @@ fn viewer_safe_failure_message(error: &ApplicationError) -> &'static str {
         | ApplicationError::GuardedResourceUnavailable
         | ApplicationError::InvalidGuardedResource { .. }
         | ApplicationError::InvalidAccessCredential
-        | ApplicationError::ExpiredAccessCredential => "verification failed",
+        | ApplicationError::ExpiredAccessCredential
+        | ApplicationError::ReaderAuthChallengeUnavailable
+        | ApplicationError::ReaderAuthChallengeExpired
+        | ApplicationError::ReaderAuthChallengeAlreadyConsumed
+        | ApplicationError::ReaderSessionUnavailable
+        | ApplicationError::ReaderSessionExpired
+        | ApplicationError::ReaderSessionInvalidated
+        | ApplicationError::ReaderSessionRenewalConflict
+        | ApplicationError::ReaderAuthPopVerificationFailed { .. }
+        | ApplicationError::ReaderIdentityConflict => "verification failed",
     }
 }
 

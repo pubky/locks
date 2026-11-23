@@ -6,10 +6,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use locks_core::ids::TaskId;
 use locks_service::application::{
     errors::ApplicationError,
-    models::{AccessCredential, CreatorConnectFlowId, FrontendSessionCode, FrontendSessionToken},
+    models::{
+        AccessCredential, CreatorConnectFlowId, FrontendSessionCode, FrontendSessionToken,
+        ReaderSessionToken,
+    },
     ports::{
         AccessCredentialGenerator, Clock, CreatorConnectFlowIdGenerator,
-        FrontendSessionCodeGenerator, FrontendSessionTokenGenerator, VerificationTaskIdGenerator,
+        FrontendSessionCodeGenerator, FrontendSessionTokenGenerator, ReaderSessionTokenGenerator,
+        VerificationTaskIdGenerator,
     },
 };
 use rand::RngCore;
@@ -70,6 +74,17 @@ impl AccessCredentialGenerator for OsRandomAccessCredentialGenerator {
         let mut bytes = [0_u8; 32];
         OsRng.fill_bytes(&mut bytes);
         Ok(AccessCredential::new(URL_SAFE_NO_PAD.encode(bytes)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsRandomReaderSessionTokenGenerator;
+
+impl ReaderSessionTokenGenerator for OsRandomReaderSessionTokenGenerator {
+    fn generate_reader_session_token(&self) -> ReaderSessionToken {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        ReaderSessionToken::new(URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 

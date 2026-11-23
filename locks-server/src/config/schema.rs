@@ -26,6 +26,7 @@ pub struct LockServerRuntimeConfig {
     pub worker: WorkerConfig,
     pub runtime: RuntimeConfig,
     pub creator_authority_acquisition: CreatorAuthorityAcquisitionConfig,
+    pub reader_auth: ReaderAuthConfig,
     pub secrets: SecretsConfig,
     pub logging: LoggingConfig,
     pub pubky: PubkyConfig,
@@ -36,6 +37,12 @@ pub struct LockServerRuntimeConfig {
     pub deletion_worker: DeletionWorkerConfig,
     pub paykit: Option<PaykitConfig>,
     pub nexus: Option<NexusConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReaderAuthConfig {
+    /// Exact HTTPS browser origins allowed to request and exchange Reader sessions.
+    pub allowed_origins: Vec<String>,
 }
 
 pub const MAX_DELETION_CREDENTIAL_WINDOW_SECONDS: u64 = 3600;
@@ -461,6 +468,8 @@ pub enum ConfigError {
         "creator_authority_acquisition.grant_connect.allowed_return_origins must not be \"*\" when runtime.environment is production; list explicit origins"
     )]
     WildcardReturnOriginInProduction,
+    #[error("reader_auth.allowed_origins must contain exact HTTPS origins: {0}")]
+    InvalidReaderAuthOrigin(String),
     #[error("pubky.pkarr_relays must contain at least one relay when configured")]
     EmptyPubkyPkarrRelays,
     #[error(

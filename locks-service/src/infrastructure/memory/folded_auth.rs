@@ -245,6 +245,27 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .map(|stored| stored.attempt.clone()))
     }
 
+    async fn get_live_accepted_by_state_hash_and_handle(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        creator: &locks_core::ids::CreatorPubky,
+        bundle_id: &locks_core::ids::BundleId,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let state = self.state.read().await;
+        let now = self.graph.authoritative_time();
+        Ok(state
+            .records
+            .iter()
+            .find(|stored| {
+                &stored.attempt.state_hash == state_hash
+                    && stored.attempt.status == FoldedAuthStatus::Accepted
+                    && &stored.attempt.creator == creator
+                    && &stored.attempt.bundle_id == bundle_id
+                    && stored.attempt.expires_at > now
+            })
+            .map(|stored| stored.attempt.clone()))
+    }
+
     async fn restore_pending(
         &self,
         state_hash: &FoldedAuthStateHash,

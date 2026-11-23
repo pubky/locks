@@ -26,7 +26,7 @@ use locks_service::{
             GraphTaskRepository, GuardedResourceRepository, InvoiceAdmissionRepository,
             LockServicePointerRepository, MixedTaskClaimer, MixedTaskRepository,
             PaymentDrainClient, PaymentDrainRepository, PaymentTaskClaimer, PaymentTaskRepository,
-            VerificationTaskClaimer, VerificationTaskRepository,
+            ReaderAuthStore, VerificationTaskClaimer, VerificationTaskRepository,
         },
         use_cases::start_creator_connect_flow::default_requested_scopes,
     },
@@ -40,6 +40,7 @@ use locks_service::{
             content_locks::InMemoryContentLockRepository, graph_tasks::InMemoryGraphTaskRepository,
             mixed_tasks::InMemoryMixedTaskRepository, payment_tasks::InMemoryPaymentTaskRepository,
             public_content_locks::InMemoryPublicContentLockStore,
+            reader_auth::InMemoryReaderAuthStore,
             verification_task_claims::InMemoryVerificationTaskClaimer,
             verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence,
             verification_tasks::InMemoryVerificationTaskRepository,
@@ -51,7 +52,7 @@ use locks_service::{
             PostgresCreatorConnectFlowStore, PostgresFoldedAuthRepository,
             PostgresFrontendSessionCodeStore, PostgresFrontendSessionStore,
             PostgresGraphTaskRepository, PostgresMixedTaskRepository,
-            PostgresPaymentDrainRepository, PostgresPaymentTaskRepository,
+            PostgresPaymentDrainRepository, PostgresPaymentTaskRepository, PostgresReaderAuthStore,
             PostgresVerificationTaskClaimer, PostgresVerificationTaskRepository,
         },
         pubky::{
@@ -77,7 +78,7 @@ use crate::app_state::creator_repositories::CreatorRepositoryAdapters;
 pub use crate::app_state::generators::{
     OsRandomAccessCredentialGenerator, OsRandomCreatorConnectFlowIdGenerator,
     OsRandomFrontendSessionCodeGenerator, OsRandomFrontendSessionTokenGenerator,
-    OsRandomTaskIdGenerator, SystemClock,
+    OsRandomReaderSessionTokenGenerator, OsRandomTaskIdGenerator, SystemClock,
 };
 use crate::app_state::private_runtime::{
     InMemoryCreatorAuthorityStore, InMemoryCreatorConnectFlowStore,
@@ -95,7 +96,8 @@ use crate::config::{LockServerRuntimeConfig, load_lock_server_signing_keypair};
 use crate::nexus_http_client::{LiveNexusEndpoint, NexusEndpoint};
 use crate::paykit_http_client::{PaykitHttpClient, PaykitSetupStatusProvider};
 use crate::rate_limit::{
-    InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryVerificationSubmissionRateLimiter,
+    InMemoryPaykitConnectionStateLookupRateLimiter, InMemoryReaderAuthRateLimiter,
+    InMemoryVerificationSubmissionRateLimiter, READER_AUTH_MAX_IN_FLIGHT,
 };
 
 #[async_trait]
@@ -280,6 +282,8 @@ pub struct AppState {
     paykit_connection_state_lookup_rate_limiter:
         Arc<InMemoryPaykitConnectionStateLookupRateLimiter>,
     paykit_connection_status_semaphore: Arc<Semaphore>,
+    reader_auth_rate_limiter: Arc<InMemoryReaderAuthRateLimiter>,
+    reader_auth_semaphore: Arc<Semaphore>,
     reader_pubky_resolver: Arc<dyn ReaderPubkyResolver>,
     paykit_http_client: Option<Arc<PaykitHttpClient>>,
     paykit_setup_status_provider: Option<Arc<dyn PaykitSetupStatusProvider>>,
@@ -287,6 +291,9 @@ pub struct AppState {
     folded_auth: Option<Arc<dyn FoldedAuthRepository>>,
     folded_auth_poller: Option<Arc<dyn FoldedAuthApprovalPoller>>,
     folded_auth_flow_starter: Option<Arc<dyn FoldedAuthFlowStarter>>,
+    reader_auth: Option<Arc<dyn ReaderAuthStore>>,
+    reader_session_token_generator: Arc<OsRandomReaderSessionTokenGenerator>,
+    canonical_lock_server_origin: Option<String>,
 }
 
 /// Purpose-separated runtime ciphers derived from the configured master key.
@@ -845,6 +852,8 @@ impl AppState {
                 .paykit_connection_state_lookup
                 .max_in_flight,
         ));
+        let reader_auth_rate_limiter = Arc::new(InMemoryReaderAuthRateLimiter::default());
+        let reader_auth_semaphore = Arc::new(Semaphore::new(READER_AUTH_MAX_IN_FLIGHT));
         let reader_pubky_resolver = Arc::new(PubkyReaderPubkyResolver {
             client: build_pubky_client(&config.pubky),
         });
@@ -876,6 +885,20 @@ impl AppState {
                 config.runtime.environment.is_development() && nexus.allow_insecure_loopback,
             ))
         });
+
+        let canonical_lock_server_origin =
+            crate::config::canonical_lock_server_origin(&config.pkdns, config.runtime.environment);
+        let reader_auth: Option<Arc<dyn ReaderAuthStore>> =
+            if canonical_lock_server_origin.is_some() {
+                match (private_runtime_storage_kind, postgres_pool.as_ref()) {
+                    (RuntimeStorageKind::Postgres, Some(pool)) => {
+                        Some(Arc::new(PostgresReaderAuthStore::new(pool.clone())))
+                    }
+                    _ => Some(Arc::new(InMemoryReaderAuthStore::with_clock(clock.clone()))),
+                }
+            } else {
+                None
+            };
 
         Self {
             config,
@@ -921,6 +944,8 @@ impl AppState {
             verification_submission_rate_limiter,
             paykit_connection_state_lookup_rate_limiter,
             paykit_connection_status_semaphore,
+            reader_auth_rate_limiter,
+            reader_auth_semaphore,
             reader_pubky_resolver,
             paykit_http_client,
             paykit_setup_status_provider,
@@ -928,6 +953,9 @@ impl AppState {
             folded_auth: None,
             folded_auth_poller: None,
             folded_auth_flow_starter: None,
+            reader_auth,
+            reader_session_token_generator: Arc::new(OsRandomReaderSessionTokenGenerator),
+            canonical_lock_server_origin,
         }
     }
 
@@ -1146,7 +1174,12 @@ impl AppState {
 
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+        self.clock = clock.clone();
+        if self.reader_auth.is_some()
+            && self.private_runtime_storage_kind == RuntimeStorageKind::InMemory
+        {
+            self.reader_auth = Some(Arc::new(InMemoryReaderAuthStore::with_clock(clock)));
+        }
         self
     }
 
@@ -1217,6 +1250,14 @@ impl AppState {
         &self.paykit_connection_status_semaphore
     }
 
+    pub fn reader_auth_rate_limiter(&self) -> &Arc<InMemoryReaderAuthRateLimiter> {
+        &self.reader_auth_rate_limiter
+    }
+
+    pub fn reader_auth_semaphore(&self) -> &Arc<Semaphore> {
+        &self.reader_auth_semaphore
+    }
+
     pub fn reader_pubky_resolver(&self) -> &Arc<dyn ReaderPubkyResolver> {
         &self.reader_pubky_resolver
     }
@@ -1247,6 +1288,29 @@ impl AppState {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_reader_pubky_resolver(mut self, resolver: Arc<dyn ReaderPubkyResolver>) -> Self {
         self.reader_pubky_resolver = resolver;
+        self
+    }
+
+    pub fn reader_auth_enabled(&self) -> bool {
+        self.canonical_lock_server_origin.is_some()
+    }
+
+    pub fn canonical_lock_server_origin(&self) -> Option<&str> {
+        self.canonical_lock_server_origin.as_deref()
+    }
+
+    pub fn reader_auth(&self) -> Option<&Arc<dyn ReaderAuthStore>> {
+        self.reader_auth.as_ref()
+    }
+
+    pub fn reader_session_token_generator(&self) -> &Arc<OsRandomReaderSessionTokenGenerator> {
+        &self.reader_session_token_generator
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_reader_auth(mut self, store: Arc<dyn ReaderAuthStore>, origin: String) -> Self {
+        self.reader_auth = Some(store);
+        self.canonical_lock_server_origin = Some(origin);
         self
     }
 }

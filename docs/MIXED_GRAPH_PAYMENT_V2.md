@@ -3,7 +3,7 @@
 Mixed Content Lock v2 combines one graph policy with one Paykit payment policy. It is an acceleration lane, not debt forgiveness:
 
 1. Locks durably admits or exact-replays payment obligation before evaluator work.
-2. Folded auth derives Reader server-side. Mixed submissions MUST omit wire `reader_pubky`.
+2. A Locks-local Reader session derives Reader server-side; folded auth remains the explicit compatibility fallback. Mixed submissions MUST omit wire `reader_pubky`.
 3. Each evaluation wave keeps payment evidence live and eligible. Payment unavailability, conflict, ineligibility, or expiry blocks Graph bypass.
 4. Timely qualifying payment evidence **or** Graph success paired with same-wave eligible payment evidence can satisfy the lock. BTC eligibility retains its `minimum_confirmations = 0` rule. USDT requires amount-matched, on-time verified Arbitrum inclusion; denomination, offered BTC conversion, and Bitcoin thresholds cannot qualify USDT. Accepted request state alone is never enough. Graph success never cancels, erases, or forgives payment.
 5. Canonical `satisfied_by` values are `payment`, `zero_conf_graph`, or `[payment, zero_conf_graph]` in that order.
@@ -26,9 +26,10 @@ First timely payment threshold and first true Graph observations are sticky audi
 
 Viewer:
 
-- `POST /proof-bundles` starts folded auth for mixed v2.
-- `POST /proof-bundles/auth-status` polls folded auth.
+- `POST /proof-bundles` with a Reader bearer and exact bound browser Origin directly admits mixed v2 with immutable session-derived Reader.
+- `POST /proof-bundles` without Authorization starts folded auth; `POST /proof-bundles/auth-status` polls it. Current child/delegated grants require this fallback because direct Custom PoP supports direct grants only.
 - `POST /verification-task-lookups` reads lifecycle by Creator + bundle ID.
+- `POST /access-credentials` requires the matching Reader bearer for session-admitted tasks or the exact accepted folded-auth state bearer for fallback tasks. A failed Reader bearer never downgrades to folded lookup.
 
 Creator:
 
@@ -36,7 +37,7 @@ Creator:
 
 Exact replay returns stored state without Paykit or Nexus calls. Changed mode, lock hash, graph policy, payment policy, or bundle binding conflicts.
 
-Rust SDK exposes `submit_mixed_proof_bundle`, `lookup_mixed_verification_task`, `parse_mixed_lifecycle_response`, and `parse_mixed_verification_evidence_response`. JS/WASM exposes `submitMixedProofBundle`, `pollMixedFoldedAuth`, and `lookupMixedVerificationTask`; `verificationEvidence` dispatches its closed parser by `mode`.
+Rust SDK exposes Reader-session and folded-fallback forms of `submit_mixed_proof_bundle` and credential issuance, plus `lookup_mixed_verification_task`, `parse_mixed_lifecycle_response`, and `parse_mixed_verification_evidence_response`. JS/WASM exposes the same negotiated Reader-session path plus `submitMixedProofBundle`, `pollMixedFoldedAuth`, and `lookupMixedVerificationTask`; `verificationEvidence` dispatches its closed parser by `mode`.
 
 ## Deletion
 

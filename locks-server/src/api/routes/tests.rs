@@ -23,7 +23,8 @@ use locks_core::lock_policy::{
     SecondaryGuardedResource, VerifierType,
 };
 use locks_core::verification::{
-    Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
+    Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SatisfiedByV2, SubmittedProofBundle,
+    SubmittedProofBundleV2, VERIFIED_PROOF_BUNDLE_V2_VERSION, VerifiedProofBundleV2,
 };
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
@@ -35,15 +36,17 @@ use locks_service::application::models::{
     FrontendSessionRecord, FrontendSessionToken, GrantCreatorConnectFlowApproval, GrantPopKeyId,
     GraphTaskRecord, GuardedResourceRecord, InvoiceAdmissionRetryReason, MixedTaskRecord,
     OrdinaryCredentialLookupResult, PaymentInvoiceState, PendingCreatorConnectFlowRecord,
-    PrepareForceDeletionResult, RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
+    PrepareForceDeletionResult, ReaderAuthChallengeHash, ReaderSessionRecord, ReaderSessionToken,
+    ReaderSessionTokenHash, RestoredFoldedAuthAttempt, StartFoldedAuthAttempt,
 };
 use locks_service::application::ports::{
     AccessCredentialStore, Clock, ContentLockDeletionActionAcquireResult,
     ContentLockDeletionActionClaim, ContentLockDeletionActionOwnership,
     ContentLockDeletionRepository, ContentLockRepository, CreatorAuthorityManager,
-    CreatorAuthorityStatus, FoldedAuthApprovalPoll, FoldedAuthApprovalPollError,
-    FoldedAuthApprovalPoller, FoldedAuthFlowStarter, FoldedAuthPollCall, FoldedAuthRepository,
-    GrantCreatorConnectFlowClient, GuardedResourceRepository,
+    CreatorAuthorityStatus, ExchangeReaderSession, FoldedAuthApprovalPoll,
+    FoldedAuthApprovalPollError, FoldedAuthApprovalPoller, FoldedAuthFlowStarter,
+    FoldedAuthPollCall, FoldedAuthRepository, GrantCreatorConnectFlowClient,
+    GuardedResourceRepository,
 };
 
 use pubky_common::crypto::Keypair;
@@ -88,6 +91,7 @@ use locks_service::infrastructure::memory::graph_tasks::InMemoryGraphTaskReposit
 use locks_service::infrastructure::memory::guarded_resources::InMemoryGuardedResourceRepository;
 use locks_service::infrastructure::memory::lock_service_pointers::InMemoryLockServicePointerRepository;
 use locks_service::infrastructure::memory::public_content_locks::InMemoryPublicContentLockStore;
+use locks_service::infrastructure::memory::reader_auth::InMemoryReaderAuthStore;
 
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
 use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
@@ -177,6 +181,15 @@ impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
     async fn get_by_state_hash(
         &self,
         _state_hash: &FoldedAuthStateHash,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        Err(folded_auth_storage_failure())
+    }
+
+    async fn get_live_accepted_by_state_hash_and_handle(
+        &self,
+        _state_hash: &FoldedAuthStateHash,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
         Err(folded_auth_storage_failure())
     }
@@ -734,7 +747,553 @@ async fn well_known_locks_server_returns_service_version_and_lock_server_identit
         body["lock_server"],
         "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
     );
-    assert_eq!(body.as_object().unwrap().len(), 3);
+    // reader_auth is present when canonical lock server origin can be derived from PKDNS config.
+    let obj = body.as_object().unwrap();
+    if obj.contains_key("reader_auth") {
+        assert_eq!(obj.len(), 4);
+        assert!(body["reader_auth"].is_array());
+    } else {
+        assert_eq!(obj.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn reader_challenge_cors_requires_one_exact_configured_origin() {
+    async fn request_with_origins(origins: &[&str]) -> axum::response::Response {
+        let app = router(test_state());
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/reader-auth/challenges")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        for origin in origins {
+            request
+                .headers_mut()
+                .append(header::ORIGIN, origin.parse().unwrap());
+        }
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    for origins in [
+        vec![],
+        vec!["null"],
+        vec!["https://evil.example"],
+        vec!["https://pubky.app", "https://pubky.app"],
+    ] {
+        let response = request_with_origins(&origins).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origins:?}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+
+    let response = request_with_origins(&["https://pubky.app"]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn reader_challenge_rate_limit_isolated_by_client_ip_and_origin() {
+    let app = router(test_state());
+    for request_number in 1..=62 {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/reader-auth/challenges")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://pubky.app")
+            .body(Body::from("{}"))
+            .unwrap();
+        let peer: SocketAddr = if request_number == 61 {
+            "192.0.2.2:12345"
+        } else {
+            "192.0.2.1:12345"
+        }
+        .parse()
+        .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        let response = app.clone().oneshot(request).await.unwrap();
+        let expected = if request_number <= 61 {
+            StatusCode::OK
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(response.status(), expected, "request {request_number}");
+    }
+}
+
+#[tokio::test]
+async fn reader_challenge_creation_purges_expired_auth_state() {
+    let now = datetime!(2026-11-01 12:00:00 UTC);
+    let clock = Arc::new(AdjustableClock::new(now - time::Duration::minutes(3)));
+    let state = test_state().with_clock(clock.clone());
+    let expired_id = Uuid::new_v4();
+    state
+        .reader_auth()
+        .unwrap()
+        .create_challenge(
+            locks_service::application::ports::CreateReaderAuthChallenge {
+                challenge_id: expired_id,
+                challenge_hash: ReaderAuthChallengeHash::derive(b"expired"),
+                browser_origin: "https://pubky.app".to_owned(),
+                ttl_seconds: 120,
+            },
+        )
+        .await
+        .unwrap();
+    clock.set(now);
+    let app = router(state.clone());
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/reader-auth/challenges")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://pubky.app")
+        .body(Body::from("{}"))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+    ));
+
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert!(
+        state
+            .reader_auth()
+            .unwrap()
+            .get_challenge(expired_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reader_challenge_endpoint_uses_store_clock_not_skewed_node_clock() {
+    let storage_now = datetime!(2026-11-01 12:00:00 UTC);
+    let storage_clock = Arc::new(AdjustableClock::new(storage_now));
+    let reader_auth = Arc::new(InMemoryReaderAuthStore::with_clock(storage_clock));
+    let state = test_state()
+        .with_clock(Arc::new(AdjustableClock::new(
+            storage_now + time::Duration::days(30),
+        )))
+        .with_reader_auth(reader_auth, "https://locks.example".to_owned());
+    let app = router(state);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/reader-auth/challenges")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://pubky.app")
+        .body(Body::from("{}"))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["expires_at"],
+        "2026-11-01T12:02:00Z"
+    );
+}
+
+#[tokio::test]
+async fn reader_session_exchange_rejects_when_concurrency_is_exhausted() {
+    let state = test_state();
+    let _permits = state
+        .reader_auth_semaphore()
+        .acquire_many(16)
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/reader-sessions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://pubky.app")
+        .body(Body::from(
+            r#"{"challenge_id":"00000000-0000-0000-0000-000000000000","credentials":{"grant":"x","pop":"x"}}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "rate_limited"
+    );
+}
+
+async fn seed_reader_session(
+    state: &AppState,
+    token_value: &str,
+    reader: CreatorPubky,
+    browser_origin: &str,
+) {
+    let now = state.clock().now();
+    let challenge_id = Uuid::new_v4();
+    let challenge_hash = ReaderAuthChallengeHash::derive(challenge_id.as_bytes());
+    state
+        .reader_auth()
+        .unwrap()
+        .create_challenge(
+            locks_service::application::ports::CreateReaderAuthChallenge {
+                challenge_id,
+                challenge_hash: challenge_hash.clone(),
+                browser_origin: browser_origin.to_owned(),
+                ttl_seconds: 120,
+            },
+        )
+        .await
+        .unwrap();
+    state
+        .reader_auth()
+        .unwrap()
+        .exchange_session(ExchangeReaderSession {
+            challenge_id,
+            challenge_hash,
+            browser_origin: browser_origin.to_owned(),
+            previous_token_hash: None,
+            session: ReaderSessionRecord {
+                session_id: Uuid::new_v4(),
+                reader,
+                token_hash: ReaderSessionTokenHash::derive(&ReaderSessionToken::new(token_value)),
+                challenge_id,
+                grant_id: Uuid::new_v4().to_string(),
+                grant_client_id: "pubky.app".to_owned(),
+                proof_nonce: Uuid::new_v4().to_string(),
+                lock_server_pubky: state
+                    .config()
+                    .credentials
+                    .lock_server_public_key
+                    .to_string(),
+                lock_server_origin: state.canonical_lock_server_origin().unwrap().to_owned(),
+                browser_origin: browser_origin.to_owned(),
+                grant_expires_at: now + time::Duration::hours(2),
+                idle_expires_at: now + time::Duration::minutes(15),
+                absolute_expires_at: now + time::Duration::hours(1),
+                created_at: now,
+                renewed_from_session_id: None,
+                invalidated_at: None,
+            },
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn reader_session_logout_rejects_another_allowed_origin() {
+    let mut config = test_config(RuntimeEnvironment::Development, true);
+    config.reader_auth.allowed_origins = vec![
+        "https://pubky.app".to_owned(),
+        "https://reader.example".to_owned(),
+    ];
+    let state = AppState::new_empty_in_memory(config);
+    seed_reader_session(&state, "reader-token", other_creator(), "https://pubky.app").await;
+    let app = router(state);
+
+    let wrong_origin = Request::builder()
+        .method("DELETE")
+        .uri("/reader-sessions/current")
+        .header(header::AUTHORIZATION, "Bearer reader-token")
+        .header(header::ORIGIN, "https://reader.example")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(wrong_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let matching_origin = Request::builder()
+        .method("DELETE")
+        .uri("/reader-sessions/current")
+        .header(header::AUTHORIZATION, "Bearer reader-token")
+        .header(header::ORIGIN, "https://pubky.app")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(matching_origin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn reader_session_origin_is_required_on_graph_submission_without_folded_auth_downgrade() {
+    let (state, bundle) = folded_auth_test_state().await;
+    seed_reader_session(&state, "reader-token", other_creator(), "https://pubky.app").await;
+    let app = router(state);
+    let mut request = json_request(
+        "POST",
+        "/proof-bundles",
+        json!({"submitted_proof_bundle": bundle}),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer reader-token".parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reader_bearer_submission_cors_rejects_unapproved_origin_without_reflection() {
+    let (state, bundle) = folded_auth_test_state().await;
+    seed_reader_session(&state, "reader-token", other_creator(), "https://pubky.app").await;
+    let app = router(state);
+    let mut request = json_request(
+        "POST",
+        "/proof-bundles",
+        serde_json::to_value(bundle).unwrap(),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer reader-token".parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn graph_submission_caller_reader_cannot_override_reader_session_identity() {
+    let (state, mut bundle) = folded_auth_test_state().await;
+    seed_reader_session(&state, "reader-token", other_creator(), "https://pubky.app").await;
+    bundle.reader_pubky = Some(third_creator());
+    let app = router(state);
+    let mut request = json_request(
+        "POST",
+        "/proof-bundles",
+        json!({"submitted_proof_bundle": bundle}),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer reader-token".parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn leaked_graph_handle_cannot_issue_credential_to_another_reader_session() {
+    let (state, bundle) = folded_auth_test_state().await;
+    const READER_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const READER_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+    seed_reader_session(&state, READER_A, other_creator(), "https://pubky.app").await;
+    seed_reader_session(&state, READER_B, third_creator(), "https://pubky.app").await;
+    let lock_resource = bundle.pubky_lock_resource.clone();
+    let bundle_id = bundle.bundle_id.clone();
+    let app = router(state.clone());
+
+    let mut submit = json_request(
+        "POST",
+        "/proof-bundles",
+        json!({"submitted_proof_bundle": bundle}),
+    );
+    submit.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {READER_A}").parse().unwrap(),
+    );
+    submit
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let submit_response = app.clone().oneshot(submit).await.unwrap();
+    let submit_status = submit_response.status();
+    let submit_body = response_json(submit_response).await;
+    assert_eq!(submit_status, StatusCode::ACCEPTED, "{submit_body}");
+    state
+        .entitlements()
+        .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: creator(),
+            reader: other_creator(),
+            bundle_id,
+            pubky_lock_resource: lock_resource,
+            verified_at: datetime!(2026-11-01 12:00:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Graph],
+        })
+        .await
+        .unwrap();
+
+    let mut credential = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    credential.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {READER_B}").parse().unwrap(),
+    );
+    credential
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let response = app.clone().oneshot(credential).await.unwrap();
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "reader_session_unavailable");
+
+    let mut matching = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    matching.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {READER_A}").parse().unwrap(),
+    );
+    matching
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let matching_response = app.oneshot(matching).await.unwrap();
+    let matching_status = matching_response.status();
+    assert_eq!(
+        matching_response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+    assert_eq!(
+        matching_response.headers()[header::CACHE_CONTROL],
+        "no-store"
+    );
+    let matching_body = response_json(matching_response).await;
+    assert_eq!(matching_status, StatusCode::OK, "{matching_body}");
+}
+
+#[tokio::test]
+async fn non_reader_access_credentials_do_not_gain_unrestricted_cors() {
+    for authorization in [None, Some("Bearer 00000000-0000-4000-8000-000000000001")] {
+        let mut request = json_request(
+            "POST",
+            "/access-credentials",
+            json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+        );
+        if let Some(authorization) = authorization {
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, authorization.parse().unwrap());
+        }
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+
+        let response = router(test_state()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn reader_access_credential_cors_rejects_missing_unapproved_duplicate_and_null_origin() {
+    const READER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    async fn request_with_origins(origins: &[&str]) -> axum::response::Response {
+        let app = router(test_state());
+        let mut request = json_request(
+            "POST",
+            "/access-credentials",
+            json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {READER_TOKEN}").parse().unwrap(),
+        );
+        request.headers_mut().remove(header::ORIGIN);
+        for origin in origins {
+            request
+                .headers_mut()
+                .append(header::ORIGIN, origin.parse().unwrap());
+        }
+        app.oneshot(request).await.unwrap()
+    }
+
+    for origins in [
+        vec![],
+        vec!["https://evil.example"],
+        vec!["https://pubky.app", "https://pubky.app"],
+        vec!["null"],
+    ] {
+        let response = request_with_origins(&origins).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origins:?}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_reader_access_bearer_does_not_downgrade_to_folded_auth() {
+    const READER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let (state, _) = folded_auth_test_state().await;
+    let state = state.with_folded_auth_runtime(
+        Arc::new(StorageFailingFoldedAuthRepository),
+        Arc::new(FakeFoldedAuth),
+        Arc::new(FakeFoldedAuth),
+    );
+    let mut request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {READER_TOKEN}").parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+
+    let response = router(state).oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "reader_session_unavailable");
 }
 
 #[tokio::test]
@@ -1080,10 +1639,15 @@ async fn folded_auth_repository_failure_is_closed_500_cors_and_no_store() {
 
 #[tokio::test]
 async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_http_response() {
-    let (state, bundle) = folded_auth_test_state_with_poller(Arc::new(FakeFoldedAuthPoller(
-        FakeFoldedAuthPollResult::Approved,
-    )))
+    let clock = Arc::new(AdjustableClock::new(datetime!(2026-11-01 12:00:00 UTC)));
+    let (state, bundle) = folded_auth_test_state_with_runtime(
+        Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
+        vec!["https://pubky.app".to_owned()],
+        Some(clock.clone()),
+    )
     .await;
+    let lock_resource = bundle.pubky_lock_resource.clone();
+    let entitlement_bundle_id = bundle.bundle_id.clone();
     let app = router(state.clone());
     let submitted = app
         .clone()
@@ -1096,6 +1660,11 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
         .unwrap();
     assert_eq!(submitted.status(), StatusCode::ACCEPTED);
     let submitted_body = response_json(submitted).await;
+    let expires_at = time::OffsetDateTime::parse(
+        submitted_body["expires_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
     let status_request = || {
         json_request(
             "POST",
@@ -1114,6 +1683,67 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
     assert_eq!(accepted_body["task"]["creator"], creator().to_string());
     assert_eq!(accepted_body["task"]["bundle_id"], BUNDLE_ID);
     assert_json_contains_no_null(&accepted_body["task"]);
+
+    state
+        .entitlements()
+        .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: creator(),
+            reader: other_creator(),
+            bundle_id: entitlement_bundle_id,
+            pubky_lock_resource: lock_resource,
+            verified_at: datetime!(2026-11-01 12:00:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Graph],
+        })
+        .await
+        .unwrap();
+    let mut credential_request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    credential_request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", submitted_body["state"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    credential_request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let credential = app.clone().oneshot(credential_request).await.unwrap();
+    assert_eq!(credential.status(), StatusCode::OK);
+    assert_eq!(credential.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        credential.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://pubky.app"
+    );
+
+    clock.set(expires_at);
+    let mut expired_credential_request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    expired_credential_request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", submitted_body["state"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    expired_credential_request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let expired_credential = app
+        .clone()
+        .oneshot(expired_credential_request)
+        .await
+        .unwrap();
+    assert_eq!(expired_credential.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        expired_credential.headers()[header::CACHE_CONTROL],
+        "no-store"
+    );
 
     let lifecycle = app
         .clone()
@@ -8129,6 +8759,9 @@ fn test_config(
         },
         runtime: RuntimeConfig { environment },
         creator_authority_acquisition: CreatorAuthorityAcquisitionConfig::default(),
+        reader_auth: crate::config::ReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+        },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
         pubky: PubkyConfig::default(),
@@ -8590,6 +9223,10 @@ fn creator() -> CreatorPubky {
 
 fn other_creator() -> CreatorPubky {
     CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky").unwrap()
+}
+
+fn third_creator() -> CreatorPubky {
+    CreatorPubky::from_str(&Keypair::from_secret(&[3_u8; 32]).public_key().to_string()).unwrap()
 }
 
 async fn seed_frontend_session(state: &AppState, raw_token: &str, creator: CreatorPubky) {

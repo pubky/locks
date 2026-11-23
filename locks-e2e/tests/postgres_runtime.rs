@@ -1912,6 +1912,7 @@ fn test_config() -> LockServerRuntimeConfig {
             environment: RuntimeEnvironment::Development,
         },
         creator_authority_acquisition: CreatorAuthorityAcquisitionConfig::default(),
+        reader_auth: locks_server::config::ReaderAuthConfig::default(),
         secrets: SecretsConfig::default(),
         rate_limits: RateLimitsConfig::default(),
         logging: LoggingConfig::default(),

@@ -1,21 +1,21 @@
 # Graph Stage 1
 
-Graph Stage 1 is bounded support for graph-only Content Lock v2 policies. It binds Reader identity through folded auth, evaluates selected Nexus `app_spec_v0_7` predicates, durably publishes entitlement, and exposes redacted lifecycle/evidence. Mixed Graph+Paykit support is additive and documented in [Mixed Graph + Payment v2](MIXED_GRAPH_PAYMENT_V2.md); graph-only wire and snapshot behavior remains unchanged.
+Graph Stage 1 is bounded support for graph-only Content Lock v2 policies. It binds Reader identity through a Locks-local Reader session or the folded-auth compatibility fallback, evaluates selected Nexus `app_spec_v0_7` predicates, durably publishes entitlement, and exposes redacted lifecycle/evidence. Mixed Graph+Paykit support is additive and documented in [Mixed Graph + Payment v2](MIXED_GRAPH_PAYMENT_V2.md); graph-only wire and snapshot behavior remains unchanged.
 
 Architecture decisions: [ADR 0022](ADRs/0022-graph-stage1-folded-auth-nexus.md).
 
 ## Wire flow
 
 1. Creator publishes Content Lock v2 with `graph` policy and no `payment` policy.
-2. Viewer generates cryptographically random `bundle_id`, keeps it local, and sends Submitted Proof Bundle v2 to `POST /proof-bundles`.
-3. Server returns `202 auth_pending` with public folded-auth `state`, `auth_url`, and `expires_at`.
-4. Viewer approves in folded-auth UI, then calls `POST /proof-bundles/auth-status` with `state`.
-5. `pending` means poll later. Failure before dependency dispatch is retryable. Ambiguous failure after attempted dispatch returns `restart_required`; resubmit same immutable bundle to create fresh auth state. Expired state returns `expired`.
+2. Viewer generates cryptographically random `bundle_id`, keeps it local, and sends Submitted Proof Bundle v2 to `POST /proof-bundles`. Graph submissions omit caller-supplied Reader identity.
+3. Preferred flow sends `Authorization: Bearer <reader-session-token>` plus the exact browser `Origin`. Locks validates and touches the session, derives Reader only from the session, and immediately admits the immutable Reader + Creator + lock resource/hash/revision + bundle + policy/deadline snapshot.
+4. Compatibility flow omits Authorization. Server returns `202 auth_pending` with folded-auth `state`, `auth_url`, and `expires_at`; Viewer approves, then calls `POST /proof-bundles/auth-status` with `state`.
+5. Folded `pending` means poll later. Failure before dependency dispatch is retryable. Ambiguous failure after attempted dispatch returns `restart_required`; resubmit same immutable bundle to create fresh auth state. Expired state returns `expired`. Direct child/delegated grants are unsupported by current Custom PoP and must negotiate this folded fallback.
 
 Lock Server renews durable ownership while an approval poll is live. Cleanup recovers a crashed or abandoned poll after one minute without renewal; concurrent status requests remain `pending` and cannot invalidate active ownership.
 6. Approved auth atomically binds Reader and creates durable graph task. Viewer polls `POST /verification-task-lookups` with `{ creator, bundle_id }`.
 7. Worker evaluates Nexus. Operational failures retry until deadline. Invalid successful response fails closed. Valid false remains pending until policy can no longer be satisfied. Valid true is retained monotonically.
-8. Satisfied policy enters `publishing_entitlement`; publication retries under claim fencing. Completed lifecycle enables existing access-credential flow.
+8. Satisfied policy enters `publishing_entitlement`; publication retries under claim fencing. Credential issuance requires the matching Reader session bearer, or the exact accepted folded-auth state bearer for fallback tasks. Reader session failures never downgrade to folded lookup. Payment-only issuance remains anonymous.
 9. Authenticated Creator reads redacted result from `POST /creator/verification-evidence`.
 
 Public responses never include internal task UUID, claim token, folded-auth secret, raw Nexus body, dependency config, runtime master key, or unredacted failure history.
@@ -36,12 +36,15 @@ Stage 1 supports bounded predicates from `GraphPredicateV2`:
 Use canonical request planners and response parsers; do not rebuild route bodies manually:
 
 ```rust
-use locks_sdk::{FoldedAuthStatusRequest, ViewerLocks};
+use locks_sdk::{FoldedAuthStatusRequest, ReaderSessionToken, ViewerLocks};
 
-let submitted_request = viewer.submit_graph_proof_bundle(bundle_v2);
+let session = viewer.reader_session(ReaderSessionToken::new(session_token));
+let submitted_request = session.submit_graph_proof_bundle(bundle_v2.clone());
 // Execute request with caller transport, then parse closed response.
 let submitted = ViewerLocks::parse_graph_submit_response(submitted_json)?;
 
+// Explicit fallback when capability negotiation selects folded-auth-v2.
+let submitted_request = viewer.submit_graph_proof_bundle(bundle_v2);
 if let Some((_auth_url, state, _expires_at)) = submitted.auth_pending_parts() {
     let poll_request = viewer.poll_folded_auth(FoldedAuthStatusRequest::new(state));
     let auth = ViewerLocks::parse_folded_auth_status_response(auth_json)?;
@@ -61,7 +64,11 @@ Generated package exposes same contract as plain JavaScript objects:
 ```js
 import { VerificationTaskHandleOptions } from "@synonymdev/locks-sdk";
 
-const submitted = await viewer.submitProofBundle(bundleV2);
+const session = viewer.restoreReaderSession(readerSessionToken);
+const submitted = await session.submitGraphProofBundle(bundleV2);
+
+// Explicit fallback when direct-grant Custom PoP is unavailable:
+// const submitted = await viewer.submitProofBundle(bundleV2);
 let state = submitted.state;
 
 while (submitted.status === "auth_pending") {
@@ -79,7 +86,7 @@ const lifecycle = await viewer.lookupGraphVerificationTask(handle);
 const evidence = await creator.verificationEvidence(bundleId);
 ```
 
-Never put `bundleId` or folded-auth state in URL/query, analytics, exception telemetry, or shared browser storage. SDK does not expose folded-auth flow secret.
+Never put `bundleId`, Reader session token, or folded-auth state in URL/query, analytics, exception telemetry, or shared browser storage. SDK does not expose folded-auth flow secret.
 
 ## Deterministic local E2E
 
@@ -159,6 +166,6 @@ Record exact commands, counts, hashes, container/image receipts, and any unavail
 
 ## Boundaries
 
-Included: graph-only Content Lock v2, folded auth, selected Nexus `app_spec_v0_7`, durable graph worker/publication, redacted evidence, deterministic fake-service E2E.
+Included: graph-only Content Lock v2, direct-grant Reader sessions, folded-auth fallback, selected Nexus `app_spec_v0_7`, durable graph worker/publication, redacted evidence, deterministic fake-service E2E.
 
 Excluded from this Stage 1 lane: mixed Graph+Paykit evaluation, generalized policy migration, live dependency smoke, Paykit changes, credential semantic changes, production deployment. Historical roadmap naming called mixed Graph+Paykit composition Stage 2 and generalized policy/migration Stage 3; current mixed behavior is documented in [Mixed Graph + Payment v2](MIXED_GRAPH_PAYMENT_V2.md).

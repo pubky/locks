@@ -206,6 +206,55 @@ pub struct InMemoryVerificationSubmissionRateLimiter {
     windows: Mutex<HashMap<VerificationSubmissionRateLimitKey, WindowCounter>>,
 }
 
+pub const READER_AUTH_MAX_REQUESTS: u32 = 60;
+pub const READER_AUTH_WINDOW_SECONDS: u64 = 60;
+pub const READER_AUTH_MAX_KEYS: usize = 10_000;
+pub const READER_AUTH_MAX_IN_FLIGHT: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReaderAuthRateLimitKey {
+    pub client_ip: IpAddr,
+    pub origin: String,
+}
+
+/// Per-node Reader-auth admission bound, keyed by trusted client IP and exact approved Origin.
+/// Durable replay protection remains in ReaderAuthStore; this only bounds work.
+#[derive(Debug, Default)]
+pub struct InMemoryReaderAuthRateLimiter {
+    windows: Mutex<HashMap<ReaderAuthRateLimitKey, WindowCounter>>,
+}
+
+impl InMemoryReaderAuthRateLimiter {
+    pub fn check(&self, key: &ReaderAuthRateLimitKey, now: OffsetDateTime) -> RateLimitDecision {
+        let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
+        if !windows.contains_key(key) && windows.len() >= READER_AUTH_MAX_KEYS {
+            windows.retain(|_, window| {
+                !window_has_expired(window.started_at, now, READER_AUTH_WINDOW_SECONDS)
+            });
+            if windows.len() >= READER_AUTH_MAX_KEYS {
+                return RateLimitDecision::rejected(READER_AUTH_WINDOW_SECONDS);
+            }
+        }
+        let window = windows.entry(key.clone()).or_insert(WindowCounter {
+            started_at: now,
+            count: 0,
+        });
+        if window_has_expired(window.started_at, now, READER_AUTH_WINDOW_SECONDS) {
+            window.started_at = now;
+            window.count = 0;
+        }
+        if window.count >= READER_AUTH_MAX_REQUESTS {
+            return RateLimitDecision::rejected(retry_after_seconds(
+                window.started_at,
+                now,
+                READER_AUTH_WINDOW_SECONDS,
+            ));
+        }
+        window.count += 1;
+        RateLimitDecision::allowed()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowCounter {
     started_at: OffsetDateTime,

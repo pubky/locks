@@ -627,6 +627,7 @@ fn test_config() -> LockServerRuntimeConfig {
             environment: RuntimeEnvironment::Development,
         },
         creator_authority_acquisition: crate::config::CreatorAuthorityAcquisitionConfig::default(),
+        reader_auth: crate::config::ReaderAuthConfig::default(),
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
         pubky: PubkyConfig::default(),

@@ -1,5 +1,5 @@
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -21,6 +21,9 @@ use crate::api::creator_publishing::{
     set_lock_service_pointer_for_authenticated_creator,
 };
 use crate::api::paykit::paykit_setup_status_for_authenticated_creator;
+use crate::api::reader_auth::{
+    create_reader_auth_challenge, create_reader_session, delete_reader_session,
+};
 use crate::api::runtime::{healthz, readyz, well_known_locks_server};
 use crate::api::verification::{
     complete_verification_task, creator_verification_evidence, lookup_folded_auth_status,
@@ -40,7 +43,6 @@ pub fn router(state: AppState) -> Router {
             "/paykit-connection-state-lookups",
             post(lookup_paykit_connection_state),
         )
-        .route("/access-credentials", post(issue_access_credential))
         .route(
             "/creator/authority-status",
             get(creator_authority_status_route),
@@ -122,6 +124,10 @@ pub fn router(state: AppState) -> Router {
         .layer(CorsLayer::very_permissive());
     let auth = Router::new()
         .route(
+            "/access-credentials",
+            post(issue_access_credential).options(auth_preflight),
+        )
+        .route(
             "/proof-bundles",
             post(submit_proof_bundle).options(auth_preflight),
         )
@@ -130,8 +136,74 @@ pub fn router(state: AppState) -> Router {
             post(lookup_folded_auth_status).options(auth_preflight),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_cors))
+        .with_state(state.clone());
+    let reader = Router::new()
+        .route(
+            "/reader-auth/challenges",
+            post(create_reader_auth_challenge).options(reader_preflight),
+        )
+        .route(
+            "/reader-sessions",
+            post(create_reader_session).options(reader_preflight),
+        )
+        .route(
+            "/reader-sessions/current",
+            delete(delete_reader_session).options(reader_preflight),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .route_layer(middleware::from_fn_with_state(state.clone(), reader_cors))
         .with_state(state);
-    public.merge(auth)
+    public.merge(auth).merge(reader)
+}
+
+async fn reader_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn reader_cors(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let mut values = request.headers().get_all(header::ORIGIN).iter();
+    let origin = values.next().cloned();
+    let allowed = values.next().is_none()
+        && origin.as_ref().is_some_and(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value != "null"
+                    && crate::config::canonical_grant_origin(value).as_deref() == Some(value)
+                    && state
+                        .config()
+                        .reader_auth
+                        .allowed_origins
+                        .iter()
+                        .any(|allowed| allowed == value)
+            })
+        });
+    if !allowed {
+        let mut response = StatusCode::FORBIDDEN.into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    let is_preflight = request.method() == Method::OPTIONS;
+    let mut response = next.run(request).await;
+    let response_headers = response.headers_mut();
+    response_headers.remove(header::SET_COOKIE);
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.expect("allowed reader origin exists"),
+    );
+    response_headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if is_preflight {
+        response_headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("POST, DELETE"),
+        );
+        response_headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("authorization, content-type, pubky-host"),
+        );
+    }
+    response
 }
 
 async fn auth_preflight() -> StatusCode {
@@ -150,22 +222,64 @@ pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> b
 
 async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let is_submission = request.uri().path() == "/proof-bundles";
+    let is_access_credential = request.uri().path() == "/access-credentials";
+    let access_bearer = is_access_credential.then(|| {
+        let invalid = || {
+            crate::api::errors::ApiError::new(
+                crate::api::errors::ApiErrorCode::ReaderSessionUnavailable,
+                "reader session unavailable",
+            )
+        };
+        crate::api::auth::parse_viewer_access_bearer(request.headers(), invalid)
+    });
+    let invalid_access_bearer = matches!(access_bearer.as_ref(), Some(Err(_)));
+    let is_reader_submission = is_submission
+        && request.headers().contains_key(header::AUTHORIZATION)
+        || matches!(
+            access_bearer.as_ref(),
+            Some(Ok(Some(crate::api::auth::ViewerAccessBearer::Reader(_))))
+        );
     let mut origins = request.headers().get_all(header::ORIGIN).iter();
     let origin = origins.next().cloned();
     let duplicate_origin = origins.next().is_some();
-    let allowed = !duplicate_origin
-        && (is_submission
-            || origin.as_ref().is_none_or(|origin| {
-                let Ok(origin) = origin.to_str() else {
-                    return false;
-                };
-                state
+    let is_preflight = request.method() == Method::OPTIONS;
+    let reader_origin_allowed = || {
+        origin.as_ref().is_some_and(|origin| {
+            let Ok(origin) = origin.to_str() else {
+                return false;
+            };
+            origin != "null"
+                && crate::config::canonical_grant_origin(origin).as_deref() == Some(origin)
+                && state
                     .config()
-                    .creator_authority_acquisition
-                    .grant_connect
-                    .as_ref()
-                    .is_some_and(|grant| auth_origin_allowed(&grant.allowed_return_origins, origin))
-            }));
+                    .reader_auth
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed == origin)
+        })
+    };
+    let legacy_origin_allowed = || {
+        origin.as_ref().is_none_or(|origin| {
+            let Ok(origin) = origin.to_str() else {
+                return false;
+            };
+            state
+                .config()
+                .creator_authority_acquisition
+                .grant_connect
+                .as_ref()
+                .is_some_and(|grant| auth_origin_allowed(&grant.allowed_return_origins, origin))
+        })
+    };
+    let allowed = !duplicate_origin
+        && !invalid_access_bearer
+        && if is_reader_submission {
+            reader_origin_allowed()
+        } else if is_access_credential && is_preflight {
+            reader_origin_allowed() || legacy_origin_allowed()
+        } else {
+            is_submission || legacy_origin_allowed()
+        };
     if !allowed {
         let mut response = StatusCode::FORBIDDEN.into_response();
         response
@@ -173,7 +287,6 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return response;
     }
-    let is_preflight = request.method() == Method::OPTIONS;
     let mut response = next.run(request).await;
     let origin_denied = response
         .headers_mut()

@@ -2,6 +2,7 @@ use locks_core::ids::{BundleId, ClientReference, CreatorPubky, PubkyLockResource
 use locks_core::verification::{SubmittedProofBundle, SubmittedProofBundleV2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 use crate::creator::encode_content_path;
 use crate::graph::{
@@ -13,12 +14,183 @@ use crate::{LocksSdkError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewerLocks;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SdkViewerRequest {
     pub method: &'static str,
     pub path: String,
     pub authorization: Option<String>,
     pub body: Value,
+}
+
+impl fmt::Debug for SdkViewerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let body = if self.path == "/reader-sessions" {
+            Value::String("<redacted>".to_owned())
+        } else {
+            self.body.clone()
+        };
+        formatter
+            .debug_struct("SdkViewerRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .field("body", &body)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ReaderSessionCredentials {
+    grant: String,
+    pop: String,
+}
+
+impl ReaderSessionCredentials {
+    pub fn new(grant: impl Into<String>, pop: impl Into<String>) -> Self {
+        Self {
+            grant: grant.into(),
+            pop: pop.into(),
+        }
+    }
+}
+
+impl fmt::Debug for ReaderSessionCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReaderSessionCredentials(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReaderSessionToken(String);
+
+impl ReaderSessionToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn export_secret(&self) -> &str {
+        &self.0
+    }
+
+    fn authorization_header_value(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+}
+
+impl fmt::Debug for ReaderSessionToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReaderSessionToken(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CreateReaderSessionRequest {
+    pub challenge_id: String,
+    pub credentials: ReaderSessionCredentials,
+    pub existing_session: Option<ReaderSessionToken>,
+}
+
+impl fmt::Debug for CreateReaderSessionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateReaderSessionRequest")
+            .field("challenge_id", &"<redacted>")
+            .field("credentials", &self.credentials)
+            .field("existing_session", &self.existing_session)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+struct CreateReaderSessionBody<'a> {
+    challenge_id: &'a str,
+    credentials: &'a ReaderSessionCredentials,
+}
+
+pub const READER_SESSION_PURPOSE: &str = "reader-session-v1";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReaderAuthChallengeResponse {
+    pub challenge_id: String,
+    pub challenge: String,
+    pub lock_server_pubky: locks_core::ids::LockServerPubky,
+    pub lock_server_origin: url::Url,
+    pub purpose: String,
+    pub expires_at: time::OffsetDateTime,
+}
+
+impl fmt::Debug for ReaderAuthChallengeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReaderAuthChallengeResponse")
+            .field("challenge_id", &"<redacted>")
+            .field("challenge", &"<redacted>")
+            .field("lock_server_pubky", &self.lock_server_pubky)
+            .field("lock_server_origin", &self.lock_server_origin)
+            .field("purpose", &self.purpose)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReaderAuthChallengeWire {
+    challenge_id: String,
+    challenge: String,
+    lock_server_pubky: locks_core::ids::LockServerPubky,
+    lock_server_origin: String,
+    purpose: String,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReaderSessionResponse {
+    pub reader: CreatorPubky,
+    pub session_token: ReaderSessionToken,
+    pub idle_expires_at: time::OffsetDateTime,
+    pub expires_at: time::OffsetDateTime,
+}
+
+impl fmt::Debug for ReaderSessionResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReaderSessionResponse")
+            .field("reader", &self.reader)
+            .field("session_token", &self.session_token)
+            .field("idle_expires_at", &self.idle_expires_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReaderSessionWire {
+    reader: CreatorPubky,
+    session_token: String,
+    #[serde(with = "time::serde::rfc3339")]
+    idle_expires_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReaderSessionLocks {
+    token: ReaderSessionToken,
+}
+
+impl fmt::Debug for ReaderSessionLocks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReaderSessionLocks")
+            .field("token", &self.token)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -166,6 +338,78 @@ impl ViewerLocks {
         Self
     }
 
+    pub fn create_reader_auth_challenge(&self) -> SdkViewerRequest {
+        self.post_json(
+            "/reader-auth/challenges",
+            serde_json::Map::<String, Value>::new(),
+        )
+    }
+
+    pub fn create_reader_session(&self, request: CreateReaderSessionRequest) -> SdkViewerRequest {
+        SdkViewerRequest {
+            method: "POST",
+            path: "/reader-sessions".to_owned(),
+            authorization: request
+                .existing_session
+                .as_ref()
+                .map(ReaderSessionToken::authorization_header_value),
+            body: serde_json::to_value(CreateReaderSessionBody {
+                challenge_id: &request.challenge_id,
+                credentials: &request.credentials,
+            })
+            .expect("reader session request serializes to JSON"),
+        }
+    }
+
+    pub fn reader_session(&self, token: ReaderSessionToken) -> ReaderSessionLocks {
+        ReaderSessionLocks { token }
+    }
+
+    pub fn parse_reader_auth_challenge_response(
+        value: Value,
+        expected_lock_server: &locks_core::ids::LockServerPubky,
+    ) -> Result<ReaderAuthChallengeResponse> {
+        let wire: ReaderAuthChallengeWire = serde_json::from_value(value)
+            .map_err(|error| LocksSdkError::InvalidResponse(error.to_string()))?;
+        let lock_server_origin = url::Url::parse(&wire.lock_server_origin)
+            .map_err(|error| LocksSdkError::InvalidResponse(error.to_string()))?;
+        if wire.challenge_id.is_empty()
+            || wire.challenge.is_empty()
+            || wire.purpose != READER_SESSION_PURPOSE
+            || &wire.lock_server_pubky != expected_lock_server
+            || lock_server_origin.cannot_be_a_base()
+            || !matches!(lock_server_origin.scheme(), "http" | "https")
+        {
+            return Err(LocksSdkError::InvalidResponse(
+                "invalid reader authentication challenge".to_owned(),
+            ));
+        }
+        Ok(ReaderAuthChallengeResponse {
+            challenge_id: wire.challenge_id,
+            challenge: wire.challenge,
+            lock_server_pubky: wire.lock_server_pubky,
+            lock_server_origin,
+            purpose: wire.purpose,
+            expires_at: wire.expires_at,
+        })
+    }
+
+    pub fn parse_reader_session_response(value: Value) -> Result<ReaderSessionResponse> {
+        let wire: ReaderSessionWire = serde_json::from_value(value)
+            .map_err(|error| LocksSdkError::InvalidResponse(error.to_string()))?;
+        if wire.session_token.is_empty() || wire.idle_expires_at > wire.expires_at {
+            return Err(LocksSdkError::InvalidResponse(
+                "invalid reader session response".to_owned(),
+            ));
+        }
+        Ok(ReaderSessionResponse {
+            reader: wire.reader,
+            session_token: ReaderSessionToken::new(wire.session_token),
+            idle_expires_at: wire.idle_expires_at,
+            expires_at: wire.expires_at,
+        })
+    }
+
     pub fn submit_proof_bundle(
         &self,
         submitted_proof_bundle: SubmittedProofBundle,
@@ -258,6 +502,17 @@ impl ViewerLocks {
         request: VerificationTaskHandleRequest,
     ) -> SdkViewerRequest {
         self.post_json("/access-credentials", request)
+    }
+
+    /// Issues through the compatibility folded-auth flow using its opaque state capability.
+    pub fn issue_access_credential_with_folded_auth(
+        &self,
+        request: VerificationTaskHandleRequest,
+        folded_auth: &crate::FoldedAuthStatusRequest,
+    ) -> SdkViewerRequest {
+        let mut request = self.issue_access_credential(request);
+        request.authorization = Some(format!("Bearer {}", folded_auth.state()));
+        request
     }
 
     pub fn complete_verification_task(
@@ -363,6 +618,43 @@ impl ViewerLocks {
     }
 }
 
+impl ReaderSessionLocks {
+    fn authorize(&self, mut request: SdkViewerRequest) -> SdkViewerRequest {
+        request.authorization = Some(self.token.authorization_header_value());
+        request
+    }
+
+    pub fn submit_graph_proof_bundle(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundleV2,
+    ) -> SdkViewerRequest {
+        self.authorize(ViewerLocks::new().submit_graph_proof_bundle(submitted_proof_bundle))
+    }
+
+    pub fn submit_mixed_proof_bundle(
+        &self,
+        submitted_proof_bundle: SubmittedProofBundleV2,
+    ) -> SdkViewerRequest {
+        self.authorize(ViewerLocks::new().submit_mixed_proof_bundle(submitted_proof_bundle))
+    }
+
+    pub fn issue_access_credential(
+        &self,
+        request: VerificationTaskHandleRequest,
+    ) -> SdkViewerRequest {
+        self.authorize(ViewerLocks::new().issue_access_credential(request))
+    }
+
+    pub fn delete_current(&self) -> SdkViewerRequest {
+        SdkViewerRequest {
+            method: "DELETE",
+            path: "/reader-sessions/current".to_owned(),
+            authorization: Some(self.token.authorization_header_value()),
+            body: Value::Null,
+        }
+    }
+}
+
 impl Default for ViewerLocks {
     fn default() -> Self {
         Self::new()
@@ -460,6 +752,102 @@ mod tests {
     const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
     const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+
+    #[test]
+    fn reader_session_responses_and_protected_request_plans_are_closed_and_redacted() {
+        let viewer = ViewerLocks::new();
+        let lock_server = locks_core::ids::LockServerPubky::from_str(
+            "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+        )
+        .unwrap();
+        let challenge = ViewerLocks::parse_reader_auth_challenge_response(
+            json!({
+                "challenge_id": "challenge-1",
+                "challenge": "challenge-secret",
+                "lock_server_pubky": lock_server,
+                "lock_server_origin": "https://locks.example",
+                "purpose": "reader-session-v1",
+                "expires_at": "2026-11-23T12:05:00Z"
+            }),
+            &lock_server,
+        )
+        .unwrap();
+        assert_eq!(challenge.purpose, "reader-session-v1");
+        assert!(!format!("{challenge:?}").contains("challenge-secret"));
+
+        let response = ViewerLocks::parse_reader_session_response(json!({
+            "reader": CREATOR,
+            "session_token": "reader-session-secret",
+            "idle_expires_at": "2026-11-23T12:10:00Z",
+            "expires_at": "2026-11-23T13:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            response.session_token.export_secret(),
+            "reader-session-secret"
+        );
+        assert!(!format!("{response:?}").contains("reader-session-secret"));
+
+        let session = viewer.reader_session(response.session_token);
+        let handle = VerificationTaskHandleRequest {
+            creator: CREATOR.parse().unwrap(),
+            bundle_id: BundleId::from_str(BUNDLE_ID).unwrap(),
+        };
+        let issued = session.issue_access_credential(handle);
+        assert_eq!(issued.path, "/access-credentials");
+        assert_eq!(
+            issued.authorization.as_deref(),
+            Some("Bearer reader-session-secret")
+        );
+        let deleted = session.delete_current();
+        assert_eq!(deleted.method, "DELETE");
+        assert_eq!(deleted.path, "/reader-sessions/current");
+        assert_eq!(deleted.body, Value::Null);
+        assert!(!format!("{deleted:?}").contains("reader-session-secret"));
+    }
+
+    #[test]
+    fn reader_session_challenge_and_creation_requests_match_the_closed_contract() {
+        let viewer = ViewerLocks::new();
+        let challenge = viewer.create_reader_auth_challenge();
+        assert_eq!(challenge.method, "POST");
+        assert_eq!(challenge.path, "/reader-auth/challenges");
+        assert_eq!(challenge.authorization, None);
+        assert_eq!(challenge.body, json!({}));
+
+        let credentials = ReaderSessionCredentials::new("grant-secret", "pop-secret");
+        let create = viewer.create_reader_session(CreateReaderSessionRequest {
+            challenge_id: "challenge-1".to_owned(),
+            credentials: credentials.clone(),
+            existing_session: None,
+        });
+        assert_eq!(create.path, "/reader-sessions");
+        assert_eq!(create.authorization, None);
+        assert_eq!(
+            create.body,
+            json!({
+                "challenge_id": "challenge-1",
+                "credentials": {
+                    "grant": "grant-secret",
+                    "pop": "pop-secret"
+                }
+            })
+        );
+
+        let rotate = viewer.create_reader_session(CreateReaderSessionRequest {
+            challenge_id: "challenge-2".to_owned(),
+            credentials,
+            existing_session: Some(ReaderSessionToken::new("old-reader-token")),
+        });
+        assert_eq!(
+            rotate.authorization.as_deref(),
+            Some("Bearer old-reader-token")
+        );
+        let debug = format!("{rotate:?}");
+        assert!(!debug.contains("old-reader-token"));
+        assert!(!debug.contains("grant-secret"));
+        assert!(!debug.contains("pop-secret"));
+    }
 
     #[test]
     fn submit_proof_bundle_request_uses_public_envelope_without_auth_or_task_id() {

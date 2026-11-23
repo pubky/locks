@@ -82,6 +82,29 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         .map(|stored| stored.map(|stored| stored.0))
     }
 
+    async fn get_live_accepted_by_state_hash_and_handle(
+        &self,
+        state_hash: &FoldedAuthStateHash,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        sqlx::query_as::<_, FoldedAuthRow>(&format!(
+            "SELECT {COLUMNS} FROM folded_auth_attempts
+             WHERE state_hash = $1 AND status = 'accepted'
+               AND creator = $2 AND bundle_id = $3
+               AND expires_at > clock_timestamp()"
+        ))
+        .bind(state_hash.as_bytes().as_slice())
+        .bind(creator.to_string())
+        .bind(bundle_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(row_to_stored)
+        .transpose()
+        .map(|stored| stored.map(|stored| stored.0))
+    }
+
     async fn accepted_graph_task(
         &self,
         state_hash: &FoldedAuthStateHash,
@@ -1142,6 +1165,39 @@ mod tests {
         assert_eq!(row.0, "accepted");
         assert!(row.1.is_none());
         assert_eq!(row.2, Some(task.task_id.as_uuid()));
+        assert!(
+            repository
+                .get_live_accepted_by_state_hash_and_handle(
+                    &started.attempt.state_hash,
+                    &creator(),
+                    &BundleId::from_str(BUNDLE_ID).unwrap(),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        sqlx::query(
+            "WITH current AS (SELECT clock_timestamp() AS value)
+             UPDATE folded_auth_attempts
+             SET created_at = current.value - INTERVAL '10 minutes',
+                 expires_at = current.value
+             FROM current",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            repository
+                .get_live_accepted_by_state_hash_and_handle(
+                    &started.attempt.state_hash,
+                    &creator(),
+                    &BundleId::from_str(BUNDLE_ID).unwrap(),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "expiry equality must reject using database-authoritative time"
+        );
         sqlx::query(
             "UPDATE folded_auth_attempts
              SET purge_after = clock_timestamp() - INTERVAL '1 second'",

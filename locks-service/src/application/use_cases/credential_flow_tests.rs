@@ -14,7 +14,7 @@ use locks_core::ids::{
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
     GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    LockServerConfig, PaymentPolicyV2, VerifierType,
 };
 use locks_core::verification::{
     CriterionVerificationResult, EntitlementLifetime, SatisfiedByV2,
@@ -47,8 +47,10 @@ const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 async fn final_credential_winner_uses_fresh_time_after_generation() {
     let before_generation = datetime!(2026-05-29 12:00:00 UTC);
     let after_generation = datetime!(2026-05-29 12:00:01 UTC);
-    let entitlements = FakeEntitlements::new(None);
-    let content_locks = FakeContentLocks::new(None);
+    let content_lock = content_lock_fixture(900);
+    let entitlement = verified_proof_bundle_fixture(&content_lock);
+    let entitlements = FakeEntitlements::new(Some(entitlement));
+    let content_locks = FakeContentLocks::new(Some(content_lock));
     let store = FakeAccessCredentialStore::with_final_credential();
     let generator = FakeGenerator::new(AccessCredential::new("final-bearer"));
     let clock = SequenceClock::new([before_generation, after_generation]);
@@ -112,7 +114,7 @@ async fn issue_access_credential_rechecks_entitlement_and_stores_lookup_key() {
 }
 
 #[tokio::test]
-async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
+async fn issue_access_credential_requires_reader_for_mixed_payment_satisfaction() {
     let content_lock = ContentLockV2 {
         version: 2,
         creator: creator(),
@@ -126,7 +128,12 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
             .unwrap(),
         ),
         secondary_resources: BTreeMap::new(),
-        payment: None,
+        payment: Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "1000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
         graph: Some(GraphPolicyV2 {
             predicates: vec![GraphPredicateV2::Follows {
                 follower: GraphParticipantV2::Reader,
@@ -158,7 +165,7 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
             bundle_id: bundle_id(),
             pubky_lock_resource: resource,
             verified_at: datetime!(2026-05-29 12:00:00 UTC),
-            satisfied_by: vec![SatisfiedByV2::Graph],
+            satisfied_by: vec![SatisfiedByV2::Payment],
         })
         .await
         .unwrap();
@@ -174,11 +181,23 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
         AccessCredentialPolicy::new(3600),
     );
 
-    let issued = use_case
+    let unauthorized = use_case
         .execute(IssueAccessCredentialRequest {
             creator: creator(),
             bundle_id: bundle_id(),
         })
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized, ApplicationError::ReaderSessionUnavailable);
+
+    let issued = use_case
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: creator(),
+                bundle_id: bundle_id(),
+            },
+            Some(other_creator()),
+        )
         .await
         .unwrap();
 

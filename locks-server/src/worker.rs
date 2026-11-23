@@ -481,6 +481,19 @@ fn application_error_class(error: &ApplicationError) -> &'static str {
         ApplicationError::InvalidGuardedResource { .. } => "invalid_guarded_resource",
         ApplicationError::InvalidAccessCredential => "invalid_access_credential",
         ApplicationError::ExpiredAccessCredential => "expired_access_credential",
+        ApplicationError::ReaderAuthChallengeUnavailable => "reader_auth_challenge_unavailable",
+        ApplicationError::ReaderAuthChallengeExpired => "reader_auth_challenge_expired",
+        ApplicationError::ReaderAuthChallengeAlreadyConsumed => {
+            "reader_auth_challenge_already_consumed"
+        }
+        ApplicationError::ReaderSessionUnavailable => "reader_session_unavailable",
+        ApplicationError::ReaderSessionExpired => "reader_session_expired",
+        ApplicationError::ReaderSessionInvalidated => "reader_session_invalidated",
+        ApplicationError::ReaderSessionRenewalConflict => "reader_session_renewal_conflict",
+        ApplicationError::ReaderAuthPopVerificationFailed { .. } => {
+            "reader_auth_pop_verification_failed"
+        }
+        ApplicationError::ReaderIdentityConflict => "reader_identity_conflict",
     }
 }
 
@@ -1176,6 +1189,7 @@ mod tests {
             runtime: RuntimeConfig { environment },
             creator_authority_acquisition:
                 crate::config::CreatorAuthorityAcquisitionConfig::default(),
+            reader_auth: crate::config::ReaderAuthConfig::default(),
             secrets: SecretsConfig::default(),
             logging: LoggingConfig::default(),
             pubky: PubkyConfig::default(),

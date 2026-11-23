@@ -22,6 +22,7 @@ pub mod mixed_tasks;
 pub mod payment_drains;
 pub mod payment_tasks;
 mod proof_admission;
+pub mod reader_auth;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod verification_task_claims;
@@ -41,5 +42,6 @@ pub use migrations::run_migrations;
 pub use mixed_tasks::PostgresMixedTaskRepository;
 pub use payment_drains::PostgresPaymentDrainRepository;
 pub use payment_tasks::PostgresPaymentTaskRepository;
+pub use reader_auth::PostgresReaderAuthStore;
 pub use verification_task_claims::PostgresVerificationTaskClaimer;
 pub use verification_tasks::PostgresVerificationTaskRepository;

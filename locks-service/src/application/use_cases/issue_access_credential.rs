@@ -65,7 +65,28 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
         &self,
         request: IssueAccessCredentialRequest,
     ) -> Result<IssuedAccessCredential, ApplicationError> {
+        self.execute_authenticated(request, None).await
+    }
+
+    /// Executes with Reader identity derived from a live Locks-local session.
+    pub async fn execute_authenticated(
+        &self,
+        request: IssueAccessCredentialRequest,
+        authenticated_reader: Option<CreatorPubky>,
+    ) -> Result<IssuedAccessCredential, ApplicationError> {
         let now = self.clock.now();
+        let valid_entitlement = load_valid_entitlement(
+            self.entitlements,
+            self.content_locks,
+            &request.creator,
+            &request.bundle_id,
+        )
+        .await?;
+        if let Some(required_reader) = &valid_entitlement.required_reader
+            && authenticated_reader.as_ref() != Some(required_reader)
+        {
+            return Err(ApplicationError::ReaderSessionUnavailable);
+        }
         if self
             .credential_store
             .final_credential_available(&request.creator, &request.bundle_id, now)
@@ -92,14 +113,6 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
                 });
             }
         }
-        let valid_entitlement = load_valid_entitlement(
-            self.entitlements,
-            self.content_locks,
-            &request.creator,
-            &request.bundle_id,
-        )
-        .await?;
-
         let requested_ttl_seconds = self
             .policy
             .validate_requested_ttl_seconds(valid_entitlement.requested_credential_ttl_seconds())?;

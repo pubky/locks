@@ -38,6 +38,45 @@ Authenticated creator sessions expose `creatorAuthorityStatus()` for a live, sec
 status check. Operational homeserver failures reject; only confirmed missing/revoked/expired grants
 resolve with `authorized: false`.
 
+## Reader sessions
+
+When `/.well-known/locks-server` advertises
+`reader_auth: ["custom-pop-session-v1", "folded-auth-v2"]`, authenticate protected Reader calls:
+
+```js
+const viewer = locks.viewer;
+const challenge = await viewer.createReaderAuthChallenge();
+const credentials = await wallet.answerLocksChallenge(challenge); // { grant, pop }
+let readerSession = await viewer.createReaderSession(challenge.challenge_id, credentials);
+
+const submitted = await readerSession.submitGraphProofBundle(graphBundle);
+const mixed = await readerSession.submitMixedProofBundle(mixedBundle);
+const access = await readerSession.issueAccessCredential(handle);
+
+// The application owns persistence, as with creator sessions.
+const savedToken = readerSession.exportSecret();
+readerSession = viewer.restoreReaderSession(savedToken);
+
+// Rotation authenticates with the current Reader token.
+const nextChallenge = await viewer.createReaderAuthChallenge();
+readerSession = await readerSession.rotate(
+  nextChallenge.challenge_id,
+  await wallet.answerLocksChallenge(nextChallenge),
+);
+await readerSession.signout();
+```
+
+`createReaderAuthChallenge()` sends the strict empty JSON body `{}`. Reader-session creation sends
+`{ challenge_id, credentials: { grant, pop } }`; rotation additionally sends the existing Reader
+bearer. Graph and mixed submission plus access-credential issuance belong on `ReaderSession` and use
+that bearer. Payment-only submission remains on `Viewer.submitPaymentProofBundle()` and anonymous.
+
+Use folded auth when Reader sessions are absent or when both modes are advertised but the wallet
+cannot produce the currently supported direct-grant Custom PoP (for example, it has an Accounts
+parent/child grant). Once a Reader bearer is presented, surface challenge, credential, session, and
+protected-call failures; never retry that failed bearer anonymously. Session and credential secrets
+are caller-persisted and redacted from Rust `Debug` output.
+
 ## License
 
 MIT

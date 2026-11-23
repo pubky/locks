@@ -115,6 +115,8 @@ mod tests {
         assert_table_exists(&mut connection, "pending_creator_connect_flows").await;
         assert_table_exists(&mut connection, "frontend_session_codes").await;
         assert_table_exists(&mut connection, "frontend_sessions").await;
+        assert_table_exists(&mut connection, "reader_auth_challenges").await;
+        assert_table_exists(&mut connection, "reader_sessions").await;
         assert_table_exists(&mut connection, "content_lock_ownership").await;
         assert_table_exists(&mut connection, "content_lock_deletion_jobs").await;
         assert_table_exists(&mut connection, "content_lock_force_deletion_receipts").await;
@@ -538,7 +540,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(upgraded_versions, (1..=33).collect::<Vec<_>>());
+        assert_eq!(upgraded_versions, (1..=34).collect::<Vec<_>>());
 
         database.cleanup().await;
     }
@@ -579,7 +581,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             after.iter().map(|row| row.0).collect::<Vec<_>>(),
-            (1..=33).collect::<Vec<_>>()
+            (1..=34).collect::<Vec<_>>()
         );
         assert_eq!(
             &after[..26],
@@ -824,7 +826,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_versions, (1..=33).collect::<Vec<_>>());
+        assert_eq!(applied_versions, (1..=34).collect::<Vec<_>>());
 
         let mut connection = database.pool().acquire().await.unwrap();
         sqlx::query(
@@ -1078,7 +1080,7 @@ mod tests {
                 .fetch_all(database.pool())
                 .await
                 .unwrap();
-        assert_eq!(applied_after, (1..=33).collect::<Vec<_>>());
+        assert_eq!(applied_after, (1..=34).collect::<Vec<_>>());
 
         let pending_after: (Vec<u8>, String, Option<String>, i64, String) = sqlx::query_as(
             "SELECT convert_to(evaluator_snapshot::text, 'UTF8'), status, terminal_reason,

@@ -50,6 +50,8 @@ pub struct WellKnownLocksServerHttpResponse {
     pub service: &'static str,
     pub api_version: &'static str,
     pub lock_server: LockServerPubky,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader_auth: Option<Vec<&'static str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

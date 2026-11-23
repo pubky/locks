@@ -6,7 +6,8 @@ use super::schema::{
     ConfigError, ConfigPathResolution, ContentLocksConfig, CreatorAuthorityAcquisitionConfig,
     DatabaseConfig, DeletionConfig, DeletionWorkerConfig, GrantConnectAcquisitionConfig,
     LockServerCredentialsConfig, LockServerRuntimeConfig, LoggingConfig, PaykitConfig, PkdnsConfig,
-    PubkyConfig, RateLimitsConfig, RuntimeConfig, RuntimeEnvironment, SecretsConfig, WorkerConfig,
+    PubkyConfig, RateLimitsConfig, ReaderAuthConfig, RuntimeConfig, RuntimeEnvironment,
+    SecretsConfig, WorkerConfig,
 };
 use super::secrets::{LockServerIdentityProvider, parse_lock_server_keypair_seed};
 
@@ -182,6 +183,9 @@ fn initialize_default_config_with_database_url(
             }),
             ..CreatorAuthorityAcquisitionConfig::default()
         },
+        reader_auth: ReaderAuthConfig {
+            allowed_origins: vec!["https://localhost:3002".to_owned()],
+        },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
         pubky: PubkyConfig::default(),
@@ -238,6 +242,9 @@ frontend_session_code_ttl_seconds = {} # One-time callback code lifetime. Keep s
 [creator_authority_acquisition.grant_connect]
 client_id = "{}" # Hostname naming this Lock Server to Pubky signers in grant requests, e.g. "locks.example". No scheme, port, or path.
 allowed_return_origins = {} # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"] (https only). Must not be empty; ["*"] is development/staging-only and rejected in production.
+
+[reader_auth]
+allowed_origins = {} # Exact HTTPS browser origins allowed to use Reader challenge/session routes. Empty disables Reader-session negotiation; no wildcard.
 
 [secrets]
 runtime_master_key_env = "{}" # Environment variable containing the 32-byte base64url runtime master key. Domain-separated keys encrypt creator authority and final credentials. Rotating requires data migration.
@@ -322,6 +329,7 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
             .frontend_session_code_ttl_seconds,
         generated_grant.client_id,
         toml_string_array(&generated_grant.allowed_return_origins),
+        toml_string_array(&config.reader_auth.allowed_origins),
         config.secrets.runtime_master_key_env,
         config.deletion.retry_max_attempts,
         config.deletion.retry_initial_backoff_seconds,
