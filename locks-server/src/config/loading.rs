@@ -263,7 +263,7 @@ level = "{}" # Tracing level/filter, e.g. error, warn, info, debug, trace, or En
 network = "testnet" # One of: testnet, mainnet. Selects Pubky SDK network defaults; testnet expects local pubky-testnet services.
 resolution = "default" # One of: default, relay-only. relay-only disables direct Mainline DHT resolution while retaining PKARR relays on mainnet.
 # pkarr_relays = ["http://127.0.0.1:15411"] # Optional shared PKARR relay URL array for Pubky auth/storage resolution and Lock Server record publication. Omit to use network defaults.
-# auth_relay = "https://relay.example/inbox" # Optional Pubky AUTH relay inbox written into creator grant-connect and reader folded-auth URLs. https, or http on localhost; no credentials, query, or fragment. Omit to use network defaults.
+# auth_relay = "https://relay.example/inbox" # Optional Pubky AUTH relay inbox written into creator grant-connect and reader folded-auth URLs. https, or http on localhost in development; no credentials, query, or fragment. Omit to use network defaults.
 
 [pkdns]
 public_ip = "{}" # Public IP advertised in PKARR/PKDNS records. Local default is loopback; production must use the externally reachable address.
