@@ -581,9 +581,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "cookie"
-version = "0.18.3"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
+checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
 dependencies = [
  "percent-encoding",
  "time",
@@ -1028,9 +1028,9 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.3"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
+checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "base32",
  "blake3",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "locks-e2e"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "locks-sdk"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "locks-core",
  "locks-server",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "locks-sdk-wasm"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "futures-lite",
  "js-sys",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "locks-server"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "locks-service"
-version = "0.1.1-rc6"
+version = "0.1.1-rc5"
 dependencies = [
  "async-trait",
  "axum",
@@ -4123,9 +4123,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.9"
+version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
 dependencies = [
  "form_urlencoded",
  "idna",
