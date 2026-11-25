@@ -51,11 +51,13 @@ pub(crate) type InMemoryStoredMixedTask = StoredEvaluatorTask<MixedTaskRecord>;
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 ///
-/// When several fields are needed, acquire them in this global order:
-/// `folded_auth_reservations` -> `deactivated_folded_auth_task_ids` -> `records` ->
-/// `payment_records` -> `mixed_records` -> `current_statuses` -> `graph_records`. Per-lock
-/// admission does not serialize operations for different locks, so reversing this order can
-/// deadlock globally.
+/// When several admission mutexes or fields are needed, acquire them in this global order:
+/// handle admission -> lock admission -> `folded_auth_reservations` ->
+/// `deactivated_folded_auth_task_ids` -> `records` -> `payment_records` -> `mixed_records` ->
+/// `current_statuses` -> `graph_records`. Callers may hold admission guards across awaits, so no
+/// path may acquire handle admission while holding lock admission. Per-lock admission does not
+/// serialize operations for different locks, so reversing the data-guard order can also deadlock
+/// globally.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
     pub(crate) graph_records: RwLock<Vec<InMemoryStoredGraphTask>>,

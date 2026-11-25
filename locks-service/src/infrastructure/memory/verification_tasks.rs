@@ -83,13 +83,13 @@ impl VerificationTaskRepository for InMemoryVerificationTaskRepository {
             .pubky_lock_resource
             .lock_id()
             .clone();
-        let _admission_guard = self
-            .deletion_fence
-            .acquire_lock_admission(&task.creator, &lock_id)
-            .await;
         let _handle_admission_guard = self
             .deletion_fence
             .acquire_handle_admission(&task.creator, &task.submitted_proof_bundle.bundle_id)
+            .await;
+        let _admission_guard = self
+            .deletion_fence
+            .acquire_lock_admission(&task.creator, &lock_id)
             .await;
         if self
             .deletion_fence

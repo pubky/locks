@@ -135,13 +135,13 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         request: StartFoldedAuthAttempt,
     ) -> Result<FoldedAuthStartResult, ApplicationError> {
         request.validate().map_err(invalid_state)?;
-        let _admission = self
-            .graph
-            .acquire_admission(request.creator(), request.pubky_lock_resource.lock_id())
-            .await;
         let _handle_admission = self
             .graph
             .acquire_handle_admission(request.creator(), request.bundle_id())
+            .await;
+        let _admission = self
+            .graph
+            .acquire_admission(request.creator(), request.pubky_lock_resource.lock_id())
             .await;
         let mut state = self.state.write().await;
         let deactivated = self
@@ -713,7 +713,9 @@ mod tests {
     use locks_core::ids::{
         BundleId, ContentLockPath, CreatorPubky, LockHash, LockId, PubkyLockResource, TaskId,
     };
-    use locks_core::lock_policy::{GraphParticipantV2, GraphPolicyV2, GraphPredicateV2};
+    use locks_core::lock_policy::{
+        GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, PaymentPolicyV2,
+    };
     use locks_core::verification::SubmittedProofBundleV2;
     use time::macros::datetime;
     use tokio::sync::Notify;
@@ -723,11 +725,12 @@ mod tests {
     use crate::application::models::{
         FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL, FoldedAuthFlowSecret,
         FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, GraphTaskSnapshot,
-        GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
+        GraphTaskSnapshotV1, MixedTaskRecord, MixedTaskSnapshot, MixedTaskSnapshotV1,
+        StartFoldedAuthAttempt, VerificationTaskStatus,
     };
     use crate::application::ports::{
         Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPoller, FoldedAuthPollCall,
-        FoldedAuthRepository, GraphTaskRepository,
+        FoldedAuthRepository, GraphTaskRepository, MixedTaskRepository,
     };
     use crate::application::use_cases::poll_folded_auth::{
         PollFoldedAuthAttempt, PollFoldedAuthOutcome,
@@ -945,6 +948,62 @@ mod tests {
             .unwrap()
             .is_some();
         assert_ne!(has_attempt, has_task);
+    }
+
+    #[tokio::test]
+    async fn folded_start_and_direct_mixed_admission_complete_without_deadlock() {
+        let graph = Arc::new(InMemoryGraphTaskRepository::new());
+        let repository = Arc::new(InMemoryFoldedAuthRepository::new(
+            Arc::clone(&graph),
+            cipher(),
+        ));
+        let mixed = repository.mixed_repository();
+        let creator = creator();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let resource =
+            PubkyLockResource::new(creator.clone(), ContentLockPath::from_lock_id(lock_id()));
+
+        // Hold handle admission so direct mixed admission queues first while folded start reaches
+        // the same gate. Polling after release in this exact order exposes any handle -> lock /
+        // lock -> handle cycle without relying on executor scheduling, yields, or sleeps.
+        let held_handle = graph.acquire_handle_admission(&creator, &bundle_id).await;
+        let mut starting = Box::pin(
+            repository.start_or_rotate(start_request(bundle_id.clone(), resource.clone())),
+        );
+        let mut inserting =
+            Box::pin(mixed.insert_mixed_task(mixed_task(creator, bundle_id, resource)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(inserting.as_mut().poll(&mut context).is_pending());
+        assert!(starting.as_mut().poll(&mut context).is_pending());
+        drop(held_handle);
+
+        let inserted = match inserting.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        };
+        let started = match starting.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        };
+        let (started, inserted) = tokio::time::timeout(StdDuration::from_secs(1), async {
+            let started = match started {
+                Some(result) => result,
+                None => starting.await,
+            };
+            let inserted = match inserted {
+                Some(result) => result,
+                None => inserting.await,
+            };
+            (started, inserted)
+        })
+        .await
+        .expect("folded start and direct mixed admission must not deadlock");
+
+        assert_ne!(started.is_ok(), inserted.is_ok());
+        assert!(matches!(
+            started.err().or_else(|| inserted.err()).unwrap(),
+            ApplicationError::VerificationTaskConflict
+        ));
     }
 
     #[tokio::test]
@@ -1232,6 +1291,44 @@ mod tests {
             ),
             evaluator_revision: 0,
             status: VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        }
+    }
+
+    fn mixed_task(
+        creator: CreatorPubky,
+        bundle_id: BundleId,
+        resource: PubkyLockResource,
+    ) -> MixedTaskRecord {
+        MixedTaskRecord {
+            task_id: TaskId::from_str("028fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap(),
+            snapshot: MixedTaskSnapshot::V1(
+                MixedTaskSnapshotV1::new(
+                    SubmittedProofBundleV2 {
+                        version: 2,
+                        bundle_id,
+                        pubky_lock_resource: resource,
+                        reader_pubky: None,
+                    },
+                    [9; 32],
+                    creator.clone(),
+                    graph_policy(),
+                    PaymentPolicyV2 {
+                        recipient_pubky: creator,
+                        amount: "1".to_owned(),
+                        asset: "BTC".to_owned(),
+                        minimum_confirmations: 0,
+                    },
+                    datetime!(2026-10-30 12:00:00 UTC),
+                    300,
+                )
+                .unwrap(),
+            ),
+            evaluator_revision: 0,
+            status: VerificationTaskStatus::Pending,
+            terminal_reason: None,
             entitlement_to_publish: None,
             entitlement_publication_token: None,
             completed_at: None,
