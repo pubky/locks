@@ -1,6 +1,6 @@
 # Reader authentication and sessions
 
-Locks supports `custom-pop-session-v1` for browser Reader authentication and retains `folded-auth-v2` as the compatibility fallback. Discovery advertises both, in that order, in `reader_auth` from `GET /.well-known/locks-server`.
+Locks supports `custom-pop-session-v1` for browser Reader authentication and retains `folded-auth-v2` as the compatibility fallback. `GET /.well-known/locks-server` advertises `custom-pop-session-v1` whenever Reader sessions are enabled, then advertises `folded-auth-v2` only when the folded-auth starter and poller are both composed from Grant Connect configuration.
 
 ## API flow
 
@@ -18,6 +18,8 @@ Reader challenge and exchange traffic is bounded per Lock Server node: each trus
 ## Compatibility and no downgrade
 
 Graph-only and mixed-v2 submission without a Reader bearer continues through folded auth. A valid Reader bearer directly creates the same durable graph/mixed snapshot with immutable Reader binding. Credential issuance dispatches once between disjoint bearer forms: canonical 32-byte base64url Reader tokens and canonical UUID folded-auth states. If a presented Reader bearer is malformed, unknown, expired, invalidated, or bound to another Reader, Locks fails closed and never reinterprets it as folded auth. Reader credential issuance uses the exact session Origin CORS boundary and `Cache-Control: no-store`; payment-only and Creator flows are unchanged. Existing lifecycle/status lookup remains capability-based rather than Reader-session authenticated.
+
+After folded auth is accepted, its exact state remains usable for credential issuance and reissue until the later of the 24-hour replay-fence retention and the accepted task's verification deadline. Authorization ends at that half-open deadline boundary and remains bound to the exact Creator, Bundle ID, and accepted task ID; retention does not permit a new submission or another task.
 
 Roll out Lock Server support and discovery first, then clients. A client selects the typed `ReaderSessionPreferred` mode only when discovery advertises `custom-pop-session-v1`; it may explicitly select folded auth when `folded-auth-v2` is also advertised and its wallet cannot produce a supported direct-grant Custom PoP. Never retry a failed or rejected presented Reader bearer through folded auth.
 

@@ -493,7 +493,9 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             .accepted_graph_task(task_id, reader, database_now)
             .map_err(invalid_state)?;
         insert_graph_task_tx(&mut transaction, &task).await?;
-        let purge_after = checked_purge_after(database_now)?;
+        let purge_after = attempt
+            .accepted_purge_after(database_now)
+            .ok_or_else(|| storage_message("accepted folded auth retention overflow"))?;
         let updated = sqlx::query(
             "UPDATE folded_auth_attempts
              SET status = 'accepted', encrypted_flow_secret = NULL,
@@ -564,7 +566,9 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             .accepted_mixed_task(task_id, reader, database_now)
             .map_err(invalid_state)?;
         insert_mixed_task_tx(&mut transaction, &task).await?;
-        let purge_after = checked_purge_after(database_now)?;
+        let purge_after = attempt
+            .accepted_purge_after(database_now)
+            .ok_or_else(|| storage_message("accepted folded auth retention overflow"))?;
         let updated = sqlx::query(
             "UPDATE folded_auth_attempts SET status='accepted', encrypted_flow_secret=NULL, poll_dispatched_at=NULL, terminal_at=$3, purge_after=$4, task_id=$5::uuid WHERE state_hash=$1 AND generation=$2 AND status='pending'"
         ).bind(state_hash.as_bytes().as_slice()).bind(generation).bind(database_now).bind(purge_after).bind(task.task_id.to_string()).execute(&mut *transaction).await.map_err(storage_error)?;
@@ -1156,8 +1160,15 @@ mod tests {
                 .unwrap(),
             Some(task.clone())
         );
-        let row: (String, Option<String>, Option<uuid::Uuid>) = sqlx::query_as(
-            "SELECT status, encrypted_flow_secret, task_id FROM folded_auth_attempts",
+        let row: (
+            String,
+            Option<String>,
+            Option<uuid::Uuid>,
+            time::OffsetDateTime,
+            time::OffsetDateTime,
+        ) = sqlx::query_as(
+            "SELECT status, encrypted_flow_secret, task_id, terminal_at, purge_after
+             FROM folded_auth_attempts",
         )
         .fetch_one(database.pool())
         .await
@@ -1165,6 +1176,7 @@ mod tests {
         assert_eq!(row.0, "accepted");
         assert!(row.1.is_none());
         assert_eq!(row.2, Some(task.task_id.as_uuid()));
+        assert_eq!(row.4 - row.3, time::Duration::hours(24));
         assert!(
             repository
                 .get_retained_accepted_by_state_hash_and_handle(
@@ -1243,6 +1255,61 @@ mod tests {
                 .unwrap(),
             Some(task)
         );
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn accepted_mixed_authorization_is_retained_through_full_verification_window() {
+        let database = TestDatabase::create().await;
+        let repository = PostgresFoldedAuthRepository::new(
+            database.pool().clone(),
+            cipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        let mut lock = graph_lock();
+        lock.verification_window_seconds = 604_800;
+        lock.payment = Some(locks_core::lock_policy::PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        });
+        let mut request = start_request(
+            &lock,
+            FoldedAuthStateHash::derive(b"mixed-seven-day-retention"),
+            b"mixed-seven-day-flow",
+            time::OffsetDateTime::now_utc(),
+        );
+        request.evaluator_mode = crate::application::models::FoldedAuthEvaluatorMode::Mixed;
+        request.payment = lock.payment.clone();
+        let started = repository.start_or_rotate(request).await.unwrap();
+        let task = repository
+            .accept_and_insert_mixed_task(
+                &started.attempt.state_hash,
+                started.attempt.generation,
+                TaskId::from_str(TASK_ID).unwrap(),
+                reader(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .accepted_mixed_task(&started.attempt.state_hash)
+                .await
+                .unwrap(),
+            Some(task)
+        );
+        let (terminal_at, purge_after): (time::OffsetDateTime, time::OffsetDateTime) =
+            sqlx::query_as(
+                "SELECT terminal_at, purge_after FROM folded_auth_attempts WHERE state_hash = $1",
+            )
+            .bind(started.attempt.state_hash.as_bytes().as_slice())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(purge_after - terminal_at, time::Duration::days(7));
         database.cleanup().await;
     }
 

@@ -747,14 +747,27 @@ async fn well_known_locks_server_returns_service_version_and_lock_server_identit
         body["lock_server"],
         "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
     );
-    // reader_auth is present when canonical lock server origin can be derived from PKDNS config.
-    let obj = body.as_object().unwrap();
-    if obj.contains_key("reader_auth") {
-        assert_eq!(obj.len(), 4);
-        assert!(body["reader_auth"].is_array());
-    } else {
-        assert_eq!(obj.len(), 3);
-    }
+    assert_eq!(
+        body["reader_auth"],
+        json!(["custom-pop-session-v1"]),
+        "folded auth must not be advertised without its starter and poller"
+    );
+}
+
+#[tokio::test]
+async fn well_known_locks_server_advertises_folded_auth_when_operational() {
+    let (state, _) = folded_auth_test_state().await;
+    let response = router(state)
+        .oneshot(empty_request("GET", "/.well-known/locks-server"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["reader_auth"],
+        json!(["custom-pop-session-v1", "folded-auth-v2"])
+    );
 }
 
 #[tokio::test]
@@ -1788,10 +1801,12 @@ async fn folded_auth_repository_failure_is_closed_500_cors_and_no_store() {
 #[tokio::test]
 async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
     let clock = Arc::new(AdjustableClock::new(datetime!(2026-11-01 12:00:00 UTC)));
-    let (state, bundle) = folded_auth_test_state_with_runtime(
+    let (state, bundle) = folded_auth_test_state_with_runtime_payment_and_window(
         Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
         vec!["https://pubky.app".to_owned()],
         Some(clock.clone()),
+        None,
+        604_800,
     )
     .await;
     let lock_resource = bundle.pubky_lock_resource.clone();
@@ -1808,11 +1823,6 @@ async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
         .unwrap();
     assert_eq!(submitted.status(), StatusCode::ACCEPTED);
     let submitted_body = response_json(submitted).await;
-    let expires_at = time::OffsetDateTime::parse(
-        submitted_body["expires_at"].as_str().unwrap(),
-        &time::format_description::well_known::Rfc3339,
-    )
-    .unwrap();
     let status_request = || {
         json_request(
             "POST",
@@ -1867,7 +1877,8 @@ async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
         "https://pubky.app"
     );
 
-    clock.set(expires_at + time::Duration::minutes(1));
+    let verification_deadline = datetime!(2026-11-08 12:00:00 UTC);
+    clock.set(verification_deadline - time::Duration::SECOND);
     let mut expired_credential_request = json_request(
         "POST",
         "/access-credentials",
@@ -1899,6 +1910,24 @@ async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
         "{expired_credential_body}"
     );
 
+    clock.set(verification_deadline);
+    let mut boundary_request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    boundary_request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", submitted_body["state"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    boundary_request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let boundary = app.clone().oneshot(boundary_request).await.unwrap();
+    assert_eq!(boundary.status(), StatusCode::UNAUTHORIZED);
+
     let lifecycle = app
         .clone()
         .oneshot(json_request(
@@ -1924,7 +1953,7 @@ async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
 #[tokio::test]
 async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_expiry() {
     let clock = Arc::new(AdjustableClock::new(datetime!(2026-11-01 12:00:00 UTC)));
-    let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
+    let (state, bundle) = folded_auth_test_state_with_runtime_payment_and_window(
         Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
         vec!["https://pubky.app".to_owned()],
         Some(clock.clone()),
@@ -1934,6 +1963,7 @@ async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_e
             asset: "BTC".to_owned(),
             minimum_confirmations: 1,
         }),
+        604_800,
     )
     .await;
     let paykit = Arc::new(
@@ -1955,11 +1985,6 @@ async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_e
         .unwrap();
     assert_eq!(submitted.status(), StatusCode::ACCEPTED);
     let submitted = response_json(submitted).await;
-    let expires_at = time::OffsetDateTime::parse(
-        submitted["expires_at"].as_str().unwrap(),
-        &time::format_description::well_known::Rfc3339,
-    )
-    .unwrap();
     let accepted = app
         .clone()
         .oneshot(json_request(
@@ -1985,7 +2010,8 @@ async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_e
         })
         .await
         .unwrap();
-    clock.set(expires_at + time::Duration::minutes(1));
+    let verification_deadline = datetime!(2026-11-08 12:00:00 UTC);
+    clock.set(verification_deadline - time::Duration::SECOND);
 
     for _ in 0..2 {
         let mut credential_request = json_request(
@@ -2007,6 +2033,24 @@ async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_e
         let body = response_json(credential).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
+
+    clock.set(verification_deadline);
+    let mut boundary_request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    boundary_request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {}", submitted["state"].as_str().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    boundary_request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let boundary = app.oneshot(boundary_request).await.unwrap();
+    assert_eq!(boundary.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -8797,6 +8841,23 @@ async fn folded_auth_test_state_with_runtime_and_payment(
     clock: Option<Arc<dyn Clock>>,
     payment: Option<PaymentPolicyV2>,
 ) -> (AppState, SubmittedProofBundleV2) {
+    folded_auth_test_state_with_runtime_payment_and_window(
+        poller,
+        allowed_return_origins,
+        clock,
+        payment,
+        300,
+    )
+    .await
+}
+
+async fn folded_auth_test_state_with_runtime_payment_and_window(
+    poller: Arc<dyn FoldedAuthApprovalPoller>,
+    allowed_return_origins: Vec<String>,
+    clock: Option<Arc<dyn Clock>>,
+    payment: Option<PaymentPolicyV2>,
+    verification_window_seconds: u64,
+) -> (AppState, SubmittedProofBundleV2) {
     let lock = ContentLockV2 {
         version: 2,
         creator: creator(),
@@ -8818,7 +8879,7 @@ async fn folded_auth_test_state_with_runtime_and_payment(
             }],
             operator: None,
         }),
-        verification_window_seconds: 300,
+        verification_window_seconds,
         access_policy: AccessPolicy {
             requested_credential_ttl_seconds: 300,
         },

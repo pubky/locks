@@ -30,6 +30,10 @@ struct FoldedAuthMemoryState {
 }
 
 #[derive(Debug, Clone)]
+/// Lock order for folded-auth data: `state` -> `folded_auth_reservations` ->
+/// `deactivated_folded_auth_task_ids` -> task-record guards. Admission mutexes are outer
+/// serialization gates and may precede `state`; no path may acquire `state` while holding any
+/// deletion-fence data guard.
 pub struct InMemoryFoldedAuthRepository {
     state: Arc<RwLock<FoldedAuthMemoryState>>,
     graph: Arc<InMemoryGraphTaskRepository>,
@@ -75,15 +79,13 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         creator: &locks_core::ids::CreatorPubky,
         bundle_id: &locks_core::ids::BundleId,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let state = self.state.read().await;
         let deactivated = self
             .deletion_fence
             .deactivated_folded_auth_task_ids
             .read()
             .await;
-        Ok(self
-            .state
-            .read()
-            .await
+        Ok(state
             .records
             .iter()
             .filter(|stored| {
@@ -141,13 +143,13 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .graph
             .acquire_handle_admission(request.creator(), request.bundle_id())
             .await;
+        let mut state = self.state.write().await;
         let deactivated = self
             .deletion_fence
             .deactivated_folded_auth_task_ids
             .read()
             .await
             .clone();
-        let mut state = self.state.write().await;
         if self
             .graph
             .has_graph_task_by_handle_under_admission(request.creator(), request.bundle_id())
@@ -260,15 +262,13 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         &self,
         state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let state = self.state.read().await;
         let deactivated = self
             .deletion_fence
             .deactivated_folded_auth_task_ids
             .read()
             .await;
-        Ok(self
-            .state
-            .read()
-            .await
+        Ok(state
             .records
             .iter()
             .find(|stored| &stored.attempt.state_hash == state_hash)
@@ -538,7 +538,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .attempt
             .accepted_graph_task(task_id, reader, now)
             .map_err(invalid_state)?;
-        let purge_after = checked_purge_after(now)?;
+        let purge_after = stored
+            .attempt
+            .accepted_purge_after(now)
+            .ok_or_else(|| storage("accepted folded auth retention overflow"))?;
         let inserted = self
             .graph
             .insert_graph_task_before_publish_under_admission(
@@ -594,7 +597,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .attempt
             .accepted_mixed_task(task_id, reader, now)
             .map_err(invalid_state)?;
-        let purge_after = checked_purge_after(now)?;
+        let purge_after = stored
+            .attempt
+            .accepted_purge_after(now)
+            .ok_or_else(|| storage("accepted folded auth retention overflow"))?;
         let inserted = self
             .mixed
             .insert_mixed_task_before_publish_under_admission(task, |inserted| {
@@ -696,9 +702,11 @@ fn invalid_state(message: impl Into<String>) -> ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
+    use std::task::{Context, Waker};
     use std::time::Duration as StdDuration;
 
     use async_trait::async_trait;
@@ -713,9 +721,9 @@ mod tests {
     use super::InMemoryFoldedAuthRepository;
     use crate::application::errors::ApplicationError;
     use crate::application::models::{
-        FOLDED_AUTH_POLL_ABANDONED_AFTER, FoldedAuthFlowSecret, FoldedAuthStateHash,
-        FoldedAuthStatus, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
-        StartFoldedAuthAttempt, VerificationTaskStatus,
+        FOLDED_AUTH_POLL_ABANDONED_AFTER, FOLDED_AUTH_TOMBSTONE_TTL, FoldedAuthFlowSecret,
+        FoldedAuthStateHash, FoldedAuthStatus, GraphTaskRecord, GraphTaskSnapshot,
+        GraphTaskSnapshotV1, StartFoldedAuthAttempt, VerificationTaskStatus,
     };
     use crate::application::ports::{
         Clock, FoldedAuthApprovalPoll, FoldedAuthApprovalPoller, FoldedAuthPollCall,
@@ -728,6 +736,162 @@ mod tests {
     use crate::infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository;
     use crate::infrastructure::memory::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
     use crate::infrastructure::runtime_master_key::RuntimeMasterKey;
+
+    #[tokio::test]
+    async fn accepted_authorization_is_retained_through_full_verification_window() {
+        let now = datetime!(2026-10-30 12:00:00 UTC);
+        let clock = Arc::new(MutableClock::new(now));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(fence));
+        let repository = InMemoryFoldedAuthRepository::new(graph, cipher());
+        let creator = creator();
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let mut request = start_request(
+            bundle_id.clone(),
+            PubkyLockResource::new(creator.clone(), ContentLockPath::from_lock_id(lock_id())),
+        );
+        request.verification_window_seconds = 604_800;
+        request.state_hash = FoldedAuthStateHash::derive(b"seven-day-retention");
+        let started = repository.start_or_rotate(request).await.unwrap();
+        let task_id = TaskId::from_str("018fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap();
+        repository
+            .accept_and_insert_graph_task(
+                &started.attempt.state_hash,
+                started.attempt.generation,
+                task_id,
+                creator.clone(),
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let deadline = now + time::Duration::days(7);
+        let accepted = repository
+            .get_by_state_hash(&started.attempt.state_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.purge_after, Some(deadline));
+        clock.set(deadline - time::Duration::SECOND);
+        assert!(
+            repository
+                .get_retained_accepted_by_state_hash_and_handle(
+                    &started.attempt.state_hash,
+                    &creator,
+                    &bundle_id,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        clock.set(deadline);
+        assert!(
+            repository
+                .get_retained_accepted_by_state_hash_and_handle(
+                    &started.attempt.state_hash,
+                    &creator,
+                    &bundle_id,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        clock.set(now);
+        let short_fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let short_graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            short_fence,
+        ));
+        let short_repository = InMemoryFoldedAuthRepository::new(short_graph, cipher());
+        let short_bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1X").unwrap();
+        let mut short_request = start_request(
+            short_bundle_id,
+            PubkyLockResource::new(creator.clone(), ContentLockPath::from_lock_id(lock_id())),
+        );
+        short_request.verification_window_seconds = 300;
+        short_request.state_hash = FoldedAuthStateHash::derive(b"tombstone-minimum-retention");
+        let short_started = short_repository
+            .start_or_rotate(short_request)
+            .await
+            .unwrap();
+        short_repository
+            .accept_and_insert_graph_task(
+                &short_started.attempt.state_hash,
+                short_started.attempt.generation,
+                TaskId::from_str("118fc6ec-2f3d-4f7e-8b7d-6f5c4b3a2d10").unwrap(),
+                creator,
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let short_accepted = short_repository
+            .get_by_state_hash(&short_started.attempt.state_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            short_accepted.purge_after,
+            Some(now + FOLDED_AUTH_TOMBSTONE_TTL)
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_expiry_and_deletion_follow_one_lock_order_without_deadlock() {
+        let now = datetime!(2026-10-30 12:00:00 UTC);
+        let clock = Arc::new(MutableClock::new(now));
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(
+            clock.clone(),
+        ));
+        let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let repository = Arc::new(InMemoryFoldedAuthRepository::new(graph, cipher()));
+        let bundle_id = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let started = repository
+            .start_or_rotate(start_request(
+                bundle_id.clone(),
+                PubkyLockResource::new(creator(), ContentLockPath::from_lock_id(lock_id())),
+            ))
+            .await
+            .unwrap();
+
+        // Hold folded state, then poll every contender exactly once. Each must stop on
+        // `state` before it can acquire a deletion-fence data guard.
+        let state_guard = repository.state.write().await;
+        let state_hash = started.attempt.state_hash.clone();
+        let creator = creator();
+        let mut by_state = Box::pin(repository.get_by_state_hash(&state_hash));
+        let mut by_handle = Box::pin(repository.get_latest_by_handle(&creator, &bundle_id));
+        let mut expiring =
+            Box::pin(repository.expire(&state_hash, started.attempt.generation, now));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(by_state.as_mut().poll(&mut context).is_pending());
+        assert!(by_handle.as_mut().poll(&mut context).is_pending());
+        assert!(expiring.as_mut().poll(&mut context).is_pending());
+
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            let _reservations = fence.folded_auth_reservations.write().await;
+            let _deactivated = fence.deactivated_folded_auth_task_ids.write().await;
+            let _task_records = fence.records.write().await;
+        })
+        .await
+        .expect("blocked lookup/expiry must not hold deletion cleanup guards");
+
+        drop(state_guard);
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            by_state.await.unwrap();
+            by_handle.await.unwrap();
+            expiring.await.unwrap();
+        })
+        .await
+        .expect("lookup and expiry must complete after deletion guards are released");
+    }
 
     #[tokio::test]
     async fn folded_start_and_ordinary_graph_admission_cannot_both_win() {
