@@ -220,6 +220,43 @@ pub(crate) fn auth_origin_allowed(allowed_origins: &[String], origin: &str) -> b
     allowed_origins.iter().any(|allowed| allowed == &origin)
 }
 
+fn public_submission_origin_allowed(origin: &str) -> bool {
+    if origin == "null" {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    let scheme_allowed = match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }),
+        _ => false,
+    };
+    scheme_allowed
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.origin().ascii_serialization() == origin
+}
+
+fn preflight_requests_authorization(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("authorization"))
+        })
+}
+
 async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let is_submission = request.uri().path() == "/proof-bundles";
     let is_access_credential = request.uri().path() == "/access-credentials";
@@ -233,8 +270,10 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
         crate::api::auth::parse_viewer_access_bearer(request.headers(), invalid)
     });
     let invalid_access_bearer = matches!(access_bearer.as_ref(), Some(Err(_)));
-    let is_reader_submission = is_submission
-        && request.headers().contains_key(header::AUTHORIZATION)
+    let is_preflight = request.method() == Method::OPTIONS;
+    let requests_authorization = request.headers().contains_key(header::AUTHORIZATION)
+        || is_preflight && preflight_requests_authorization(&request);
+    let is_reader_submission = is_submission && requests_authorization
         || matches!(
             access_bearer.as_ref(),
             Some(Ok(Some(crate::api::auth::ViewerAccessBearer::Reader(_))))
@@ -242,7 +281,20 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
     let mut origins = request.headers().get_all(header::ORIGIN).iter();
     let origin = origins.next().cloned();
     let duplicate_origin = origins.next().is_some();
-    let is_preflight = request.method() == Method::OPTIONS;
+    let anonymous_access_credential = is_access_credential
+        && if is_preflight {
+            !requests_authorization
+        } else {
+            matches!(access_bearer.as_ref(), Some(Ok(None)))
+        };
+    let public_origin_allowed = || {
+        origin.as_ref().is_none_or(|origin| {
+            origin
+                .to_str()
+                .ok()
+                .is_some_and(public_submission_origin_allowed)
+        })
+    };
     let reader_origin_allowed = || {
         origin.as_ref().is_some_and(|origin| {
             let Ok(origin) = origin.to_str() else {
@@ -275,6 +327,8 @@ async fn auth_cors(State(state): State<AppState>, request: Request, next: Next) 
         && !invalid_access_bearer
         && if is_reader_submission {
             reader_origin_allowed()
+        } else if anonymous_access_credential {
+            public_origin_allowed()
         } else if is_access_credential && is_preflight {
             reader_origin_allowed() || legacy_origin_allowed()
         } else {

@@ -86,7 +86,7 @@ async fn authenticate_access_reader(
     let attempt = state
         .folded_auth()
         .ok_or_else(invalid)?
-        .get_live_accepted_by_state_hash_and_handle(
+        .get_retained_accepted_by_state_hash_and_handle(
             &FoldedAuthStateHash::derive(bearer.as_bytes()),
             creator,
             bundle_id,

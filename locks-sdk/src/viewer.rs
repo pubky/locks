@@ -117,7 +117,7 @@ pub struct ReaderAuthChallengeResponse {
     pub challenge_id: String,
     pub challenge: String,
     pub lock_server_pubky: locks_core::ids::LockServerPubky,
-    pub lock_server_origin: url::Url,
+    pub lock_server_origin: String,
     pub purpose: String,
     pub expires_at: time::OffsetDateTime,
 }
@@ -371,14 +371,19 @@ impl ViewerLocks {
     ) -> Result<ReaderAuthChallengeResponse> {
         let wire: ReaderAuthChallengeWire = serde_json::from_value(value)
             .map_err(|error| LocksSdkError::InvalidResponse(error.to_string()))?;
-        let lock_server_origin = url::Url::parse(&wire.lock_server_origin)
+        let parsed_lock_server_origin = url::Url::parse(&wire.lock_server_origin)
             .map_err(|error| LocksSdkError::InvalidResponse(error.to_string()))?;
         if wire.challenge_id.is_empty()
             || wire.challenge.is_empty()
             || wire.purpose != READER_SESSION_PURPOSE
             || &wire.lock_server_pubky != expected_lock_server
-            || lock_server_origin.cannot_be_a_base()
-            || !matches!(lock_server_origin.scheme(), "http" | "https")
+            || parsed_lock_server_origin.cannot_be_a_base()
+            || !matches!(parsed_lock_server_origin.scheme(), "http" | "https")
+            || !parsed_lock_server_origin.username().is_empty()
+            || parsed_lock_server_origin.password().is_some()
+            || parsed_lock_server_origin.query().is_some()
+            || parsed_lock_server_origin.fragment().is_some()
+            || parsed_lock_server_origin.origin().ascii_serialization() != wire.lock_server_origin
         {
             return Err(LocksSdkError::InvalidResponse(
                 "invalid reader authentication challenge".to_owned(),
@@ -388,7 +393,7 @@ impl ViewerLocks {
             challenge_id: wire.challenge_id,
             challenge: wire.challenge,
             lock_server_pubky: wire.lock_server_pubky,
-            lock_server_origin,
+            lock_server_origin: wire.lock_server_origin,
             purpose: wire.purpose,
             expires_at: wire.expires_at,
         })
@@ -773,6 +778,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(challenge.purpose, "reader-session-v1");
+        assert_eq!(challenge.lock_server_origin, "https://locks.example");
         assert!(!format!("{challenge:?}").contains("challenge-secret"));
 
         let response = ViewerLocks::parse_reader_session_response(json!({

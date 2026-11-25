@@ -205,6 +205,16 @@ pub(super) async fn create_reader_session(
             "reader authentication proof verification failed",
         )
     })?;
+    let expected_client_id = state
+        .config()
+        .reader_auth
+        .client_id
+        .as_deref()
+        .ok_or_else(reader_auth_pop_verification_failed)?;
+    authorize_reader_grant_client(
+        expected_client_id,
+        &verified.grant_claims().client_id.to_string(),
+    )?;
 
     // Validate strict closed PoP data schema.
     let pop_data = verified.data();
@@ -462,6 +472,24 @@ fn extract_single_origin(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(origin.to_owned())
 }
 
+fn reader_auth_pop_verification_failed() -> ApiError {
+    ApiError::new(
+        ApiErrorCode::ReaderAuthPopVerificationFailed,
+        "reader authentication proof verification failed",
+    )
+}
+
+fn authorize_reader_grant_client(
+    expected_client_id: &str,
+    actual_client_id: &str,
+) -> Result<(), ApiError> {
+    if actual_client_id == expected_client_id {
+        Ok(())
+    } else {
+        Err(reader_auth_pop_verification_failed())
+    }
+}
+
 pub(crate) fn extract_allowed_reader_origin(
     state: &AppState,
     headers: &HeaderMap,
@@ -622,6 +650,13 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use time::macros::datetime;
+
+    #[test]
+    fn reader_grant_client_authorization_rejects_unrelated_and_read_only_apps() {
+        assert!(authorize_reader_grant_client("pubky.app", "pubky.app").is_ok());
+        assert!(authorize_reader_grant_client("pubky.app", "unrelated.app").is_err());
+        assert!(authorize_reader_grant_client("pubky.app", "read-only.app").is_err());
+    }
 
     #[test]
     fn create_session_response_debug_redacts_session_token() {

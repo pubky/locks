@@ -75,6 +75,34 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
         authenticated_reader: Option<CreatorPubky>,
     ) -> Result<IssuedAccessCredential, ApplicationError> {
         let now = self.clock.now();
+        if let Some(reader) = authenticated_reader.as_ref()
+            && self
+                .credential_store
+                .final_credential_available(&request.creator, &request.bundle_id, now)
+                .await?
+        {
+            let candidate = self
+                .credential_generator
+                .generate_access_credential()
+                .await?;
+            let final_issue_now = self.clock.now();
+            if let Some(final_credential) = self
+                .credential_store
+                .issue_or_replay_final_credential(
+                    &request.creator,
+                    &request.bundle_id,
+                    Some(reader),
+                    final_issue_now,
+                    candidate,
+                )
+                .await?
+            {
+                return Ok(IssuedAccessCredential {
+                    credential: final_credential.credential,
+                    expires_at: final_credential.expires_at,
+                });
+            }
+        }
         let valid_entitlement = load_valid_entitlement(
             self.entitlements,
             self.content_locks,
@@ -102,6 +130,7 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
                 .issue_or_replay_final_credential(
                     &request.creator,
                     &request.bundle_id,
+                    authenticated_reader.as_ref(),
                     final_issue_now,
                     candidate,
                 )

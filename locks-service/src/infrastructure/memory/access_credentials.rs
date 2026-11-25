@@ -136,6 +136,15 @@ impl DeletionBundleSnapshot {
                 == VerificationTaskStatus::Completed
             && self.final_credential_eligible_at.is_some()
     }
+
+    fn frozen_reader(&self) -> Option<&CreatorPubky> {
+        self.provider_v2
+            .as_ref()
+            .map(|provider| match &provider.snapshot {
+                ProviderV2EvaluatorSnapshot::Payment(snapshot) => &snapshot.as_v1().reader,
+                ProviderV2EvaluatorSnapshot::Mixed(snapshot) => &snapshot.as_v1().reader,
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1922,6 +1931,7 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
+        reader: Option<&CreatorPubky>,
         _caller_now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
@@ -1950,6 +1960,15 @@ impl AccessCredentialStore for InMemoryAccessCredentialStore {
             || deletion
                 .read_deadline
                 .is_none_or(|deadline| deadline <= now)
+        {
+            return Ok(None);
+        }
+        if reader.is_some()
+            && deletion
+                .bundle_snapshots
+                .get(bundle_id)
+                .and_then(DeletionBundleSnapshot::frozen_reader)
+                != reader
         {
             return Ok(None);
         }
@@ -2445,12 +2464,15 @@ mod tests {
             LockServerConfig, PaymentPolicyV2, VerifierType,
         },
         verification::{
-            Proof, SUBMITTED_PROOF_BUNDLE_VERSION, SubmittedProofBundle, SubmittedProofBundleV2,
+            Proof, SUBMITTED_PROOF_BUNDLE_V2_VERSION, SUBMITTED_PROOF_BUNDLE_VERSION,
+            SubmittedProofBundle, SubmittedProofBundleV2,
         },
     };
 
     use super::*;
-    use crate::application::models::VerificationTaskRecord;
+    use crate::application::models::{
+        PaymentTaskSnapshot, PaymentTaskSnapshotV1, VerificationTaskRecord,
+    };
     use crate::application::ports::{AdmitPaymentTask, PaymentTaskRepository};
     use crate::infrastructure::memory::payment_tasks::InMemoryPaymentTaskRepository;
 
@@ -3186,6 +3208,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_credential_reader_fence_uses_frozen_provider_snapshot() {
+        let now = datetime!(2026-08-17 12:00:00 UTC);
+        let store = final_materialization_store_at(now).await;
+        let creator = record().creator;
+        let bundle = BundleId::from_str("000G40R40M30E209185GR38E1W").unwrap();
+        let frozen_reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        {
+            let mut state = store.state.write().await;
+            let deletion = state.deletions.get_mut(&Uuid::from_u128(7)).unwrap();
+            let snapshot = deletion.bundle_snapshots.get_mut(&bundle).unwrap();
+            snapshot.final_credential_eligible_at = Some(now);
+            assert_eq!(snapshot.frozen_reader(), Some(&frozen_reader));
+            assert!(snapshot.permits_final_credential());
+            assert_eq!(deletion.creator, creator);
+            assert!(
+                deletion
+                    .read_deadline
+                    .is_some_and(|deadline| deadline > now)
+            );
+        }
+
+        let issued = store
+            .issue_or_replay_final_credential(
+                &creator,
+                &bundle,
+                Some(&frozen_reader),
+                now,
+                AccessCredential::new("reader-fenced-final"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(issued.credential.as_str(), "reader-fenced-final");
+
+        assert!(
+            store
+                .issue_or_replay_final_credential(
+                    &creator,
+                    &bundle,
+                    Some(&creator),
+                    now,
+                    AccessCredential::new("wrong-reader-must-not-replay"),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn final_winner_paths_sample_time_after_waiting_for_state_fence() {
         let initial = datetime!(2026-08-17 12:00:00 UTC);
         let clock = Arc::new(MutableClock::new(initial));
@@ -3204,6 +3278,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &issuing_creator,
                     &issuing_bundle,
+                    None,
                     initial,
                     AccessCredential::new("stale-public-candidate"),
                 )
@@ -3293,7 +3368,7 @@ mod tests {
         let creator = record().creator;
         let bundle = BundleId::from_str("000G40R40M30E209185GR38E1R").unwrap();
         store
-            .issue_or_replay_final_credential(&creator, &bundle, initial, credential)
+            .issue_or_replay_final_credential(&creator, &bundle, None, initial, credential)
             .await
             .unwrap()
             .unwrap();
@@ -3337,7 +3412,7 @@ mod tests {
         let creator = record().creator;
         let bundle = BundleId::from_str("000G40R40M30E209185GR38E1R").unwrap();
         store
-            .issue_or_replay_final_credential(&creator, &bundle, initial, credential)
+            .issue_or_replay_final_credential(&creator, &bundle, None, initial, credential)
             .await
             .unwrap()
             .unwrap();
@@ -3553,6 +3628,12 @@ mod tests {
         let creator =
             CreatorPubky::from_str("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
                 .unwrap();
+        let frozen_reader =
+            CreatorPubky::from_str("pubkyorhzqdiexwmi6iidktucgud63ufa5nwtsuzdxe176a8izd6jsqky")
+                .unwrap();
+        let frozen_content_lock = test_content_lock();
+        let lock_id = frozen_content_lock.lock_id().unwrap();
+        let lock_hash = *frozen_content_lock.lock_hash().unwrap().as_bytes();
         let eligible_at = datetime!(2026-08-17 11:00:00 UTC);
         let snapshots = [
             ("000G40R40M30E209185GR38E1W", true),
@@ -3562,8 +3643,30 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, (bundle, eligible))| {
+            let bundle_id = BundleId::from_str(bundle).unwrap();
+            let payment_snapshot = PaymentTaskSnapshotV1::new(
+                SubmittedProofBundleV2 {
+                    version: SUBMITTED_PROOF_BUNDLE_V2_VERSION,
+                    bundle_id: bundle_id.clone(),
+                    pubky_lock_resource: PubkyLockResource::from_str(&format!(
+                        "{creator}/pub/app.locks/{lock_id}.json"
+                    ))
+                    .unwrap(),
+                    reader_pubky: Some(frozen_reader.clone()),
+                },
+                lock_hash,
+                PaymentPolicyV2 {
+                    recipient_pubky: creator.clone(),
+                    amount: "1".to_owned(),
+                    asset: "BTC".to_owned(),
+                    minimum_confirmations: 0,
+                },
+                eligible_at,
+                300,
+            )
+            .unwrap();
             (
-                BundleId::from_str(bundle).unwrap(),
+                bundle_id,
                 DeletionBundleSnapshot {
                     task_id: TaskId::from_str(&format!(
                         "550e8400-e29b-41d4-a716-44665544000{index}"
@@ -3577,7 +3680,17 @@ mod tests {
                     final_credential_eligible_at: eligible.then_some(eligible_at),
                     final_credential_issued: false,
                     paykit_v1: None,
-                    provider_v2: None,
+                    provider_v2: Some(FrozenProviderV2Deletion {
+                        evaluator_revision: 0,
+                        snapshot: ProviderV2EvaluatorSnapshot::Payment(PaymentTaskSnapshot::V1(
+                            payment_snapshot,
+                        )),
+                        create_conflict: None,
+                        create_response: None,
+                        provider_status: None,
+                        status_checkpointed: false,
+                        reconciliation_terminal: false,
+                    }),
                 },
             )
         })
@@ -3586,9 +3699,8 @@ mod tests {
             Uuid::from_u128(7),
             DeletionAccessState {
                 creator,
-                lock_id: LockId::from_str("000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG")
-                    .unwrap(),
-                frozen_content_lock: test_content_lock().into(),
+                lock_id,
+                frozen_content_lock: frozen_content_lock.into(),
                 state: ContentLockDeletionState::Running,
                 phase: ContentLockDeletionPhase::IssueFinalCredentials,
                 force_requested: false,

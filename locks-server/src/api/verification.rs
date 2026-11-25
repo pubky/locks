@@ -157,7 +157,7 @@ pub(super) async fn submit_proof_bundle(
             ));
         }
         return Ok((
-            StatusCode::ACCEPTED,
+            StatusCode::OK,
             Json(accepted_mixed_status_response(existing)),
         )
             .into_response());
@@ -185,11 +185,7 @@ pub(super) async fn submit_proof_bundle(
                 "reader session unavailable",
             ));
         }
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(GraphVerificationTaskLifecycleHttpResponse::from(&existing)),
-        )
-            .into_response());
+        return Ok((StatusCode::OK, Json(accepted_status_response(existing))).into_response());
     }
     let creator = match &request.submitted_proof_bundle {
         SubmittedProofBundlePayload::V1(bundle) => bundle.pubky_lock_resource.creator().clone(),
@@ -551,11 +547,7 @@ async fn start_reader_session_verification(
             completed_at: None,
         };
         let task = state.mixed_tasks().insert_mixed_task(task).await?;
-        Ok((
-            StatusCode::ACCEPTED,
-            Json(GraphVerificationTaskLifecycleHttpResponse::from(&task)),
-        )
-            .into_response())
+        Ok((StatusCode::OK, Json(accepted_mixed_status_response(task))).into_response())
     } else {
         // Graph-only. V2 schema validation rejects any caller-provided Reader before this point;
         // the validated session is the sole Reader source.
@@ -580,11 +572,7 @@ async fn start_reader_session_verification(
             completed_at: None,
         };
         let task = state.graph_tasks().insert_graph_task(task).await?;
-        Ok((
-            StatusCode::ACCEPTED,
-            Json(GraphVerificationTaskLifecycleHttpResponse::from(&task)),
-        )
-            .into_response())
+        Ok((StatusCode::OK, Json(accepted_status_response(task))).into_response())
     }
 }
 

@@ -1487,7 +1487,7 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
 
     let candidate = AccessCredential::new("final-secret-bearer");
     let first = access
-        .issue_or_replay_final_credential(&job.creator, &bundle_id, NOW, candidate.clone())
+        .issue_or_replay_final_credential(&job.creator, &bundle_id, None, NOW, candidate.clone())
         .await
         .unwrap()
         .unwrap();
@@ -1495,6 +1495,7 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .issue_or_replay_final_credential(
             &job.creator,
             &bundle_id,
+            None,
             NOW + time::Duration::minutes(1),
             AccessCredential::new("different-candidate-must-not-win"),
         )
@@ -1509,6 +1510,7 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .issue_or_replay_final_credential(
             &job.creator,
             &bundle_id,
+            None,
             issuance_deadline,
             AccessCredential::new("boundary-candidate-must-not-win"),
         )
@@ -1533,6 +1535,7 @@ async fn in_memory_final_credential_is_exactly_replayable_and_reads_are_lease_fe
         .issue_or_replay_final_credential(
             &job.creator,
             &bundle_id,
+            None,
             issuance_deadline,
             AccessCredential::new("post-advance-candidate-must-not-win"),
         )
@@ -1685,6 +1688,7 @@ async fn mutable_task_completion_cannot_resolve_the_immutable_deletion_snapshot(
             .issue_or_replay_final_credential(
                 &job.creator,
                 &bundle_id,
+                None,
                 NOW,
                 AccessCredential::new("mutable-completion-must-not-win"),
             )
@@ -2684,6 +2688,7 @@ async fn in_memory_phase_and_success_finish_guards_preserve_access_obligations()
             .issue_or_replay_final_credential(
                 &job.creator,
                 &bundle_id,
+                None,
                 deadline,
                 AccessCredential::new("fresh-at-deadline-must-not-issue"),
             )
@@ -2813,6 +2818,7 @@ async fn in_memory_final_credential_eligibility_does_not_change_when_cutoff_cred
             .issue_or_replay_final_credential(
                 &job.creator,
                 &bundle_id,
+                None,
                 after_expiry,
                 AccessCredential::new("must-remain-ineligible"),
             )
@@ -2866,6 +2872,7 @@ async fn in_memory_final_credential_rejects_completed_non_paykit_snapshot() {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &bundle_id,
+                None,
                 NOW,
                 AccessCredential::new("must-not-be-issued"),
             )

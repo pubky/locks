@@ -185,6 +185,7 @@ fn initialize_default_config_with_database_url(
         },
         reader_auth: ReaderAuthConfig {
             allowed_origins: vec!["https://localhost:3002".to_owned()],
+            client_id: Some("app.locks".to_owned()),
         },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
@@ -244,6 +245,7 @@ client_id = "{}" # Hostname naming this Lock Server to Pubky signers in grant re
 allowed_return_origins = {} # Origins allowed to receive auth callback codes, e.g. ["https://pubky.app"] (https only). Must not be empty; ["*"] is development/staging-only and rejected in production.
 
 [reader_auth]
+client_id = "{}" # Exact Pubky Grant client ID authorized to create Locks Reader sessions.
 allowed_origins = {} # Exact HTTPS browser origins allowed to use Reader challenge/session routes. Empty disables Reader-session negotiation; no wildcard.
 
 [secrets]
@@ -329,6 +331,11 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
             .frontend_session_code_ttl_seconds,
         generated_grant.client_id,
         toml_string_array(&generated_grant.allowed_return_origins),
+        config
+            .reader_auth
+            .client_id
+            .as_deref()
+            .expect("generated config enables Reader auth"),
         toml_string_array(&config.reader_auth.allowed_origins),
         config.secrets.runtime_master_key_env,
         config.deletion.retry_max_attempts,

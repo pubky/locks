@@ -310,6 +310,18 @@ pub struct Viewer {
     inner: locks_sdk::ViewerLocks,
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn reader_auth_challenge_json(challenge: locks_sdk::ReaderAuthChallengeResponse) -> Value {
+    serde_json::json!({
+        "challenge_id": challenge.challenge_id,
+        "challenge": challenge.challenge,
+        "lock_server_pubky": challenge.lock_server_pubky,
+        "lock_server_origin": challenge.lock_server_origin,
+        "purpose": challenge.purpose,
+        "expires_at": challenge.expires_at.to_string()
+    })
+}
+
 #[wasm_bindgen]
 impl Viewer {
     #[cfg(target_arch = "wasm32")]
@@ -328,15 +340,8 @@ impl Viewer {
             self.client.lock_server(),
         )
         .map_err(|err| invalid_input(err.to_string()))?;
-        to_plain_js_value(&serde_json::json!({
-            "challenge_id": challenge.challenge_id,
-            "challenge": challenge.challenge,
-            "lock_server_pubky": challenge.lock_server_pubky,
-            "lock_server_origin": challenge.lock_server_origin.as_str(),
-            "purpose": challenge.purpose,
-            "expires_at": challenge.expires_at.to_string()
-        }))
-        .map_err(|err| invalid_input(format!("failed to encode reader challenge: {err:?}")))
+        to_plain_js_value(&reader_auth_challenge_json(challenge))
+            .map_err(|err| invalid_input(format!("failed to encode reader challenge: {err:?}")))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1212,6 +1217,42 @@ mod tests {
             locks_sdk::LocksClient::for_server(lock_server),
             LocksOptions::new(),
         )
+    }
+
+    #[test]
+    fn reader_auth_challenge_projection_preserves_exact_origin_for_wallet_pop() {
+        let lock_server = locks_core::ids::LockServerPubky::from_str(
+            "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+        )
+        .unwrap();
+        let challenge = locks_sdk::ViewerLocks::parse_reader_auth_challenge_response(
+            json!({
+                "challenge_id": "challenge-1",
+                "challenge": "challenge-secret",
+                "lock_server_pubky": lock_server,
+                "lock_server_origin": "https://locks.example",
+                "purpose": "reader-session-v1",
+                "expires_at": "2026-11-23T12:05:00Z"
+            }),
+            &lock_server,
+        )
+        .unwrap();
+
+        let projected = reader_auth_challenge_json(challenge);
+        assert_eq!(
+            projected["lock_server_origin"],
+            json!("https://locks.example")
+        );
+        let wallet_pop_data = json!({
+            "challenge": projected["challenge"],
+            "lock_server_pubky": projected["lock_server_pubky"],
+            "lock_server_origin": projected["lock_server_origin"],
+            "purpose": projected["purpose"],
+        });
+        assert_eq!(
+            wallet_pop_data["lock_server_origin"],
+            json!("https://locks.example")
+        );
     }
 
     fn handle_options() -> VerificationTaskHandleOptions {

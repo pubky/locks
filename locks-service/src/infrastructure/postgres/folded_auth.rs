@@ -82,7 +82,7 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
         .map(|stored| stored.map(|stored| stored.0))
     }
 
-    async fn get_live_accepted_by_state_hash_and_handle(
+    async fn get_retained_accepted_by_state_hash_and_handle(
         &self,
         state_hash: &FoldedAuthStateHash,
         creator: &CreatorPubky,
@@ -92,7 +92,7 @@ impl FoldedAuthRepository for PostgresFoldedAuthRepository {
             "SELECT {COLUMNS} FROM folded_auth_attempts
              WHERE state_hash = $1 AND status = 'accepted'
                AND creator = $2 AND bundle_id = $3
-               AND expires_at > clock_timestamp()"
+               AND purge_after > clock_timestamp()"
         ))
         .bind(state_hash.as_bytes().as_slice())
         .bind(creator.to_string())
@@ -1167,7 +1167,7 @@ mod tests {
         assert_eq!(row.2, Some(task.task_id.as_uuid()));
         assert!(
             repository
-                .get_live_accepted_by_state_hash_and_handle(
+                .get_retained_accepted_by_state_hash_and_handle(
                     &started.attempt.state_hash,
                     &creator(),
                     &BundleId::from_str(BUNDLE_ID).unwrap(),
@@ -1188,7 +1188,7 @@ mod tests {
         .unwrap();
         assert!(
             repository
-                .get_live_accepted_by_state_hash_and_handle(
+                .get_retained_accepted_by_state_hash_and_handle(
                     &started.attempt.state_hash,
                     &creator(),
                     &BundleId::from_str(BUNDLE_ID).unwrap(),

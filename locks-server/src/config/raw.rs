@@ -65,6 +65,7 @@ pub(super) struct RawConfig {
 struct RawReaderAuthConfig {
     #[serde(default)]
     allowed_origins: Vec<String>,
+    client_id: Option<String>,
 }
 
 impl RawReaderAuthConfig {
@@ -80,7 +81,21 @@ impl RawReaderAuthConfig {
                 allowed_origins.push(canonical);
             }
         }
-        Ok(ReaderAuthConfig { allowed_origins })
+        let client_id = match (allowed_origins.is_empty(), self.client_id) {
+            (true, None) => None,
+            (false, Some(client_id)) => {
+                let client_id = validate_grant_connect_client_id(client_id)
+                    .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
+                pubky::ClientId::new(&client_id)
+                    .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
+                Some(client_id)
+            }
+            _ => return Err(ConfigError::InvalidReaderAuthClientId),
+        };
+        Ok(ReaderAuthConfig {
+            allowed_origins,
+            client_id,
+        })
     }
 }
 
@@ -193,6 +208,34 @@ impl RawPubkyConfig {
 
 fn default_pubky_network() -> PubkyNetwork {
     PubkyNetwork::Testnet
+}
+
+#[cfg(test)]
+mod reader_auth_tests {
+    use super::*;
+
+    #[test]
+    fn enabled_reader_auth_requires_valid_client_id() {
+        let missing = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: None,
+        }
+        .into_reader_auth_config();
+        assert!(matches!(
+            missing,
+            Err(ConfigError::InvalidReaderAuthClientId)
+        ));
+
+        let malformed = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: Some("not a client id".to_owned()),
+        }
+        .into_reader_auth_config();
+        assert!(matches!(
+            malformed,
+            Err(ConfigError::InvalidReaderAuthClientId)
+        ));
+    }
 }
 
 #[cfg(test)]

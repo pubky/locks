@@ -44,6 +44,66 @@ use crate::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 
 #[tokio::test]
+async fn authenticated_reader_replays_final_credential_after_live_lock_is_tombstoned() {
+    let entitlements = FakeEntitlements::new(None);
+    let content_locks = FakeContentLocks::new(None);
+    let store = FakeAccessCredentialStore::with_final_credential();
+    let generator = FakeGenerator::new(AccessCredential::new("final-reader-bearer"));
+    let clock = FakeClock::new(datetime!(2026-05-29 12:00:00 UTC));
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+
+    let issued = use_case
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: creator(),
+                bundle_id: bundle_id(),
+            },
+            Some(other_creator()),
+        )
+        .await
+        .expect("frozen-bound Reader should replay final credential after tombstone");
+
+    assert_eq!(issued.credential.as_str(), "final-reader-bearer");
+}
+
+#[tokio::test]
+async fn different_reader_cannot_claim_frozen_final_credential_after_tombstone() {
+    let entitlements = FakeEntitlements::new(None);
+    let content_locks = FakeContentLocks::new(None);
+    let store = FakeAccessCredentialStore::with_final_credential();
+    let generator = FakeGenerator::new(AccessCredential::new("must-not-issue"));
+    let clock = FakeClock::new(datetime!(2026-05-29 12:00:00 UTC));
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+
+    let denied = use_case
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: creator(),
+                bundle_id: bundle_id(),
+            },
+            Some(creator()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(denied, ApplicationError::EntitlementNotFound));
+}
+
+#[tokio::test]
 async fn final_credential_winner_uses_fresh_time_after_generation() {
     let before_generation = datetime!(2026-05-29 12:00:00 UTC);
     let after_generation = datetime!(2026-05-29 12:00:01 UTC);
@@ -692,6 +752,7 @@ struct FakeAccessCredentialStore {
     record: Mutex<Option<(AccessCredentialLookupKey, AccessCredentialRecord)>>,
     deleted: Mutex<Option<AccessCredentialLookupKey>>,
     final_available: bool,
+    final_reader: Option<CreatorPubky>,
     final_issue_time: Mutex<Option<OffsetDateTime>>,
 }
 
@@ -701,6 +762,7 @@ impl FakeAccessCredentialStore {
             record: Mutex::new(Some((lookup_key, record))),
             deleted: Mutex::new(None),
             final_available: false,
+            final_reader: None,
             final_issue_time: Mutex::new(None),
         }
     }
@@ -708,6 +770,7 @@ impl FakeAccessCredentialStore {
     fn with_final_credential() -> Self {
         Self {
             final_available: true,
+            final_reader: Some(other_creator()),
             ..Self::default()
         }
     }
@@ -776,9 +839,13 @@ impl AccessCredentialStore for FakeAccessCredentialStore {
         &self,
         _creator: &CreatorPubky,
         _bundle_id: &BundleId,
+        reader: Option<&CreatorPubky>,
         now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
+        if reader.is_some() && reader != self.final_reader.as_ref() {
+            return Ok(None);
+        }
         *self.final_issue_time.lock().unwrap() = Some(now);
         Ok(Some(IssuedDeletionCredential {
             credential: candidate,

@@ -245,7 +245,7 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .map(|stored| stored.attempt.clone()))
     }
 
-    async fn get_live_accepted_by_state_hash_and_handle(
+    async fn get_retained_accepted_by_state_hash_and_handle(
         &self,
         state_hash: &FoldedAuthStateHash,
         creator: &locks_core::ids::CreatorPubky,
@@ -261,7 +261,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
                     && stored.attempt.status == FoldedAuthStatus::Accepted
                     && &stored.attempt.creator == creator
                     && &stored.attempt.bundle_id == bundle_id
-                    && stored.attempt.expires_at > now
+                    && stored
+                        .attempt
+                        .purge_after
+                        .is_some_and(|purge_after| purge_after > now)
             })
             .map(|stored| stored.attempt.clone()))
     }

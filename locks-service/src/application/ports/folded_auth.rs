@@ -34,11 +34,11 @@ pub trait FoldedAuthRepository: Send + Sync {
         state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError>;
 
-    /// Returns an unexpired accepted attempt for the exact public handle.
+    /// Returns a retained accepted attempt for the exact public handle.
     ///
-    /// Expiry uses repository-authoritative time so API-node clock skew cannot
+    /// Retention uses repository-authoritative time so API-node clock skew cannot
     /// extend or shorten folded-auth credential authorization.
-    async fn get_live_accepted_by_state_hash_and_handle(
+    async fn get_retained_accepted_by_state_hash_and_handle(
         &self,
         state_hash: &FoldedAuthStateHash,
         creator: &CreatorPubky,

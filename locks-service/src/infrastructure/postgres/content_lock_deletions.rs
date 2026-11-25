@@ -4702,6 +4702,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("first-final-bearer"),
             )
@@ -4712,6 +4713,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at + time::Duration::seconds(1),
                 AccessCredential::new("different-retry-candidate"),
             )
@@ -4725,6 +4727,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline + time::Duration::seconds(1),
                 AccessCredential::new("candidate-after-issuance-deadline"),
             )
@@ -5375,12 +5378,14 @@ mod tests {
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("concurrent-final-one"),
             ),
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("concurrent-final-two"),
             ),
@@ -5429,6 +5434,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &job.creator,
                     &task.submitted_proof_bundle.bundle_id,
+                    None,
                     NOW,
                     AccessCredential::new("malformed-frozen-manifest"),
                 )
@@ -5448,6 +5454,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("final-before-force"),
             )
@@ -5527,6 +5534,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &issuing_creator,
                     &issuing_bundle,
+                    None,
                     final_access_started_at,
                     AccessCredential::new("must-not-escape-force"),
                 )
@@ -5583,6 +5591,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("phase-obligation-final"),
             )
@@ -6157,6 +6166,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("expires-with-final-read-window"),
             )
@@ -6598,6 +6608,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &job.creator,
                     &task.submitted_proof_bundle.bundle_id,
+                    None,
                     issuance_deadline,
                     AccessCredential::new("must-not-insert-at-deadline"),
                 )
@@ -6629,6 +6640,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline - time::Duration::seconds(1),
                 AccessCredential::new("persisted-before-transition"),
             )
@@ -6665,6 +6677,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline + time::Duration::seconds(1),
                 AccessCredential::new("must-not-replace-persisted-winner"),
             )
@@ -6685,6 +6698,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("fixed-storage-lease"),
             )

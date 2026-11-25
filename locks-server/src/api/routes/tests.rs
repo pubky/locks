@@ -185,7 +185,7 @@ impl FoldedAuthRepository for StorageFailingFoldedAuthRepository {
         Err(folded_auth_storage_failure())
     }
 
-    async fn get_live_accepted_by_state_hash_and_handle(
+    async fn get_retained_accepted_by_state_hash_and_handle(
         &self,
         _state_hash: &FoldedAuthStateHash,
         _creator: &CreatorPubky,
@@ -1123,7 +1123,7 @@ async fn leaked_graph_handle_cannot_issue_credential_to_another_reader_session()
     let mut submit = json_request(
         "POST",
         "/proof-bundles",
-        json!({"submitted_proof_bundle": bundle}),
+        json!({"submitted_proof_bundle": bundle.clone()}),
     );
     submit.headers_mut().insert(
         header::AUTHORIZATION,
@@ -1135,7 +1135,28 @@ async fn leaked_graph_handle_cannot_issue_credential_to_another_reader_session()
     let submit_response = app.clone().oneshot(submit).await.unwrap();
     let submit_status = submit_response.status();
     let submit_body = response_json(submit_response).await;
-    assert_eq!(submit_status, StatusCode::ACCEPTED, "{submit_body}");
+    assert_eq!(submit_status, StatusCode::OK, "{submit_body}");
+    assert_eq!(submit_body["status"], "accepted");
+    assert_eq!(submit_body["task"]["status"], "pending");
+    locks_sdk::ViewerLocks::parse_graph_submit_response(submit_body.clone()).unwrap();
+
+    let mut replay = json_request(
+        "POST",
+        "/proof-bundles",
+        json!({"submitted_proof_bundle": bundle}),
+    );
+    replay.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {READER_A}").parse().unwrap(),
+    );
+    replay
+        .headers_mut()
+        .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+    let replay = app.clone().oneshot(replay).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = response_json(replay).await;
+    locks_sdk::ViewerLocks::parse_graph_submit_response(replay_body.clone()).unwrap();
+    assert_eq!(replay_body, submit_body);
     state
         .entitlements()
         .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
@@ -1196,32 +1217,159 @@ async fn leaked_graph_handle_cannot_issue_credential_to_another_reader_session()
 }
 
 #[tokio::test]
-async fn non_reader_access_credentials_do_not_gain_unrestricted_cors() {
-    for authorization in [None, Some("Bearer 00000000-0000-4000-8000-000000000001")] {
+async fn reader_session_mixed_submission_and_replay_roundtrip_sdk_parser() {
+    let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
+        Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
+        vec!["https://pubky.app".to_owned()],
+        None,
+        Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let state = state.with_paykit_http_client(Some(paykit));
+    seed_reader_session(&state, "reader-token", other_creator(), "https://pubky.app").await;
+    let app = router(state);
+
+    let submit = || {
         let mut request = json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle.clone()}),
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer reader-token".parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+        request
+    };
+
+    let first = app.clone().oneshot(submit()).await.unwrap();
+    let first_status = first.status();
+    let first = response_json(first).await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(first["status"], "accepted");
+    assert_eq!(first["task"]["status"], "pending");
+    locks_sdk::ViewerLocks::parse_mixed_submit_response(first.clone()).unwrap();
+
+    let replay = app.oneshot(submit()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = response_json(replay).await;
+    locks_sdk::ViewerLocks::parse_mixed_submit_response(replay.clone()).unwrap();
+    assert_eq!(replay, first);
+}
+
+#[tokio::test]
+async fn folded_access_credentials_do_not_gain_unrestricted_cors() {
+    let mut request = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer 00000000-0000-4000-8000-000000000001"
+            .parse()
+            .unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+
+    let response = router(test_state()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn anonymous_access_credentials_cors_allows_local_http_and_unlisted_https() {
+    for origin in ["http://127.0.0.1:8088", "https://payments.example"] {
+        let request = json_request(
             "POST",
             "/access-credentials",
             json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
         );
-        if let Some(authorization) = authorization {
-            request
-                .headers_mut()
-                .insert(header::AUTHORIZATION, authorization.parse().unwrap());
-        }
+        let mut request = request;
         request
             .headers_mut()
-            .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+            .insert(header::ORIGIN, origin.parse().unwrap());
 
         let response = router(test_state()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        assert!(
-            response
-                .headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none()
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            origin
         );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
+
+    let mut nonlocal_http = json_request(
+        "POST",
+        "/access-credentials",
+        json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+    );
+    nonlocal_http
+        .headers_mut()
+        .insert(header::ORIGIN, "http://payments.example".parse().unwrap());
+    let rejected = router(test_state()).oneshot(nonlocal_http).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert!(
+        rejected
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn anonymous_access_credentials_preflight_allows_public_origin_but_auth_stays_strict() {
+    let preflight = |requested_headers: &'static str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/access-credentials")
+            .header(header::ORIGIN, "https://payments.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, requested_headers)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let anonymous = router(test_state())
+        .oneshot(preflight("content-type, pubky-host"))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        anonymous.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://payments.example"
+    );
+
+    let bearer = router(test_state())
+        .oneshot(preflight("authorization, content-type"))
+        .await
+        .unwrap();
+    assert_eq!(bearer.status(), StatusCode::FORBIDDEN);
+    assert!(
+        bearer
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1405,7 +1553,7 @@ async fn mixed_v2_usdt_submission_replays_into_one_invoice_pending_task() {
         ))
         .await
         .unwrap();
-    assert_eq!(accepted_replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(accepted_replay.status(), StatusCode::OK);
     assert_eq!(response_json(accepted_replay).await, accepted);
 
     let task = state
@@ -1638,7 +1786,7 @@ async fn folded_auth_repository_failure_is_closed_500_cors_and_no_store() {
 }
 
 #[tokio::test]
-async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_http_response() {
+async fn accepted_graph_folded_auth_reissues_credentials_after_flow_expiry() {
     let clock = Arc::new(AdjustableClock::new(datetime!(2026-11-01 12:00:00 UTC)));
     let (state, bundle) = folded_auth_test_state_with_runtime(
         Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
@@ -1719,7 +1867,7 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
         "https://pubky.app"
     );
 
-    clock.set(expires_at);
+    clock.set(expires_at + time::Duration::minutes(1));
     let mut expired_credential_request = json_request(
         "POST",
         "/access-credentials",
@@ -1739,10 +1887,16 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
         .oneshot(expired_credential_request)
         .await
         .unwrap();
-    assert_eq!(expired_credential.status(), StatusCode::UNAUTHORIZED);
+    let expired_credential_status = expired_credential.status();
     assert_eq!(
         expired_credential.headers()[header::CACHE_CONTROL],
         "no-store"
+    );
+    let expired_credential_body = response_json(expired_credential).await;
+    assert_eq!(
+        expired_credential_status,
+        StatusCode::OK,
+        "{expired_credential_body}"
     );
 
     let lifecycle = app
@@ -1765,6 +1919,94 @@ async fn folded_auth_acceptance_replays_identical_terminal_response_after_lost_h
     assert_eq!(replayed.status(), StatusCode::OK);
     assert_eq!(replayed.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(response_json(replayed).await, accepted_body);
+}
+
+#[tokio::test]
+async fn accepted_mixed_folded_auth_issues_and_reissues_credentials_after_flow_expiry() {
+    let clock = Arc::new(AdjustableClock::new(datetime!(2026-11-01 12:00:00 UTC)));
+    let (state, bundle) = folded_auth_test_state_with_runtime_and_payment(
+        Arc::new(FakeFoldedAuthPoller(FakeFoldedAuthPollResult::Approved)),
+        vec!["https://pubky.app".to_owned()],
+        Some(clock.clone()),
+        Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "50000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
+    )
+    .await;
+    let paykit = Arc::new(
+        PaykitHttpClient::new_for_test("http://127.0.0.1:1", Keypair::from_secret(&[9_u8; 32]))
+            .unwrap(),
+    );
+    let state = state.with_paykit_http_client(Some(paykit));
+    let lock_resource = bundle.pubky_lock_resource.clone();
+    let bundle_id = bundle.bundle_id.clone();
+    let app = router(state.clone());
+    let submitted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles",
+            json!({"submitted_proof_bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+    let submitted = response_json(submitted).await;
+    let expires_at = time::OffsetDateTime::parse(
+        submitted["expires_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let accepted = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/proof-bundles/auth-status",
+            json!({"state": submitted["state"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(response_json(accepted).await["status"], "accepted");
+
+    state
+        .entitlements()
+        .insert_verified_proof_bundle_v2(VerifiedProofBundleV2 {
+            version: VERIFIED_PROOF_BUNDLE_V2_VERSION,
+            creator: creator(),
+            reader: other_creator(),
+            bundle_id,
+            pubky_lock_resource: lock_resource,
+            verified_at: datetime!(2026-11-01 12:00:00 UTC),
+            satisfied_by: vec![SatisfiedByV2::Payment, SatisfiedByV2::ZeroConfGraph],
+        })
+        .await
+        .unwrap();
+    clock.set(expires_at + time::Duration::minutes(1));
+
+    for _ in 0..2 {
+        let mut credential_request = json_request(
+            "POST",
+            "/access-credentials",
+            json!({"creator": creator(), "bundle_id": BUNDLE_ID}),
+        );
+        credential_request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", submitted["state"].as_str().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        credential_request
+            .headers_mut()
+            .insert(header::ORIGIN, "https://pubky.app".parse().unwrap());
+        let credential = app.clone().oneshot(credential_request).await.unwrap();
+        let status = credential.status();
+        let body = response_json(credential).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
 }
 
 #[tokio::test]
@@ -8761,6 +9003,7 @@ fn test_config(
         creator_authority_acquisition: CreatorAuthorityAcquisitionConfig::default(),
         reader_auth: crate::config::ReaderAuthConfig {
             allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: Some("pubky.app".to_owned()),
         },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),

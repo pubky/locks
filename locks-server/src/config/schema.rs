@@ -43,6 +43,8 @@ pub struct LockServerRuntimeConfig {
 pub struct ReaderAuthConfig {
     /// Exact HTTPS browser origins allowed to request and exchange Reader sessions.
     pub allowed_origins: Vec<String>,
+    /// Pubky Grant client ID authorized to create Locks Reader sessions.
+    pub client_id: Option<String>,
 }
 
 pub const MAX_DELETION_CREDENTIAL_WINDOW_SECONDS: u64 = 3600;
@@ -470,6 +472,8 @@ pub enum ConfigError {
     WildcardReturnOriginInProduction,
     #[error("reader_auth.allowed_origins must contain exact HTTPS origins: {0}")]
     InvalidReaderAuthOrigin(String),
+    #[error("reader_auth.client_id must be a valid Pubky client ID when allowed_origins is set")]
+    InvalidReaderAuthClientId,
     #[error("pubky.pkarr_relays must contain at least one relay when configured")]
     EmptyPubkyPkarrRelays,
     #[error(
