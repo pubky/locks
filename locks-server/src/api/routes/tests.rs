@@ -9004,6 +9004,7 @@ fn test_config(
         reader_auth: crate::config::ReaderAuthConfig {
             allowed_origins: vec!["https://pubky.app".to_owned()],
             client_id: Some("pubky.app".to_owned()),
+            required_capability: Some(pubky::Capability::read_write("/pub/pubky.app/").unwrap()),
         },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),

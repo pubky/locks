@@ -725,6 +725,11 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
                 .folded_auth_reservations
                 .write()
                 .await;
+            let mut deactivated_folded_auth_task_ids = self
+                .verification_task_fence
+                .deactivated_folded_auth_task_ids
+                .write()
+                .await;
             let mut fence_records = self.verification_task_fence.records.write().await;
             let task_ids = fence_records
                 .iter()
@@ -769,6 +774,7 @@ impl ContentLockDeletionRepository for InMemoryContentLockDeletionRepository {
             completed.failure_code = None;
             completed.next_attempt_at = None;
             self.access_credentials.purge_deletion(job_id).await;
+            deactivated_folded_auth_task_ids.extend(task_ids.iter().copied());
             fence_records.retain(|task_id, _| !task_ids.contains(task_id));
             graph_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
             payment_records.retain(|stored| !task_ids.contains(&stored.task.task_id));
@@ -1168,6 +1174,7 @@ mod lock_order_tests {
         time::Duration as StdDuration,
     };
 
+    use locks_core::verification::SubmittedProofBundleV2;
     use locks_core::{
         ids::{BundleId, CreatorPubky, GuardedResourceHash, PubkyLockResource, TaskId},
         lock_policy::{
@@ -1180,10 +1187,20 @@ mod lock_order_tests {
     use super::*;
     use crate::{
         application::{
-            models::{GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1},
-            ports::{Clock, GraphTaskClaimer, GraphTaskRepository},
+            models::{
+                FoldedAuthEvaluatorMode, FoldedAuthFlowSecret, FoldedAuthPendingResponse,
+                FoldedAuthStateHash, GraphTaskRecord, GraphTaskSnapshot, GraphTaskSnapshotV1,
+                StartFoldedAuthAttempt,
+            },
+            ports::{Clock, FoldedAuthRepository, GraphTaskClaimer, GraphTaskRepository},
         },
-        infrastructure::memory::graph_tasks::InMemoryGraphTaskRepository,
+        infrastructure::{
+            folded_auth::FoldedAuthSecretCipher,
+            memory::{
+                folded_auth::InMemoryFoldedAuthRepository, graph_tasks::InMemoryGraphTaskRepository,
+            },
+            runtime_master_key::RuntimeMasterKey,
+        },
     };
 
     const NOW: OffsetDateTime = datetime!(2026-11-10 12:00:00 UTC);
@@ -1497,6 +1514,92 @@ mod lock_order_tests {
         );
     }
 
+    #[tokio::test]
+    async fn successful_finish_deactivates_folded_bearer_and_allows_handle_reuse() {
+        let fence = Arc::new(InMemoryVerificationTaskDeletionFence::with_clock(Arc::new(
+            FixedClock,
+        )));
+        let graph = Arc::new(InMemoryGraphTaskRepository::with_deletion_fence(
+            Arc::clone(&fence),
+        ));
+        let folded = InMemoryFoldedAuthRepository::new(Arc::clone(&graph), folded_cipher());
+        let lock = content_lock(7);
+        let bundle_id = BundleId::new_random();
+        let resource = PubkyLockResource::from_str(&format!(
+            "{}/pub/app.locks/{}.json",
+            lock.creator,
+            lock.lock_id().unwrap()
+        ))
+        .unwrap();
+        let old_state = FoldedAuthStateHash::derive(b"old-folded-state");
+        let started = folded
+            .start_or_rotate(folded_start_request(
+                &lock,
+                bundle_id.clone(),
+                resource.clone(),
+                old_state.clone(),
+            ))
+            .await
+            .unwrap();
+        let old_task_id = TaskId::from_str("123e4567-e89b-42d3-a456-426614174080").unwrap();
+        folded
+            .accept_and_insert_graph_task(
+                &old_state,
+                started.attempt.generation,
+                old_task_id,
+                lock.creator.clone(),
+                NOW,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        fence
+            .records
+            .write()
+            .await
+            .get_mut(&old_task_id)
+            .unwrap()
+            .status = VerificationTaskStatus::Completed;
+        fence
+            .current_statuses
+            .write()
+            .await
+            .insert(old_task_id, VerificationTaskStatus::Completed);
+        fence.graph_records.write().await[0].task.status = VerificationTaskStatus::Completed;
+
+        let deletions =
+            InMemoryContentLockDeletionRepository::with_verification_task_fence(Arc::clone(&fence));
+        let claim = ready_to_finish(&deletions, lock.clone()).await;
+        deletions
+            .finish(claim.job.job_id, "finish-worker", claim.claim_token, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            folded
+                .get_retained_accepted_by_state_hash_and_handle(
+                    &old_state,
+                    &lock.creator,
+                    &bundle_id,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "graceful cleanup must deactivate the accepted folded bearer"
+        );
+        let replacement = folded
+            .start_or_rotate(folded_start_request(
+                &lock,
+                bundle_id,
+                resource,
+                FoldedAuthStateHash::derive(b"replacement-folded-state"),
+            ))
+            .await
+            .expect("cleanup must allow creator/bundle handle reuse");
+        assert_eq!(replacement.attempt.generation, 1);
+    }
+
     async fn ready_to_finish(
         repository: &InMemoryContentLockDeletionRepository,
         lock: ContentLock,
@@ -1540,6 +1643,48 @@ mod lock_order_tests {
         })
         .await
         .expect("contender reached decisive lock");
+    }
+
+    fn folded_start_request(
+        lock: &ContentLock,
+        bundle_id: BundleId,
+        resource: PubkyLockResource,
+        state_hash: FoldedAuthStateHash,
+    ) -> StartFoldedAuthAttempt {
+        StartFoldedAuthAttempt {
+            submitted_proof_bundle: SubmittedProofBundleV2 {
+                version: 2,
+                bundle_id,
+                pubky_lock_resource: resource.clone(),
+                reader_pubky: None,
+            },
+            pubky_lock_resource: resource,
+            lock_hash: *lock.lock_hash().unwrap().as_bytes(),
+            verification_window_seconds: 60,
+            graph: GraphPolicyV2 {
+                predicates: vec![GraphPredicateV2::Follows {
+                    follower: GraphParticipantV2::Reader,
+                    followed: GraphParticipantV2::Creator,
+                }],
+                operator: None,
+            },
+            evaluator_mode: FoldedAuthEvaluatorMode::Graph,
+            payment: None,
+            state_hash,
+            flow_secret: FoldedAuthFlowSecret::new(b"folded-flow-secret".to_vec()),
+            pending_response: FoldedAuthPendingResponse {
+                auth_url: "https://auth.example/approve".to_owned(),
+                state: "folded-state".to_owned(),
+            },
+            created_at: NOW,
+        }
+    }
+
+    fn folded_cipher() -> FoldedAuthSecretCipher {
+        let master_key =
+            RuntimeMasterKey::from_base64url("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap();
+        FoldedAuthSecretCipher::from_runtime_master_key(&master_key)
     }
 
     fn graph_task(lock: &ContentLock) -> GraphTaskRecord {

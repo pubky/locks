@@ -45,6 +45,8 @@ pub struct ReaderAuthConfig {
     pub allowed_origins: Vec<String>,
     /// Pubky Grant client ID authorized to create Locks Reader sessions.
     pub client_id: Option<String>,
+    /// Exact Pubky capability required on the verified Reader grant.
+    pub required_capability: Option<pubky::Capability>,
 }
 
 pub const MAX_DELETION_CREDENTIAL_WINDOW_SECONDS: u64 = 3600;
@@ -474,6 +476,10 @@ pub enum ConfigError {
     InvalidReaderAuthOrigin(String),
     #[error("reader_auth.client_id must be a valid Pubky client ID when allowed_origins is set")]
     InvalidReaderAuthClientId,
+    #[error(
+        "reader_auth.required_capability must be one exact canonical Pubky capability when allowed_origins is set"
+    )]
+    InvalidReaderAuthCapability,
     #[error("pubky.pkarr_relays must contain at least one relay when configured")]
     EmptyPubkyPkarrRelays,
     #[error(

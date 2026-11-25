@@ -186,6 +186,10 @@ fn initialize_default_config_with_database_url(
         reader_auth: ReaderAuthConfig {
             allowed_origins: vec!["https://localhost:3002".to_owned()],
             client_id: Some("app.locks".to_owned()),
+            required_capability: Some(
+                pubky::Capability::read_write("/pub/app.locks/")
+                    .expect("generated Reader capability is valid"),
+            ),
         },
         secrets: SecretsConfig::default(),
         logging: LoggingConfig::default(),
@@ -246,6 +250,7 @@ allowed_return_origins = {} # Origins allowed to receive auth callback codes, e.
 
 [reader_auth]
 client_id = "{}" # Exact Pubky Grant client ID authorized to create Locks Reader sessions.
+required_capability = "{}" # Exact canonical Pubky capability the verified grant must contain; extra capabilities do not substitute for it.
 allowed_origins = {} # Exact HTTPS browser origins allowed to use Reader challenge/session routes. Empty disables Reader-session negotiation; no wildcard.
 
 [secrets]
@@ -335,6 +340,11 @@ max_total_resource_bytes = {} # Maximum combined bytes across resources in one c
             .reader_auth
             .client_id
             .as_deref()
+            .expect("generated config enables Reader auth"),
+        config
+            .reader_auth
+            .required_capability
+            .as_ref()
             .expect("generated config enables Reader auth"),
         toml_string_array(&config.reader_auth.allowed_origins),
         config.secrets.runtime_master_key_env,

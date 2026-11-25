@@ -1195,8 +1195,27 @@ mod tests {
                 )
                 .await
                 .unwrap()
+                .is_some(),
+            "flow expiry equality must retain accepted authorization until purge_after"
+        );
+        sqlx::query(
+            "UPDATE folded_auth_attempts
+             SET purge_after = clock_timestamp()",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            repository
+                .get_retained_accepted_by_state_hash_and_handle(
+                    &started.attempt.state_hash,
+                    &creator(),
+                    &BundleId::from_str(BUNDLE_ID).unwrap(),
+                )
+                .await
+                .unwrap()
                 .is_none(),
-            "expiry equality must reject using database-authoritative time"
+            "purge boundary equality must reject using database-authoritative time"
         );
         sqlx::query(
             "UPDATE folded_auth_attempts

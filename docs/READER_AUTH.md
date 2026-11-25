@@ -28,9 +28,10 @@ Reader sessions require both boundaries in runtime config:
 ```toml
 [reader_auth]
 client_id = "pubky.app"
+required_capability = "/pub/pubky.app/:rw"
 allowed_origins = ["https://pubky.app"]
 ```
 
-When `allowed_origins` is non-empty, `client_id` is required and must be a valid Pubky Grant client ID. Locks accepts Custom PoP only when verified grant `client_id` exactly matches this configured application identity. Browser Origin remains a separate transport boundary; matching or forging an Origin never authorizes a grant issued to another application. Leave both settings absent/empty to disable Reader-session negotiation.
+When `allowed_origins` is non-empty, `client_id` and one canonical `required_capability` are required. Locks accepts Custom PoP only when verified grant `client_id` exactly matches this configured application identity and `grant.caps` contains that exact capability. A read-only capability, a capability for another scope, or a correct capability from another client does not authorize a Reader session. Browser Origin remains a separate transport boundary; matching or forging an Origin never substitutes for either grant check. Leave all three settings absent/empty to disable Reader-session negotiation.
 
 Custom-PoP verification is offline. It checks direct-grant/proof signatures, binding, and `grant.exp`, but cannot observe homeserver revocation before expiry. Current Pubky Custom PoP carries one direct grant and no verifiable parent chain, so Accounts parent/child grants are rejected as unsupported; clients must use advertised folded auth for that case. Locks does not claim delegated-grant compatibility. Keep grant lifetimes short enough for the offline revocation window. Challenges are single-use replay fences. Session renewal has one winning predecessor invalidation, and logout invalidates the current token. Browser applications must keep challenges, grants, PoPs, and session tokens out of URLs, logs, analytics, exception telemetry, and shared storage. Do not send Reader session tokens to Creator routes or third-party origins. Reusing one Reader session across requests lets the Lock Server correlate those requests to one Reader until rotation or expiry; exact browser-Origin binding limits where the bearer works but does not provide unlinkability from the Lock Server.

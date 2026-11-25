@@ -15,6 +15,7 @@ use crate::infrastructure::folded_auth::FoldedAuthSecretCipher;
 
 use super::graph_tasks::InMemoryGraphTaskRepository;
 use super::mixed_tasks::InMemoryMixedTaskRepository;
+use super::verification_task_deletion_fence::InMemoryVerificationTaskDeletionFence;
 
 #[derive(Debug, Clone)]
 struct StoredAttempt {
@@ -33,6 +34,7 @@ pub struct InMemoryFoldedAuthRepository {
     state: Arc<RwLock<FoldedAuthMemoryState>>,
     graph: Arc<InMemoryGraphTaskRepository>,
     mixed: Arc<InMemoryMixedTaskRepository>,
+    deletion_fence: Arc<InMemoryVerificationTaskDeletionFence>,
     cipher: FoldedAuthSecretCipher,
 }
 
@@ -41,10 +43,12 @@ impl InMemoryFoldedAuthRepository {
         let mixed = Arc::new(InMemoryMixedTaskRepository::with_deletion_fence(
             graph.shared_deletion_fence(),
         ));
+        let deletion_fence = graph.shared_deletion_fence();
         Self {
             state: Arc::new(RwLock::new(FoldedAuthMemoryState::default())),
             graph,
             mixed,
+            deletion_fence,
             cipher,
         }
     }
@@ -54,6 +58,7 @@ impl InMemoryFoldedAuthRepository {
             state: self.state.clone(),
             graph: self.graph.clone(),
             mixed: self.mixed.clone(),
+            deletion_fence: self.deletion_fence.clone(),
             cipher,
         }
     }
@@ -70,6 +75,11 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         creator: &locks_core::ids::CreatorPubky,
         bundle_id: &locks_core::ids::BundleId,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let deactivated = self
+            .deletion_fence
+            .deactivated_folded_auth_task_ids
+            .read()
+            .await;
         Ok(self
             .state
             .read()
@@ -77,7 +87,12 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .records
             .iter()
             .filter(|stored| {
-                &stored.attempt.creator == creator && &stored.attempt.bundle_id == bundle_id
+                &stored.attempt.creator == creator
+                    && &stored.attempt.bundle_id == bundle_id
+                    && !stored
+                        .attempt
+                        .task_id
+                        .is_some_and(|task_id| deactivated.contains(&task_id))
             })
             .max_by_key(|stored| stored.attempt.generation)
             .map(|stored| stored.attempt.clone()))
@@ -126,6 +141,12 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .graph
             .acquire_handle_admission(request.creator(), request.bundle_id())
             .await;
+        let deactivated = self
+            .deletion_fence
+            .deactivated_folded_auth_task_ids
+            .read()
+            .await
+            .clone();
         let mut state = self.state.write().await;
         if self
             .graph
@@ -152,6 +173,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .filter(|(_, stored)| {
                 stored.attempt.creator == *request.creator()
                     && stored.attempt.bundle_id == *request.bundle_id()
+                    && !stored
+                        .attempt
+                        .task_id
+                        .is_some_and(|task_id| deactivated.contains(&task_id))
             })
             .max_by_key(|(_, stored)| stored.attempt.generation)
             .map(|(index, _)| index);
@@ -235,6 +260,11 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         &self,
         state_hash: &FoldedAuthStateHash,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
+        let deactivated = self
+            .deletion_fence
+            .deactivated_folded_auth_task_ids
+            .read()
+            .await;
         Ok(self
             .state
             .read()
@@ -242,6 +272,12 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
             .records
             .iter()
             .find(|stored| &stored.attempt.state_hash == state_hash)
+            .filter(|stored| {
+                !stored
+                    .attempt
+                    .task_id
+                    .is_some_and(|task_id| deactivated.contains(&task_id))
+            })
             .map(|stored| stored.attempt.clone()))
     }
 
@@ -252,6 +288,11 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
         bundle_id: &locks_core::ids::BundleId,
     ) -> Result<Option<FoldedAuthAttempt>, ApplicationError> {
         let state = self.state.read().await;
+        let deactivated = self
+            .deletion_fence
+            .deactivated_folded_auth_task_ids
+            .read()
+            .await;
         let now = self.graph.authoritative_time();
         Ok(state
             .records
@@ -261,6 +302,10 @@ impl FoldedAuthRepository for InMemoryFoldedAuthRepository {
                     && stored.attempt.status == FoldedAuthStatus::Accepted
                     && &stored.attempt.creator == creator
                     && &stored.attempt.bundle_id == bundle_id
+                    && !stored
+                        .attempt
+                        .task_id
+                        .is_some_and(|task_id| deactivated.contains(&task_id))
                     && stored
                         .attempt
                         .purge_after

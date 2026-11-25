@@ -211,9 +211,17 @@ pub(super) async fn create_reader_session(
         .client_id
         .as_deref()
         .ok_or_else(reader_auth_pop_verification_failed)?;
-    authorize_reader_grant_client(
+    let required_capability = state
+        .config()
+        .reader_auth
+        .required_capability
+        .as_ref()
+        .ok_or_else(reader_auth_pop_verification_failed)?;
+    authorize_reader_grant(
         expected_client_id,
+        required_capability,
         &verified.grant_claims().client_id.to_string(),
+        &verified.grant_claims().caps,
     )?;
 
     // Validate strict closed PoP data schema.
@@ -479,11 +487,17 @@ fn reader_auth_pop_verification_failed() -> ApiError {
     )
 }
 
-fn authorize_reader_grant_client(
+fn authorize_reader_grant(
     expected_client_id: &str,
+    required_capability: &pubky::Capability,
     actual_client_id: &str,
+    actual_capabilities: &[pubky::Capability],
 ) -> Result<(), ApiError> {
-    if actual_client_id == expected_client_id {
+    if actual_client_id == expected_client_id
+        && actual_capabilities
+            .iter()
+            .any(|capability| capability == required_capability)
+    {
         Ok(())
     } else {
         Err(reader_auth_pop_verification_failed())
@@ -652,10 +666,16 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
-    fn reader_grant_client_authorization_rejects_unrelated_and_read_only_apps() {
-        assert!(authorize_reader_grant_client("pubky.app", "pubky.app").is_ok());
-        assert!(authorize_reader_grant_client("pubky.app", "unrelated.app").is_err());
-        assert!(authorize_reader_grant_client("pubky.app", "read-only.app").is_err());
+    fn reader_grant_authorization_requires_exact_client_and_capability() {
+        let required = pubky::Capability::read_write("/pub/pubky.app/").unwrap();
+        let correct = vec![required.clone()];
+        let read_only = vec![pubky::Capability::read("/pub/pubky.app/").unwrap()];
+        let unrelated = vec![pubky::Capability::read_write("/pub/other.app/").unwrap()];
+
+        assert!(authorize_reader_grant("pubky.app", &required, "pubky.app", &correct).is_ok());
+        assert!(authorize_reader_grant("pubky.app", &required, "pubky.app", &read_only).is_err());
+        assert!(authorize_reader_grant("pubky.app", &required, "pubky.app", &unrelated).is_err());
+        assert!(authorize_reader_grant("pubky.app", &required, "other.app", &correct).is_err());
     }
 
     #[test]

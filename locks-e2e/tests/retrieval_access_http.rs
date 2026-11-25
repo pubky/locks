@@ -149,6 +149,8 @@ async fn mixed_completion_issues_credential_and_serves_guarded_resource() {
     let mut config = TestServerApp::default_in_memory_config();
     config.reader_auth.allowed_origins = vec!["https://pubky.app".to_owned()];
     config.reader_auth.client_id = Some("pubky.app".to_owned());
+    config.reader_auth.required_capability =
+        Some(pubky::Capability::read_write("/pub/pubky.app/").unwrap());
     let test_app = TestServerApp::new_in_memory(config);
     let content_lock = mixed_content_lock();
     let lock_path = ContentLockPath::from_lock_id(content_lock.lock_id().unwrap());

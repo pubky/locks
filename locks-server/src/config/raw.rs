@@ -66,6 +66,7 @@ struct RawReaderAuthConfig {
     #[serde(default)]
     allowed_origins: Vec<String>,
     client_id: Option<String>,
+    required_capability: Option<String>,
 }
 
 impl RawReaderAuthConfig {
@@ -81,20 +82,33 @@ impl RawReaderAuthConfig {
                 allowed_origins.push(canonical);
             }
         }
-        let client_id = match (allowed_origins.is_empty(), self.client_id) {
-            (true, None) => None,
-            (false, Some(client_id)) => {
+        let (client_id, required_capability) = match (
+            allowed_origins.is_empty(),
+            self.client_id,
+            self.required_capability,
+        ) {
+            (true, None, None) => (None, None),
+            (false, Some(client_id), Some(required_capability)) => {
                 let client_id = validate_grant_connect_client_id(client_id)
                     .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
                 pubky::ClientId::new(&client_id)
                     .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
-                Some(client_id)
+                let parsed = pubky::Capability::from_str(&required_capability)
+                    .map_err(|_| ConfigError::InvalidReaderAuthCapability)?;
+                if parsed.to_string() != required_capability {
+                    return Err(ConfigError::InvalidReaderAuthCapability);
+                }
+                (Some(client_id), Some(parsed))
             }
-            _ => return Err(ConfigError::InvalidReaderAuthClientId),
+            (false, None, _) | (true, Some(_), _) => {
+                return Err(ConfigError::InvalidReaderAuthClientId);
+            }
+            _ => return Err(ConfigError::InvalidReaderAuthCapability),
         };
         Ok(ReaderAuthConfig {
             allowed_origins,
             client_id,
+            required_capability,
         })
     }
 }
@@ -215,10 +229,11 @@ mod reader_auth_tests {
     use super::*;
 
     #[test]
-    fn enabled_reader_auth_requires_valid_client_id() {
+    fn enabled_reader_auth_requires_valid_client_id_and_capability() {
         let missing = RawReaderAuthConfig {
             allowed_origins: vec!["https://pubky.app".to_owned()],
             client_id: None,
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
         }
         .into_reader_auth_config();
         assert!(matches!(
@@ -229,12 +244,65 @@ mod reader_auth_tests {
         let malformed = RawReaderAuthConfig {
             allowed_origins: vec!["https://pubky.app".to_owned()],
             client_id: Some("not a client id".to_owned()),
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
         }
         .into_reader_auth_config();
         assert!(matches!(
             malformed,
             Err(ConfigError::InvalidReaderAuthClientId)
         ));
+
+        for required_capability in [
+            None,
+            Some("not-a-capability".to_owned()),
+            Some("/pub/pubky.app/:wr".to_owned()),
+        ] {
+            let invalid = RawReaderAuthConfig {
+                allowed_origins: vec!["https://pubky.app".to_owned()],
+                client_id: Some("pubky.app".to_owned()),
+                required_capability,
+            }
+            .into_reader_auth_config();
+            assert!(matches!(
+                invalid,
+                Err(ConfigError::InvalidReaderAuthCapability)
+            ));
+        }
+
+        let valid = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: Some("pubky.app".to_owned()),
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+        }
+        .into_reader_auth_config()
+        .unwrap();
+        assert_eq!(valid.client_id.as_deref(), Some("pubky.app"));
+        assert_eq!(
+            valid.required_capability.unwrap().to_string(),
+            "/pub/pubky.app/:rw"
+        );
+
+        let disabled = RawReaderAuthConfig::default()
+            .into_reader_auth_config()
+            .unwrap();
+        assert!(disabled.allowed_origins.is_empty());
+        assert!(disabled.client_id.is_none());
+        assert!(disabled.required_capability.is_none());
+
+        for disabled_with_policy in [
+            RawReaderAuthConfig {
+                allowed_origins: Vec::new(),
+                client_id: Some("pubky.app".to_owned()),
+                required_capability: None,
+            },
+            RawReaderAuthConfig {
+                allowed_origins: Vec::new(),
+                client_id: None,
+                required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+            },
+        ] {
+            assert!(disabled_with_policy.into_reader_auth_config().is_err());
+        }
     }
 }
 

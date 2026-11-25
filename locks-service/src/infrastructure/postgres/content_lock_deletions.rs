@@ -6556,6 +6556,32 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
+        sqlx::query(
+            "INSERT INTO folded_auth_attempts
+                 (creator, bundle_id, generation, state_hash, status,
+                  submitted_proof_bundle, pubky_lock_resource, lock_hash,
+                  verification_window_seconds, graph_policy, evaluator_mode, created_at, expires_at,
+                  terminal_at, purge_after)
+             VALUES ($1, 'purge-folded-auth', 1, $2, 'expired', '{}'::jsonb,
+                     'replacement-resource', $3, 60, '{}'::jsonb, 'graph', $4,
+                     $4 + INTERVAL '10 minutes', $4, $4 + INTERVAL '1 hour')",
+        )
+        .bind(job.creator.to_string())
+        .bind(vec![27_u8; 32])
+        .bind(vec![28_u8; 32])
+        .bind(NOW)
+        .execute(database.pool())
+        .await
+        .expect("graceful cleanup must allow creator/bundle folded handle reuse");
+        let replacement_handle_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM folded_auth_attempts
+             WHERE creator = $1 AND bundle_id = 'purge-folded-auth'",
+        )
+        .bind(job.creator.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(replacement_handle_count, 1);
         let replacement_lock = LockId::from_hash(LockHash::from_bytes([99; 32]));
         ownership
             .reserve_paths(&job.creator, &owned_paths, &replacement_lock)
