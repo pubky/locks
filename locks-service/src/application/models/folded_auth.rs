@@ -176,6 +176,16 @@ impl FoldedAuthAttempt {
         }
     }
 
+    /// Retains accepted Reader authorization through the task verification window.
+    /// Shorter windows still keep the replay fence for the normal tombstone TTL.
+    pub fn accepted_purge_after(&self, accepted_at: OffsetDateTime) -> Option<OffsetDateTime> {
+        let verification_seconds = i64::try_from(self.verification_window_seconds).ok()?;
+        let verification_deadline =
+            accepted_at.checked_add(Duration::seconds(verification_seconds))?;
+        let tombstone_deadline = accepted_at.checked_add(FOLDED_AUTH_TOMBSTONE_TTL)?;
+        Some(verification_deadline.max(tombstone_deadline))
+    }
+
     pub fn accepted_graph_task(
         &self,
         task_id: TaskId,

@@ -52,9 +52,19 @@ pub(super) async fn readyz(State(state): State<AppState>) -> Response {
 pub(super) async fn well_known_locks_server(
     State(state): State<AppState>,
 ) -> Json<WellKnownLocksServerHttpResponse> {
+    let reader_auth = (state.reader_auth_enabled()
+        && !state.config().reader_auth.allowed_origins.is_empty())
+    .then(|| {
+        let mut methods = vec!["custom-pop-session-v1"];
+        if state.folded_auth_flow_starter().is_some() && state.folded_auth_poller().is_some() {
+            methods.push("folded-auth-v2");
+        }
+        methods
+    });
     Json(WellKnownLocksServerHttpResponse {
         service: "pubky-locks-server",
         api_version: "0.1",
         lock_server: state.config().credentials.lock_server_public_key.clone(),
+        reader_auth,
     })
 }

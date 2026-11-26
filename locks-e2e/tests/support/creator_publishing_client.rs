@@ -161,12 +161,17 @@ impl LocalCreatorPublishingClient {
         creator: CreatorPubky,
         bundle_id: &str,
     ) -> Result<String, HttpTestError> {
-        let body = self
-            .post_json(
+        let response = self
+            .router
+            .clone()
+            .oneshot(json_request(
+                "POST",
                 "/access-credentials",
                 public_handle_body(creator, bundle_id),
-            )
-            .await?;
+            ))
+            .await
+            .unwrap();
+        let body = json_success_or_error(response).await?;
         Ok(body["credential"]
             .as_str()
             .expect("credential response contains string credential")
@@ -208,7 +213,9 @@ impl LocalCreatorPublishingClient {
 
     fn json_request(&self, method: &str, uri: &str, body: Value) -> Request<Body> {
         let mut request = json_request(method, uri, body);
-        if let Some(token) = &self.frontend_session_token {
+        if uri.starts_with("/creator/")
+            && let Some(token) = &self.frontend_session_token
+        {
             request.headers_mut().insert(
                 header::AUTHORIZATION,
                 format!("Bearer {token}").parse().unwrap(),

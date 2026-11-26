@@ -21,8 +21,9 @@ use super::schema::{
     GrantConnectAcquisitionConfig, LockServerCredentialsConfig, LockServerRuntimeConfig,
     LoggingConfig, MAX_DELETION_CREDENTIAL_WINDOW_SECONDS, MAX_TRUSTED_PROXY_HOPS, NexusConfig,
     PAYKIT_REQUEST_TIMEOUT_SECONDS, PaykitConfig, PaykitConnectionStateLookupRateLimitConfig,
-    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, RuntimeConfig,
-    RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig, WorkerConfig,
+    PkdnsConfig, PubkyConfig, PubkyNetwork, PubkyResolution, RateLimitsConfig, ReaderAuthConfig,
+    RuntimeConfig, RuntimeEnvironment, SecretsConfig, VerificationSubmissionRateLimitConfig,
+    WorkerConfig,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,8 @@ pub(super) struct RawConfig {
     runtime: RawRuntimeConfig,
     #[serde(default)]
     creator_authority_acquisition: RawCreatorAuthorityAcquisitionConfig,
+    #[serde(default)]
+    reader_auth: RawReaderAuthConfig,
     #[serde(default)]
     secrets: RawSecretsConfig,
     #[serde(default)]
@@ -55,6 +58,59 @@ pub(super) struct RawConfig {
     paykit: Option<RawPaykitConfig>,
     #[serde(default)]
     nexus: Option<RawNexusConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReaderAuthConfig {
+    #[serde(default)]
+    allowed_origins: Vec<String>,
+    client_id: Option<String>,
+    required_capability: Option<String>,
+}
+
+impl RawReaderAuthConfig {
+    fn into_reader_auth_config(self) -> Result<ReaderAuthConfig, ConfigError> {
+        let mut allowed_origins = Vec::with_capacity(self.allowed_origins.len());
+        for origin in self.allowed_origins {
+            let canonical = super::validation::canonical_grant_origin(&origin)
+                .ok_or_else(|| ConfigError::InvalidReaderAuthOrigin(origin.clone()))?;
+            if canonical != origin {
+                return Err(ConfigError::InvalidReaderAuthOrigin(origin));
+            }
+            if !allowed_origins.contains(&canonical) {
+                allowed_origins.push(canonical);
+            }
+        }
+        let (client_id, required_capability) = match (
+            allowed_origins.is_empty(),
+            self.client_id,
+            self.required_capability,
+        ) {
+            (true, None, None) => (None, None),
+            (false, Some(client_id), Some(required_capability)) => {
+                let client_id = validate_grant_connect_client_id(client_id)
+                    .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
+                pubky::ClientId::new(&client_id)
+                    .map_err(|_| ConfigError::InvalidReaderAuthClientId)?;
+                let parsed = pubky::Capability::from_str(&required_capability)
+                    .map_err(|_| ConfigError::InvalidReaderAuthCapability)?;
+                if parsed.to_string() != required_capability {
+                    return Err(ConfigError::InvalidReaderAuthCapability);
+                }
+                (Some(client_id), Some(parsed))
+            }
+            (false, None, _) | (true, Some(_), _) => {
+                return Err(ConfigError::InvalidReaderAuthClientId);
+            }
+            _ => return Err(ConfigError::InvalidReaderAuthCapability),
+        };
+        Ok(ReaderAuthConfig {
+            allowed_origins,
+            client_id,
+            required_capability,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +222,88 @@ impl RawPubkyConfig {
 
 fn default_pubky_network() -> PubkyNetwork {
     PubkyNetwork::Testnet
+}
+
+#[cfg(test)]
+mod reader_auth_tests {
+    use super::*;
+
+    #[test]
+    fn enabled_reader_auth_requires_valid_client_id_and_capability() {
+        let missing = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: None,
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+        }
+        .into_reader_auth_config();
+        assert!(matches!(
+            missing,
+            Err(ConfigError::InvalidReaderAuthClientId)
+        ));
+
+        let malformed = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: Some("not a client id".to_owned()),
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+        }
+        .into_reader_auth_config();
+        assert!(matches!(
+            malformed,
+            Err(ConfigError::InvalidReaderAuthClientId)
+        ));
+
+        for required_capability in [
+            None,
+            Some("not-a-capability".to_owned()),
+            Some("/pub/pubky.app/:wr".to_owned()),
+        ] {
+            let invalid = RawReaderAuthConfig {
+                allowed_origins: vec!["https://pubky.app".to_owned()],
+                client_id: Some("pubky.app".to_owned()),
+                required_capability,
+            }
+            .into_reader_auth_config();
+            assert!(matches!(
+                invalid,
+                Err(ConfigError::InvalidReaderAuthCapability)
+            ));
+        }
+
+        let valid = RawReaderAuthConfig {
+            allowed_origins: vec!["https://pubky.app".to_owned()],
+            client_id: Some("pubky.app".to_owned()),
+            required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+        }
+        .into_reader_auth_config()
+        .unwrap();
+        assert_eq!(valid.client_id.as_deref(), Some("pubky.app"));
+        assert_eq!(
+            valid.required_capability.unwrap().to_string(),
+            "/pub/pubky.app/:rw"
+        );
+
+        let disabled = RawReaderAuthConfig::default()
+            .into_reader_auth_config()
+            .unwrap();
+        assert!(disabled.allowed_origins.is_empty());
+        assert!(disabled.client_id.is_none());
+        assert!(disabled.required_capability.is_none());
+
+        for disabled_with_policy in [
+            RawReaderAuthConfig {
+                allowed_origins: Vec::new(),
+                client_id: Some("pubky.app".to_owned()),
+                required_capability: None,
+            },
+            RawReaderAuthConfig {
+                allowed_origins: Vec::new(),
+                client_id: None,
+                required_capability: Some("/pub/pubky.app/:rw".to_owned()),
+            },
+        ] {
+            assert!(disabled_with_policy.into_reader_auth_config().is_err());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -985,6 +1123,7 @@ impl RawConfig {
         let creator_authority_acquisition = self
             .creator_authority_acquisition
             .into_creator_authority_acquisition_config(runtime.environment)?;
+        let reader_auth = self.reader_auth.into_reader_auth_config()?;
         let secrets = self.secrets.into_secrets_config()?;
         let logging = self.logging.into_logging_config()?;
         let pubky = self.pubky.into_pubky_config()?;
@@ -1038,6 +1177,7 @@ impl RawConfig {
             },
             runtime,
             creator_authority_acquisition,
+            reader_auth,
             secrets,
             logging,
             pubky,

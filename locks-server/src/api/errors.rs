@@ -36,6 +36,15 @@ pub enum ApiErrorCode {
     PaykitInvoiceCreationFailed,
     PaykitConnectionStateUnavailable,
     PaykitConnectionStateTimeout,
+    ReaderAuthChallengeUnavailable,
+    ReaderAuthChallengeExpired,
+    ReaderAuthChallengeAlreadyConsumed,
+    ReaderSessionUnavailable,
+    ReaderSessionExpired,
+    ReaderSessionInvalidated,
+    ReaderSessionRenewalConflict,
+    ReaderAuthPopVerificationFailed,
+    ReaderIdentityConflict,
     RateLimited,
     PayloadTooLarge,
     InternalError,
@@ -74,6 +83,15 @@ impl ApiErrorCode {
             Self::PaykitInvoiceCreationFailed => "paykit_invoice_creation_failed",
             Self::PaykitConnectionStateUnavailable => "paykit_connection_state_unavailable",
             Self::PaykitConnectionStateTimeout => "paykit_connection_state_timeout",
+            Self::ReaderAuthChallengeUnavailable => "reader_auth_challenge_unavailable",
+            Self::ReaderAuthChallengeExpired => "reader_auth_challenge_expired",
+            Self::ReaderAuthChallengeAlreadyConsumed => "reader_auth_challenge_already_consumed",
+            Self::ReaderSessionUnavailable => "reader_session_unavailable",
+            Self::ReaderSessionExpired => "reader_session_expired",
+            Self::ReaderSessionInvalidated => "reader_session_invalidated",
+            Self::ReaderSessionRenewalConflict => "reader_session_renewal_conflict",
+            Self::ReaderAuthPopVerificationFailed => "reader_auth_pop_verification_failed",
+            Self::ReaderIdentityConflict => "reader_identity_conflict",
             Self::RateLimited => "rate_limited",
             Self::PayloadTooLarge => "payload_too_large",
             Self::InternalError => "internal_error",
@@ -115,6 +133,15 @@ impl ApiErrorCode {
                 StatusCode::BAD_GATEWAY
             }
             Self::PaykitConnectionStateTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::ReaderAuthChallengeUnavailable => StatusCode::NOT_FOUND,
+            Self::ReaderAuthChallengeExpired => StatusCode::GONE,
+            Self::ReaderAuthChallengeAlreadyConsumed => StatusCode::GONE,
+            Self::ReaderSessionUnavailable => StatusCode::UNAUTHORIZED,
+            Self::ReaderSessionExpired => StatusCode::UNAUTHORIZED,
+            Self::ReaderSessionInvalidated => StatusCode::UNAUTHORIZED,
+            Self::ReaderSessionRenewalConflict => StatusCode::CONFLICT,
+            Self::ReaderAuthPopVerificationFailed => StatusCode::UNAUTHORIZED,
+            Self::ReaderIdentityConflict => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -271,6 +298,41 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::CorruptContentLockDeletionManifest { .. } => {
                 Self::new(ApiErrorCode::InternalError, "state_corrupt")
             }
+            ApplicationError::ReaderAuthChallengeUnavailable => Self::new(
+                ApiErrorCode::ReaderAuthChallengeUnavailable,
+                "reader auth challenge unavailable",
+            ),
+            ApplicationError::ReaderAuthChallengeExpired => Self::new(
+                ApiErrorCode::ReaderAuthChallengeExpired,
+                "reader auth challenge expired",
+            ),
+            ApplicationError::ReaderAuthChallengeAlreadyConsumed => Self::new(
+                ApiErrorCode::ReaderAuthChallengeAlreadyConsumed,
+                "reader auth challenge already consumed",
+            ),
+            ApplicationError::ReaderSessionUnavailable => Self::new(
+                ApiErrorCode::ReaderSessionUnavailable,
+                "reader session unavailable",
+            ),
+            ApplicationError::ReaderSessionExpired => {
+                Self::new(ApiErrorCode::ReaderSessionExpired, "reader session expired")
+            }
+            ApplicationError::ReaderSessionInvalidated => Self::new(
+                ApiErrorCode::ReaderSessionInvalidated,
+                "reader session invalidated",
+            ),
+            ApplicationError::ReaderSessionRenewalConflict => Self::new(
+                ApiErrorCode::ReaderSessionRenewalConflict,
+                "reader session renewal conflict",
+            ),
+            ApplicationError::ReaderAuthPopVerificationFailed { .. } => Self::new(
+                ApiErrorCode::ReaderAuthPopVerificationFailed,
+                "reader auth verification failed",
+            ),
+            ApplicationError::ReaderIdentityConflict => Self::new(
+                ApiErrorCode::ReaderIdentityConflict,
+                "reader identity conflict",
+            ),
             ApplicationError::Storage { .. }
             | ApplicationError::VerificationDependencyUnavailable
             | ApplicationError::FinalCredentialSecret { .. }

@@ -14,7 +14,7 @@ use locks_core::ids::{
 use locks_core::lock_policy::{
     AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, ContentLockPayload, ContentLockV2, Criterion,
     GraphParticipantV2, GraphPolicyV2, GraphPredicateV2, GuardedResource, LockLogic,
-    LockServerConfig, VerifierType,
+    LockServerConfig, PaymentPolicyV2, VerifierType,
 };
 use locks_core::verification::{
     CriterionVerificationResult, EntitlementLifetime, SatisfiedByV2,
@@ -44,11 +44,80 @@ use crate::infrastructure::memory::entitlements::InMemoryEntitlementRepository;
 const BUNDLE_ID: &str = "000G40R40M30E209185GR38E1W";
 
 #[tokio::test]
+async fn authenticated_reader_claims_and_replays_final_credential_after_live_lock_is_tombstoned() {
+    let entitlements = FakeEntitlements::new(None);
+    let content_locks = FakeContentLocks::new(None);
+    let store = FakeAccessCredentialStore::with_final_credential();
+    let generator = FakeGenerator::sequence([
+        AccessCredential::new("final-reader-bearer"),
+        AccessCredential::new("different-replay-candidate"),
+    ]);
+    let clock = FakeClock::new(datetime!(2026-05-29 12:00:00 UTC));
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+    let request = || IssueAccessCredentialRequest {
+        creator: creator(),
+        bundle_id: bundle_id(),
+    };
+
+    let issued = use_case
+        .execute_authenticated(request(), Some(other_creator()))
+        .await
+        .expect("frozen-bound Reader should claim final credential after tombstone");
+    let replayed = use_case
+        .execute_authenticated(request(), Some(other_creator()))
+        .await
+        .expect("frozen-bound Reader should replay final credential after tombstone");
+
+    assert_eq!(issued.credential.as_str(), "final-reader-bearer");
+    assert_eq!(replayed, issued);
+    assert_eq!(generator.generate_count(), 2);
+}
+
+#[tokio::test]
+async fn different_reader_cannot_claim_frozen_final_credential_after_tombstone() {
+    let entitlements = FakeEntitlements::new(None);
+    let content_locks = FakeContentLocks::new(None);
+    let store = FakeAccessCredentialStore::with_final_credential();
+    let generator = FakeGenerator::new(AccessCredential::new("must-not-issue"));
+    let clock = FakeClock::new(datetime!(2026-05-29 12:00:00 UTC));
+    let use_case = IssueAccessCredentialUseCase::new(
+        &entitlements,
+        &content_locks,
+        &store,
+        &generator,
+        &clock,
+        AccessCredentialPolicy::new(3600),
+    );
+
+    let denied = use_case
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: creator(),
+                bundle_id: bundle_id(),
+            },
+            Some(creator()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(denied, ApplicationError::EntitlementNotFound));
+}
+
+#[tokio::test]
 async fn final_credential_winner_uses_fresh_time_after_generation() {
     let before_generation = datetime!(2026-05-29 12:00:00 UTC);
     let after_generation = datetime!(2026-05-29 12:00:01 UTC);
-    let entitlements = FakeEntitlements::new(None);
-    let content_locks = FakeContentLocks::new(None);
+    let content_lock = content_lock_fixture(900);
+    let entitlement = verified_proof_bundle_fixture(&content_lock);
+    let entitlements = FakeEntitlements::new(Some(entitlement));
+    let content_locks = FakeContentLocks::new(Some(content_lock));
     let store = FakeAccessCredentialStore::with_final_credential();
     let generator = FakeGenerator::new(AccessCredential::new("final-bearer"));
     let clock = SequenceClock::new([before_generation, after_generation]);
@@ -112,7 +181,7 @@ async fn issue_access_credential_rechecks_entitlement_and_stores_lookup_key() {
 }
 
 #[tokio::test]
-async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
+async fn issue_access_credential_requires_reader_for_mixed_payment_satisfaction() {
     let content_lock = ContentLockV2 {
         version: 2,
         creator: creator(),
@@ -126,7 +195,12 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
             .unwrap(),
         ),
         secondary_resources: BTreeMap::new(),
-        payment: None,
+        payment: Some(PaymentPolicyV2 {
+            recipient_pubky: creator(),
+            amount: "1000".to_owned(),
+            asset: "BTC".to_owned(),
+            minimum_confirmations: 1,
+        }),
         graph: Some(GraphPolicyV2 {
             predicates: vec![GraphPredicateV2::Follows {
                 follower: GraphParticipantV2::Reader,
@@ -158,7 +232,7 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
             bundle_id: bundle_id(),
             pubky_lock_resource: resource,
             verified_at: datetime!(2026-05-29 12:00:00 UTC),
-            satisfied_by: vec![SatisfiedByV2::Graph],
+            satisfied_by: vec![SatisfiedByV2::Payment],
         })
         .await
         .unwrap();
@@ -174,11 +248,23 @@ async fn issue_access_credential_accepts_current_graph_v2_entitlement() {
         AccessCredentialPolicy::new(3600),
     );
 
-    let issued = use_case
+    let unauthorized = use_case
         .execute(IssueAccessCredentialRequest {
             creator: creator(),
             bundle_id: bundle_id(),
         })
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized, ApplicationError::ReaderSessionUnavailable);
+
+    let issued = use_case
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: creator(),
+                bundle_id: bundle_id(),
+            },
+            Some(other_creator()),
+        )
         .await
         .unwrap();
 
@@ -673,6 +759,8 @@ struct FakeAccessCredentialStore {
     record: Mutex<Option<(AccessCredentialLookupKey, AccessCredentialRecord)>>,
     deleted: Mutex<Option<AccessCredentialLookupKey>>,
     final_available: bool,
+    final_reader: Option<CreatorPubky>,
+    final_winner: Mutex<Option<IssuedDeletionCredential>>,
     final_issue_time: Mutex<Option<OffsetDateTime>>,
 }
 
@@ -682,6 +770,8 @@ impl FakeAccessCredentialStore {
             record: Mutex::new(Some((lookup_key, record))),
             deleted: Mutex::new(None),
             final_available: false,
+            final_reader: None,
+            final_winner: Mutex::new(None),
             final_issue_time: Mutex::new(None),
         }
     }
@@ -689,6 +779,7 @@ impl FakeAccessCredentialStore {
     fn with_final_credential() -> Self {
         Self {
             final_available: true,
+            final_reader: Some(other_creator()),
             ..Self::default()
         }
     }
@@ -757,14 +848,24 @@ impl AccessCredentialStore for FakeAccessCredentialStore {
         &self,
         _creator: &CreatorPubky,
         _bundle_id: &BundleId,
+        reader: Option<&CreatorPubky>,
         now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
+        if reader.is_some() && reader != self.final_reader.as_ref() {
+            return Ok(None);
+        }
         *self.final_issue_time.lock().unwrap() = Some(now);
-        Ok(Some(IssuedDeletionCredential {
+        let mut winner = self.final_winner.lock().unwrap();
+        if let Some(existing) = winner.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+        let issued = IssuedDeletionCredential {
             credential: candidate,
             expires_at: now + time::Duration::minutes(1),
-        }))
+        };
+        *winner = Some(issued.clone());
+        Ok(Some(issued))
     }
 
     async fn finish_ordinary_credential_lookup(
@@ -790,6 +891,7 @@ impl AccessCredentialStore for FakeAccessCredentialStore {
 
 struct FakeGenerator {
     credential: AccessCredential,
+    sequence: Mutex<Option<VecDeque<AccessCredential>>>,
     generate_count: Mutex<usize>,
 }
 
@@ -797,6 +899,20 @@ impl FakeGenerator {
     fn new(credential: AccessCredential) -> Self {
         Self {
             credential,
+            sequence: Mutex::new(None),
+            generate_count: Mutex::new(0),
+        }
+    }
+
+    fn sequence(credentials: impl IntoIterator<Item = AccessCredential>) -> Self {
+        let credentials: VecDeque<_> = credentials.into_iter().collect();
+        let credential = credentials
+            .front()
+            .cloned()
+            .expect("credential sequence must not be empty");
+        Self {
+            credential,
+            sequence: Mutex::new(Some(credentials)),
             generate_count: Mutex::new(0),
         }
     }
@@ -810,7 +926,17 @@ impl FakeGenerator {
 impl AccessCredentialGenerator for FakeGenerator {
     async fn generate_access_credential(&self) -> Result<AccessCredential, ApplicationError> {
         *self.generate_count.lock().unwrap() += 1;
-        Ok(self.credential.clone())
+        Ok(self
+            .sequence
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|credentials| {
+                credentials
+                    .pop_front()
+                    .expect("credential sequence exhausted")
+            })
+            .unwrap_or_else(|| self.credential.clone()))
     }
 }
 

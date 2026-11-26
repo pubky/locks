@@ -50,6 +50,10 @@ impl TestDatabase {
         &self.schema_name
     }
 
+    pub(crate) async fn independent_pool(&self) -> PgPool {
+        isolated_schema_pool(&test_database_url(), &self.schema_name).await
+    }
+
     pub(crate) async fn cleanup(self) {
         self.pool.close().await;
         let mut admin_connection = PgConnection::connect(&test_database_url())

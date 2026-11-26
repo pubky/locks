@@ -444,6 +444,7 @@ mod tests {
                 environment: RuntimeEnvironment::Development,
             },
             creator_authority_acquisition: CreatorAuthorityAcquisitionConfig::default(),
+            reader_auth: crate::config::ReaderAuthConfig::default(),
             secrets: SecretsConfig::default(),
             logging: LoggingConfig::default(),
             pubky: PubkyConfig::default(),

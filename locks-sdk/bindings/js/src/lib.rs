@@ -17,4 +17,4 @@ pub use locks::{
     ConnectCallback, ConnectUrlOptions, ExchangeFrontendSessionCodeOptions, Locks, LocksOptions,
 };
 pub use session::Session;
-pub use viewer::{BundleId, VerificationTaskHandleOptions, Viewer};
+pub use viewer::{BundleId, ReaderSession, VerificationTaskHandleOptions, Viewer};

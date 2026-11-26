@@ -65,11 +65,21 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
         &self,
         request: IssueAccessCredentialRequest,
     ) -> Result<IssuedAccessCredential, ApplicationError> {
+        self.execute_authenticated(request, None).await
+    }
+
+    /// Executes with Reader identity derived from a live Locks-local session.
+    pub async fn execute_authenticated(
+        &self,
+        request: IssueAccessCredentialRequest,
+        authenticated_reader: Option<CreatorPubky>,
+    ) -> Result<IssuedAccessCredential, ApplicationError> {
         let now = self.clock.now();
-        if self
-            .credential_store
-            .final_credential_available(&request.creator, &request.bundle_id, now)
-            .await?
+        if let Some(reader) = authenticated_reader.as_ref()
+            && self
+                .credential_store
+                .final_credential_available(&request.creator, &request.bundle_id, now)
+                .await?
         {
             let candidate = self
                 .credential_generator
@@ -81,6 +91,7 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
                 .issue_or_replay_final_credential(
                     &request.creator,
                     &request.bundle_id,
+                    Some(reader),
                     final_issue_now,
                     candidate,
                 )
@@ -99,7 +110,38 @@ impl<'a> IssueAccessCredentialUseCase<'a> {
             &request.bundle_id,
         )
         .await?;
-
+        if let Some(required_reader) = &valid_entitlement.required_reader
+            && authenticated_reader.as_ref() != Some(required_reader)
+        {
+            return Err(ApplicationError::ReaderSessionUnavailable);
+        }
+        if self
+            .credential_store
+            .final_credential_available(&request.creator, &request.bundle_id, now)
+            .await?
+        {
+            let candidate = self
+                .credential_generator
+                .generate_access_credential()
+                .await?;
+            let final_issue_now = self.clock.now();
+            if let Some(final_credential) = self
+                .credential_store
+                .issue_or_replay_final_credential(
+                    &request.creator,
+                    &request.bundle_id,
+                    authenticated_reader.as_ref(),
+                    final_issue_now,
+                    candidate,
+                )
+                .await?
+            {
+                return Ok(IssuedAccessCredential {
+                    credential: final_credential.credential,
+                    expires_at: final_credential.expires_at,
+                });
+            }
+        }
         let requested_ttl_seconds = self
             .policy
             .validate_requested_ttl_seconds(valid_entitlement.requested_credential_ttl_seconds())?;

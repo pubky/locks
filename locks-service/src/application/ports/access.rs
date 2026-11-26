@@ -86,6 +86,7 @@ pub trait AccessCredentialStore: Send + Sync {
         &self,
         _creator: &CreatorPubky,
         _bundle_id: &BundleId,
+        _reader: Option<&CreatorPubky>,
         _now: OffsetDateTime,
         _candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {

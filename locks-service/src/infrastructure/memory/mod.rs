@@ -13,6 +13,7 @@ pub mod lock_service_pointers;
 pub mod mixed_tasks;
 pub mod payment_tasks;
 pub mod public_content_locks;
+pub mod reader_auth;
 pub mod verification_task_claims;
 pub mod verification_task_deletion_fence;
 pub mod verification_tasks;

@@ -1908,6 +1908,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "locks-core",
+ "locks-sdk",
  "locks-service",
  "mime",
  "percent-encoding",

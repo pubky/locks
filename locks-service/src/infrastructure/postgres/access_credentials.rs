@@ -401,6 +401,7 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
         &self,
         creator: &CreatorPubky,
         bundle_id: &BundleId,
+        reader: Option<&CreatorPubky>,
         _caller_now: OffsetDateTime,
         candidate: AccessCredential,
     ) -> Result<Option<IssuedDeletionCredential>, ApplicationError> {
@@ -424,11 +425,16 @@ impl AccessCredentialStore for PostgresAccessCredentialStore {
                      AND snapshot.bundle_id = $2
                      AND snapshot.resolved_status = 'completed'
                      AND snapshot.final_credential_eligible_at IS NOT NULL
+                     AND ($3::text IS NULL OR (
+                         snapshot.obligation_kind = 'provider_v2'
+                         AND snapshot.evaluator_snapshot_at_cutoff->>'reader' = $3
+                     ))
                )
              FOR UPDATE OF job",
         )
         .bind(creator.to_string())
         .bind(bundle_id.to_string())
+        .bind(reader.map(ToString::to_string))
         .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -1721,6 +1727,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &creator,
                     &bundle_id,
+                    None,
                     caller_now,
                     AccessCredential::new("must-not-persist-after-public-lock-wait"),
                 )

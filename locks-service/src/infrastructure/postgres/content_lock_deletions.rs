@@ -4702,6 +4702,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("first-final-bearer"),
             )
@@ -4712,6 +4713,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at + time::Duration::seconds(1),
                 AccessCredential::new("different-retry-candidate"),
             )
@@ -4725,6 +4727,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline + time::Duration::seconds(1),
                 AccessCredential::new("candidate-after-issuance-deadline"),
             )
@@ -5375,12 +5378,14 @@ mod tests {
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("concurrent-final-one"),
             ),
             access.issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("concurrent-final-two"),
             ),
@@ -5429,6 +5434,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &job.creator,
                     &task.submitted_proof_bundle.bundle_id,
+                    None,
                     NOW,
                     AccessCredential::new("malformed-frozen-manifest"),
                 )
@@ -5448,6 +5454,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("final-before-force"),
             )
@@ -5527,6 +5534,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &issuing_creator,
                     &issuing_bundle,
+                    None,
                     final_access_started_at,
                     AccessCredential::new("must-not-escape-force"),
                 )
@@ -5583,6 +5591,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("phase-obligation-final"),
             )
@@ -6157,6 +6166,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("expires-with-final-read-window"),
             )
@@ -6546,6 +6556,32 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
+        sqlx::query(
+            "INSERT INTO folded_auth_attempts
+                 (creator, bundle_id, generation, state_hash, status,
+                  submitted_proof_bundle, pubky_lock_resource, lock_hash,
+                  verification_window_seconds, graph_policy, evaluator_mode, created_at, expires_at,
+                  terminal_at, purge_after)
+             VALUES ($1, 'purge-folded-auth', 1, $2, 'expired', '{}'::jsonb,
+                     'replacement-resource', $3, 60, '{}'::jsonb, 'graph', $4,
+                     $4 + INTERVAL '10 minutes', $4, $4 + INTERVAL '1 hour')",
+        )
+        .bind(job.creator.to_string())
+        .bind(vec![27_u8; 32])
+        .bind(vec![28_u8; 32])
+        .bind(NOW)
+        .execute(database.pool())
+        .await
+        .expect("graceful cleanup must allow creator/bundle folded handle reuse");
+        let replacement_handle_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM folded_auth_attempts
+             WHERE creator = $1 AND bundle_id = 'purge-folded-auth'",
+        )
+        .bind(job.creator.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(replacement_handle_count, 1);
         let replacement_lock = LockId::from_hash(LockHash::from_bytes([99; 32]));
         ownership
             .reserve_paths(&job.creator, &owned_paths, &replacement_lock)
@@ -6598,6 +6634,7 @@ mod tests {
                 .issue_or_replay_final_credential(
                     &job.creator,
                     &task.submitted_proof_bundle.bundle_id,
+                    None,
                     issuance_deadline,
                     AccessCredential::new("must-not-insert-at-deadline"),
                 )
@@ -6629,6 +6666,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline - time::Duration::seconds(1),
                 AccessCredential::new("persisted-before-transition"),
             )
@@ -6665,6 +6703,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 issuance_deadline + time::Duration::seconds(1),
                 AccessCredential::new("must-not-replace-persisted-winner"),
             )
@@ -6685,6 +6724,7 @@ mod tests {
             .issue_or_replay_final_credential(
                 &job.creator,
                 &task.submitted_proof_bundle.bundle_id,
+                None,
                 final_access_started_at,
                 AccessCredential::new("fixed-storage-lease"),
             )

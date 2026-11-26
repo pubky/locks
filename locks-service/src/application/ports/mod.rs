@@ -16,6 +16,7 @@ mod mixed_tasks;
 mod payment_drain;
 mod payment_drain_repository;
 mod payment_tasks;
+mod reader_auth;
 mod runtime;
 mod verification;
 
@@ -35,6 +36,7 @@ pub use mixed_tasks::*;
 pub use payment_drain::*;
 pub use payment_drain_repository::*;
 pub use payment_tasks::*;
+pub use reader_auth::*;
 pub use runtime::*;
 pub use verification::*;
 

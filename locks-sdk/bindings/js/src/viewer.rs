@@ -112,6 +112,194 @@ pub(crate) struct JsPreparedViewerRequest {
 }
 
 #[wasm_bindgen]
+#[derive(Clone)]
+pub struct ReaderSession {
+    client: locks_sdk::LocksClient,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    options: LocksOptions,
+    token: locks_sdk::ReaderSessionToken,
+}
+
+impl std::fmt::Debug for ReaderSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReaderSession")
+            .field("lock_server", &self.client.lock_server())
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[wasm_bindgen]
+impl ReaderSession {
+    #[wasm_bindgen(js_name = exportSecret)]
+    pub fn export_secret(&self) -> String {
+        self.token.export_secret().to_owned()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn rotate(
+        &self,
+        challenge_id: String,
+        credentials: wasm_bindgen::JsValue,
+    ) -> JsResult<ReaderSession> {
+        self.create_or_rotate(challenge_id, credentials, true).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn signout(&self) -> JsResult<()> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .request_plan(
+                locks_sdk::ViewerLocks::new()
+                    .reader_session(self.token.clone())
+                    .delete_current(),
+            )
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let response = fetch_viewer(&request).await?;
+        if response.ok() {
+            Ok(())
+        } else {
+            Err(invalid_input(format!(
+                "Lock Server reader session request failed with HTTP {}",
+                response.status()
+            )))
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = submitGraphProofBundle)]
+    pub async fn submit_graph_proof_bundle(
+        &self,
+        submitted_proof_bundle: wasm_bindgen::JsValue,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let value: Value = serde_wasm_bindgen::from_value(submitted_proof_bundle)
+            .map_err(|err| invalid_input(format!("invalid graph proof bundle: {err}")))?;
+        let bundle: locks_core::verification::SubmittedProofBundleV2 =
+            serde_json::from_value(value)
+                .map_err(|err| invalid_input(format!("invalid graph proof bundle: {err}")))?;
+        let request = locks_sdk::ViewerLocks::new()
+            .reader_session(self.token.clone())
+            .submit_graph_proof_bundle(bundle);
+        let prepared = self.prepare_protected(request).await?;
+        fetch_graph_or_mixed_submit_json(&prepared).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = submitMixedProofBundle)]
+    pub async fn submit_mixed_proof_bundle(
+        &self,
+        submitted_proof_bundle: wasm_bindgen::JsValue,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let value: Value = serde_wasm_bindgen::from_value(submitted_proof_bundle)
+            .map_err(|err| invalid_input(format!("invalid mixed proof bundle: {err}")))?;
+        let bundle: locks_core::verification::SubmittedProofBundleV2 =
+            serde_json::from_value(value)
+                .map_err(|err| invalid_input(format!("invalid mixed proof bundle: {err}")))?;
+        if bundle.reader_pubky.is_some() {
+            return Err(invalid_input("mixed proof bundle must omit reader_pubky"));
+        }
+        let request = locks_sdk::ViewerLocks::new()
+            .reader_session(self.token.clone())
+            .submit_mixed_proof_bundle(bundle);
+        let prepared = self.prepare_protected(request).await?;
+        fetch_mixed_submit_json(&prepared).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = issueAccessCredential)]
+    pub async fn issue_access_credential(
+        &self,
+        options: &VerificationTaskHandleOptions,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let handle = parse_handle_options(options).map_err(invalid_input)?;
+        let request = locks_sdk::ViewerLocks::new()
+            .reader_session(self.token.clone())
+            .issue_access_credential(handle);
+        let prepared = self.prepare_protected(request).await?;
+        fetch_viewer_access_credential_json(&prepared).await
+    }
+}
+
+impl ReaderSession {
+    fn new(
+        client: locks_sdk::LocksClient,
+        options: LocksOptions,
+        token: locks_sdk::ReaderSessionToken,
+    ) -> Self {
+        Self {
+            client,
+            options,
+            token,
+        }
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
+    fn request_plan(&self, request: locks_sdk::SdkViewerRequest) -> JsViewerRequestPlan {
+        JsViewerRequestPlan {
+            method: request.method,
+            path: request.path.clone(),
+            url: self
+                .client
+                .transport_url(&request.path)
+                .expect("binding reader request path is valid"),
+            authorization: request.authorization,
+            body: request.body,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn create_or_rotate(
+        &self,
+        challenge_id: String,
+        credentials: wasm_bindgen::JsValue,
+        rotate: bool,
+    ) -> JsResult<ReaderSession> {
+        let credentials = parse_reader_credentials(credentials)?;
+        let request = locks_sdk::ViewerLocks::new().create_reader_session(
+            locks_sdk::CreateReaderSessionRequest {
+                challenge_id,
+                credentials,
+                existing_session: rotate.then(|| self.token.clone()),
+            },
+        );
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let prepared = self
+            .request_plan(request)
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let value = fetch_viewer_json_value(&prepared).await?;
+        let response = locks_sdk::ViewerLocks::parse_reader_session_response(value)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        Ok(Self::new(
+            self.client.clone(),
+            self.options.clone(),
+            response.session_token,
+        ))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn prepare_protected(
+        &self,
+        request: locks_sdk::SdkViewerRequest,
+    ) -> JsResult<JsPreparedViewerRequest> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let prepared = self
+            .request_plan(request)
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        Ok(prepared)
+    }
+}
+
+#[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct Viewer {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -122,8 +310,66 @@ pub struct Viewer {
     inner: locks_sdk::ViewerLocks,
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn reader_auth_challenge_json(challenge: locks_sdk::ReaderAuthChallengeResponse) -> Value {
+    serde_json::json!({
+        "challenge_id": challenge.challenge_id,
+        "challenge": challenge.challenge,
+        "lock_server_pubky": challenge.lock_server_pubky,
+        "lock_server_origin": challenge.lock_server_origin,
+        "purpose": challenge.purpose,
+        "expires_at": challenge.expires_at.to_string()
+    })
+}
+
 #[wasm_bindgen]
 impl Viewer {
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = createReaderAuthChallenge)]
+    pub async fn create_reader_auth_challenge(&self) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .request_plan(self.inner.create_reader_auth_challenge())
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let value = fetch_viewer_json_value(&request).await?;
+        let challenge = locks_sdk::ViewerLocks::parse_reader_auth_challenge_response(
+            value,
+            self.client.lock_server(),
+        )
+        .map_err(|err| invalid_input(err.to_string()))?;
+        to_plain_js_value(&reader_auth_challenge_json(challenge))
+            .map_err(|err| invalid_input(format!("failed to encode reader challenge: {err:?}")))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = createReaderSession)]
+    pub async fn create_reader_session(
+        &self,
+        challenge_id: String,
+        credentials: wasm_bindgen::JsValue,
+    ) -> JsResult<ReaderSession> {
+        let session = ReaderSession::new(
+            self.client.clone(),
+            self.options.clone(),
+            locks_sdk::ReaderSessionToken::new(""),
+        );
+        session
+            .create_or_rotate(challenge_id, credentials, false)
+            .await
+    }
+
+    #[wasm_bindgen(js_name = restoreReaderSession)]
+    pub fn restore_reader_session(&self, session_token: String) -> ReaderSession {
+        ReaderSession::new(
+            self.client.clone(),
+            self.options.clone(),
+            locks_sdk::ReaderSessionToken::new(session_token),
+        )
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_name = submitProofBundle)]
     pub async fn submit_proof_bundle(
@@ -310,6 +556,24 @@ impl Viewer {
             .map_err(|err| invalid_input(err.to_string()))?;
         let request = self
             .build_issue_access_credential_request(options)
+            .map_err(invalid_input)?
+            .prepare_with_pkarr_resolver(&resolver, None)
+            .await
+            .map_err(|err| invalid_input(err.to_string()))?;
+        fetch_viewer_access_credential_json(&request).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = issueAccessCredentialWithFoldedAuth)]
+    pub async fn issue_access_credential_with_folded_auth(
+        &self,
+        options: &VerificationTaskHandleOptions,
+        state: String,
+    ) -> JsResult<wasm_bindgen::JsValue> {
+        let resolver = BrowserPkarrResolver::new_with_options(&self.options)
+            .map_err(|err| invalid_input(err.to_string()))?;
+        let request = self
+            .build_folded_auth_access_credential_request(options, &state)
             .map_err(invalid_input)?
             .prepare_with_pkarr_resolver(&resolver, None)
             .await
@@ -507,6 +771,23 @@ impl Viewer {
     }
 
     #[cfg(any(test, target_arch = "wasm32"))]
+    pub(crate) fn build_folded_auth_access_credential_request(
+        &self,
+        options: &VerificationTaskHandleOptions,
+        state: &str,
+    ) -> Result<JsViewerRequestPlan, String> {
+        if state.is_empty() {
+            return Err("folded auth state must not be empty".to_owned());
+        }
+        Ok(
+            self.request_plan(self.inner.issue_access_credential_with_folded_auth(
+                parse_handle_options(options)?,
+                &locks_sdk::FoldedAuthStatusRequest::new(state),
+            )),
+        )
+    }
+
+    #[cfg(any(test, target_arch = "wasm32"))]
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn build_complete_verification_task_request(
         &self,
@@ -544,6 +825,25 @@ fn parse_handle_options(
         bundle_id: locks_core::ids::BundleId::from_str(&options.bundle_id)
             .map_err(|err| format!("invalid bundle id: {err}"))?,
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_reader_credentials(
+    credentials: wasm_bindgen::JsValue,
+) -> JsResult<locks_sdk::ReaderSessionCredentials> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Credentials {
+        grant: String,
+        pop: String,
+    }
+
+    let credentials: Credentials = serde_wasm_bindgen::from_value(credentials)
+        .map_err(|err| invalid_input(format!("invalid reader credentials: {err}")))?;
+    Ok(locks_sdk::ReaderSessionCredentials::new(
+        credentials.grant,
+        credentials.pop,
+    ))
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -919,6 +1219,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn reader_auth_challenge_projection_preserves_exact_origin_for_wallet_pop() {
+        let lock_server = locks_core::ids::LockServerPubky::from_str(
+            "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+        )
+        .unwrap();
+        let challenge = locks_sdk::ViewerLocks::parse_reader_auth_challenge_response(
+            json!({
+                "challenge_id": "challenge-1",
+                "challenge": "challenge-secret",
+                "lock_server_pubky": lock_server,
+                "lock_server_origin": "https://locks.example",
+                "purpose": "reader-session-v1",
+                "expires_at": "2026-11-23T12:05:00Z"
+            }),
+            &lock_server,
+        )
+        .unwrap();
+
+        let projected = reader_auth_challenge_json(challenge);
+        assert_eq!(
+            projected["lock_server_origin"],
+            json!("https://locks.example")
+        );
+        let wallet_pop_data = json!({
+            "challenge": projected["challenge"],
+            "lock_server_pubky": projected["lock_server_pubky"],
+            "lock_server_origin": projected["lock_server_origin"],
+            "purpose": projected["purpose"],
+        });
+        assert_eq!(
+            wallet_pop_data["lock_server_origin"],
+            json!("https://locks.example")
+        );
+    }
+
     fn handle_options() -> VerificationTaskHandleOptions {
         VerificationTaskHandleOptions::new(CREATOR.to_owned(), BUNDLE_ID.to_owned()).unwrap()
     }
@@ -996,6 +1332,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn reader_session_binding_keeps_reader_bearer_in_protected_request_only() {
+        let session = ReaderSession::new(
+            test_viewer().client,
+            LocksOptions::new(),
+            locks_sdk::ReaderSessionToken::new("reader-session-secret"),
+        );
+        let request = locks_sdk::ViewerLocks::new()
+            .reader_session(locks_sdk::ReaderSessionToken::new("reader-session-secret"))
+            .issue_access_credential(parse_handle_options(&handle_options()).unwrap());
+        let plan = session.request_plan(request);
+
+        assert_eq!(plan.path, "/access-credentials");
+        assert_eq!(
+            plan.authorization.as_deref(),
+            Some("Bearer reader-session-secret")
+        );
+        assert!(!format!("{session:?}").contains("reader-session-secret"));
+    }
+
+    #[test]
+    fn folded_auth_credential_request_keeps_state_capability_in_authorization_only() {
+        let viewer = test_viewer();
+        let request = viewer
+            .build_folded_auth_access_credential_request(&handle_options(), "opaque-state")
+            .unwrap();
+
+        assert_eq!(request.path, "/access-credentials");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer opaque-state")
+        );
+        assert!(!request.body.to_string().contains("opaque-state"));
     }
 
     #[test]

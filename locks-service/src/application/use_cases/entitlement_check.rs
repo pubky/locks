@@ -14,6 +14,8 @@ pub(super) struct ValidEntitlement {
     content_lock: ContentLockPayload,
     /// Canonical Lock ID verified against the entitlement path.
     pub lock_id: LockId,
+    /// Reader required for graph-containing v2 entitlements.
+    pub required_reader: Option<CreatorPubky>,
 }
 
 impl ValidEntitlement {
@@ -93,9 +95,11 @@ pub(super) async fn load_valid_entitlement(
             )?;
             validate_verified_content_lock_publication(&content_lock, &bundle)
                 .map_err(|_| ApplicationError::EntitlementNotSatisfied)?;
+            let required_reader = content_lock.graph.is_some().then_some(bundle.reader);
             Ok(ValidEntitlement {
                 content_lock: ContentLockPayload::V2(content_lock),
                 lock_id,
+                required_reader,
             })
         }
     }
@@ -120,6 +124,7 @@ async fn load_valid_v1_entitlement(
     Ok(ValidEntitlement {
         content_lock: ContentLockPayload::V1(content_lock),
         lock_id,
+        required_reader: None,
     })
 }
 

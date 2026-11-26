@@ -125,21 +125,6 @@ pub(super) async fn submit_proof_bundle(
     let request = parse_json(request)?;
     if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
         && let Some(existing) = state
-            .mixed_tasks()
-            .get_mixed_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
-            .await?
-    {
-        if existing.snapshot.as_v1().submitted_proof_bundle != *bundle {
-            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
-        }
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(accepted_mixed_status_response(existing)),
-        )
-            .into_response());
-    }
-    if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
-        && let Some(existing) = state
             .payment_tasks()
             .get_payment_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
             .await?
@@ -152,6 +137,55 @@ pub(super) async fn submit_proof_bundle(
             Json(GraphVerificationTaskLifecycleHttpResponse::from(&existing)),
         )
             .into_response());
+    }
+    if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
+        && let Some(existing) = state
+            .mixed_tasks()
+            .get_mixed_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+            .await?
+    {
+        if existing.snapshot.as_v1().submitted_proof_bundle != *bundle {
+            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
+        }
+        if let Some(session) =
+            crate::api::reader_auth::extract_optional_reader_session(&state, &headers).await?
+            && session.reader != existing.snapshot.as_v1().reader
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::ReaderSessionUnavailable,
+                "reader session unavailable",
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(accepted_mixed_status_response(existing)),
+        )
+            .into_response());
+    }
+    if let SubmittedProofBundlePayload::V2(bundle) = &request.submitted_proof_bundle
+        && let Some(existing) = state
+            .graph_tasks()
+            .get_graph_task_by_handle(bundle.pubky_lock_resource.creator(), &bundle.bundle_id)
+            .await?
+    {
+        if existing.snapshot.as_v1().pubky_lock_resource != bundle.pubky_lock_resource
+            || bundle
+                .reader_pubky
+                .as_ref()
+                .is_some_and(|reader| reader != &existing.snapshot.as_v1().reader)
+        {
+            return Err(ApiError::from(ApplicationError::VerificationTaskConflict));
+        }
+        if let Some(session) =
+            crate::api::reader_auth::extract_optional_reader_session(&state, &headers).await?
+            && session.reader != existing.snapshot.as_v1().reader
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::ReaderSessionUnavailable,
+                "reader session unavailable",
+            ));
+        }
+        return Ok((StatusCode::OK, Json(accepted_status_response(existing))).into_response());
     }
     let creator = match &request.submitted_proof_bundle {
         SubmittedProofBundlePayload::V1(bundle) => bundle.pubky_lock_resource.creator().clone(),
@@ -269,13 +303,40 @@ async fn start_v2_verification(
             )
                 .into_response())
         }
-        (Some(_), payment) => {
+        (Some(graph), payment) => {
             if payment.is_some() && state.paykit_http_client().is_none() {
                 return Err(ApiError::new(
                     ApiErrorCode::PaykitNotConfigured,
                     "paykit is not configured",
                 ));
             }
+            // Reader session binding: when a reader session bearer is present,
+            // admit the graph/mixed task directly instead of folded auth.
+            // Never downgrade an invalid bearer to anonymous.
+            let reader_session =
+                crate::api::reader_auth::extract_optional_reader_session(state, headers).await?;
+            if let Some(session) = reader_session {
+                let lock_hash = *lock
+                    .lock_hash()
+                    .map_err(|_| ApiError::new(ApiErrorCode::InvalidRequest, "invalid request"))?
+                    .as_bytes();
+                let raw_now = state.clock().now();
+                let now = raw_now
+                    .replace_nanosecond((raw_now.nanosecond() / 1_000) * 1_000)
+                    .expect("truncated nanoseconds remain valid");
+                return start_reader_session_verification(
+                    state,
+                    submitted,
+                    lock_hash,
+                    lock.verification_window_seconds,
+                    graph.clone(),
+                    payment.cloned(),
+                    session.reader,
+                    now,
+                )
+                .await;
+            }
+            // No bearer — fall through to folded auth.
             if let Some(origin) = headers.get(header::ORIGIN) {
                 let allowed = origin.to_str().ok().is_some_and(|origin| {
                     state
@@ -441,6 +502,78 @@ async fn start_folded_auth(
         }),
     )
         .into_response())
+}
+
+/// Directly admit a graph or mixed verification task authenticated by a reader session.
+#[allow(clippy::too_many_arguments)]
+async fn start_reader_session_verification(
+    state: &AppState,
+    submitted: locks_core::verification::SubmittedProofBundleV2,
+    lock_hash: [u8; 32],
+    verification_window_seconds: u64,
+    graph: locks_core::lock_policy::GraphPolicyV2,
+    payment: Option<locks_core::lock_policy::PaymentPolicyV2>,
+    reader: locks_core::ids::CreatorPubky,
+    now: time::OffsetDateTime,
+) -> Result<Response, ApiError> {
+    let task_id = state.task_ids().generate_task_id().await?;
+
+    if let Some(payment) = payment {
+        // Mixed: graph + payment.
+        if submitted.reader_pubky.is_some() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "invalid request",
+            ));
+        }
+        let snapshot = locks_service::application::models::MixedTaskSnapshotV1::new(
+            submitted,
+            lock_hash,
+            reader,
+            graph,
+            payment,
+            now,
+            verification_window_seconds,
+        )
+        .map_err(|msg| ApiError::new(ApiErrorCode::InvalidRequest, msg))?;
+        let task = MixedTaskRecord {
+            task_id,
+            snapshot: locks_service::application::models::MixedTaskSnapshot::V1(snapshot),
+            evaluator_revision: 0,
+            status: locks_service::application::models::VerificationTaskStatus::Pending,
+            terminal_reason: None,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        };
+        let task = state.mixed_tasks().insert_mixed_task(task).await?;
+        Ok((StatusCode::OK, Json(accepted_mixed_status_response(task))).into_response())
+    } else {
+        // Graph-only. V2 schema validation rejects any caller-provided Reader before this point;
+        // the validated session is the sole Reader source.
+        let snapshot = locks_service::application::models::GraphTaskSnapshotV1::new(
+            submitted.pubky_lock_resource.creator().clone(),
+            submitted.bundle_id.clone(),
+            submitted.pubky_lock_resource.clone(),
+            lock_hash,
+            reader,
+            now,
+            verification_window_seconds,
+            graph,
+        )
+        .map_err(|msg| ApiError::new(ApiErrorCode::InvalidRequest, msg))?;
+        let task = GraphTaskRecord {
+            task_id,
+            snapshot: locks_service::application::models::GraphTaskSnapshot::V1(snapshot),
+            evaluator_revision: 0,
+            status: locks_service::application::models::VerificationTaskStatus::Pending,
+            entitlement_to_publish: None,
+            entitlement_publication_token: None,
+            completed_at: None,
+        };
+        let task = state.graph_tasks().insert_graph_task(task).await?;
+        Ok((StatusCode::OK, Json(accepted_status_response(task))).into_response())
+    }
 }
 
 struct PreparedSubmission {

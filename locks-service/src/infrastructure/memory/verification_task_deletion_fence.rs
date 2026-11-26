@@ -51,10 +51,13 @@ pub(crate) type InMemoryStoredMixedTask = StoredEvaluatorTask<MixedTaskRecord>;
 
 /// Shared in-memory serialization state for all admission decisions for one content lock.
 ///
-/// When several fields are needed, acquire them in this global order:
-/// `folded_auth_reservations` -> `records` -> `payment_records` -> `mixed_records` ->
-/// `current_statuses` -> `graph_records`. Per-lock admission does not serialize
-/// operations for different locks, so reversing this order can deadlock globally.
+/// When several admission mutexes or fields are needed, acquire them in this global order:
+/// handle admission -> lock admission -> `folded_auth_reservations` ->
+/// `deactivated_folded_auth_task_ids` -> `records` -> `payment_records` -> `mixed_records` ->
+/// `current_statuses` -> `graph_records`. Callers may hold admission guards across awaits, so no
+/// path may acquire handle admission while holding lock admission. Per-lock admission does not
+/// serialize operations for different locks, so reversing the data-guard order can also deadlock
+/// globally.
 pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) records: RwLock<HashMap<TaskId, InMemoryVerificationTaskFenceRecord>>,
     pub(crate) graph_records: RwLock<Vec<InMemoryStoredGraphTask>>,
@@ -63,6 +66,7 @@ pub struct InMemoryVerificationTaskDeletionFence {
     pub(crate) current_statuses: RwLock<HashMap<TaskId, VerificationTaskStatus>>,
     pub(crate) deletion_cutoffs: RwLock<HashSet<LockKey>>,
     pub(crate) folded_auth_reservations: RwLock<HashSet<HandleKey>>,
+    pub(crate) deactivated_folded_auth_task_ids: RwLock<HashSet<TaskId>>,
     lock_admissions: Mutex<HashMap<LockKey, Arc<Mutex<()>>>>,
     handle_admissions: Mutex<HashMap<HandleKey, Arc<Mutex<()>>>>,
     clock: Arc<dyn Clock>,
@@ -79,6 +83,10 @@ impl fmt::Debug for InMemoryVerificationTaskDeletionFence {
             .field("current_statuses", &self.current_statuses)
             .field("deletion_cutoffs", &self.deletion_cutoffs)
             .field("folded_auth_reservations", &self.folded_auth_reservations)
+            .field(
+                "deactivated_folded_auth_task_ids",
+                &self.deactivated_folded_auth_task_ids,
+            )
             .field("lock_admissions", &self.lock_admissions)
             .field("handle_admissions", &self.handle_admissions)
             .field("clock", &"<clock>")
@@ -106,6 +114,7 @@ impl InMemoryVerificationTaskDeletionFence {
             current_statuses: RwLock::new(HashMap::new()),
             deletion_cutoffs: RwLock::new(HashSet::new()),
             folded_auth_reservations: RwLock::new(HashSet::new()),
+            deactivated_folded_auth_task_ids: RwLock::new(HashSet::new()),
             lock_admissions: Mutex::new(HashMap::new()),
             handle_admissions: Mutex::new(HashMap::new()),
             clock,

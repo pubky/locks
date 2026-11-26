@@ -3,7 +3,10 @@ use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use locks_service::application::models::AccessCredential;
+use locks_core::ids::{BundleId, CreatorPubky, TaskId};
+use locks_service::application::models::{
+    AccessCredential, FoldedAuthStateHash, READER_SESSION_IDLE_TTL_SECONDS, ReaderSessionTokenHash,
+};
 use locks_service::application::use_cases::issue_access_credential::{
     IssueAccessCredentialRequest, IssueAccessCredentialUseCase,
 };
@@ -18,9 +21,12 @@ use crate::app_state::AppState;
 
 pub(super) async fn issue_access_credential(
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
     request: Result<Json<IssueAccessCredentialHttpRequest>, JsonRejection>,
 ) -> Result<Json<IssueAccessCredentialHttpResponse>, ApiError> {
     let request = parse_json(request)?;
+    let authenticated_reader =
+        authenticate_access_reader(&state, &headers, &request.creator, &request.bundle_id).await?;
     let use_case = IssueAccessCredentialUseCase::new(
         state.entitlements().as_ref(),
         state.content_locks().as_ref(),
@@ -30,13 +36,93 @@ pub(super) async fn issue_access_credential(
         state.access_credential_policy(),
     );
     let issued = use_case
-        .execute(IssueAccessCredentialRequest {
-            creator: request.creator,
-            bundle_id: request.bundle_id,
-        })
+        .execute_authenticated(
+            IssueAccessCredentialRequest {
+                creator: request.creator,
+                bundle_id: request.bundle_id,
+            },
+            authenticated_reader,
+        )
         .await?;
 
     Ok(Json(IssueAccessCredentialHttpResponse::from(issued)))
+}
+
+async fn authenticate_access_reader(
+    state: &AppState,
+    headers: &HeaderMap,
+    creator: &CreatorPubky,
+    bundle_id: &BundleId,
+) -> Result<Option<CreatorPubky>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            ApiErrorCode::ReaderSessionUnavailable,
+            "reader session unavailable",
+        )
+    };
+    let bearer = crate::api::auth::parse_viewer_access_bearer(headers, invalid)?;
+    let Some(bearer) = bearer else {
+        return Ok(None);
+    };
+    if let crate::api::auth::ViewerAccessBearer::Reader(token) = bearer {
+        let reader_origin = crate::api::reader_auth::extract_allowed_reader_origin(state, headers)?;
+        let session = state
+            .reader_auth()
+            .ok_or_else(&invalid)?
+            .validate_and_touch(
+                &ReaderSessionTokenHash::derive(&token),
+                &reader_origin,
+                READER_SESSION_IDLE_TTL_SECONDS,
+            )
+            .await?
+            .ok_or_else(invalid)?;
+        return Ok(Some(session.reader));
+    }
+
+    let crate::api::auth::ViewerAccessBearer::Folded(bearer) = bearer else {
+        unreachable!("Reader bearer returned above")
+    };
+
+    let attempt = state
+        .folded_auth()
+        .ok_or_else(invalid)?
+        .get_retained_accepted_by_state_hash_and_handle(
+            &FoldedAuthStateHash::derive(bearer.as_bytes()),
+            creator,
+            bundle_id,
+        )
+        .await?
+        .ok_or_else(invalid)?;
+    debug_assert_eq!(&attempt.creator, creator);
+
+    if let Some(task) = state
+        .mixed_tasks()
+        .get_mixed_task_by_handle(creator, bundle_id)
+        .await?
+    {
+        if folded_attempt_authorizes_task(attempt.task_id, &task.task_id) {
+            return Ok(Some(task.snapshot.as_v1().reader.clone()));
+        }
+        return Err(invalid());
+    }
+    if let Some(task) = state
+        .graph_tasks()
+        .get_graph_task_by_handle(creator, bundle_id)
+        .await?
+    {
+        if folded_attempt_authorizes_task(attempt.task_id, &task.task_id) {
+            return Ok(Some(task.snapshot.as_v1().reader.clone()));
+        }
+        return Err(invalid());
+    }
+    Err(invalid())
+}
+
+fn folded_attempt_authorizes_task(
+    accepted_task_id: Option<TaskId>,
+    current_task_id: &TaskId,
+) -> bool {
+    accepted_task_id.as_ref() == Some(current_task_id)
 }
 
 pub(super) async fn proxy_read_guarded_resource(
@@ -147,4 +233,23 @@ fn parse_bearer_credential(headers: &HeaderMap) -> Result<AccessCredential, ApiE
         return Err(invalid());
     }
     Ok(AccessCredential::new(token.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn folded_attempt_must_bind_to_exact_current_task() {
+        let accepted = TaskId::from_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let replacement = TaskId::from_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+
+        assert!(folded_attempt_authorizes_task(Some(accepted), &accepted));
+        assert!(!folded_attempt_authorizes_task(
+            Some(accepted),
+            &replacement
+        ));
+        assert!(!folded_attempt_authorizes_task(None, &accepted));
+    }
 }
