@@ -1111,6 +1111,7 @@ async fn deletion_first_proof_submission_returns_409_without_calling_paykit() {
     config.paykit = Some(PaykitConfig {
         server_url: paykit_url,
         minimum_confirmations: 0,
+        creator_server_urls: Default::default(),
     });
     let state = AppState::new_with_postgres_runtime_and_creator_repositories(
         config,
@@ -1207,6 +1208,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
     config.paykit = Some(PaykitConfig {
         server_url: paykit_url,
         minimum_confirmations: 0,
+        creator_server_urls: Default::default(),
     });
     let initial_state = AppState::new_with_postgres_runtime_and_creator_repositories(
         config.clone(),
@@ -1239,7 +1241,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
     assert_eq!(invoice_calls.load(Ordering::SeqCst), 0);
 
     let zero_jitter = ZeroInvoiceRetryJitter;
-    let initial_paykit = initial_state.paykit_http_client().unwrap();
+    let initial_paykit = initial_state.paykit_router().unwrap();
     assert!(matches!(
         InvoiceAdmissionWorker::from_state(&initial_state, initial_paykit.as_ref(), &zero_jitter)
             .run_once()
@@ -1274,7 +1276,7 @@ async fn snapshotted_unready_paykit_replay_ignores_tombstoned_lock_and_reader_re
         Arc::new(InMemoryEntitlementRepository::new()),
     )
     .with_reader_pubky_resolver(Arc::new(NeverResolvesReader));
-    let tombstoned_paykit = tombstoned_state.paykit_http_client().unwrap();
+    let tombstoned_paykit = tombstoned_state.paykit_router().unwrap();
     assert!(matches!(
         InvoiceAdmissionWorker::from_state(
             &tombstoned_state,

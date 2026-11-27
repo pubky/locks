@@ -181,6 +181,11 @@ pub trait PaymentDrainClient: Send + Sync {
         None
     }
 
+    /// Normalized authority of the Paykit Server that serves `lock_resource`'s creator.
+    fn authority_for(&self, _lock_resource: &PubkyLockResource) -> Option<PaykitAuthority> {
+        self.authority()
+    }
+
     async fn start_payment_drain(
         &self,
         lock_resource: &PubkyLockResource,

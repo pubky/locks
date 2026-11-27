@@ -1384,6 +1384,7 @@ mod tests {
         config.paykit = Some(PaykitConfig {
             server_url: format!("http://{}", paykit_listener.local_addr().unwrap()),
             minimum_confirmations: 0,
+            creator_server_urls: Default::default(),
         });
         config.nexus = Some(NexusConfig {
             server_url: "https://nexus.example".to_owned(),
@@ -1413,7 +1414,7 @@ mod tests {
             "graph-worker".to_owned(),
             time::Duration::seconds(30),
         );
-        let paykit = state.paykit_http_client().unwrap();
+        let paykit = state.paykit_router().unwrap();
         let invoice = InvoiceAdmissionWorker::from_state(&state, paykit.as_ref(), &FixedJitter);
         let verification = VerificationWorker::from_state(&state);
 

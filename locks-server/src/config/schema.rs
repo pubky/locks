@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-use locks_core::ids::LockServerPubky;
+use locks_core::ids::{CreatorPubky, LockServerPubky};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -98,6 +99,9 @@ impl Default for DeletionWorkerConfig {
 pub struct PaykitConfig {
     pub server_url: String,
     pub minimum_confirmations: u32,
+    /// Operator-set Paykit Server origins for specific creators; every other creator uses
+    /// `server_url`.
+    pub creator_server_urls: HashMap<CreatorPubky, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +492,10 @@ pub enum ConfigError {
     InvalidPubkyPkarrRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
+    #[error(
+        "paykit.creator_server_urls keys must be canonical creator pubkys and values exact HTTP(S) origins without credentials"
+    )]
+    InvalidPaykitCreatorServerUrl,
     #[error(
         "nexus.server_url must be an exact HTTPS origin, or loopback HTTP in development when allow_insecure_loopback is true"
     )]

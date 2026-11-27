@@ -202,6 +202,7 @@ fn initialize_default_config_with_database_url(
         paykit: Some(PaykitConfig {
             server_url: "http://127.0.0.1:3001".to_owned(),
             minimum_confirmations: 0,
+            creator_server_urls: Default::default(),
         }),
         nexus: None,
     };
@@ -237,6 +238,7 @@ environment = "development" # One of: development, staging, production. developm
 [paykit]
 server_url = "{}" # Paykit Server base URL used by paykit-payment locks. Local dev default expects Paykit Server on 127.0.0.1:3001.
 minimum_confirmations = {} # Bitcoin confirmation threshold. 0 allows full on-time mempool payments. USDT requires verified Arbitrum inclusion.
+# creator_server_urls = {{ "pubky<creator>" = "https://paykit.creator.example" }} # Optional operator-set Paykit Server per creator, same origin rules as server_url. Unlisted creators use server_url. Each server must trust this Lock Server's public key.
 
 [creator_authority_acquisition]
 enabled = {} # true mounts hosted creator connect/session routes; false disables browser acquisition of creator authority.

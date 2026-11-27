@@ -115,6 +115,9 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 - An enabled in-process Paykit worker requires `claim_timeout_seconds > 20`.
 - `worker.poll_interval_ms` must be greater than zero whether the worker is enabled or disabled.
 - Configured Paykit `server_url` is a canonical exact HTTP(S) origin without credentials, path, query, fragment, or trailing slash; endpoint paths are appended only after validation.
+- `[paykit.creator_server_urls]` optionally maps a canonical creator pubky to that creator's own Paykit Server origin, under the same origin rules. Locks routes every Paykit call by the creator of the lock or task; creators without an entry use `server_url`. Origins come only from this runtime configuration, never from creator data. Every configured Paykit Server receives requests signed with the same Lock Server keypair and must trust its public key.
+- A Paykit Server authorizes each trusted key for every signed route and every creator it serves. A mapped Paykit Server must therefore trust this Lock Server's key for all of its creators, and a mapping is safe only when every creator on that Paykit Server accepts this Lock Server's operator.
+- A deletion with provider-v2 obligations persists the normalized authority of the creator's Paykit Server; a changed `server_url` or creator entry during such a deletion fails closed. Paykit v1 drains persist no authority and follow the current configuration.
 
 ## Consequences
 
@@ -132,6 +135,7 @@ The status body uses the same `X-Paykit-Signature` authentication as invoice cre
 - Paykit must parse the public Locks payment criterion and therefore depends on its versioned shape.
 - Snapshotted `invoice_pending` tasks must resolve before deletion may start the Paykit drain.
 - Terminal payment attempts require a fresh Bundle ID for retry; payment evidence remains owned and queryable by Paykit.
+- A creator's mapped Paykit Server shares the Lock Server's workers and connection-state lookup capacity, so its unavailability can delay other creators' payment work and exhaust lookups for every creator.
 
 ## Rejected alternatives
 
