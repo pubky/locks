@@ -86,7 +86,7 @@ use crate::app_state::private_runtime::{
 };
 pub(crate) use crate::app_state::pubky_clients::configure_pkarr_builder;
 use crate::app_state::pubky_clients::{
-    build_pubky_client, build_pubky_http_client, pubky_auth_relay_for_network,
+    build_pubky_client, build_pubky_http_client, pubky_auth_relay,
 };
 pub use crate::app_state::readiness::{
     ReadinessStatus, RuntimeStorageKind, WorkerKind, WorkerReadiness, WorkerReadinessEvidence,
@@ -224,7 +224,7 @@ where
     let grant_client = config.creator_authority_acquisition.enabled.then(|| {
         Arc::new(PubkyGrantCreatorConnectFlowClient::new(
             http.clone(),
-            pubky_auth_relay_for_network(config.pubky.network),
+            pubky_auth_relay(&config.pubky),
             client_id,
             keys,
         )) as Arc<dyn GrantCreatorConnectFlowClient>
@@ -740,7 +740,7 @@ impl AppState {
             )));
             state.folded_auth_flow_starter = Some(Arc::new(PubkyFoldedAuthFlowStarter::new(
                 client,
-                pubky_auth_relay_for_network(state.config.pubky.network),
+                pubky_auth_relay(&state.config.pubky),
                 client_id,
                 keys,
             )));

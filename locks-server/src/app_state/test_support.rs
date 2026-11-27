@@ -9,7 +9,7 @@ use sqlx::postgres::PgPoolOptions;
 use time::macros::datetime;
 
 use crate::app_state::pubky_clients::{
-    PubkyHttpClientConstructor, configure_pkarr_builder, pubky_auth_relay_for_network,
+    PubkyHttpClientConstructor, configure_pkarr_builder, pubky_auth_relay,
     pubky_http_client_constructor,
 };
 use crate::app_state::{AppState, OsRandomTaskIdGenerator, RuntimeStorageKind};
@@ -24,7 +24,7 @@ use crate::rate_limit::VerificationSubmissionRateLimitKey;
 use locks_service::application::errors::ApplicationError;
 use locks_service::application::models::{
     ContentLockDeletionPhase, CreatorAuthorityAuthKind, CreatorAuthorityRecord,
-    CreatorAuthoritySecret,
+    CreatorAuthoritySecret, CreatorConnectFlowId, GrantPopKeyId,
 };
 use locks_service::application::ports::{
     ContentLockDeletionActionAcquireResult, ContentLockDeletionActionClaim,
@@ -33,7 +33,9 @@ use locks_service::application::ports::{
     TombstoneReadback, VerificationTaskIdGenerator,
 };
 use locks_service::infrastructure::final_credentials::FinalCredentialCipher;
+use locks_service::infrastructure::folded_auth::FoldedAuthSecretCipher;
 use locks_service::infrastructure::postgres::CreatorAuthoritySecretCipher;
+use locks_service::infrastructure::runtime_master_key::RuntimeMasterKey;
 
 #[test]
 fn in_memory_state_uses_in_memory_private_runtime_adapters() {
@@ -234,14 +236,11 @@ async fn postgres_state_wires_connect_flow_runtime_state() {
     assert!(Arc::strong_count(state.creator_authority_manager()) >= 1);
 }
 
-#[tokio::test]
-async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configured() {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://locks:***@localhost/locks_test")
-        .unwrap();
-    let secret_dir = tempfile::tempdir().unwrap();
+const CONFIGURED_AUTH_RELAY: &str = "https://relay.shop.example/inbox";
+
+fn grant_connect_config(secret_dir: &std::path::Path) -> LockServerRuntimeConfig {
     let mut config = test_config();
-    config.credentials.lock_server_secret_key = write_keypair_seed_secret(secret_dir.path());
+    config.credentials.lock_server_secret_key = write_keypair_seed_secret(secret_dir);
     config.credentials.lock_server_public_key = LockServerPubky::from_str(
         &pubky_common::crypto::Keypair::from_secret(&[9; 32])
             .public_key()
@@ -254,15 +253,73 @@ async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configure
             client_id: "locks.example".to_owned(),
             allowed_return_origins: vec!["https://pubky.app".to_owned()],
         });
+    config.pubky.auth_relay = Some(CONFIGURED_AUTH_RELAY.parse().unwrap());
+    config
+}
+
+fn auth_relay_of(authorization_url: &str) -> String {
+    url::Url::parse(authorization_url)
+        .unwrap()
+        .query_pairs()
+        .find(|(name, _)| name == "relay")
+        .map(|(_, relay)| relay.into_owned())
+        .expect("authorization URL names its AUTH relay")
+}
+
+#[tokio::test]
+async fn postgres_state_wires_grant_connect_client_when_grant_table_is_configured() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
+        .unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
 
     let state = AppState::new_with_postgres_runtime(
-        config,
+        grant_connect_config(secret_dir.path()),
         pool,
         test_creator_authority_cipher(),
         test_final_credential_cipher(),
     );
 
-    assert!(state.grant_creator_connect_flow_client().is_some());
+    let authorization_url = state
+        .grant_creator_connect_flow_client()
+        .expect("grant connect is configured")
+        .start_grant_creator_connect_flow(
+            &super::default_requested_scopes(),
+            &GrantPopKeyId::for_connect_flow(&CreatorConnectFlowId::new("flow-relay")),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        auth_relay_of(authorization_url.expose_url()),
+        CONFIGURED_AUTH_RELAY
+    );
+}
+
+#[tokio::test]
+async fn postgres_folded_auth_state_starts_flows_on_the_configured_auth_relay() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://locks:***@localhost/locks_test")
+        .unwrap();
+    let secret_dir = tempfile::tempdir().unwrap();
+
+    let state = AppState::new_with_postgres_runtime_and_folded_auth(
+        grant_connect_config(secret_dir.path()),
+        pool,
+        test_creator_authority_cipher(),
+        test_final_credential_cipher(),
+        FoldedAuthSecretCipher::from_runtime_master_key(
+            &RuntimeMasterKey::from_base64url("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap(),
+        ),
+    );
+
+    let (authorization_url, _) = state
+        .folded_auth_flow_starter()
+        .expect("folded auth is wired when grant connect is configured")
+        .start(&GrantPopKeyId::new("folded-relay".to_owned()))
+        .unwrap();
+    assert_eq!(auth_relay_of(&authorization_url), CONFIGURED_AUTH_RELAY);
 }
 
 #[tokio::test]
@@ -489,6 +546,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::Default,
         pkarr_relays: None,
+        auth_relay: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet),
@@ -499,6 +557,7 @@ fn pubky_http_client_constructor_follows_configured_network() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: None,
+        auth_relay: None,
     };
     assert_eq!(
         pubky_http_client_constructor(&mainnet_relay_only),
@@ -518,6 +577,7 @@ fn relay_only_pkarr_builder_keeps_default_relays_when_not_configured() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: None,
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -535,6 +595,7 @@ fn configured_pubky_pkarr_relays_replace_defaults_without_disabling_dht() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::Default,
         pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -553,6 +614,7 @@ fn configured_relay_only_pkarr_builder_replaces_defaults_and_disables_dht() {
         network: PubkyNetwork::Mainnet,
         resolution: PubkyResolution::RelayOnly,
         pkarr_relays: Some(vec!["https://relay.example/".to_owned()]),
+        auth_relay: None,
     };
     let mut builder = pkarr::Client::builder();
 
@@ -567,13 +629,28 @@ fn configured_relay_only_pkarr_builder_replaces_defaults_and_disables_dht() {
 
 #[test]
 fn testnet_creator_connect_uses_local_pubky_auth_relay() {
-    assert!(pubky_auth_relay_for_network(PubkyNetwork::Mainnet).is_none());
+    let mainnet = PubkyConfig {
+        network: PubkyNetwork::Mainnet,
+        ..PubkyConfig::default()
+    };
+    assert!(pubky_auth_relay(&mainnet).is_none());
     assert_eq!(
-        pubky_auth_relay_for_network(PubkyNetwork::Testnet)
-            .unwrap()
-            .as_str(),
+        pubky_auth_relay(&PubkyConfig::default()).unwrap().as_str(),
         "http://127.0.0.1:15412/inbox/"
     );
+}
+
+#[test]
+fn configured_pubky_auth_relay_replaces_the_network_default() {
+    let relay: url::Url = "https://relay.shop.example/inbox".parse().unwrap();
+    for network in [PubkyNetwork::Mainnet, PubkyNetwork::Testnet] {
+        let config = PubkyConfig {
+            network,
+            auth_relay: Some(relay.clone()),
+            ..PubkyConfig::default()
+        };
+        assert_eq!(pubky_auth_relay(&config), Some(relay.clone()));
+    }
 }
 
 #[test]

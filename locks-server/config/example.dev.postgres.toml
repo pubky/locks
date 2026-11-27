@@ -59,6 +59,7 @@ level = "info"
 network = "testnet"
 resolution = "default"
 # pkarr_relays = ["http://127.0.0.1:15411"]
+# auth_relay = "http://127.0.0.1:15412/inbox/"
 
 [pkdns]
 # Public endpoint data published in the Lock Server PKARR record.

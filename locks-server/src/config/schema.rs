@@ -128,6 +128,9 @@ pub struct PubkyConfig {
     pub network: PubkyNetwork,
     pub resolution: PubkyResolution,
     pub pkarr_relays: Option<Vec<String>>,
+    /// Pubky AUTH relay inbox for grant-connect and folded-auth flows; `None` keeps the
+    /// network default.
+    pub auth_relay: Option<url::Url>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -151,6 +154,7 @@ impl Default for PubkyConfig {
             network: PubkyNetwork::Testnet,
             resolution: PubkyResolution::Default,
             pkarr_relays: None,
+            auth_relay: None,
         }
     }
 }
@@ -486,6 +490,10 @@ pub enum ConfigError {
         "pubky.pkarr_relays must contain valid http(s) URLs without credentials, query, or fragment"
     )]
     InvalidPubkyPkarrRelayUrl,
+    #[error(
+        "pubky.auth_relay must be an https URL, or http on localhost in development, without credentials, query, or fragment"
+    )]
+    InvalidPubkyAuthRelayUrl,
     #[error("paykit.server_url must be an exact HTTP(S) origin without credentials")]
     InvalidPaykitServerUrl,
     #[error(
